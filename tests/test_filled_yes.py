@@ -44,7 +44,7 @@ import numpy as np
 import pytest
 
 import jarvis.app as app_mod
-from jarvis.commander import Commander, IntentClassifier
+from jarvis.commander import Commander, CommandResult, IntentClassifier
 from jarvis.config import CONFIG, PATHS
 from jarvis.endpoint import FILLER_WORDS
 from jarvis.transcriber import FILLER_PROMPT_HINT, Transcriber
@@ -517,3 +517,510 @@ def test_a_filled_yes_answers_the_uncertain_card(build, monkeypatch):  # noqa: F
         a._pending_uncertain["req-1"] = "turn the lights down"
     a._ask_uncertain("req-1")
     assert answered == [("req-1", True)]
+
+
+# ===================================================================
+# 11. THE COMPLETION (2026-09-05, second pass)
+# ===================================================================
+# The first pass stopped at eleven rungs and the verdict measured six more
+# that still throw his answer away. Same class, same one-line move, same
+# vocabulary -- and each one is pinned BARE vs FILLED below, because the
+# only thing that must change is what a filled pause does. The bare row is
+# the control: it passed before this pass and it has to keep passing.
+#
+#   1. pick_from_answer's ORDINAL leg   ("uh, the second one")
+#   2. _PICK_CANCEL_RX                  ("uh, neither")
+#   3. _LEAVE_DECLINE_RX                ("uh, no idea")
+#   4. correction_kind, BOTH shapes     ("uh, I said Lisbon")
+#   5. feedback_kind                    ("uh, that was for you")
+#   6. _QUIZ_SKIP_RX                    ("uh, skip it")  <- marks a card WRONG
+FILLED_PREFIX = ["uh, ", "Um, ", "er, ", "uh, um, ", "Hmm, "]
+
+
+class TestThePickAnswer:
+    """"Which one, sir?" -- the ambiguous-file question (rung 1)."""
+
+    CANDS = ("/tmp/example/alpha.txt", "/tmp/example/bravo.txt")
+
+    def test_bare_the_control(self):
+        from jarvis.commander import pick_from_answer
+        choice, near = pick_from_answer("the second one", self.CANDS)
+        assert choice is not None and choice.name == "bravo.txt"
+        assert near is False
+
+    @pytest.mark.parametrize("said", [
+        "uh, the second one", "Um, the second one.", "er, the second one",
+        "the second one, uh", "uh, second", "uh, um, the second one",
+    ])
+    def test_a_filled_ordinal_picks_the_same_file(self, said):
+        from jarvis.commander import pick_from_answer
+        choice, near = pick_from_answer(said, self.CANDS)
+        assert choice is not None and choice.name == "bravo.txt", said
+        assert near is False, said
+
+    def test_a_filled_name_picks_the_same_file(self):
+        from jarvis.commander import pick_from_answer
+        bare = pick_from_answer("bravo", self.CANDS)
+        filled = pick_from_answer("uh, bravo", self.CANDS)
+        assert bare[0] is not None and bare[0].name == "bravo.txt"
+        assert filled[0] is not None and filled[0].name == bare[0].name
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_picks_nothing(self, said):
+        from jarvis.commander import pick_from_answer
+        assert pick_from_answer(said, self.CANDS) == (None, False), said
+
+    @pytest.mark.parametrize("said", ["uh, what time is it",
+                                      "um, turn the lights off"])
+    def test_a_new_subject_that_starts_with_a_filler_picks_nothing(self, said):
+        from jarvis.commander import pick_from_answer
+        assert pick_from_answer(said, self.CANDS)[0] is None, said
+
+
+class TestThePickCancel:
+    """"uh, neither" must drop the question, not fall through (rung 2)."""
+
+    def _arm(self, cmdr):
+        import time as t
+        cmdr._pending_filepick = (
+            ["/tmp/example/alpha.txt", "/tmp/example/bravo.txt"],
+            lambda choice: None, "voice", t.monotonic(), False)
+
+    def test_bare_the_control(self, cmdr):
+        self._arm(cmdr)
+        res = cmdr._try_filepick_answer("neither", "voice")
+        assert res is not None and res.status == "Dropped"
+        assert cmdr._pending_filepick is None
+
+    @pytest.mark.parametrize("said", ["uh, neither", "Um, neither.",
+                                      "er, never mind", "uh, forget it",
+                                      "neither, uh", "uh, um, cancel"])
+    def test_a_filled_cancel_drops_the_question(self, cmdr, said):
+        self._arm(cmdr)
+        res = cmdr._try_filepick_answer(said, "voice")
+        assert res is not None and res.status == "Dropped", said
+        assert cmdr._pending_filepick is None, said
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_does_not_cancel(self, cmdr, said):
+        self._arm(cmdr)
+        res = cmdr._try_filepick_answer(said, "voice")
+        assert res is None or res.status != "Dropped", said
+
+
+class TestTheLeaveDecline:
+    """"How long do you need to get to X, sir?" -- the decline (rung 3)."""
+
+    @pytest.fixture
+    def leave_cmdr(self, cmdr):
+        import time as t
+        cmdr.services.leavetime = SimpleNamespace(
+            learn=lambda key, minutes: int(minutes))
+        cmdr._pending_leave = ("Example Hall", "Example Hall", t.monotonic())
+        return cmdr
+
+    def test_bare_the_control(self, leave_cmdr):
+        from jarvis.commander import LEAVE_DROPPED_LINE
+        res = leave_cmdr._try_leave_answer("no idea")
+        assert res is not None and res.reply == LEAVE_DROPPED_LINE
+        assert leave_cmdr._pending_leave is None
+
+    @pytest.mark.parametrize("said", ["uh, no idea", "Um, no idea.",
+                                      "er, not sure", "uh, never mind",
+                                      "no idea, uh", "uh, um, dunno"])
+    def test_a_filled_decline_closes_the_question(self, leave_cmdr, said):
+        from jarvis.commander import LEAVE_DROPPED_LINE
+        res = leave_cmdr._try_leave_answer(said)
+        assert res is not None and res.reply == LEAVE_DROPPED_LINE, said
+        assert leave_cmdr._pending_leave is None, said
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_leaves_the_question_standing(self, leave_cmdr, said):
+        assert leave_cmdr._try_leave_answer(said) is None, said
+        assert leave_cmdr._pending_leave is not None, said
+
+    def test_a_command_inside_the_window_is_still_that_command(self, leave_cmdr):
+        assert leave_cmdr._try_leave_answer("uh, set a timer for five minutes") is None
+        assert leave_cmdr._pending_leave is not None
+
+
+class TestTheCorrection:
+    """"I said Lisbon" / "not the terminal, the calendar" (rung 4).
+
+    A man correcting a mishearing is PRECISELY when he hesitates, so this
+    is the rung where the bug should have been expected first."""
+
+    def test_bare_the_control(self):
+        from jarvis.commander import correction_kind
+        assert correction_kind("I said Lisbon") == "Lisbon"
+        assert correction_kind("not the terminal, the calendar") == "the calendar"
+
+    @pytest.mark.parametrize("prefix", FILLED_PREFIX)
+    def test_a_filled_i_said_is_still_a_correction(self, prefix):
+        from jarvis.commander import correction_kind
+        assert correction_kind(prefix + "I said Lisbon") == "Lisbon", prefix
+
+    @pytest.mark.parametrize("prefix", FILLED_PREFIX)
+    def test_a_filled_not_x_y_is_still_a_correction(self, prefix):
+        from jarvis.commander import correction_kind
+        said = prefix + "not the terminal, the calendar"
+        assert correction_kind(said) == "the calendar", prefix
+
+    def test_a_trailing_filler_does_not_end_up_in_the_meant_text(self):
+        from jarvis.commander import correction_kind
+        assert correction_kind("I said Lisbon, uh") == "Lisbon"
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_is_not_a_correction(self, said):
+        from jarvis.commander import correction_kind
+        assert correction_kind(said) is None, said
+
+    @pytest.mark.parametrize("said", ["uh, what time is it",
+                                      "um, not now", "er, not really"])
+    def test_a_new_subject_that_starts_with_a_filler_is_not_a_correction(self, said):
+        from jarvis.commander import correction_kind
+        assert correction_kind(said) is None, said
+
+    def test_the_question_mark_still_survives(self):
+        """09-04's sixth pass: a "?" on the meant text is the send bar."""
+        from jarvis.commander import correction_kind
+        assert correction_kind("uh, I said yes?") == "yes?"
+
+
+class TestTheFeedback:
+    """"that was for you" -- the rung that RE-RUNS a dropped command (5)."""
+
+    def test_bare_the_control(self):
+        from jarvis.commander import feedback_kind
+        assert feedback_kind("that was for you") is True
+        assert feedback_kind("that wasn't for you") is False
+
+    @pytest.mark.parametrize("prefix", FILLED_PREFIX)
+    def test_a_filled_yes_is_still_feedback(self, prefix):
+        from jarvis.commander import feedback_kind
+        assert feedback_kind(prefix + "that was for you") is True, prefix
+
+    @pytest.mark.parametrize("prefix", FILLED_PREFIX)
+    def test_a_filled_no_is_still_feedback(self, prefix):
+        from jarvis.commander import feedback_kind
+        assert feedback_kind(prefix + "that wasn't for you") is False, prefix
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_is_not_feedback(self, said):
+        from jarvis.commander import feedback_kind
+        assert feedback_kind(said) is None, said
+
+    @pytest.mark.parametrize("said", ["uh, what time is it",
+                                      "um, that was for her"])
+    def test_a_new_subject_that_starts_with_a_filler_is_not_feedback(self, said):
+        from jarvis.commander import feedback_kind
+        assert feedback_kind(said) is None, said
+
+    def test_the_dropped_command_is_re_run_through_the_real_rung(self, cmdr):
+        """The teeth: a command the classifier dropped is run again."""
+        import time as t
+        from jarvis.commander import LastTurn
+        cmdr._last_turn = LastTurn("what time is it", "Ignored (background)",
+                                   t.monotonic())
+        res = cmdr._try_feedback("uh, that was for you", None, "voice")
+        assert res is not None and res.handled
+        assert res.status == "Clock", res.status
+        assert res.corrected == "what time is it"
+
+
+class TestTheQuizSkip:
+    """THE ONE WITH TEETH, driven through the real handler (rung 6).
+
+    Measured before the fix, same three words, same open card:
+
+        "skip it"      -> session.results == [(1, None)]   ungraded
+        "uh, skip it"  -> session.results == [(1, False)]  MARKED WRONG
+
+    A card marked wrong is not a lost turn he can repeat: it is a Leitner
+    demotion written to his deck, and it will come back at him for weeks.
+    And on the briefing rung -- which the first pass DID fix -- those same
+    three words are correctly a decline. Identical words, opposite
+    treatment, one of them silently editing his study schedule."""
+
+    @pytest.fixture
+    def quiz_cmdr(self, cmdr, tmp_path):
+        from jarvis.tools.quiz import FlashcardStore, QuizSession
+        store = FlashcardStore(tmp_path / "cards.db")
+        cards = store.add_cards(
+            [{"question": "What is impedance?", "answer": "V over I"},
+             {"question": "Name a transducer", "answer": "thermistor"}],
+            source="example.md", topic="example")
+        cmdr.services.flashcards = store
+        cmdr._pending_quiz = QuizSession(cards, topic="example")
+        cmdr._pending_quiz.ask()
+        yield cmdr, store, cards
+        store.close()
+
+    def test_bare_the_control(self, quiz_cmdr):
+        from jarvis.tools.quiz import SKIP_LINE
+        cmdr, store, cards = quiz_cmdr
+        cid = cards[0]["id"]
+        res = cmdr.handle("skip it", "voice")
+        assert res is not None and res.reply.startswith(
+            SKIP_LINE.format(answer="V over I"))
+        assert cmdr._pending_quiz.results == [(cid, None)]
+        assert store.get(cid)["seen"] == 0 and store.get(cid)["box"] == 1
+
+    @pytest.mark.parametrize("said", ["uh, skip it", "Um, skip it.",
+                                      "er, skip it", "uh, pass",
+                                      "uh, no idea", "skip it, uh",
+                                      "uh, um, I don't know"])
+    def test_a_filled_skip_settles_the_card_ungraded(self, quiz_cmdr, said):
+        cmdr, store, cards = quiz_cmdr
+        cid = cards[0]["id"]
+        cmdr.handle(said, "voice")
+        assert cmdr._pending_quiz.results == [(cid, None)], said
+        assert store.get(cid)["seen"] == 0, said
+        assert store.get(cid)["box"] == 1, said
+
+    def test_a_filled_skip_names_the_answer_like_a_bare_one(self, quiz_cmdr):
+        from jarvis.tools.quiz import SKIP_LINE
+        cmdr, store, cards = quiz_cmdr
+        res = cmdr.handle("uh, skip it", "voice")
+        assert res is not None
+        assert res.reply.startswith(SKIP_LINE.format(answer="V over I"))
+
+    def test_a_real_filled_answer_is_still_graded(self, quiz_cmdr):
+        """The trap in the other direction: stripping the filler must not
+        turn a genuine answer into a skip."""
+        cmdr, store, cards = quiz_cmdr
+        cid = cards[0]["id"]
+        cmdr.handle("uh, v over i", "voice")
+        assert cmdr._pending_quiz.results == [(cid, True)]
+
+
+# ===================================================================
+# 12. THE SEVENTH, and what the AST sweep found with it
+# ===================================================================
+# The six above were the verdict's list. An AST sweep of jarvis/ -- every
+# re.compile whose pattern is start-anchored, reassembled from the tree
+# rather than grepped, and every .match() site traced back to the
+# assignment that feeds it -- turned up 28 spoken-answer grammars across
+# 33 match sites, and FIVE more of them were still losing his answer.
+# Measured bare vs filled before the fix:
+#
+#   _person_from_answer ordinal  "the second one" -> Bea Example
+#                                "uh, the second one" -> None
+#   _QUIZ_STOP_RX                True  -> False   (and the card is GRADED)
+#   _TAKE_QUIZ_RX                True  -> False
+#   _ENROL_CONFIRM_RX            "enrol" -> "uh, enrol" is not the word
+#   _SEND_MAYBE_RX (destructive) True  -> False   (the re-ask is lost)
+#
+# NOT fixed, and deliberately: quiz_kind / review_kind. They are COMMAND
+# grammars the registry shares, and a filled "uh, quiz me on the recipe"
+# spoken over an open card is graded rather than starting a new quiz.
+# Stripping at the quiz rung ALONE would drop the open session and still
+# not start the new one, because the registry would then be handed the
+# unstripped words -- so the fix belongs in the command grammar, which is
+# a different decision from this one. Pinned here as it stands today.
+class TestThePersonPick:
+    """"Which Heather, sir?" -- the same ordinal leg as the file pick,
+    which is why it was missed: two functions, one grammar."""
+
+    NAMES = ["Ada Example", "Bea Example"]
+
+    def test_bare_the_control(self):
+        from jarvis.commander import _person_from_answer
+        assert _person_from_answer("the second one", self.NAMES) == "Bea Example"
+
+    @pytest.mark.parametrize("said", ["uh, the second one", "Um, the second one.",
+                                      "er, second", "the second one, uh"])
+    def test_a_filled_ordinal_names_the_same_person(self, said):
+        from jarvis.commander import _person_from_answer
+        assert _person_from_answer(said, self.NAMES) == "Bea Example", said
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_names_nobody(self, said):
+        from jarvis.commander import _person_from_answer
+        assert _person_from_answer(said, self.NAMES) is None, said
+
+
+class TestTheQuizStopWords:
+    """"uh, stop the quiz" must stop the quiz, not be marked wrong."""
+
+    @pytest.fixture
+    def quiz_cmdr(self, cmdr, tmp_path):
+        from jarvis.tools.quiz import FlashcardStore, QuizSession
+        store = FlashcardStore(tmp_path / "cards.db")
+        cards = store.add_cards(
+            [{"question": "What is impedance?", "answer": "V over I"},
+             {"question": "Name a transducer", "answer": "thermistor"}],
+            source="example.md", topic="example")
+        cmdr.services.flashcards = store
+        cmdr._pending_quiz = QuizSession(cards, topic="example")
+        cmdr._pending_quiz.ask()
+        yield cmdr, store, cards
+        store.close()
+
+    def test_bare_the_control(self, quiz_cmdr):
+        cmdr, store, cards = quiz_cmdr
+        res = cmdr.handle("stop the quiz", "voice")
+        assert res is not None and res.status == "Quiz stopped"
+        assert cmdr._pending_quiz is None
+        assert store.get(cards[0]["id"])["seen"] == 0
+
+    @pytest.mark.parametrize("said", ["uh, stop the quiz", "Um, stop the quiz.",
+                                      "er, no more questions"])
+    def test_a_filled_stop_stops_it_without_grading_the_card(self, quiz_cmdr, said):
+        cmdr, store, cards = quiz_cmdr
+        res = cmdr.handle(said, "voice")
+        assert res is not None and res.status == "Quiz stopped", said
+        assert cmdr._pending_quiz is None, said
+        assert store.get(cards[0]["id"])["seen"] == 0, said
+
+
+class TestTheTeachOffer:
+    """"Shall I quiz you on it, sir?" -- "uh, go on" takes the offer."""
+
+    def _arm(self, cmdr):
+        import time as t
+        cmdr._pending_teach = ("example", "some body text", t.monotonic())
+
+    def test_bare_the_control(self, cmdr):
+        from jarvis.commander import _TAKE_QUIZ_RX
+        assert _TAKE_QUIZ_RX.match("go on")
+        self._arm(cmdr)
+        res = cmdr._try_teach_offer("go on")
+        assert res is not None and res.status != "No quiz"
+
+    @pytest.mark.parametrize("said", ["uh, go on", "Um, go ahead.",
+                                      "er, quiz me", "go on, uh"])
+    def test_a_filled_yes_takes_the_offer(self, cmdr, said):
+        self._arm(cmdr)
+        res = cmdr._try_teach_offer(said)
+        assert res is not None, said
+        assert res.status != "No quiz", said
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_takes_nothing(self, cmdr, said):
+        self._arm(cmdr)
+        assert cmdr._try_teach_offer(said) is None, said
+
+
+class TestTheEnrolConfirm:
+    """The enrolment offer is taken by ONE word ("enrol") on purpose --
+    it starts the camera. A filled pause must not un-say it."""
+
+    def _arm(self, cmdr):
+        cmdr.services.enrol_offer = {"made_at": _t.time(), "name": "Ada Example"}
+        cmdr.services.enrol_run = None
+
+    def test_bare_the_control(self):
+        from jarvis.commander import _ENROL_CONFIRM_RX
+        assert _ENROL_CONFIRM_RX.match("enrol")
+
+    @pytest.mark.parametrize("said", ["uh, enrol", "Um, enrol.", "enrol, uh"])
+    def test_a_filled_confirm_is_still_the_word(self, cmdr, said):
+        self._arm(cmdr)
+        res = cmdr._try_enrol(said)
+        assert res is not None, said
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_starts_no_camera(self, cmdr, said):
+        self._arm(cmdr)
+        assert cmdr._try_enrol(said) is None, said
+
+    def test_a_new_subject_that_starts_with_a_filler_starts_no_camera(self, cmdr):
+        self._arm(cmdr)
+        assert cmdr._try_enrol("uh, what time is it") is None
+
+
+class TestTheDestructiveVagueAnswer:
+    """A vague answer to a destructive read-back earns ONE re-ask. Filled,
+    it earned nothing: the read-back was dropped in silence."""
+
+    def _arm(self, cmdr):
+        import time as t
+        pend = (lambda: CommandResult(handled=True, reply="done", status="Done"),
+                "delete the example list", t.monotonic())
+        cmdr._pending_destructive = pend
+        cmdr._pending_destructive_meta = ("voice", True, pend)
+        cmdr._strict_reasked = False
+        cmdr.services.notes = None
+
+    def test_bare_the_control(self, cmdr):
+        self._arm(cmdr)
+        res = cmdr._try_destructive_confirm("okay", "voice")
+        assert res is not None and res.status == "Confirm?"
+
+    @pytest.mark.parametrize("said", ["uh, okay", "Um, sure.", "er, alright",
+                                      "okay, uh"])
+    def test_a_filled_vague_answer_still_earns_the_re_ask(self, cmdr, said):
+        self._arm(cmdr)
+        res = cmdr._try_destructive_confirm(said, "voice")
+        assert res is not None and res.status == "Confirm?", said
+
+    def test_a_filled_yes_is_still_a_yes(self, cmdr):
+        self._arm(cmdr)
+        res = cmdr._try_destructive_confirm("uh, yes do it", "voice")
+        assert res is not None and res.status == "Done"
+
+
+def test_the_ast_sweep_finds_no_unstripped_answer_grammar_left():
+    """The sweep itself, in one assertion: every start-anchored grammar in
+    an ANSWER position either strips or is on the named exception list.
+
+    Kept as a test, not a one-off script, because the next answer rung
+    someone adds is the next "Uh, yeah." thrown away. It reads the AST of
+    jarvis/commander.py -- no import-time behaviour, no regex over source.
+    """
+    import ast
+    import pathlib
+    src = pathlib.Path(cm_path()).read_text()
+    tree = ast.parse(src)
+    # Every function that judges an answer while a question is parked.
+    rungs = {"pick_from_answer", "_person_from_answer", "correction_kind",
+             "feedback_kind", "briefing_answer", "parse_yes_no",
+             "_try_filepick_answer", "_try_sendask_answer", "_try_leave_answer",
+             "_try_quiz_answer", "_try_teach_offer", "_try_enrol",
+             "_try_approval", "_try_terminal_offer", "_try_briefing_offer",
+             "_try_destructive_confirm"}
+    # Matched inside a rung but NOT an answer grammar, each for a reason
+    # written down above: the two COMMAND grammars the registry shares.
+    exempt = {"_QUIZ_RX", "_REVIEW_RX"}
+    missing = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef) or fn.name not in rungs:
+            continue
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("match", "fullmatch")
+                    and isinstance(node.func.value, ast.Name)):
+                continue
+            name = node.func.value.id
+            if not name.isupper() and not name.startswith("_"):
+                continue
+            if name in exempt:
+                continue
+            arg = ast.unparse(node.args[0]) if node.args else ""
+            if "strip_fillers" in arg:
+                continue
+            # ...or the variable it is handed was stripped on its way in
+            hit = False
+            for a in ast.walk(fn):
+                if (isinstance(a, ast.Assign) and "strip_fillers" in ast.unparse(a.value)
+                        and any(isinstance(t, ast.Name) and t.id in arg
+                                for t in a.targets)):
+                    hit = True
+                    break
+                # _send_clean strips on the caller's behalf (its own tests
+                # pin that); a name assigned from it counts.
+                if (isinstance(a, ast.Assign) and "_send_clean(" in ast.unparse(a.value)
+                        and any(isinstance(t, ast.Name) and t.id in arg
+                                for t in a.targets)):
+                    hit = True
+                    break
+            if not hit and "_send_clean(" not in arg:
+                missing.append(f"{fn.name}(): {name}.match({arg})")
+    assert missing == [], "answer grammars still handed an unstripped filled pause"
+
+
+def cm_path():
+    import jarvis.commander
+    return jarvis.commander.__file__

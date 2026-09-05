@@ -6319,7 +6319,15 @@ def pick_from_answer(text, candidates) -> tuple:
     the margin was not there. The caller asks once more rather than
     dropping it in silence. (None, False) is "not an answer at all".
     """
-    said = " ".join(str(text or "").split())
+    # THE FILLED PAUSE COMES OFF FIRST (jarvis.endpoint.strip_fillers, the
+    # ONE list the filler hold uses). _PICK_ORDINAL_RX is anchored on the
+    # ordinal WORD after an optional "jarvis" -- deliberately, because a
+    # loose match here sends the WRONG FILE -- so "uh, the second one" was
+    # not answer-SHAPED and picked nothing at all, where "the second one"
+    # picks the second. The anchoring is untouched; only the throat-clearing
+    # goes. A reply that is nothing but fillers strips to "" and is
+    # (None, False): not an answer, and not a near miss either.
+    said = " ".join(strip_fillers(text).split())
     cands = [Path(c) for c in (candidates or ())]
     if not said or not cands:
         return None, False
@@ -6360,7 +6368,11 @@ def _person_from_answer(text, candidates) -> Optional[str]:
     else. A first name is the very ambiguity being asked about, and a
     near-miss is a stranger holding his file.
     """
-    said = " ".join(str(text or "").split())
+    # Same strip as pick_from_answer, and for the same reason: this is
+    # _PICK_ORDINAL_RX again. Two functions, ONE grammar -- which is
+    # exactly why fixing the file pick alone would have left "uh, the
+    # second one" naming nobody when the question was which Heather.
+    said = " ".join(strip_fillers(text).split())
     names = [str(c) for c in (candidates or ())]
     if not said or not names:
         return None
@@ -10066,8 +10078,19 @@ _CORRECTION_NOT_RX = re.compile(
 
 
 def correction_kind(text: str) -> Optional[str]:
-    """The meant text when the utterance is a correction, else None."""
-    t = (text or "").strip()
+    """The meant text when the utterance is a correction, else None.
+
+    The filled pause comes off first (jarvis.endpoint.strip_fillers). Both
+    shapes are start-anchored -- "I said X" and "not X, Y" -- and a man
+    correcting a mishearing is PRECISELY when he hesitates, so this is the
+    rung that loses the most: "uh, I said Lisbon" and "uh, not the
+    terminal, the calendar" were not corrections at all, and the wrong
+    word stood. The trailing edge goes too, so "I said Lisbon, uh" does
+    not carry the filler into the MEANT text and re-dispatch it. Nothing
+    but fillers strips to "" and corrects nothing; "uh, not now" and
+    "uh, not really" are still plain sentences, exactly as before.
+    """
+    t = strip_fillers(text).strip()
     m = _CORRECTION_RX.match(t) or _CORRECTION_NOT_RX.match(t)
     if not m:
         return None
@@ -10135,8 +10158,15 @@ _FEEDBACK_NO_RX = re.compile(
 
 
 def feedback_kind(text: str) -> Optional[bool]:
-    """True = "that was for you", False = "that wasn't for you", else None."""
-    t = (text or "").strip()
+    """True = "that was for you", False = "that wasn't for you", else None.
+
+    The filled pause comes off first: both grammars are start-anchored,
+    and this rung RE-RUNS a command the classifier dropped -- so "uh, that
+    was for you" losing its shape does not merely lose the label, it loses
+    the command a second time, which is the exact failure the feedback
+    rung exists to repair.
+    """
+    t = strip_fillers(text).strip()
     if _FEEDBACK_NO_RX.match(t):
         return False
     if _FEEDBACK_YES_RX.match(t):
@@ -11644,7 +11674,10 @@ class Commander:
         choice, near = pick_from_answer(text, cands)
         if choice is None:
             said = " ".join(str(text or "").split())
-            if _PICK_CANCEL_RX.match(said):
+            # Start-anchored like every answer grammar here, so the filled
+            # pause comes off before it: "uh, neither" is a neither, and
+            # the question is dropped out loud instead of standing.
+            if _PICK_CANCEL_RX.match(strip_fillers(said)):
                 self._pending_filepick = None
                 self._answered_pending = True
                 return CommandResult(handled=True, reply="Very good, sir.",
@@ -11983,7 +12016,8 @@ class Commander:
             return None
         self._pending_sendask = None
         said = " ".join(str(text or "").split())
-        if _PICK_CANCEL_RX.match(said) or parse_yes_no(said) is False:
+        # Same grammar, same strip (parse_yes_no does its own).
+        if _PICK_CANCEL_RX.match(strip_fillers(said)) or parse_yes_no(said) is False:
             self._answered_pending = True
             return CommandResult(handled=True, reply=outbox.ASK_SPENT_LINE,
                                  speak=True, status="Dropped")
@@ -12218,7 +12252,7 @@ class Commander:
                 # obeying "okay" is how a file lands on the wrong machine,
                 # and dropping it in silence is how he learns the feature
                 # does not work. The second vague answer spends the offer.
-                vague = bool(_SEND_MAYBE_RX.match(said)) or (
+                vague = bool(_SEND_MAYBE_RX.match(strip_fillers(said))) or (
                     len(said.split()) <= 6 and parse_yes_no(said) is True)
                 if vague and not self._strict_reasked:
                     self._strict_reasked = True
@@ -12532,7 +12566,10 @@ class Commander:
         offer = getattr(services, "enrol_offer", None)
         if not isinstance(offer, dict) or not offer:
             return None
-        if not _ENROL_CONFIRM_RX.match(stripped):
+        # ONE word takes this offer ("enrol"), because it starts the
+        # camera. That narrowness is right, and it is also what made
+        # "uh, enrol" not the word at all.
+        if not _ENROL_CONFIRM_RX.match(strip_fillers(stripped)):
             # Anything else leaves the offer parked and routes normally. It
             # is NOT dropped the way the briefing offer is: that one holds an
             # open microphone, this one holds nothing at all, and asking him
@@ -12936,14 +12973,24 @@ class Commander:
             _cut_speech(self)
             return CommandResult(handled=True, reply="Very good, sir.", speak=False,
                                  status="Quiz stopped")
-        if _QUIZ_STOP_RX.match(t):
+        # The same teeth as the skip below: unrecognised, "uh, stop the
+        # quiz" is not a stop, it is GRADED -- the card is marked wrong
+        # AND the quiz carries on asking.
+        if _QUIZ_STOP_RX.match(strip_fillers(t)):
             self._pending_quiz = None
             return CommandResult(handled=True, reply=session.score_line(), speak=True,
                                  status="Quiz stopped")
         if source != "voice":
             return None            # not the answer: route it as a command
         card = session.current
-        if _QUIZ_SKIP_RX.match(tl):
+        # THE ONE WITH TEETH. Measured on the real handler: "skip it"
+        # settles the card ungraded (results [(1, None)]); "uh, skip it"
+        # fell through to the GRADER and the card was marked WRONG
+        # ([(1, False)]) -- a Leitner demotion written to his deck that
+        # comes back at him for weeks. The same three words on the briefing
+        # offer are correctly a decline. The filler comes off the SKIP test
+        # only: the grader still sees ``t`` exactly as he said it.
+        if _QUIZ_SKIP_RX.match(strip_fillers(tl)):
             session.settle(None)
             line = quiz_mod.SKIP_LINE.format(answer=card["answer"])
         else:
@@ -13092,7 +13139,10 @@ class Commander:
             return None
         minutes = leave_mod.answer_minutes(text)
         if minutes is None:
-            if _LEAVE_DECLINE_RX.match(strip_address(text) or text or ""):
+            # "uh, no idea" closes the question for good, like "no idea":
+            # the grammar is start-anchored, so the filler comes off first.
+            if _LEAVE_DECLINE_RX.match(
+                    strip_fillers(strip_address(text) or text or "")):
                 self._pending_leave = None
                 return CommandResult(handled=True, speak=True,
                                      reply=LEAVE_DROPPED_LINE,
@@ -13135,7 +13185,7 @@ class Commander:
             # "quiz me" on its own carries no topic (quiz_kind wants an
             # "on ..."), so the registry would never route it; here it is
             # the plainest way to say yes.
-            if not _TAKE_QUIZ_RX.match(t.rstrip(".!?")):
+            if not _TAKE_QUIZ_RX.match(strip_fillers(t).rstrip(".!?")):
                 return None
             answer = True
         if not answer:
