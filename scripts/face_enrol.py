@@ -289,8 +289,18 @@ def _isatty(stream) -> bool:
         return False
 
 
-def consent(label: str, owner: str, root, say, args) -> tuple:
+def consent(label: str, owner: str, root, say, args, lines=None) -> tuple:
     """``(ok, how)``. Enrolling somebody else takes THEIR agreement.
+
+    ``lines`` EXISTS SO THERE IS ONE CONSENT RULE AND NOT TWO. The RULE is
+    everything below -- no --json, no --auto, both ends must be a terminal,
+    and they type their own name -- and it is identical whatever is being
+    measured. The WORDING is not: ``CONSENT_LINES`` says "a measurement of
+    their FACE: 128 numbers", and printing that over a voice enrolment would
+    be a false statement of what is being stored, which is worse than a second
+    rule. So scripts/voice_enrol.py passes its own text through here rather
+    than copying this function; a second copy is two rules that can drift,
+    which is facegallery's own argument for not exporting ``_LABEL_RE``.
 
     NOT A COMMENT AND NOT A README LINE. Storing a second person's biometric
     data without them knowing is the failure this flow exists to prevent, so
@@ -339,7 +349,7 @@ def consent(label: str, owner: str, root, say, args) -> tuple:
                        "and type their own name, at a terminal. Run this "
                        "without redirecting stdin or stdout." % label)
     say("")
-    for line in CONSENT_LINES:
+    for line in (CONSENT_LINES if lines is None else tuple(lines)):
         say(line % fields)
     try:
         answer = input('Type "%s" to agree: ' % label).strip().lower()

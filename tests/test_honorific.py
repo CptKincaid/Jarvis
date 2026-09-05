@@ -461,7 +461,22 @@ def test_the_commander_bypass_is_wired_too():
 def test_the_startup_line_does_not_call_a_512_row_stale(tmp_path):
     """app.py read facegallery.EMBED_DIM -- 128, the SFace width -- while
     the live backend is arcface_mbf at 512, so an honest 512-D enrolment
-    was reported as stale and he was told to re-enrol for nothing."""
+    was reported as stale and he was told to re-enrol for nothing.
+
+    AND IT NAMES THE FALLBACK, added at the integration merge (09-05).
+    This branch compared against ``backend_for(None)``, the default;
+    jarvis-v3 compares against the CONFIGURED backend
+    (``camera.face_backend``), which is the behaviour that survived --
+    it is the documented one-line reversal to SFace, and asking about the
+    default would call a correct SFace enrolment stale the day he takes
+    it. The stand-in below answers every option with ``True``, so
+    ``camera.face_backend`` reads as the unknown name "True" and
+    ``facemodels.backend_for`` RAISES on it by design. Letting that escape
+    turned the whole sentence into "the camera could not be asked" and hid
+    the stale row this test is about; ``_face_leg_why`` now falls back to
+    the DEFAULT's width and logs why. ``width`` below is that same default,
+    which is what makes the two assertions meaningful here.
+    """
     from types import SimpleNamespace
 
     from jarvis import app as app_mod

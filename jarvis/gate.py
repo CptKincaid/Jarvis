@@ -126,7 +126,16 @@ FAILING OPEN ON ITS OWN FAILURE IS NOT FAILING OPEN ON A NEGATIVE
     A missing, corrupt or unreadable registry, nothing enrolled, no leg
     running at all, a raised exception anywhere inside ``judge`` -- all of
     those admit, loudly. Somebody the registry does not know is still
-    refused.
+    refused. ONE EXCEPTION, RULED 2026-09-04: a fault reported BY the voice
+    leg's naming instrument (``who_fault``) is not the gate failing, it is
+    the leg abstaining, and it names nobody -- fail shut, never the owner.
+    See ``_voice_leg``.
+
+THE GALLERY'S LABELS ARE NOT THE REGISTRY'S
+    The voice gallery files the owner under ``identity.owner_label`` (the
+    config slug); his registry row is typed. ``_registry_label`` is the one
+    place the two are reconciled, and every label the voice leg reads goes
+    through it.
 """
 from __future__ import annotations
 
@@ -136,7 +145,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from jarvis import passphrase as pp
-from jarvis import signin
+# TWO MODULES WITH TWO DIFFERENT JOBS, and the merge keeps both because
+# neither does the other's. ``signin`` turns WORDS INTO AT MOST ONE LABEL
+# to confirm (pure, no verdict, no admission). ``signinlines`` owns the
+# SENTENCES -- his verbatim welcome and the near-miss line -- and
+# tests/test_signin_lines.py::test_the_sentence_lives_in_one_file fails on
+# a second copy of the welcome anywhere under jarvis/, which is why nothing
+# below re-types it.
+from jarvis import signin, signinlines
 from jarvis.identity import (ROLE_KNOWN, ROLE_OWNER, ROLE_UNKNOWN, Registry,
                              startup_line)
 from jarvis.logs import get_logger
@@ -236,6 +252,9 @@ KNOWN_SCOPE_LINE = ("That one's the owner's, {name}. I can give you the time, "
 # the phrase, how close it was, or how long the floor stays open: it is
 # spoken out loud in a room that may hold whoever the gate just refused.
 PHRASE_OK_LINE = "Thank you, sir. I'm listening."
+# The refusal for a voice the gallery could not tell from another enrolled
+# one. Imported so there is one wording, in jarvis/signinlines.py.
+NEAR_MISS_LINE = signinlines.NEAR_MISS_LINE
 # ...AND WHAT MODE_OFF SAYS INSTEAD, because in off the phrase opens no
 # window (see _phrase_consumed) and the speaker filter -- which is not the
 # gate and does not care what mode the gate is in -- goes on dropping his
@@ -263,14 +282,23 @@ SIGNIN_NO_LEG_LINE = ("I have a {name} on file, but I've no way to confirm "
                       "you in at the keyboard.")
 # Confirmed. HIS WORDING, VERBATIM (09-04): "Voice and identity
 # recognized, welcome back <first name>. How may I be of assistance
-# today?" -- the same sentence jarvis/signinlines.py carries on the
-# voice-multispeaker branch, so the two cannot disagree at the merge. A
-# {first} template: the name does the work of address, there is no
+# today?"
+#
+# AND IT IS AN ALIAS, NOT A COPY -- this is the merge, and this is where
+# the two branches said the same sentence twice. Both wrote it out in
+# full: people-signin here, voice-multispeaker in jarvis/signinlines.py,
+# which had already been named (09-04, in that module's own docstring) as
+# the file that OWNS the line and the rule. Keeping both literals passed
+# every wording test and still broke
+# tests/test_signin_lines.py::test_the_sentence_lives_in_one_file, which
+# is right: two copies of a sentence is two places for it to drift. The
+# name stays because this gate's callers and tests know it.
+#
+# A {first} template: the name does the work of address, there is no
 # honorific in it, and Mara and Heather -- "ma'am" everywhere else --
 # hear their own first name here. Like every {name} template it is never
 # prewarmed.
-SIGNIN_OK_LINE = ("Voice and identity recognized, welcome back {first}. "
-                  "How may I be of assistance today?")
+SIGNIN_OK_LINE = signinlines.BOTH_LEGS_LINE
 # A KNOWN person reaching for a setting or a privilege. A {name} template
 # like KNOWN_SCOPE_LINE, and for the same reason: he is already recognised
 # and greeted by name, and a refusal that says his name back is a refusal
@@ -289,22 +317,17 @@ ENROL_AT_KEYBOARD_LINE = ("Enrolling somebody else has to happen at the "
 # rendering is a cache miss the first time a ma'am person hears it, which
 # is a latency cost and not a defect.
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE, PHRASE_OFF_LINE, ENROL_AT_KEYBOARD_LINE)
+                 PHRASE_OK_LINE, PHRASE_OFF_LINE, ENROL_AT_KEYBOARD_LINE,
+                 NEAR_MISS_LINE)
 
-
-def first_name(person, fallback: str = "") -> str:
-    """What ``{first}`` renders as: the typed first name, else the first
-    word of the display name, else ``fallback``."""
-    if person is None:
-        return fallback
-    first = str(getattr(person, "first", "") or "").strip()
-    if first:
-        return first
-    try:
-        words = str(person.display() or "").split()
-    except Exception:  # noqa: BLE001 - a row that cannot say
-        words = []
-    return words[0] if words else fallback
+# THE ONE RESOLVER OF THE FIRST NAME, imported rather than re-implemented.
+# Both branches wrote one; they agreed on the order (a typed ``first``,
+# then the display name's first word, then a fallback) and signinlines' is
+# the one the settled rule names, so this is an alias and not a copy. It
+# already honours people-signin's typed ``Person.first`` --
+# tests/test_signin_lines.py::test_a_typed_first_name_wins_over_the_display_name
+# was written for exactly this merge.
+first_name = signinlines.first_name
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -433,6 +456,42 @@ class OwnerGate:
         owners = reg.owners()
         return owners[0].label if owners else ""
 
+    def _registry_label(self, label) -> str:
+        """THE ONE RESOLVER FROM A GALLERY LABEL TO A REGISTRY LABEL, for
+        everything the voice leg reads (``who``, ``top``, ``matched_label``)
+        -- what ``_face_leg`` already does for a face label through
+        ``Registry.face_labels``.
+
+        The two stores name him differently by construction. His GALLERY
+        label is ``identity.owner_label(cfg)`` -- ``slug(user.name)``, which
+        is what ``--migrate`` files his takes under and what ``self.owner``
+        holds, since app.py passes the same derivation to both -- while his
+        REGISTRY row is TYPED (scripts/jarvis_people.py add --label). A
+        guest's gallery label IS their registry label (scripts/voice_enrol
+        says so), so only the owner can straddle the two.
+
+        Measured 2026-09-04 (tests/test_voice_owner_lockout.py) with
+        user.name -> "hunterpeyrovi" beside a registry row "hunter": the leg
+        handed ``recognise`` the raw gallery label, ``recognise`` drops any
+        label the registry lacks, and 50 of 50 of HIS turns were refused as
+        nobody after --migrate -- with load_gallery's warning silent, since
+        his label was in the gallery. Latent on his box today (slug and
+        row are both "hunter"); it bites the day one of them changes.
+
+        A registry row is itself. The config slug is the registry OWNER. A
+        label neither knows stays what it is: still SOMEBODY for the "best
+        guess is somebody else" rule, and ``recognise`` still drops it as
+        an identity.
+        """
+        label = str(label or "")
+        if not label:
+            return ""
+        if self.registry.person(label) is not None:
+            return label
+        if self.owner and label == self.owner:
+            return self._owner_label() or label
+        return label
+
     def _mode_unsafe(self) -> str:
         """The live mode. Raises only if the registry does; ``judge`` owns
         that boundary so a broken registry becomes an admit, not a crash."""
@@ -545,6 +604,31 @@ class OwnerGate:
         """
         if not isinstance(stats, dict) or "matched" not in stats:
             return "", False
+        fault = str(stats.get("who_fault") or "")
+        if fault:
+            # A FAULT IN THE IDENTITY PATH IS AN ABSTENTION: the leg RAN and
+            # names NOBODY. Fail shut, never the owner. Before this key
+            # existed a gallery that raised arrived here as who="", which is
+            # byte-identical to a voice it measured and declined to name, so
+            # a wedged store either minted the owner (one label) or refused
+            # him (two). The first fix read a fault as NO INSTRUMENT --
+            # "not running", counted toward the dead-man -- and the round-3
+            # review measured the hole in that: identify() raising while
+            # centroids() still worked let her clip clear the bar on HER
+            # pool and reach the gate with the camera off as a BLIND admit,
+            # owner scope, 50 of 50. The pool is a fact from the matching
+            # instrument, which did run; "not running" threw it away and
+            # admitted on the strength of nothing. RULING (2026-09-04):
+            # any fault here is nobody, in enforce a refusal, whichever
+            # pool it was measured on -- his included. The cost is stated:
+            # a persistently faulting gallery refuses him on the voice path
+            # rather than standing the gate down after three turns; typed
+            # input, the socket and the passphrase remain, and the face
+            # leg still rescues (recognise rule 1).
+            log.warning("gate: the voice leg's naming instrument faulted "
+                        "(%s); this turn names nobody -- never the owner",
+                        fault)
+            return "", True
         try:
             hits = int(stats.get("matched") or 0)
         except (TypeError, ValueError):
@@ -553,7 +637,129 @@ class OwnerGate:
             # The clip was dropped, or nothing matched. That is not evidence
             # against anybody else's leg: "no name from me" is all it says.
             return "", True
-        return self._owner_label(), True
+        # EVERYTHING THE GALLERY SAYS IS IN ITS OWN LABEL SPACE, and the
+        # registry's is the one the verdict is made in: see _registry_label.
+        who = self._registry_label(stats.get("who"))
+        owner = self._owner_label()
+        if who and stats.get("who_is_owner"):
+            # A NAME THE MATCHING LAYER SAYS IS THE OWNER'S OWN POOL IS THE
+            # OWNER, WHATEVER IT IS SPELLED.
+            #
+            # ``who_is_owner`` is speaker._ident's own second read --
+            # ``_pool_of_label(who) == ""``, the voiceprint's pool, decided by
+            # MEASUREMENT (the centroid measures as voiceprint.npz) or by
+            # PROVENANCE (the takes were carried out of it). It is a fact from
+            # the instrument, not an inference here: this leg does not try to
+            # tell his old gallery slug from a stray label it has never heard
+            # of, because it cannot, and a dict that does not carry the key is
+            # read exactly as it was before.
+            #
+            # THIS IS THE THIRD NAME, and it is what a rename leaves behind.
+            # ``_registry_label`` already reconciles two (his config slug and
+            # his typed registry row). A box he has renamed himself on holds a
+            # THIRD: the gallery label the old slug wrote, which no registry
+            # knows. Measured 2026-09-05 with the round-3 fold in place and
+            # the old slug still on disk, his own turns were still refused 55
+            # of 100 -- the fold correctly ranked one man once, and then the
+            # winning row wore a name the registry had never heard of and
+            # ``recognise`` dropped it. The pool is the fact; the spelling is
+            # not.
+            if who != owner:
+                log.info("gate: the voice named %r, which is the owner's own "
+                         "pool; that is %s", stats.get("who"), owner or "him")
+            who = owner or who
+        if who:
+            # A NAMED match means the person the gallery named. No threshold
+            # is applied here and none ever may be. Both bars live in
+            # jarvis/voicegallery.py, which is where the numbers were measured.
+            return who, True
+        # A NAMELESS MATCH IS THE OWNER ONLY WHEN IT WAS MEASURED ON HIS POOL
+        # AND THE GALLERY'S BEST GUESS IS NOT SOMEBODY ELSE. Two facts, both
+        # from speaker.filter_segments, and neither is a count of labels:
+        #
+        #   matched_label  whose centroid the kept windows cleared the bar on.
+        #                  "" is the voiceprint -- his -- and it is also what
+        #                  an abstention carries, since nothing was scored.
+        #   top            the label identify() ranked first above the bar,
+        #                  named or not: a provisional label ("probably
+        #                  mara"), or the winner of a margin that failed.
+        #
+        # The rule this replaces counted labels: at most one label meant "the
+        # only nameless pool is his", two meant "nobody". Measured 2026-09-04
+        # it was wrong both ways. A guest's 1.2 s command inside a 4 s clip
+        # cleared the bar on HER centroid, identify() abstained, the flag was
+        # lost, one label -> the owner, 50 of 50 with owner scope. The same
+        # path with him migrated -> two labels -> HIS short commands refused
+        # 50 of 50; two guests enrolled without --migrate -> every turn of
+        # his refused 50 of 50, provisional labels counting though they can
+        # match nobody. And a 6-take "probably mara" was minted as him
+        # 150 of 150 at a separation where her voice clears his bar.
+        top = self._registry_label(stats.get("top"))
+        pool = self._registry_label(stats.get("matched_label"))
+        if stats.get("near_miss"):
+            # THE MARGIN FAILED: the gallery could not tell two enrolled
+            # people apart on this voice, and that is nobody WHICHEVER of
+            # them was on top. The first draft of this rule admitted a near
+            # miss as the owner when he was on top and the bar had been
+            # cleared on his pool ("nothing says it is anybody else"), and
+            # measured 2026-09-04 that minted a confusable guest as him 5 of
+            # 150 (10 takes) and 22 of 150 (6 takes) at the widest synthetic
+            # overlap with him migrated, where the count rule it replaced
+            # had minted 0. A refusal that says "say a little more" is the
+            # documented answer to a coin flip. It costs him at separations
+            # scripts/voice_enrol.py refuses to enrol; at the ones it admits
+            # the measured cost is 1 of 150 of his turns, the same margin
+            # failure as before this branch.
+            log.info("gate: the voice matched with no name and the gallery's "
+                     "margin failed (%s on top); that is nobody, not the "
+                     "owner", top or "?")
+            return "", True
+        if top and top != owner:
+            # The gallery's best guess above the bar is somebody else --
+            # withheld only for takes or for a margin. A recognition that
+            # says "probably her" may not become "him".
+            log.info("gate: the voice matched with no name and the gallery's "
+                     "best guess is %s%s; that is nobody, not the owner", top,
+                     " (provisional)" if stats.get("provisional") else
+                     " (margin failed)" if stats.get("near_miss") else "")
+            return "", True
+        if pool and pool != owner:
+            # Measured on somebody else's pool. Whatever identify() could not
+            # say about it (too little speech, most often), it is not his.
+            log.info("gate: the voice cleared the bar on %s's pool with no "
+                     "name; that is nobody, not the owner", pool)
+            return "", True
+        # HIS POOL, OR NOTHING MEASURED. The voiceprint has no label, so a
+        # match on it arrives nameless and still means him, exactly as before
+        # this feature existed -- however many labels the gallery holds and
+        # whatever else is enrolled; nobody else enrolling can move this. An
+        # abstention lands here too: every "Yes." he says is under 1.5 s of
+        # speech and fails open by design (tests/test_owner_gate.py:74 is the
+        # concrete lockout), and it is his whether the clip was short or a
+        # short window of a long one -- the pipeline's documented fail-open,
+        # unchanged by the gallery.
+        if stats.get("abstained"):
+            log.info("gate: an abstention on his pool (%d label(s): %s); "
+                     "the documented fail-open stands",
+                     len(stats.get("labels") or ()),
+                     ", ".join(str(x) for x in (stats.get("labels") or ())))
+        return owner, True
+
+    @staticmethod
+    def _near_miss(stats, rejected) -> bool:
+        """A MATCHED clip whose margin failed. A rejected clip (nothing
+        cleared the pipeline's bar) may carry the flag from the gallery's
+        scoring of its strongest window -- two provisional labels can both
+        sit above the gallery's bar while matching nobody -- and telling a
+        stranger "I can hear someone I know" on the strength of that would
+        be a small lie; the ordinary unknown line answers a rejection."""
+        if rejected or not isinstance(stats, dict):
+            return False
+        try:
+            hits = int(stats.get("matched") or 0)
+        except (TypeError, ValueError):
+            return False
+        return hits >= 1 and bool(stats.get("near_miss"))
 
     def _face_leg(self, face, running) -> Tuple[str, bool]:
         """The gallery's name, mapped to a registry label.
@@ -876,6 +1082,11 @@ class OwnerGate:
                             why=verdict.why)
         has_phrase = any(p.phrase_hash for p in self.registry.owners())
         line = UNKNOWN_PHRASE_LINE if has_phrase else UNKNOWN_LINE
+        if self._near_miss(stats, rejected):
+            # The voice IS somebody enrolled and the margin could not say
+            # which. "Enrol you at the keyboard" would be the wrong answer
+            # to a person who already is; the line names nobody.
+            line = NEAR_MISS_LINE
         if mode != MODE_ENFORCE:
             log.info("gate: shadow -- would have refused this turn")
             return Decision(admit=True, how=HOW_NOBODY, would_refuse=True,

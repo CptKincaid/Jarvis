@@ -551,7 +551,11 @@ class JarvisApp:
         self.history = TypedHistory()           # typed-command history
 
         # ---- audio in -----------------------------------------------------
-        self.speaker = SpeakerVerifier(gpu=0, threshold=CONFIG.speaker_threshold)
+        # owner_label: so his migrated gallery label and his voiceprint are
+        # read as ONE pool by the per-window filter (speaker.MIGRATED_ALIAS_COSINE).
+        self.speaker = SpeakerVerifier(
+            gpu=0, threshold=CONFIG.speaker_threshold,
+            owner_label=identity_mod.owner_label(self.assistant))
         # Load the stored voiceprint now -- one npz read. Without it
         # `speaker.enrolled` stays False and BOTH gates (the wake-word gate
         # below and the transcript filter in _process_audio) silently do
@@ -4200,6 +4204,18 @@ class JarvisApp:
         try:
             scores = list(stats.get("scores") or [])
             if not scores or not CONFIG.speaker_verify:
+                return
+            # ONLY HIS OWN CLIPS GO INTO HIS VOICEPRINT. filter_segments says
+            # whose pool the kept windows cleared the bar on (matched_label,
+            # "" for his) and whom the gallery named or guessed (who / top).
+            # A KNOWN person's admitted turn -- "what's the time" from Mara
+            # -- reaches here too, and learning HER into HIS pool is the
+            # walk add_sample's cap exists to bound, one sample at a time.
+            mine = str(getattr(self.speaker, "owner_label", "") or "")
+            guess = str(stats.get("who") or stats.get("top") or "")
+            if stats.get("matched_label") or (guess and guess != mine):
+                log.info("passive learning skipped: the clip is %s's, not "
+                         "the owner's", stats.get("matched_label") or guess)
                 return
             if max(scores) < max(CONFIG.speaker_threshold + 0.2, 0.55):
                 return

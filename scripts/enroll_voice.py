@@ -15,6 +15,18 @@ Each take is scored against the running centroid before it is kept, so a bad
 take (mic bumped, someone else talking, too quiet) is visible immediately
 instead of quietly dragging the centroid off.
 
+IT IS NOT THE ONLY STORE ANY MORE, AND THAT USED TO BE INVISIBLE HERE.
+`jarvis/voicegallery.py` holds several people's embeddings, and the owner's
+label in it is a COPY of this voiceprint carried across by
+`scripts/voice_enrol.py --migrate`. Re-recording the voiceprint leaves that
+copy behind: measured 2026-09-05, two disjoint fourteen-take pools of the SAME
+man sit at 0.927-0.934 of each other, well under the 0.98 line where Jarvis
+stops reading a gallery pool as the voiceprint's. Nothing here said so -- this
+script had no mention of the gallery at all -- so the command he would
+naturally run to re-record his own voice quietly put his gallery pool off its
+anchor, and only the runtime log and `voice_enrol.py --status` reported it.
+It now refuses without `--yes`, and names `--reanchor` on the way out.
+
 Usage:
     ~/vss_env/bin/python scripts/enroll_voice.py            # 6 takes x 8s
     ~/vss_env/bin/python scripts/enroll_voice.py --takes 8 --seconds 10
@@ -32,6 +44,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from jarvis import voicegallery as vg            # noqa: E402
 from jarvis.config import CONFIG, PATHS          # noqa: E402
 from jarvis.recorder import MicArbiter, Recorder  # noqa: E402
 from jarvis.speaker import SpeakerVerifier        # noqa: E402
@@ -64,6 +77,51 @@ MIN_RMS = 0.004        # below this the take is effectively silence
 LOW_SCORE = 0.55       # a take this far from the centroid is worth redoing
 
 
+def anchor_warning(carried):
+    """``""`` or the sentence to print before re-recording the voiceprint.
+
+    PURE, SO IT IS TESTED WITHOUT A MICROPHONE -- which on this box is the
+    only way anything in this file can be. ``carried`` is
+    ``VoiceGallery.voiceprint_labels()``: the labels whose pools were copied
+    out of ``voiceprint.npz``.
+
+    Re-recording does not damage those pools; it moves the thing they are
+    measured against. The consequence is stated with its number rather than
+    hinted at.
+    """
+    if not carried:
+        return ""
+    return (
+        "THE VOICE GALLERY HOLDS A COPY OF THIS VOICEPRINT, as %s.\n"
+        "Re-recording leaves that copy behind: two separate enrolments of the\n"
+        "SAME person measure about 0.93 of each other, and %.2f is where\n"
+        "Jarvis stops reading a gallery pool as this voiceprint's. He is not\n"
+        "locked out by that -- a pool carried out of voiceprint.npz is read as\n"
+        "his whatever it measures -- but passive learning stalls and every\n"
+        "margin is then measured against a stale centroid.\n"
+        "\n"
+        "Afterwards, put them back -- no microphone needed:\n"
+        "    %s scripts/voice_enrol.py --reanchor\n"
+        "\n"
+        "Re-run with --yes to go ahead."
+        % (", ".join(carried), vg.OWNER_POOL_COSINE, sys.executable))
+
+
+def gallery_labels():
+    """The gallery's carried labels, or () when there is no gallery to read.
+
+    A store that cannot be opened must not stop him enrolling his own voice:
+    this file's job is the voiceprint, and the gallery is advice.
+    """
+    try:
+        g = vg.default_gallery()
+        g.load()
+        return g.voiceprint_labels()
+    except Exception as exc:  # noqa: BLE001 - advice, never a door
+        print("(could not read the voice gallery: %s)" % type(exc).__name__)
+        return ()
+
+
 def show_status(v: SpeakerVerifier) -> None:
     print(f"voiceprint file : {PATHS.VOICEPRINT}")
     print(f"exists          : {PATHS.VOICEPRINT.exists()}")
@@ -74,6 +132,13 @@ def show_status(v: SpeakerVerifier) -> None:
         sims = [v._cosine_similarity(e, v._centroid) for e in v._embeddings]
         print(f"self-consistency: min={min(sims):.3f} mean={np.mean(sims):.3f}")
         print("  (min well below the others means one take is an outlier)")
+    carried = gallery_labels()
+    print("voice gallery   : %s"
+          % (", ".join(carried) + " (carried from this voiceprint)"
+             if carried else "no label carried from this voiceprint"))
+    if carried:
+        print("  anchor state and the repair: "
+              "scripts/voice_enrol.py --status / --reanchor")
 
 
 def record_take(rec: Recorder, seconds: float, label: str, line: str) -> np.ndarray:
@@ -95,7 +160,10 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--status", action="store_true", help="print state and exit")
     ap.add_argument("--reset", action="store_true", help="discard the existing voiceprint first")
-    ap.add_argument("--yes", action="store_true", help="never prompt to redo a take")
+    ap.add_argument("--yes", action="store_true",
+                    help="never prompt to redo a take, and go ahead even "
+                         "though the voice gallery holds a copy of this "
+                         "voiceprint")
     args = ap.parse_args()
 
     verifier = SpeakerVerifier(gpu=0, threshold=CONFIG.speaker_threshold)
@@ -104,6 +172,15 @@ def main() -> int:
     if args.status:
         show_status(verifier)
         return 0
+
+    carried = gallery_labels()
+    warning = anchor_warning(carried)
+    if warning:
+        print("\n%s\n" % warning)
+        if not args.yes:
+            print("Nothing was recorded and nothing was cleared.",
+                  file=sys.stderr)
+            return 6
 
     if JARVIS_PID.exists():
         print("NOTE: Jarvis appears to be running. It holds the mic and its wake")
@@ -168,6 +245,10 @@ def main() -> int:
     show_status(verifier)
     print("\nNext: measure a threshold with scripts/tune_speaker_threshold.py")
     print("before turning speaker_verify on -- the 0.40 default is a guess.")
+    if carried:
+        print("\nAND PUT THE GALLERY BACK ON ITS ANCHOR -- %s still holds the "
+              "OLD\nvoiceprint. No microphone needed:" % ", ".join(carried))
+        print("    %s scripts/voice_enrol.py --reanchor" % sys.executable)
     return 0
 
 
