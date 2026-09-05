@@ -25,7 +25,11 @@ class Stub:
     def __init__(self, gate):
         self.gate = gate
 
+    _people_registry = app_mod.JarvisApp._people_registry
+    _people_unlock_left = app_mod.JarvisApp._people_unlock_left
+    _people_open_unlock = app_mod.JarvisApp._people_open_unlock
     _people_write = app_mod.JarvisApp._people_write
+    _people_write_now = app_mod.JarvisApp._people_write_now
     people_snapshot = app_mod.JarvisApp.people_snapshot
     people_unlock = app_mod.JarvisApp.people_unlock
     people_add = app_mod.JarvisApp.people_add
@@ -232,6 +236,11 @@ def test_every_write_re_reads_the_file_first(tmp_path):
 
 def test_no_seam_ever_returns_a_hash(tmp_path):
     app, _path = _app(tmp_path, code=True, known=True)
+    # UNLOCKED FIRST, so these are the SUCCESS lines rather than four
+    # refusals: a refusal quotes nothing, which would make this pass while
+    # testing nothing. tests/test_users_lock_at_the_write.py owns the
+    # refusals.
+    assert app.people_unlock(FAKE_CODE)[0] is True
     lines = [app.people_unlock("nope")[1],
              app.people_add(label="brightwell", role=ROLE_KNOWN,
                             consent="console")[1],

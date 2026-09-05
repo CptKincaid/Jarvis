@@ -193,15 +193,186 @@ def test_showing_the_page_reads_the_file_and_hiding_it_relocks(root):
     assert page._lock.locked() is True, "leaving the tab must relock at once"
 
 
-def test_the_page_never_polls_the_file(root):
-    """Unlike SENSORS there is nothing to poll: the registry is a file, and
-    a timer on a file is cost with no reading behind it. The page reads it
-    on show() and the app seam re-reads before every write."""
+def test_the_page_never_polls_the_heavy_snapshot(root):
+    """The full snapshot rebuilds every row, the startup line and the
+    gallery listing. That is far too much for a one-second tick, so the
+    tick asks people_admin_state -- one small file read and three values --
+    and only does a full refresh when the ANSWER changed."""
     page, svc, _host = _page(root)
     before = [c for c in svc.calls if c == "snapshot"]
     for _ in range(20):
+        page._tick_lock()
         root.update()
     assert [c for c in svc.calls if c == "snapshot"] == before
+
+
+# ==================================== the lock is a decision, not a memory
+class LiveSvc(Svc):
+    """An app half that answers the two seams that keep the page honest.
+
+    ``admin`` and ``unlocked_s`` are set by the test, the way the real app
+    sets them from the file on disk and its own dwell. Every write refuses
+    with the gate's own sentence when a code is owed, which is what the
+    real seam does -- the PAGE is not what decides it.
+    """
+
+    def __init__(self, snapshot=None, admin=None, unlocked_s=0.0):
+        super().__init__(snapshot)
+        from jarvis import gate as gt
+        self.admin = admin or gt.ADMIN_NOCODE
+        self.unlocked_s = float(unlocked_s)
+        self.relocked = 0
+
+    def people_admin_state(self):
+        self.calls.append("admin_state")
+        return {"admin": self.admin, "admin_line": "the file says %s"
+                % self.admin, "unlocked_s": self.unlocked_s}
+
+    def people_snapshot(self):
+        """OFF THE FILE, like the real one: app.people_snapshot re-reads
+        rather than handing back the gate's boot-time copy, so a snapshot
+        taken after the code was set says so."""
+        self.calls.append("snapshot")
+        snap = dict(self.snapshot or {})
+        snap["admin"] = self.admin
+        return snap
+
+    def people_relock(self):
+        self.calls.append("relock")
+        self.relocked += 1
+        self.unlocked_s = 0.0
+
+    def _refuse_if_owed(self):
+        from jarvis import gate as gt
+        if self.admin == gt.ADMIN_CODE and self.unlocked_s <= 0:
+            return True, gt.ADMIN_CODE_OWED
+        return False, ""
+
+    def people_forget(self, label):
+        owed, why = self._refuse_if_owed()
+        self.calls.append(("forget", label, "refused" if owed else "done"))
+        return (False, why) if owed else (True, "forgotten")
+
+    def people_add(self, **kw):
+        owed, why = self._refuse_if_owed()
+        self.calls.append(("add", kw.get("label"),
+                           "refused" if owed else "done"))
+        return (False, why) if owed else (True, "enrolled")
+
+
+def _live(root, admin=None, unlocked_s=0.0, snapshot=None):
+    """The page opened on a snapshot that says NO code is owed -- his real
+    starting point, an owner he made in this tab with no code set yet."""
+    import tkinter as tk
+    from jarvis import gate as gt
+    theme.select_look("holo")
+    root.geometry("%dx%d+0+0" % (HIS_W, HIS_H))
+    host = tk.Frame(root, bg=theme.BG, width=HIS_W, height=HIS_H)
+    host.pack(fill="both", expand=True)
+    host.pack_propagate(False)
+    snap = snapshot if snapshot is not None else _snapshot(code=False)
+    svc = LiveSvc(snap, admin=admin or gt.ADMIN_NOCODE,
+                  unlocked_s=unlocked_s)
+    page = up.UsersPage(host, services=svc)
+    root.update_idletasks()
+    page.show()
+    root.update_idletasks()
+    return page, svc, host
+
+
+def test_a_code_set_while_the_tab_is_open_raises_the_unlock_row(root):
+    """HIS SEQUENCE, ON A REAL PAGE. He makes the first owner here, the
+    foot note tells him a new code still needs a terminal, he goes and sets
+    one, and he comes back to the tab he never closed.
+
+    ``show()`` was the only thing that re-read the file, so switching tabs
+    and back was the only way to see it -- and until then ``_paint_lock``
+    drew no unlock row at all, because the snapshot still said open_nocode.
+    """
+    from jarvis import gate as gt
+    page, svc, _host = _live(root)
+    assert page.admin_state == gt.ADMIN_NOCODE
+    assert not page._lock_row.winfo_ismapped(), "a code was not owed yet"
+    assert page._guard("forget") is True
+
+    svc.admin = gt.ADMIN_CODE          # he sets one at a terminal
+    page._tick_lock()
+    root.update_idletasks()
+
+    assert page.admin_state == gt.ADMIN_CODE
+    assert page._lock_row.winfo_ismapped(), "no unlock row was drawn"
+    assert page._code_entry.winfo_ismapped()
+    assert page._guard("forget") is False
+
+
+def test_a_write_refused_by_the_seam_raises_the_row_and_takes_the_cursor(
+        root):
+    """THE PAGE IS NOT THE GUARD. Even from a stale snapshot that lets the
+    press through, the seam refuses and the page must then show him where
+    to type -- the row lives in the pinned head, and he is looking at a
+    person block halfway down."""
+    from jarvis import gate as gt
+    page, svc, _host = _live(root)
+    svc.admin = gt.ADMIN_CODE          # the file changed; the page has not
+    assert page._guard("forget") is True, "the stale snapshot still allows"
+
+    page._write("people_forget", "guest0")
+    root.update_idletasks()
+
+    assert ("forget", "guest0", "refused") in svc.calls
+    assert page._toasts[-1][0] == gt.ADMIN_CODE_OWED
+    assert page._lock_row.winfo_ismapped()
+    # focus_lastfor, not focus_get: Xvfb runs with no window manager, so
+    # the toplevel never holds the keyboard and focus_get() is None however
+    # the page behaved. focus_lastfor is where the focus WILL land.
+    assert page.focus_lastfor() is page._code_entry
+
+
+def test_leaving_the_tab_relocks_the_app_and_not_only_the_page(root):
+    """A page that dropped its own dwell and left the app's standing looked
+    locked and was not."""
+    page, svc, _host = _live(root, unlocked_s=90.0)
+    page._lock.unlock()
+    page.hide()
+    assert svc.relocked == 1
+    assert page._lock.locked() is True
+
+
+def test_the_lock_button_relocks_the_app_too(root):
+    page, svc, _host = _live(root, unlocked_s=90.0)
+    page._lock.unlock()
+    page._lock_pressed()
+    root.update_idletasks()
+    assert svc.relocked == 1
+    assert page._lock.locked() is True
+
+
+def test_the_countdown_on_screen_is_the_apps_dwell_not_a_second_clock(root):
+    """Two 120-second clocks started a moment apart is two answers to the
+    same question. The tick takes the app's remaining seconds as the
+    truth."""
+    from jarvis import gate as gt
+    page, svc, _host = _live(root, admin=gt.ADMIN_CODE,
+                             snapshot=_snapshot(code=True))
+    page._lock.unlock()                # the page thinks it has 120 s
+    svc.unlocked_s = 4.0               # the app knows it has four
+    page._tick_lock()
+    root.update_idletasks()
+    assert 3.0 <= page._lock.remaining() <= 4.0
+    svc.unlocked_s = 0.0               # and when the app shuts, so does it
+    page._tick_lock()
+    assert page._lock.locked() is True
+
+
+def test_an_app_half_without_the_two_seams_still_draws(root):
+    """build_ui_services drops what an older app half does not offer, so
+    the page has to work with neither."""
+    page, _svc, _host = _page(root)          # plain Svc: no admin_state
+    page._tick_lock()
+    root.update_idletasks()
+    assert page.is_open is True
+    page.hide()                              # must not raise on no relock
+    assert page._lock.locked() is True
 
 
 # ================================================= the code, on the screen

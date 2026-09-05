@@ -116,7 +116,15 @@ BROKEN_LINE = ("The people file could not be read as a registry, so nothing "
 
 # ============================================================== the unlock
 class Lock:
-    """This page's own unlock state, and NOTHING else's.
+    """WHAT THE PAGE DRAWS, and it is a MIRROR rather than a guard.
+
+    The authority is ``app._people_write``, which re-reads the registry and
+    re-decides at the moment of the write. This object used to be the only
+    thing enforcing the override code anywhere in the system, which is not
+    a guard at all: it lived in the UI, it was consulted against a snapshot
+    taken when the tab was OPENED, and nothing below it re-decided. It is
+    now seeded from the app on every tick (``mirror``) so the countdown on
+    screen is the app's countdown and not a second one beside it.
 
     It admits no turn, opens no microphone and grants no role. It is a
     dwell after a successful code, re-armed by each successful action so a
@@ -141,6 +149,16 @@ class Lock:
     def lock(self) -> None:
         self._until = 0.0
 
+    def mirror(self, seconds) -> None:
+        """Take the APP's remaining dwell as the truth. Called once a
+        second from the tick, so the two can differ by at most a tick and
+        the app is always the one that wins."""
+        try:
+            left = float(seconds)
+        except (TypeError, ValueError):
+            left = 0.0
+        self._until = self.clock() + max(0.0, left)
+
     def locked(self) -> bool:
         return self.clock() >= self._until
 
@@ -163,10 +181,20 @@ def check_code(gate, code, *, check: Optional[Callable] = None) -> Tuple[str, st
 
 
 def may(action: str, state: str, lock: Lock) -> Tuple[bool, str]:
-    """May this action happen right now? ``(ok, why)``.
+    """Should the page bother asking? ``(ok, why)``.
 
-    ``state`` is ``gate.admin_gate``'s answer -- the SAME decision the
-    terminal tool asks, not a second one written beside it.
+    THIS IS NOT THE GUARD, and saying so here is the point of the sentence.
+    It used to be: the code requirement was enforced in this one function,
+    from a snapshot the page read when the tab was opened, and the app
+    seams below it re-read the file only to refuse the CORRUPT case. So a
+    code set at a terminal while the tab sat open was never noticed and
+    every administrative action went through ungated.
+
+    What it is now is a courtesy: a toast that names the remedy instead of
+    a press that travels to the app to be refused there. ``state`` is
+    ``gate.admin_gate``'s answer, kept live by the page's tick, and
+    ``app._people_write`` re-decides the same question from the registry as
+    it is at the instant of the write.
     """
     from jarvis import gate as gate_mod
     if state == gate_mod.ADMIN_REFUSE:
@@ -600,9 +628,20 @@ class UsersPage(tk.Frame):
     both 1040x1760 and 920x1440 in both looks, with twelve people on the
     page (tests/test_users_page_display.py).
 
-    NOTHING HERE POLLS. Unlike SENSORS there is nothing to poll: the
-    registry is a file. It is read on ``show()`` and re-read immediately
-    before every write, by the app seam itself.
+    IT POLLS ONE THING, and only since the lock stopped being a memory.
+    ``services.people_admin_state`` re-reads the registry and answers three
+    small values; the tick that was already redrawing the countdown asks
+    for them. The reason is his own sequence: make the first owner here
+    (no code yet, so the tab is legitimately open), read the foot note
+    saying a new code still needs a terminal, go and set one, come back to
+    the SAME open tab. ``show()`` was the only thing that re-read, so
+    switching tabs and back was the only way to notice. The full snapshot
+    is too heavy for a one-second tick -- it rebuilds every row, the
+    startup line and the gallery listing -- so the page asks for the cheap
+    answer and does a full ``refresh`` only when it CHANGED.
+
+    NONE OF THAT IS THE GUARD. ``app._people_write`` re-reads and
+    re-decides at the write; this only keeps what is on screen true.
     """
 
     def __init__(self, host, services=None, cover=(),
@@ -841,8 +880,11 @@ class UsersPage(tk.Frame):
             return
         self._open = False
         # LEAVING THE TAB RELOCKS AT ONCE. The dwell is for a run of edits
-        # in one sitting, not for a console left open on his desk.
-        self._lock.lock()
+        # in one sitting, not for a console left open on his desk -- and it
+        # is the APP's dwell that has to go, because that is the one the
+        # writes consult. A page that dropped only its own looked locked
+        # and was not.
+        self._relock()
         self._forget.disarm()
         self._role_arm = ""
         self._adding = False
@@ -1008,14 +1050,53 @@ class UsersPage(tk.Frame):
                 text="unlocked for %d s" % int(self._lock.remaining()),
                 fg=theme.CYAN)
 
+    def _poll_admin(self) -> bool:
+        """Ask the app what the FILE says now. True if it changed.
+
+        Cheap by construction: one small JSON read and three values, which
+        is why it may sit on a one-second tick where ``people_snapshot``
+        may not. An app half without the seam simply never changes
+        anything -- the page keeps working against the snapshot it has,
+        which is what it did before this existed.
+        """
+        fn = self._service("people_admin_state")
+        if fn is None:
+            return False
+        try:
+            live = fn() or {}
+        except Exception:                 # noqa: BLE001 - the app boundary
+            log.exception("users page: the admin state could not be read")
+            return False
+        if not isinstance(live, dict):
+            return False
+        # The APP owns the dwell. Mirroring it every tick is what keeps the
+        # countdown on screen from being a second, drifting clock.
+        self._lock.mirror(live.get("unlocked_s") or 0.0)
+        was = self._snapshot.get("admin")
+        state = live.get("admin")
+        if not state or state == was:
+            return False
+        self._snapshot["admin"] = state
+        self._snapshot["admin_line"] = live.get("admin_line") or ""
+        log.info("users page: the people file now says %s (was %s)",
+                 state, was)
+        return True
+
     def _tick_lock(self) -> None:
-        """Repaint the countdown once a second. The clock is what relocks
-        the page, not this timer: a press that lands after the window
-        passed is refused by ``Lock`` whether or not Tk ran the tick."""
+        """Repaint the countdown once a second, and notice a code set
+        somewhere else. The clock is what relocks the page, not this timer:
+        a press that lands after the window passed is refused by the APP
+        whether or not Tk ran the tick."""
         self._lock_tick = None
         if not self._open:
             return
-        self._paint_lock()
+        if self._poll_admin():
+            # A different answer changes the buttons and the foot as well
+            # as the lock row, so it is a full repaint rather than a
+            # _paint_lock: _may_add() and the bootstrap plan both read it.
+            self._paint()
+        else:
+            self._paint_lock()
         try:
             self._lock_tick = self.after(LOCK_TICK_MS, self._tick_lock)
         except Exception:                 # noqa: BLE001 - torn down
@@ -1296,6 +1377,32 @@ class UsersPage(tk.Frame):
             self.toast(why, "warn")
         return ok
 
+    @staticmethod
+    def _code_owed() -> str:
+        """The app's refusal, imported from the gate rather than written
+        twice: a copy here would drift and the page would silently stop
+        raising its unlock row."""
+        from jarvis import gate as gate_mod
+        return gate_mod.ADMIN_CODE_OWED
+
+    def _focus_code(self) -> None:
+        """Put the cursor in the unlock box.
+
+        THE PENDING GEOMETRY HAS TO SETTLE FIRST. ``refresh`` has just
+        repacked the row, and Tk applies a pack at the next idle: focusing
+        a window that is not yet viewable is dropped on the floor, so the
+        cursor stayed wherever it was and he was told to type a code into a
+        box that had not taken it. Measured on the 1040x1760 page.
+        """
+        if self._code_entry is None:
+            return
+        try:
+            self.update_idletasks()
+            self._code_entry.focus_set()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the code entry could not take focus",
+                      exc_info=True)
+
     def _unlock_pressed(self) -> str:
         return UsersUnlockControl(
             self.services, read=lambda: self._code_entry.get(),
@@ -1307,8 +1414,20 @@ class UsersPage(tk.Frame):
         self._lock.unlock()
         self._paint_lock()
 
-    def _lock_pressed(self) -> None:
+    def _relock(self) -> None:
+        """Shut both: the app's dwell, which is what the writes check, and
+        the page's mirror, which is what he sees."""
         self._lock.lock()
+        fn = self._service("people_relock")
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:                 # noqa: BLE001 - the app boundary
+            log.exception("users page: the relock seam failed")
+
+    def _lock_pressed(self) -> None:
+        self._relock()
         self._cancel()
 
     def _cancel(self) -> None:
@@ -1472,11 +1591,21 @@ class UsersPage(tk.Frame):
             ok, line = False, "That did not work, sir; see the log."
         if ok:
             # Each successful action re-arms the dwell, so a run of edits
-            # is one code rather than five.
+            # is one code rather than five. The app re-armed its own; this
+            # is the mirror, corrected by the next tick either way.
             self._lock.touch()
             self._adding = False
         self.toast(str(line), "ok" if ok else "warn")
+        # THE SEAM IS THE GUARD, so a press may be refused here even when
+        # the page thought it was allowed -- a code set at a terminal, or a
+        # dwell that ran out between the press and the call. Refresh reads
+        # the file again, which is what makes _paint_lock draw the unlock
+        # row; then put the cursor in it, because the row he needs may have
+        # appeared in the head while he was looking at a person block.
+        owed = not ok and str(line) == self._code_owed()
         self.refresh()
+        if owed:
+            self._focus_code()
 
     # -------------------------------------------------------- the scroll
     def _sync_view(self) -> None:

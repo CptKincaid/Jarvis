@@ -662,6 +662,13 @@ ADMIN_REFUSE_LINE = (
     "enrolled from here. Its rows did NOT load, and writing a new one over "
     "the top of them would destroy whatever it holds -- there is no history "
     "and no backup. Repair or move the file, then try again.")
+# WHAT A REFUSED WRITE SAYS, and it is a constant rather than a sentence
+# written twice because TWO CALLERS HAVE TO AGREE ON IT: the app seam that
+# refuses the write (jarvis/app.py::_people_write) and the users page, which
+# raises its unlock row when it sees this exact answer come back. It names
+# no secret and quotes nothing typed.
+ADMIN_CODE_OWED = (
+    "Your override code is needed before anything here can be changed, sir.")
 
 
 def admin_gate(registry) -> Tuple[str, str]:
