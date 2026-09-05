@@ -1011,16 +1011,35 @@ def send_notice(account, subject: str, body: str, *, smtp=None,
     (verdict, 2026-09-05). It comes through here instead.
 
     The door is NARROWER than :func:`send`'s: there is no recipient
-    parameter and no attachment. A notice goes to the account's own
-    address or nowhere, so nothing that gets hold of this seam can use it
-    to mail a stranger. ``mail`` is the module seam the tests substitute.
+    parameter and no attachment. Nothing that gets hold of this seam can
+    use it to mail a stranger. ``mail`` is the module seam the tests
+    substitute.
+
+    WHERE IT GOES (2026-09-05). The account's own address, unless HIS
+    CONFIG named another one -- a key ``mail.mail_accounts()`` mints onto
+    the account dict beside the SMTP credential, spelled and specified in
+    :func:`mail.notice_destination`, which is the one place in the package
+    that knows its name. That is still NOT a recipient parameter: the
+    address the transport is handed is a pure function of the
+    account object, and the account object is a pure function of his
+    config file. A caller supplies the subject and the body and nothing
+    else, and neither is parsed for an address.
+
+    NOTE THE ``mail_mod`` ON THE NEXT LINE, not ``mail``. The destination
+    is resolved against the REAL module, never against the injected seam:
+    resolving it through ``mail`` would let a caller that passes a stub
+    module choose the recipient after all, which is the banned thing
+    wearing a different hat.
     """
     mail = mail or mail_mod
-    to_addr = str((account or {}).get("address") or "").strip()
+    to_addr = mail_mod.notice_destination(account)
     if not to_addr:
         raise mail_mod.MailSendFailed("that account has no address")
-    log.info("outbox: notice %r to the account itself (%s)", subject,
-             mail_mod.account_label(account))
+    # MASKED, like the file lane's line: the destination is now something
+    # he can configure, so "the account itself" stopped being true and a
+    # log that says where a break-glass code went should not spell it out.
+    log.info("outbox: notice %r to %s (from %s)", subject,
+             mail_mod._mask_address(to_addr), mail_mod.account_label(account))
     return mail.send_message(account, to_addr, subject, body, smtp=smtp)
 
 
