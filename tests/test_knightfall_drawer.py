@@ -242,6 +242,124 @@ def test_the_privacy_section_builds_the_row_with_a_masked_entry():
     assert "self._knightfall_row(box)" in src[priv:system]
     row = inspect.getsource(SettingsDrawer._knightfall_row)
     assert 'show="•"' in row
+    assert views_mod.KNIGHTFALL_NOT_WIRED == "Knightfall not wired"
+    # CLASSIC keeps the 09-04 words exactly; it is frozen
+    # (tests/test_ui_classic_frozen.py) and its row still overflows.
     assert '"Knightfall code"' in row
     assert '"Email me a new Knightfall code"' in row
-    assert views_mod.KNIGHTFALL_NOT_WIRED == "Knightfall not wired"
+    # HOLO -- the look he runs -- has the words that FIT the 576 px slot:
+    # the full label left no arrangement that did (2026-09-05).
+    assert SettingsDrawer.KNIGHTFALL_LABEL_HOLO == "Knightfall"
+    assert SettingsDrawer.KNIGHTFALL_NEW_HOLO == "Email me a new code"
+    assert "KNIGHTFALL_LABEL_HOLO" in row and "KNIGHTFALL_NEW_HOLO" in row
+    # the look is read at CALL time, never captured beside the def
+    assert 'theme.LOOK == "holo"' in row
+
+
+def test_the_masked_box_is_sized_from_the_code_the_generator_makes():
+    """A box narrower than a code shows him a code that scrolls. The
+    number is the drawer's, the length is passphrase's, and they are
+    pinned to each other rather than both being hand-picked."""
+    from jarvis import passphrase as pp
+    assert SettingsDrawer.KNIGHTFALL_CHARS >= pp.NEW_CODE_LEN == 8
+
+
+# ------------------------------------------- what the row says, and when
+# Before this, the caption was the flat sentence "Typed only, never spoken.
+# Using it emails you the next one." -- which is FALSE with no mail account
+# configured, the state he was actually in: the button mails nothing and
+# the promise is made before he presses. The caption is state-dependent
+# now, and the destination is MASKED because the drawer is on screen.
+def _status(**kw):
+    base = {"to": "", "problem": "", "setup": "setup line"}
+    base.update(kw)
+    return base
+
+
+def test_with_no_mail_account_the_row_says_so_and_the_button_is_dead():
+    text, can_press = views_mod.format_knightfall_status(_status())
+    assert can_press is False
+    assert views_mod.KNIGHTFALL_NO_ACCOUNT in text
+    assert "setup line" in text, "he is told where to fix it"
+    assert "emails you the next one" not in text
+
+
+def test_with_an_account_the_row_names_the_masked_destination():
+    text, can_press = views_mod.format_knightfall_status(
+        _status(to="h…@example.com"))
+    assert can_press is True
+    assert "The next code goes to h…@example.com." in text
+    assert "Typed only, never spoken." in text
+
+
+def test_a_bad_configured_destination_is_said_and_the_button_is_dead():
+    text, can_press = views_mod.format_knightfall_status(
+        _status(to="h…@example.com", problem="that address is not an address"))
+    assert can_press is False
+    assert "that address is not an address" in text
+
+
+def test_an_unwired_or_broken_status_reads_as_no_account():
+    for bad in (None, {}, "nonsense"):
+        text, can_press = views_mod.format_knightfall_status(bad)
+        assert can_press is False and views_mod.KNIGHTFALL_NO_ACCOUNT in text
+
+
+def test_the_row_is_built_from_the_status_and_refreshed_on_open():
+    """Wiring, not widgets: the caption must not be a literal any more, and
+    it must be re-read when the drawer opens (his config can change while
+    it is shut)."""
+    row = inspect.getsource(SettingsDrawer._knightfall_row)
+    assert "_refresh_knightfall" in row
+    assert "Using it emails you" not in row
+    assert "_refresh_knightfall" in inspect.getsource(SettingsDrawer.open)
+
+
+def test_refresh_sets_the_caption_and_disables_the_button():
+    d = SettingsDrawer.__new__(SettingsDrawer)
+    d.services = SimpleNamespace(knightfall_status=lambda: _status())
+    lbl, btn = _FakeLabel(), _FakeButton()
+    d._knightfall_info = lbl
+    d._knightfall_new = btn
+    d._refresh_knightfall()
+    assert views_mod.KNIGHTFALL_NO_ACCOUNT in lbl.text
+    assert btn.enabled is False
+    d.services = SimpleNamespace(
+        knightfall_status=lambda: _status(to="h…@example.com"))
+    d._refresh_knightfall()
+    assert "h…@example.com" in lbl.text and btn.enabled is True
+
+
+def test_a_status_service_that_raises_does_not_take_the_drawer_down():
+    def boom():
+        raise RuntimeError("nope")
+    d = SettingsDrawer.__new__(SettingsDrawer)
+    d.services = SimpleNamespace(knightfall_status=boom)
+    lbl, btn = _FakeLabel(), _FakeButton()
+    d._knightfall_info, d._knightfall_new = lbl, btn
+    d._refresh_knightfall()
+    assert views_mod.KNIGHTFALL_NO_ACCOUNT in lbl.text and btn.enabled is False
+
+
+def test_services_declare_the_status_hook_and_the_app_supplies_it():
+    import jarvis.app as app_mod
+    assert "knightfall_status" in {f.name for f in fields(Services)}
+    assert Services().knightfall_status is None
+    assert "knightfall_status=self.knightfall_status" in \
+        inspect.getsource(app_mod.JarvisApp.ui_service_kwargs)
+
+
+class _FakeLabel:
+    def __init__(self):
+        self.text = ""
+
+    def configure(self, **kw):
+        self.text = kw.get("text", self.text)
+
+
+class _FakeButton:
+    def __init__(self):
+        self.enabled = True
+
+    def set_enabled(self, enabled):
+        self.enabled = bool(enabled)

@@ -492,6 +492,11 @@ class Services:
     # stand-in Services simply has no row that works.
     knightfall_code: Optional[Callable] = None
     knightfall_new_code: Optional[Callable] = None
+    # ...and what the row SAYS: knightfall_status() answers a dict (to /
+    # problem / setup, spec in app.JarvisApp.knightfall_status) so the
+    # caption can name the masked destination the next code would go to,
+    # or admit there is no mail account and the button will do nothing.
+    knightfall_status: Optional[Callable] = None
     # Alt+F4 / WM close on the Board. The app owns the BoardFeed (a 5 s poll
     # that spawns nvidia-smi and walks tmux), so only the app can stop it —
     # without this seam a WM close withdrew the window and left that thread
