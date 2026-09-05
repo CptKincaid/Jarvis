@@ -212,6 +212,9 @@ PHRASE_CONSUMED = object()
 # The legs on which a clip the speaker filter dropped is let through after
 # all: the camera, the phrase's window, the code's window.
 RESCUE_HOWS = (gate_mod.HOW_FACE, gate_mod.HOW_GRANT, gate_mod.HOW_CODE)
+# ...and the two of those he opened HIMSELF. See _gate_rescue_inner: these
+# act in shadow, the camera does not.
+WINDOW_HOWS = gate_mod.WINDOW_HOWS
 # The typed code (knightfall_code / knightfall_new_code below). The mail
 # carries two lines: the code, then this sentence. The Status lines never
 # carry a code.
@@ -3110,6 +3113,35 @@ class JarvisApp:
                 self.preview_probe.retracted(PATH_GREEDY)
                 bus.publish(PartialText(text=""))
 
+    def _drop_partial(self) -> None:
+        """Take the ghost card down NOW, whatever is on it.
+
+        The turn that consumes the passphrase has no UserUtterance to
+        replace the preview with and no rejection to make the UI clear it,
+        so this is the only thing that can. Used by _gate_consumed.
+
+        PUBLISHED UNCONDITIONALLY, and that asymmetry is the whole design:
+        a redundant clear costs one no-op call on a pane that is already
+        empty, while a clear that did not fire leaves his passphrase
+        legible on the glass. The probe's retraction counter is only
+        bumped when this process believes a card was up, so the preview
+        ledger keeps meaning what it meant.
+
+        Every step is guarded because this runs in front of a redaction:
+        an instrument, a bus subscriber or a stand-in without a probe must
+        not be able to keep the words on screen by raising.
+        """
+        try:
+            if getattr(self, "_partial_shown", False):
+                self._partial_shown = False
+                try:
+                    self.preview_probe.retracted(PATH_GREEDY)
+                except Exception:              # noqa: BLE001 - instrument
+                    log.debug("preview retraction failed", exc_info=True)
+            bus.publish(PartialText(text=""))
+        except Exception:                      # noqa: BLE001 - never fatal
+            log.exception("the preview card could not be taken down")
+
     # ------------------------------------------- speculative transcription
     #
     # Every turn paid the full decode strictly AFTER the recorder stopped,
@@ -3169,7 +3201,63 @@ class JarvisApp:
             if filtered is None:
                 return audio, stats, True, None
             audio = filtered
-        return audio, stats, False, self.transcriber.transcribe(audio)
+        return audio, stats, False, self._clip_decode(audio)
+
+    def _clip_decode(self, audio):
+        """THE DECODE, REDACTED WHENEVER IT COULD BE THE SECRET.
+
+        The earlier fix closed jarvis/transcriber.py's `Transcribed: %r`
+        line on the RESCUE leg only -- a clip the speaker filter dropped.
+        That is not the leg he is on. When the filter MATCHES him (the
+        common case, and the one he tests in) this is the decode, and it
+        wrote the spoken passphrase to jarvis.log in plaintext at INFO in
+        shadow, enforce and off alike -- measured on a fresh copy at
+        ecb5abc, and again here by tests/test_knightfall_log_leak.py
+        before this method existed.
+
+        So: when an owner has a phrase set, EVERY clip is decoded quietly
+        and the words are written down only by ``_log_transcript`` below,
+        after the gate has said they are not the phrase. When no owner has
+        one there is no secret to protect and nothing changes at all --
+        not the decode, not the line, not its position in the log.
+
+        The cost is the one the redaction cannot avoid: on a turn the gate
+        consumes, no `Transcribed:` line carries words, because there are
+        no words that may be carried. The numbers stay in both cases.
+        """
+        if self._owner_has_phrase():
+            return self._gate_quiet_decode(audio)
+        return self.transcriber.transcribe(audio)
+
+    def _loggable(self, text) -> str:
+        """``repr(text)`` for a log line -- or the redaction, when an owner
+        has a phrase set and nothing has yet ruled these words are not it.
+
+        The rule this whole pass enforces, in one place: WORDS ARE WRITTEN
+        DOWN ONLY AFTER SOMETHING HAS SAID THEY ARE NOT THE PHRASE.
+        """
+        if text and self._owner_has_phrase():
+            return repr(gate_mod.REDACTED_TEXT)
+        return repr(text)
+
+    def _log_transcript(self, result) -> None:
+        """The `Transcribed:` line the quiet decode deliberately did not
+        write, now that the gate has cleared these words.
+
+        Only when the decode was actually redacted -- otherwise
+        jarvis/transcriber.py already wrote the line and this would double
+        it. Deliberately the same wording and the same numbers as that
+        line, so a reader of jarvis.log (and every grep and script written
+        against it, scripts/measure_confidence_gate.py included) sees one
+        format, not two.
+        """
+        if not self._owner_has_phrase():
+            return                     # transcriber.py wrote it already
+        text = getattr(result, "text", "") or ""
+        if not text:
+            return                     # nothing was said; nothing to say
+        log.info("Transcribed: %r (avg_logprob=%.2f)", text,
+                 float(getattr(result, "confidence", 0.0) or 0.0))
 
     def decode_clip(self, audio, verify=True):
         """Public seam for _decode_clip: the command socket's intercom must
@@ -3234,9 +3322,16 @@ class JarvisApp:
                 text, path=PATH_SPECULATIVE,
                 audio_s=getattr(result, "audio_seconds", None))
             bus.publish(PartialText(text=text))
+        # REDACTED FOR THE SAME REASON THE DECODE IS. This is a DEBUG line
+        # rather than the INFO one the verdict measured, so it only reaches
+        # jarvis.log when he has turned debug logging on -- which is exactly
+        # what he does when something is wrong, i.e. the session in which
+        # the phrase is most likely to be said and least likely to be
+        # noticed. The words reach the log from _log_transcript once the
+        # gate has cleared them, and from nowhere else.
         log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
                   key, spec.finished - spec.started,
-                  "rejected" if spec.rejected else repr(text))
+                  "rejected" if spec.rejected else self._loggable(text))
         return True
 
     def _take_speculation(self):
@@ -4905,6 +5000,32 @@ class JarvisApp:
             self._gate_consumed(d, getattr(result, "confidence", 0.0),
                                 speculative)
             return PHRASE_CONSUMED
+        if d.admit and d.how in WINDOW_HOWS:
+            # A WINDOW HE OPENED HIMSELF ACTS IN EVERY MODE THAT OPENS ONE,
+            # and this is the line that makes "Thank you, sir. I'm
+            # listening." true. It used to sit BELOW the shadow return, so
+            # in shadow -- HIS LIVE MODE -- the phrase said it was
+            # listening and then the speaker filter dropped his very next
+            # clip, exactly as it had dropped the one that made him say the
+            # phrase. Measured 2026-09-05: dispatched == [] in shadow
+            # against [("what time is it", "voice")] in enforce, for the
+            # phrase's window and the typed code's window alike.
+            #
+            # It is not shadow leaking. Shadow's rule is that the gate must
+            # not start ACTING ON ITS OWN JUDGEMENT -- a face leg answering
+            # clips he never asked it to answer is a behaviour change he did
+            # not ask for, and it still only logs, below. This is the
+            # opposite thing: he said the phrase, or he typed the code, and
+            # the only content of either is "let me in". The phrase already
+            # acts in shadow by consuming the turn and speaking a line; the
+            # five minutes it buys is the same instruction, and refusing to
+            # honour it made the feature inert in the one mode he runs.
+            log.info("owner-gate: the %s window rescued a clip the speaker "
+                     "filter dropped (%s, mode=%s)", d.how, d.who,
+                     gate.effective_mode())
+            if result is None:
+                result = self.transcriber.transcribe(audio)
+            return audio, stats, result
         if gate.effective_mode() != gate_mod.MODE_ENFORCE:
             # SHADOW CHANGES NOTHING ELSE, and that has to include the
             # rescues. A face leg that started answering clips the speaker
@@ -4946,6 +5067,18 @@ class JarvisApp:
         the mic, close the turn in the ledger, and publish ONLY the
         redaction -- no UserUtterance, no commander, no model. The log line
         carries who and which path; the text is never anywhere."""
+        # THE GLASS FIRST, BEFORE ANYTHING ELSE GETS TO RUN. While he speaks,
+        # _partial_loop and _maybe_speculate publish PartialText(<the words>)
+        # and the pane draws a ghost card. Publishing the redaction does NOT
+        # take it down: MainWindow._ev_transcribed clears the partial only
+        # when the event is NOT accepted or is empty, and this event is
+        # accepted and non-empty, while add_user -- the pane's other clearer
+        # -- never runs because the whole point is that no UserUtterance
+        # follows. So the phrase stayed legible on screen after a log line
+        # had been carefully redacted in front of it. Measured 2026-09-05 in
+        # all three modes: transcript calls were [("show", <the phrase>)]
+        # with no ("clear", "").
+        self._drop_partial()
         log.info("owner-gate: the phrase turn is consumed for %s; nothing "
                  "dispatched (mode=%s)", d.who, self.gate.effective_mode())
         bus.publish(Transcribed(text=d.redact or gate_mod.REDACTED_TEXT,
@@ -5022,6 +5155,11 @@ class JarvisApp:
                     self._gate_consumed(verdict, result.confidence,
                                         spec is not None)
                     return
+            # THE WORDS ARE WRITTEN DOWN HERE, NOT IN THE DECODE, whenever
+            # an owner has a phrase set: _clip_decode redacted the line so
+            # that a phrase-shaped clip could be judged before anything
+            # logged it, and this is the gate saying it was ordinary.
+            self._log_transcript(result)
             # The confidence gate is no longer the last word. It used to
             # fire BEFORE the commander saw a syllable, so a plain "Yes."
             # answering Jarvis's own "Clear all three off your shopping

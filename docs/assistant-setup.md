@@ -4256,10 +4256,10 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
 ## 84. Knightfall: the two ways back in when he will not admit you
 
 The owner gate (`owner.mode`) decides whether a turn is answered and in
-whose name. **Enforcement is still `shadow` and nothing in this section
-changes it** — in shadow the gate logs the verdict it *would* have given and
-refuses nobody. Knightfall is the pair of doors that work even when the
-voice check will not open: **a phrase you say**, and **a code you type**.
+whose name. **Enforcement is still `shadow`** — in shadow the gate logs the
+verdict it *would* have given and refuses nobody. Knightfall is the pair of
+doors that work even when the voice check will not open: **a phrase you
+say**, and **a code you type**.
 
 Both open the same thing: a **five-minute window** in which turns are
 attributed to you. Read that plainly — the window admits the *room*, not
@@ -4267,6 +4267,18 @@ your voice. Anyone speaking during those five minutes is taken for you.
 That is the deliberate trade the gate was built with (`jarvis/gate.py`,
 GRANT_S = 300 s); the code does not shorten it, it only adds a second way
 to open it.
+
+**One thing in shadow did change, on 2026-09-05, and it is the thing that
+makes the feature work at all in the mode you actually run.** The clip that
+gets thrown away is thrown away by the *speaker filter*, which is not the
+gate and does not care what mode the gate is in. Until this fix, a window
+you had opened by hand was honoured only under `enforce`: in shadow you said
+the phrase, heard "I'm listening", and your very next sentence was dropped
+exactly as the one before it had been — measured, nothing dispatched at all.
+Now an open window takes those clips in shadow too. The gate still does not
+start answering on its *own* judgement in shadow — a face it recognises
+still only writes "would have" to the log. The difference is that a window
+is not its judgement, it is your instruction.
 
 ### Setting them (you type these; nothing else can)
 
@@ -4304,13 +4316,40 @@ talking should not pay.
 
 When it matches, the turn ends there: he says "Thank you, sir. I'm
 listening.", re-opens the microphone, and **dispatches nothing** — no
-command, no model, no transcript. The log line names who and which path; the
-words themselves are never written down, in any mode. This works with
-`owner.mode` set to `off`, `shadow` or `enforce`.
+command, no model, no transcript. The log line names who and which path.
+This works with `owner.mode` set to `off`, `shadow` or `enforce`.
 
-Five wrong phrase-shaped guesses in five minutes from a voice nobody
-recognises close the phrase until the window passes. Your own sentences
-never count against that.
+**With the gate `off` he says "Thank you, sir." instead**, and the shorter
+line is the honest one: `off` is the single mode that opens no window (there
+is nothing to admit you past), so the speaker filter goes on dropping your
+clips and "I'm listening" would have been a promise the code does not keep.
+The two lines are deliberately different so that you, who know what they
+mean, can hear which mode you are in; neither names the phrase, the mode, or
+the fact that anything was recognised, because both are said out loud in a
+room that may hold whoever was just refused.
+
+**Where the words go.** On a turn the phrase matches, they go nowhere: not
+the log, not the bus, not the transcript pane, not the history, not the
+model. That claim used to be false in the place it mattered most — the
+decode wrote `Transcribed: '<your phrase>'` to `jarvis.log` at INFO before
+the gate had seen a syllable, on the ordinary path where the speaker filter
+*recognises* you, and the ghost card left the words legible on screen after
+the log line had been carefully redacted in front of them. Both were
+measured on 2026-09-05 and both are closed: while any owner has a phrase
+set, every clip is decoded quietly and the words are written down only
+*after* the gate has said they were not the phrase. The cost is small and
+worth naming: an ordinary sentence's `Transcribed:` line now appears a
+moment later in the log than it used to, and a clip sent from your phone
+over the intercom does not get one at all (nothing on that path can rule the
+words are not the phrase). The numbers — `avg_logprob`, the rejections, the
+speaker scores — are untouched everywhere.
+
+Five wrong phrase-shaped guesses in five minutes close the phrase until the
+window passes. **Your own sentences never count against that — but only
+yours.** Until 2026-09-05 the exemption was given to *anybody the gate could
+name*, so a known guest in front of the lens turned the limiter off
+completely: 40 phrase-shaped guesses cost 40 key derivations with a known
+face in view, against 5 with nobody named. It is now bound to the owner.
 
 ### Typing it
 

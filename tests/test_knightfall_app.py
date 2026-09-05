@@ -32,6 +32,13 @@ def _result(text, accepted=True):
                            looping=False)
 
 
+def _line(mode):
+    """What the consumed turn says out loud. Off opens no window, so it does
+    not say the sentence that means one was opened (2026-09-05)."""
+    return (gate_mod.PHRASE_OFF_LINE if mode == "off"
+            else gate_mod.PHRASE_OK_LINE)
+
+
 def _app(tmp_path, *, mode="shadow", phrase=True, said=SAID, rejected=False):
     a = _stand_in(tmp_path, mode=mode, phrase=phrase, said=said)
     a.dispatched = []
@@ -179,15 +186,38 @@ def test_the_code_window_rescues_a_dropped_clip_in_enforce(tmp_path, caplog):
         out = a._gate_rescue(object(), MATCHED, False)
     assert out is not None and out is not app_mod.PHRASE_CONSUMED
     assert a.transcriber.calls == 1
-    assert "the code leg rescued" in caplog.text
+    assert "the code window rescued" in caplog.text
 
 
-def test_the_code_window_in_shadow_only_says_it_would_have(tmp_path, caplog):
+def test_the_code_window_rescues_in_shadow_too(tmp_path, caplog):
+    """CHANGED DELIBERATELY, 2026-09-05, and this test used to assert the
+    opposite. It pinned "shadow only says it WOULD have rescued" -- which
+    meant that in HIS LIVE MODE the code he typed, and the phrase he spoke,
+    bought him exactly nothing: the speaker filter went on dropping the
+    very next clip. Shadow's rule is that the gate must not act on its own
+    judgement; a window he opened by hand is not the gate's judgement, it
+    is his instruction, and it is honoured wherever one can be opened.
+    The face leg still only logs in shadow -- the test below pins that."""
     a = _stand_in(tmp_path, mode="shadow", phrase=False, said="read me my mail")
     a.gate.open_window("hunter", gate_mod.HOW_CODE)      # the real clock
     with caplog.at_level(logging.INFO):
+        rescued = a._gate_rescue(object(), MATCHED, False)
+    assert rescued is not None and rescued[2].text == "read me my mail"
+    assert "window rescued" in caplog.text and "code" in caplog.text
+    assert a.transcriber.calls == 1
+
+
+def test_the_face_leg_still_only_says_it_would_have_in_shadow(tmp_path, caplog):
+    """The half of the shadow rule that did NOT change, pinned right beside
+    the half that did: a leg THE GATE decided on its own must not start
+    answering clips the speaker filter dropped while the mode is shadow."""
+    a = _stand_in(tmp_path, mode="shadow", phrase=False, said="read me my mail")
+    a._eye_identity = lambda: "hunter"        # the camera names him
+    a._face_running = lambda: True
+    with caplog.at_level(logging.INFO):
         assert a._gate_rescue(object(), MATCHED, False) is None
-    assert "WOULD have rescued" in caplog.text and "code" in caplog.text
+    assert "WOULD have rescued" in caplog.text and "face" in caplog.text
+    assert "window rescued" not in caplog.text
     assert a.transcriber.calls == 0
 
 
@@ -200,7 +230,7 @@ def test_with_the_gate_off_the_phrase_turn_still_dispatches_nothing(
     a = _app(tmp_path, mode="off", said=FAKE_PHRASE)
     a._process_audio(object())
     assert a.dispatched == []
-    assert a.spoken == [gate_mod.PHRASE_OK_LINE]
+    assert a.spoken == [gate_mod.PHRASE_OFF_LINE]
     kinds = [type(e).__name__ for e in events]
     assert kinds == ["Transcribed"]
     assert FAKE_PHRASE not in repr([getattr(e, "text", "") for e in events])
@@ -219,7 +249,7 @@ def test_the_wake_word_in_front_of_the_phrase_dispatches_nothing(
         tmp_path, events, mode):
     a = _app(tmp_path, mode=mode, said="Jarvis, %s." % FAKE_PHRASE)
     a._process_audio(object())
-    assert a.dispatched == [] and a.spoken == [gate_mod.PHRASE_OK_LINE]
+    assert a.dispatched == [] and a.spoken == [_line(mode)]
     assert [type(e).__name__ for e in events] == ["Transcribed"]
 
 
@@ -256,7 +286,7 @@ def test_the_rescue_decode_is_the_one_that_writes_no_words_down(tmp_path,
     a.transcriber = _QuietTranscriber(FAKE_PHRASE)
     a._process_audio(object())
     assert (a.transcriber.quiet, a.transcriber.loud) == (1, 0)
-    assert a.dispatched == [] and a.spoken == [gate_mod.PHRASE_OK_LINE]
+    assert a.dispatched == [] and a.spoken == [_line(mode)]
 
 
 def test_a_transcriber_without_the_quiet_decode_still_works(tmp_path):

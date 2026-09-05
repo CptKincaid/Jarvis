@@ -42,8 +42,11 @@ def test_a_recognised_owner_saying_the_phrase_has_the_turn_consumed(
     answers it itself. It must not travel on as a sentence."""
     g = _gate(tmp_path, mode=mode, phrase=True)
     d = g.judge("voice", SAID, stats=MATCHED)
-    assert _consumed(d) == (True, gt.HOW_PHRASE, gt.PHRASE_OK_LINE,
-                            gt.REDACTED_TEXT)
+    # Off consumes the phrase exactly as the other two do, and says a
+    # DIFFERENT line, because it is the one mode that opens no window and
+    # so has no floor to promise (tests/test_knightfall_promise.py).
+    line = gt.PHRASE_OFF_LINE if mode == "off" else gt.PHRASE_OK_LINE
+    assert _consumed(d) == (True, gt.HOW_PHRASE, line, gt.REDACTED_TEXT)
     assert d.who == "hunter" and d.admit is True
 
 
@@ -238,8 +241,11 @@ def test_the_phrase_is_consumed_with_the_gate_off_as_well(tmp_path, mode):
     the bus and into the commander."""
     g = _gate(tmp_path, mode=mode, phrase=True)
     d = g.judge("voice", SAID, stats=MATCHED)
-    assert _consumed(d) == (True, gt.HOW_PHRASE, gt.PHRASE_OK_LINE,
-                            gt.REDACTED_TEXT)
+    # Off consumes the phrase exactly as the other two do, and says a
+    # DIFFERENT line, because it is the one mode that opens no window and
+    # so has no floor to promise (tests/test_knightfall_promise.py).
+    line = gt.PHRASE_OFF_LINE if mode == "off" else gt.PHRASE_OK_LINE
+    assert _consumed(d) == (True, gt.HOW_PHRASE, line, gt.REDACTED_TEXT)
     assert d.admit is True and d.who == "hunter"
     assert FAKE_PHRASE not in (d.redact or "") + (d.line or "") + (d.why or "")
 

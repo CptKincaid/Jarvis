@@ -134,6 +134,12 @@ HOW_FAULT = "fault"
 # The legs a turn may be admitted on. HOW_CODE joins the two the window
 # already had; the app's rescue set reads the same tuple.
 ADMITTED_HOWS = (HOW_VOICE, HOW_FACE, HOW_PHRASE, HOW_GRANT, HOW_CODE)
+# THE TWO LEGS HE HIMSELF OPENED, as against the ones a sensor produced.
+# Every other leg in ADMITTED_HOWS is something the machine decided about
+# him; these two exist only because he said the phrase or typed the code,
+# and that difference is what lets them act in shadow (jarvis/app.py,
+# _gate_rescue_inner) while the face leg still only logs.
+WINDOW_HOWS = (HOW_GRANT, HOW_CODE)
 # The two ways the window can be opened, worded for the log.
 _OPENER_NAMES = {HOW_PHRASE: "the phrase", HOW_CODE: "the code"}
 
@@ -180,8 +186,19 @@ KNOWN_SCOPE_LINE = ("That one's the owner's, {name}. I can give you the time, "
 # the phrase, how close it was, or how long the floor stays open: it is
 # spoken out loud in a room that may hold whoever the gate just refused.
 PHRASE_OK_LINE = "Thank you, sir. I'm listening."
+# ...AND WHAT MODE_OFF SAYS INSTEAD, because in off the phrase opens no
+# window (see _phrase_consumed) and the speaker filter -- which is not the
+# gate and does not care what mode the gate is in -- goes on dropping his
+# clips exactly as it did a second earlier. "I'm listening." was therefore
+# a promise the code did not keep in that mode: measured 2026-09-05, the
+# turn after the phrase dispatched nothing at all in off. This says thank
+# you and claims nothing. It is deliberately still opaque to a bystander --
+# it does not name the phrase, the mode, or the fact that anything was
+# recognised -- and deliberately DIFFERENT from PHRASE_OK_LINE, so that he,
+# who knows what the two mean, can hear which mode he is in.
+PHRASE_OFF_LINE = "Thank you, sir."
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE)
+                 PHRASE_OK_LINE, PHRASE_OFF_LINE)
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -422,7 +439,7 @@ class OwnerGate:
             log.info("gate: the phrase was consumed for %s; the gate is off, "
                      "so no floor was opened", who)
             return Decision(admit=True, who=who, role=ROLE_OWNER,
-                            how=HOW_PHRASE, line=PHRASE_OK_LINE,
+                            how=HOW_PHRASE, line=PHRASE_OFF_LINE,
                             redact=REDACTED_TEXT, consumed=True,
                             why="the phrase; the gate is off and answered "
                                 "this turn")
@@ -539,7 +556,18 @@ class OwnerGate:
         # is CONSUMED here: the window opens, the line is what he hears,
         # and the app dispatches nothing. The limiter counts only a voice
         # nobody recognised (see _try_phrase).
-        spoke = self._try_phrase(text, now, limited=not named.who)
+        # THE EXEMPTION IS THE OWNER'S, AND ONLY HIS. This used to read
+        # ``limited=not named.who`` -- "somebody was named" -- which is not
+        # the same sentence at all: a KNOWN non-owner in front of the lens
+        # (a guest, the cleaner, anybody the camera has a row for) turned
+        # the five-per-window limiter OFF and bought a guesser unlimited
+        # attempts at one scrypt each, with the owner nowhere in the room.
+        # Measured 2026-09-05: 40 phrase-shaped guesses cost 40 key
+        # derivations with a KNOWN face in view, against 5 with nobody
+        # named. The reason for the exemption was only ever HIS OWN
+        # sentences not burning his own way back in, so it is his alone.
+        owner_named = bool(named.who) and named.role == ROLE_OWNER
+        spoke = self._try_phrase(text, now, limited=not owner_named)
         if spoke:
             return self._phrase_consumed(spoke, now)
 

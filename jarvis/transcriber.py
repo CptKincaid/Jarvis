@@ -931,7 +931,11 @@ class Transcriber:
         if not echo_repeats:
             echo_unit, echo_repeats = prompt_echo(text, prompt)
 
-        shown = REDACTED_WORDS if redact else text
+        # An EMPTY decode has no secret in it, and saying
+        # "«passphrase»" for one would be a lie in the log: the
+        # empty transcript is a diagnosis of its own (the VAD pass
+        # found no words) and must stay legible.
+        shown = REDACTED_WORDS if (redact and text) else text
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)
             log.info("Transcribed: %r (avg_logprob=%.2f)", shown, avg_conf)
