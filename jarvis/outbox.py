@@ -756,6 +756,23 @@ def recipient_gender(cfg, memory, who: str) -> Optional[str]:
     return None
 
 
+def draft_gender(cfg, memory, who: str,
+                 res: contacts_mod.Resolution) -> Optional[str]:
+    """What Draft.to_gender is filled with -- the ONE seam both lanes
+    designed for (Hunter's 19:00 ruling, 09-04). The ADDRESS BOOK row's
+    stored honorific comes first: a row he typed and validated, and
+    "Mr" / "Mrs" / "Ms" / "Miss" / "Sir" / "Madam" say which pronoun is
+    theirs ("Dr", and a row with no honorific, say nothing). Then
+    recipient_gender's sources -- an honorific he said, a legacy
+    send_file.contacts key, the people book. None when nobody knows, and
+    then either pronoun confirms, exactly as before the ruling. The name
+    itself is never read."""
+    hit = None
+    if getattr(res, "from_book", False):
+        hit = gender_from_honorific(getattr(res, "honorific", "") or "")
+    return hit or recipient_gender(cfg, memory, who)
+
+
 # ------------------------------------------------------------- config
 def roots(cfg) -> list:
     """Where a spoken file may be looked for."""
@@ -899,7 +916,7 @@ def prepare(cfg, memory, file_query: str, recipient: str,
                   body=str(_cfg_get(cfg, "send_file.body", "") or DEFAULT_BODY),
                   made_at=time.monotonic(), roots=kept,
                   from_book=bool(res.from_book), honorific=res.honorific,
-                  to_gender=recipient_gender(cfg, memory, recipient))
+                  to_gender=draft_gender(cfg, memory, recipient, res))
     log.info("outbox: drafted %s (%d bytes) to %s from %s", match.path.name,
              match.size, mail_mod._mask_address(addr),
              mail_mod.account_label(account))

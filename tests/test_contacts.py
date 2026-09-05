@@ -655,6 +655,93 @@ def test_the_person_question_never_reaches_the_file_offer(cmd_book, monkeypatch)
     assert res.reply.startswith("The full name, sir")
 
 
+# ---- the gender seam (the confirm-shapes merge, 09-05) -------------------
+# Hunter's 19:00 ruling: a pronoun in a yes has to be the pending person's,
+# and the gender comes from an EXPLICIT source only. The book row's stored
+# honorific is that source for a book-resolved draft: Draft.to_gender is
+# filled from it (outbox.draft_gender), "Dr" and a bare row leave it None.
+TITLED = [
+    {"name": "Dana Ruiz", "email": "dana@example.com", "honorific": "Mrs"},
+    {"name": "Sam Ortiz", "email": "sam@example.com", "honorific": "Mr"},
+    {"name": "Heather Smith", "email": "heather@example.com", "honorific": "Dr"},
+    {"name": "Heather Jones", "email": "hjones@example.com", "honorific": "Ms"},
+]
+
+
+@pytest.fixture
+def cmd_titled(cmd, book_file):  # noqa: F811
+    write(book_file, TITLED)
+    cmd.services.assistant.data["send_file.contacts"] = {}
+    return cmd
+
+
+@pytest.mark.parametrize("said, gender, wrong, right, who, addr", [
+    ("Dana", "f", "send it to him", "send it to her", "Dana Ruiz", "dana@example.com"),
+    ("Mrs Ruiz", "f", "yes, to him", "yes, to her", "Dana Ruiz", "dana@example.com"),
+    ("Sam", "m", "send it to her", "send it to him", "Sam Ortiz", "sam@example.com"),
+    ("Ortiz", "m", "okay send it to her", "okay send it to him", "Sam Ortiz",
+     "sam@example.com"),
+])
+def test_a_book_rows_honorific_fills_the_gender_seam(cmd_titled, said, gender,
+                                                     wrong, right, who, addr):
+    """The wrong-gender pronoun re-asks and keeps the draft; the right one
+    sends, to the book address, and nothing before it."""
+    c = cmd_titled
+    res = c.handle(f"email the biosensors handout to {said}", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res.reply
+    assert c._pending_send is not None
+    assert c._pending_send.from_book and c._pending_send.to_gender == gender
+    res = c.handle(wrong, source="voice")
+    assert not FakeSMTP.made, (said, wrong, res)
+    assert res is not None and res.handled and res.speak
+    assert c._pending_send is not None, "the draft is kept for the re-ask"
+    assert res.reply == outbox.gender_line(c._pending_send)
+    assert res.reply == f"The draft is to {who}, sir. Send it to {outbox.pronoun_for(gender)}?"
+    res = c.handle(right, source="voice")
+    assert res.ack, (said, right, res)
+    assert len(FakeSMTP.made) == 1 and FakeSMTP.made[-1].sent[0]["To"] == addr
+    assert c._pending_send is None
+
+
+@pytest.mark.parametrize("pronoun", ["send it to him", "send it to her"])
+def test_a_dr_row_leaves_the_gender_unknown_and_either_pronoun_sends(cmd_titled, pronoun):
+    c = cmd_titled
+    c.handle("email the biosensors handout to Heather Smith", source="voice")
+    assert c._pending_send is not None and c._pending_send.from_book
+    assert c._pending_send.to_gender is None, "Dr says nothing; the name is never read"
+    res = c.handle(pronoun, source="voice")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_the_which_answer_carries_the_picked_rows_honorific(cmd_titled):
+    """The row he picks by answering "Which Heather?" goes back through
+    prepare with the recipient settled, and its honorific fills the seam
+    the same way: Ms Heather Jones is "her"."""
+    c = cmd_titled
+    res = c.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply == "Which Heather, sir — Heather Smith or Heather Jones?"
+    c.handle("Jones", source="voice")
+    assert c._pending_send is not None and c._pending_send.to_gender == "f"
+    res = c.handle("send it to him", source="voice")
+    assert not FakeSMTP.made and res.reply == "The draft is to Heather Jones, sir. Send it to her?"
+    res = c.handle("yes, send it to her", source="voice")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "hjones@example.com"
+
+
+def test_draft_gender_reads_the_row_first_then_what_he_said(roots):  # noqa: F811
+    cfg = cfg_with_roots(roots, **{"send_file.contacts": {"mr jones": "jones@example.com"}})
+    book_row = book_mod.Resolution(addr="dana@example.com", name="Dana Ruiz",
+                                   from_book=True, honorific="Mrs")
+    assert outbox.draft_gender(cfg, None, "Dana", book_row) == "f"
+    dr_row = book_mod.Resolution(addr="h@example.com", name="Heather Smith",
+                                 from_book=True, honorific="Dr")
+    assert outbox.draft_gender(cfg, None, "Heather", dr_row) is None
+    assert outbox.draft_gender(cfg, None, "Mrs Smith", dr_row) == "f", "what he said still counts"
+    legacy = book_mod.Resolution(addr="jones@example.com", name="Jones")
+    assert outbox.draft_gender(cfg, None, "Jones", legacy) == "m", "the legacy key's Mr"
+    assert outbox.draft_gender(cfg, None, "Dana", book_mod.Resolution()) is None
+
+
 # ==================================================================
 # 6. The CLI: file-direct, works with Jarvis down, and `show` is the
 #    numbers-only instrument for the book
