@@ -4906,9 +4906,18 @@ class JarvisApp:
         if ev.dead_air_s is not None:
             self.turns.mark("speech_end", at=ev.t - ev.dead_air_s)
         # holds=N only when the filler hold fired: a turn without one keeps
-        # the line it always had.
+        # the line it always had. spell=N is its own note rather than more
+        # holds=N, because a spelled turn is a DIFFERENT wait to explain --
+        # a man saying an address one character at a time, not a man
+        # thinking after an um -- and a week of turns has to be able to
+        # tell the two apart (jarvis/spelling.py, 09-05).
         holds = int(getattr(ev, "filler_holds", 0) or 0)
-        notes = {"holds": str(holds)} if holds else {}
+        spell = int(getattr(ev, "spell_holds", 0) or 0)
+        notes = {}
+        if holds:
+            notes["holds"] = str(holds)
+        if spell:
+            notes["spell"] = str(spell)
         self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason, **notes)
 
     def _turn_on_transcribed(self, ev):

@@ -33,6 +33,7 @@ import numpy as np
 
 from jarvis.config import CONFIG, MACHINE
 from jarvis.endpoint import trailing_filler
+from jarvis.spelling import spelling_run
 from jarvis.events import (
     AudioLevel,
     MicState,
@@ -227,9 +228,11 @@ class Recorder:
     # The filler hold's per-capture state, as CLASS defaults so a bare
     # Recorder (tests build one with object.__new__) reads as "no partial
     # yet, no holds". start() resets them through _reset_filler_hold().
-    _latest_partial = None        # (filler, audio_end_s, wallclock) of the newest preview decode
+    _latest_partial = None        # (filler, spell_n, audio_end_s, wallclock) of the newest decode
     _filler_holds = 0             # distinct pauses held this capture
     _filler_hold_key = None       # last_speech_seconds of the pause being held
+    _spell_holds = 0              # ...and the same two for the SPELLING hold,
+    _spell_hold_key = None        # counted apart (jarvis/spelling.py)
     _capture_id = 0               # bumped by every start(); see note_partial
 
     def __init__(self, arbiter: MicArbiter, speaker_verifier=None):
@@ -623,7 +626,8 @@ class Recorder:
                                          endpoint=self._stop_endpoint or reason,
                                          dead_air_s=self._stop_dead_air,
                                          t=t_stop, followup=self._followup,
-                                         filler_holds=self._filler_holds))
+                                         filler_holds=self._filler_holds,
+                                         spell_holds=self._spell_holds))
         return audio
 
     def abort(self):
@@ -651,7 +655,8 @@ class Recorder:
         self._audio_frames = []
         self.last_audio = None
         bus.publish(RecordingStopped(reason="abort", followup=self._followup,
-                                     filler_holds=self._filler_holds))
+                                     filler_holds=self._filler_holds,
+                                     spell_holds=self._spell_holds))
         log.info("Recording aborted")
 
     def _dump_capture(self, audio_16k):
@@ -807,11 +812,15 @@ class Recorder:
         AFTER the grace does, and raising endpoint_silence is the remedy if
         that cuts a slow talker off.
 
-        THE FILLER HOLD: once the gap has reached endpoint_silence and the
-        stop is otherwise due, _filler_hold_extra asks whether the newest
-        preview decode ended on "um"/"uh" as the LAST thing heard; if so the
-        stop waits CONFIG.filler_hold_s longer (at most filler_max_holds
-        pauses per capture). LIMIT: the preview runs at 0.9 s cadence, the
+        THE TWO HOLDS: once the gap has reached endpoint_silence and the
+        stop is otherwise due, _hold_extra asks whether the newest preview
+        decode ended on "um"/"uh" as the LAST thing heard -- if so the stop
+        waits CONFIG.filler_hold_s longer (at most filler_max_holds pauses
+        per capture) -- or on a SPELLING RUN (jarvis/spelling.py), which
+        waits CONFIG.spell_hold_s for at most spell_max_holds pauses. One
+        seam, two counters: a man spelling an address pauses between every
+        character, and 0.8 s of quiet is what he leaves between two letters.
+        LIMIT: the preview runs at 0.9 s cadence, the
         endpoint at 0.8 s, and the speculative pass parks the preview from
         0.3 s into a pause -- so a filler said after the last snapshot may
         never have been decoded when the stop is due. The recorder does not
@@ -854,11 +863,16 @@ class Recorder:
             return False
         if ep.audio_seconds < 0.5:
             return False                      # by audio, not by frame count
-        if CONFIG.filler_hold and \
-                gap < CONFIG.endpoint_silence + self._filler_hold_extra(ep, gap):
+        if (CONFIG.filler_hold or CONFIG.spell_hold) and \
+                gap < CONFIG.endpoint_silence + self._hold_extra(ep, gap):
             return False
+        held = ", ".join(
+            filter(None, ("%d filler hold(s)" % self._filler_holds
+                          if self._filler_holds else "",
+                          "%d spelling hold(s)" % self._spell_holds
+                          if self._spell_holds else "")))
         log.info("Auto-stop: %.2fs after the last word (vad%s)", gap,
-                 ", %d filler hold(s)" % self._filler_holds if self._filler_holds else "")
+                 ", " + held if held else "")
         self._voice_stopped = True
         try:
             self.stop(reason="silence", endpoint="vad", dead_air=gap)
@@ -867,7 +881,7 @@ class Recorder:
             self.recording = False
         return True
 
-    # -- the filler hold ---------------------------------------------------
+    # -- the holds: filler and spelling -------------------------------------
     @property
     def capture_id(self) -> int:
         """Which capture is open. The preview reads this BEFORE it
@@ -881,9 +895,12 @@ class Recorder:
         loop after EVERY decode (not only a changed one -- a hold must
         survive whisper returning the same "…um" twice), with the capture
         position, in seconds, that the decoded span ends at. Only the
-        trailing filler (jarvis.endpoint.trailing_filler) is kept; the
-        recorder never sees or stores the words. Safe from any thread: one
-        tuple assignment, read whole by _filler_hold_extra.
+        trailing filler (jarvis.endpoint.trailing_filler) and the LENGTH
+        of the trailing spelling run (jarvis.spelling.spelling_run) are
+        kept; the recorder never sees or stores the words -- and a spelled
+        local part is half an address, so the run is kept as a COUNT and
+        logged as a count, never as the characters. Safe from any thread:
+        one tuple assignment, read whole by _hold_extra.
 
         ``capture_id`` is the capture the AUDIO came from -- Recorder.
         capture_id read before the snapshot. A decode takes hundreds of ms,
@@ -907,8 +924,8 @@ class Recorder:
         """
         if capture_id != self._capture_id:
             return                    # a decode that outlived its capture
-        self._latest_partial = (trailing_filler(text), float(audio_end_s),
-                                time.monotonic())
+        self._latest_partial = (trailing_filler(text), spelling_run(text),
+                                float(audio_end_s), time.monotonic())
 
     def _reset_filler_hold(self) -> None:
         """New capture: a new id, then no partial and no holds.
@@ -921,61 +938,101 @@ class Recorder:
         self._latest_partial = None
         self._filler_holds = 0
         self._filler_hold_key = None
+        self._spell_holds = 0
+        self._spell_hold_key = None
 
-    def _filler_hold_extra(self, ep, gap: float) -> float:
+    def _hold_extra(self, ep, gap: float) -> float:
         """Seconds to add to endpoint_silence for the pause the VAD is in
-        now (`gap` seconds old): CONFIG.filler_hold_s when the newest
-        preview decode ended on a filler and its span reached to within
-        FILLER_SLACK_S of the last speech, else 0.
+        now (`gap` seconds old), from the newest preview decode:
+
+        * CONFIG.filler_hold_s when it ended on a filler ("...um"), or
+        * CONFIG.spell_hold_s when it ended on a SPELLING RUN
+          (jarvis.spelling.spelling_run -- he is saying an address one
+          character at a time and the pause between two characters is
+          longer than the 0.8 s endpoint),
+
+        in both cases only when the decoded span reached to within
+        FILLER_SLACK_S of the last speech; else 0.
+
+        ONE seam, deliberately, rather than a parallel one: the two holds
+        share the span bounds, the once-per-pause key and the changes-the-
+        outcome rule below, so a fix to any of that is a fix to both. They
+        keep SEPARATE counters and caps -- an utterance has at most three
+        ums but an address has sixteen characters, and the ledger's
+        holds=N must go on meaning ums.
+
+        The filler is checked first and wins a tie. A decode ending
+        "...q-z-v, um" is a man who has stopped spelling to think, and
+        1.5 s is the figure that was measured for thinking.
 
         A hold is counted ONCE per pause (keyed on the last-speech
         position), never per poll tick and never again for a later
-        re-decode of the same pause; at most CONFIG.filler_max_holds
-        pauses per capture, after which this returns 0 and the ordinary
-        stop happens. Logs each hold once, with the word and the wait.
+        re-decode of the same pause; at most CONFIG.filler_max_holds /
+        CONFIG.spell_max_holds pauses per capture, after which this
+        returns 0 and the ordinary stop happens. Logs each hold once: the
+        filler word and the wait, or -- because a spelled local part is
+        half an address -- the character COUNT and the wait, never the
+        characters.
 
-        TWO BOUNDS, both from measurements on 09-05, neither of which can
-        stop a capture sooner than the branch already did:
-
-        * The span may not reach past the audio the endpointer has been
-          fed, plus the same slack. The original guard was one-sided
-          (`end_s < last - FILLER_SLACK_S`), so note_partial("um", 999.0)
-          -- a preview decode landing after a stop, carrying the OLD
-          capture's position -- bought a hold in a pause it never covered.
-          The slack on this side too: the preview snapshots the buffer
-          between poll ticks and feed() consumes whole 512-sample chunks,
-          so a legitimate end_s runs a fraction of a second ahead.
-
-        * A hold is counted and logged only when it CHANGES the outcome.
-          One starved poll tick arriving with the gap already past
-          endpoint_silence + filler_hold_s stops on that tick; incrementing
-          there made RecordingStopped.filler_holds -- and the ledger's
-          holds=N, the number the design added so a week of turns could say
-          how often the hold fired -- an upper bound rather than a count of
-          holds that DELAYED a stop. A hold already counted for this pause
-          stays counted on the tick it expires."""
+        THE SPAN BOUNDS, from measurements on 09-05 and now shared by both
+        holds, neither of which can stop a capture sooner than the branch
+        already did. The span may not end more than FILLER_SLACK_S before
+        the last speech (something was said after it that was never
+        decoded), nor more than FILLER_SLACK_S past the audio the
+        endpointer has been fed. The original guard was one-sided
+        (`end_s < last - FILLER_SLACK_S`), so note_partial("um", 999.0) --
+        a preview decode landing after a stop, carrying the OLD capture's
+        position -- bought a hold in a pause it never covered. The slack on
+        this side too: the preview snapshots the buffer between poll ticks
+        and feed() consumes whole 512-sample chunks, so a legitimate end_s
+        runs a fraction of a second ahead. The counting rule lives in
+        _counted_hold."""
         latest = self._latest_partial
         if latest is None:
             return 0.0
-        filler, end_s, _wall = latest
-        if not filler:
-            return 0.0
+        filler, spell_n, end_s, _wall = latest
         last = ep.last_speech_seconds
         if last is None or end_s < last - FILLER_SLACK_S:
             return 0.0            # speech followed that span: the tail was never decoded
         if end_s > ep.audio_seconds + FILLER_SLACK_S:
             return 0.0            # a partial from a capture this endpointer never heard
-        extra = float(CONFIG.filler_hold_s)
-        if self._filler_hold_key != last:
-            if self._filler_holds >= CONFIG.filler_max_holds:
+        if filler and CONFIG.filler_hold:
+            return self._counted_hold(
+                gap, last, float(CONFIG.filler_hold_s),
+                "_filler_holds", "_filler_hold_key", CONFIG.filler_max_holds,
+                "filler hold %d/%d: %r at %.1fs, waiting %.1fs",
+                (filler, last, float(CONFIG.filler_hold_s)))
+        if spell_n and CONFIG.spell_hold:
+            return self._counted_hold(
+                gap, last, float(CONFIG.spell_hold_s),
+                "_spell_holds", "_spell_hold_key", CONFIG.spell_max_holds,
+                "spelling hold %d/%d: %d characters at %.1fs, waiting %.1fs",
+                (spell_n, last, float(CONFIG.spell_hold_s)))
+        return 0.0
+
+    def _counted_hold(self, gap: float, last: float, extra: float,
+                      count_attr: str, key_attr: str, cap: int,
+                      msg: str, args: tuple) -> float:
+        """The half of a hold that is the same for both kinds: count it
+        once per pause, refuse past the cap, refuse when it would delay
+        nothing, and log it once.
+
+        A hold is counted and logged only when it CHANGES the outcome. One
+        starved poll tick arriving with the gap already past
+        endpoint_silence + extra stops on that tick; incrementing there
+        made RecordingStopped.filler_holds -- and the ledger's holds=N,
+        the number the design added so a week of turns could say how often
+        the hold fired -- an upper bound rather than a count of holds that
+        DELAYED a stop. A hold already counted for this pause stays
+        counted on the tick it expires."""
+        if getattr(self, key_attr) != last:
+            if getattr(self, count_attr) >= cap:
                 return 0.0
             if gap >= CONFIG.endpoint_silence + extra:
                 return 0.0        # already past the hold: it would delay nothing
-            self._filler_holds += 1
-            self._filler_hold_key = last
-            log.info("filler hold %d/%d: %r at %.1fs, waiting %.1fs",
-                     self._filler_holds, CONFIG.filler_max_holds, filler, last,
-                     CONFIG.filler_hold_s)
+            setattr(self, count_attr, getattr(self, count_attr) + 1)
+            setattr(self, key_attr, last)
+            log.info(msg, getattr(self, count_attr), cap, *args)
         return extra
 
     def _check_silence(self) -> bool:

@@ -282,7 +282,7 @@ def test_the_hold_never_applies_before_the_endpoint_silence_itself(monkeypatch):
 
 def test_a_new_capture_forgets_the_last_ones_partials_and_holds():
     rec = object.__new__(Recorder)
-    rec._latest_partial = ("um", 3.0, 1.0)
+    rec._latest_partial = ("um", 0, 3.0, 1.0)   # (filler, spell_n, end_s, wall)
     rec._filler_holds, rec._filler_hold_key = 2, 3.0
     rec._reset_filler_hold()
     assert rec._latest_partial is None
@@ -402,7 +402,10 @@ def test_the_hold_count_is_the_number_of_holds_that_delayed_a_stop(monkeypatch):
     """What holds=N means, pinned in one line so the docs and the ledger
     cannot drift apart again."""
     import jarvis.recorder as rm
-    doc = rm.Recorder._filler_hold_extra.__doc__ or ""
+    # The rule moved into _counted_hold on 09-05 when the spelling hold
+    # joined this seam (jarvis/spelling.py); both holds obey it now.
+    doc = (rm.Recorder._counted_hold.__doc__ or "") + \
+          (rm.Recorder._hold_extra.__doc__ or "")
     assert "delay" in doc.lower()
 
 

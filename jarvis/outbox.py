@@ -40,6 +40,7 @@ from typing import Optional
 
 from jarvis import contacts as contacts_mod
 from jarvis import filephrase
+from jarvis import spelling
 from jarvis.logs import get_logger
 from jarvis.tools import filepick
 from jarvis.tools import mail as mail_mod
@@ -326,6 +327,33 @@ def _one_said(m) -> str:
     return _mask_local(m.group("local")) + m.group("rest")
 
 
+def _mask_spelled(text: str) -> str:
+    """The local part of an address he SPELLED, masked in the RAW text.
+
+    The three passes below all read the raw text, where a spelled local
+    part is not one token: `_SPOKEN_ADDR_RX` matches "q z v at example dot
+    com" from the last single letter, so `_one_drafted` masks "v" and
+    leaves "q z " in the log line. This pass finds the same spans in the
+    FOLDED text (jarvis.spelling), maps them back through the index map
+    and masks the whole run, so what reaches the log is "q… at example dot
+    com" -- the first character and the domain, which is the mask this
+    module already applies to an address he typed.
+
+    Right-to-left, so an earlier span's offsets are still valid after a
+    later one has been replaced. Text with no spelling run in it folds to
+    itself and is returned untouched."""
+    folded, imap = spelling.fold_spans(text)
+    if folded == text:
+        return text
+    cuts = []
+    for m in _SPOKEN_ADDR_RX.finditer(folded):
+        s_i, e_i = m.start(1), m.end(1)
+        cuts.append((imap[s_i], imap[e_i - 1] + 1))
+    for s_i, e_i in reversed(cuts):
+        text = text[:s_i] + _mask_local(text[s_i:e_i]) + text[e_i:]
+    return text
+
+
 def mask_addresses(text) -> str:
     """"yes, to hjones@example.com" -> "yes, to h…@example.com", and
     "send it to dana at example dot com" -> "send it to d… at example dot
@@ -355,6 +383,10 @@ def mask_addresses(text) -> str:
 
         text = _ADDRESS_IN_TEXT_RX.sub(_one, text)
     if _AT_HINT_RX.search(text):
+        # The SPELLED pass first: it is the only one that can see a local
+        # part he said one character at a time, and the two below would
+        # otherwise mask its last letter and leave the rest in the line.
+        text = _mask_spelled(text)
         text = _SAID_ADDR_RX.sub(_one_said, text)
         text = _SPOKEN_ADDR_RX.sub(_one_drafted, text)
     return text
@@ -553,7 +585,25 @@ def address_span(text: str) -> Optional[tuple]:
     A match that is only the TAIL of what he said (a joiner word the
     parser does not read in front of it, a character an address cannot
     carry) is no address at all: None, and unresolved_address says what
-    was heard."""
+    was heard.
+
+    SPELLED ALOUD (09-05). The spoken pass runs over the text with every
+    spelling run folded into one word (jarvis.spelling), so "q-z-v at
+    example dot com" -- and every other way whisper punctuates a man
+    saying letters -- reads as "qzv at example dot com" and needs no new
+    grammar here. That is not cosmetic: BEFORE the fold this parser read
+    "q z v at example dot com" as the local part "v", because
+    _LOCAL_LABEL matched the last single letter and _spoken_lead only
+    refuses a SYMBOL word in front of it. It drafted v@example.com -- a
+    different, possibly real mailbox, and the one class of mistake a
+    read-back is least likely to catch, because it sounds almost right.
+    The returned span is mapped back through fold_spans's index map, so
+    it still cuts the raw sentence. Text with no run in it folds to
+    itself and every existing caller is unchanged.
+
+    The TYPED pass runs on the raw text first and is never folded:
+    "a.b@example.com" is already an address and rewriting it to
+    "ab@example.com" would be a fold inventing a mailbox."""
     raw = str(text or "")
     if not raw.strip():
         return None
@@ -563,15 +613,16 @@ def address_span(text: str) -> Optional[tuple]:
             return None
         addr = m.group(0).rstrip(".,;:")
         return addr, m.start(), m.start() + len(addr)
-    m = _SPOKEN_ADDR_RX.search(raw)
+    folded, imap = spelling.fold_spans(raw)
+    m = _SPOKEN_ADDR_RX.search(folded)
     if m:
-        if _spoken_lead(raw, m.start()) is not None:
+        if _spoken_lead(folded, m.start()) is not None:
             return None
         local = _JOINER_RX.sub(_joined, " ".join(m.group(1).split())).strip()
         domain = _JOINER_RX.sub(_joined, " ".join(m.group(2).split())).strip()
         addr = f"{local}@{domain}".replace(" ", "")
         if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
-            return addr, m.start(), m.end()
+            return addr, imap[m.start()], imap[m.end() - 1] + 1
     return None
 
 
@@ -589,11 +640,12 @@ def unresolved_address(text: str) -> str:
         if lead is None:
             return ""
         return spoken_address(raw[lead:m.end()].rstrip(".,;:")).strip()
-    m = _SPOKEN_ADDR_RX.search(raw)
+    folded = spelling.fold(raw)
+    m = _SPOKEN_ADDR_RX.search(folded)
     if m:
-        lead = _spoken_lead(raw, m.start())
+        lead = _spoken_lead(folded, m.start())
         if lead is not None:
-            return raw[lead:m.end()]
+            return folded[lead:m.end()]
     return ""
 
 
