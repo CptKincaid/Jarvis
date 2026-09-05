@@ -14,14 +14,17 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import stat
 import types
 from pathlib import Path
 
 import pytest
 
+from jarvis import commander as cm_mod
 from jarvis import contacts as book_mod
 from jarvis import outbox
+from jarvis.tools import mail as mail_mod
 from tests.test_send_file import (Cfg, FakeSMTP, cfg_with_roots,  # noqa: F401
                                   cmd, home, roots, _fresh_fakes)  # - fixtures
 
@@ -1656,18 +1659,13 @@ def test_mask_addresses_masks_the_spoken_shape(said, want):
 @pytest.mark.parametrize("prose", [
     "meet at noon",
     "at the dot",
-    "look at the dot on the map",
     "at 4 dot 30",
-    "meet me at 4 dot 30",
-    "the meeting is at 4 dot 30 pm",
     "aim at the red dot",
     "I'm at home. See you at six.",
     "we stopped at noon. Then we left",
     "polka dot at the dance",
     "connect the dots at the end",
     "version 3 dot 12 at the latest",
-    "she stared at the dot for a minute",
-    "look at that dot there",
     "at dot",
     "dot at",
     "email the biosensors handout to Heather Smith",
@@ -1677,6 +1675,14 @@ def test_mask_addresses_masks_the_spoken_shape(said, want):
     "",
 ])
 def test_mask_addresses_leaves_ordinary_prose_alone(prose):
+    """Prose the PARSER reads nothing out of is byte-identical. (w7) Five
+    sentences left this list -- "look at the dot on the map", "meet me at
+    4 dot 30", "the meeting is at 4 dot 30 pm", "she stared at the dot for
+    a minute", "look at that dot there" -- not because the mask got
+    greedier but because address_span DRAFTS look@the.on, me@4.30,
+    is@4.30, stared@the.for and look@that.there out of them. A sentence
+    Jarvis would mail to is not a sentence a log line may print whole;
+    they are in test_mask_addresses_deliberate_calls with what they cost."""
     assert outbox.mask_addresses(prose) == prose
 
 
@@ -1711,6 +1717,20 @@ def test_mask_addresses_leaves_ordinary_prose_alone(prose):
     # missing, and all three were DRAFTED). So a prose sentence whose last
     # word is an ordinary word now loses its first letter in a log line.
     ("look at the dot marked X", "l… at the dot marked X"),
+    # (w7) and the nine sentences the parser-consistent rule newly costs a
+    # head word. Every one of them is a sentence address_span DRAFTS an
+    # address out of -- look@the.on, me@4.30, is@4.30, stared@the.for,
+    # look@that.there, look@the.in, look@the.at, look@the.to, meet@the.to
+    # -- so every one of them is a sentence a yes could mail to.
+    ("look at the dot on the map", "l… at the dot on the map"),
+    ("meet me at 4 dot 30", "meet m… at 4 dot 30"),
+    ("the meeting is at 4 dot 30 pm", "the meeting i… at 4 dot 30 pm"),
+    ("she stared at the dot for a minute", "she s… at the dot for a minute"),
+    ("look at that dot there", "l… at that dot there"),
+    ("look at the dot in the corner", "l… at the dot in the corner"),
+    ("look at the dot at the top", "l… at the dot at the top"),
+    ("look at the dot to the left", "l… at the dot to the left"),
+    ("meet at the dot to be safe", "m… at the dot to be safe"),
 ])
 def test_mask_addresses_deliberate_calls(said, want):
     """Where the rule is a trade-off, this is the side it takes."""
@@ -1755,51 +1775,61 @@ def test_mask_addresses_masks_a_function_word_domain_on_an_unlisted_top_level(sa
 
 
 @pytest.mark.parametrize("prose", [
-    # ... and the guard that keeps the rule from eating prose: a
-    # function-word domain whose TOP LEVEL is a function word too is a
-    # sentence, and is left byte-identical.
+    # (w7) What is left of the prose guard once the word lists are gone:
+    # a sentence with no LOCAL PART in front of the "at" ("at the dot"),
+    # or no spoken "dot" between two domain labels at all, is not a shape
+    # the parser reads, so nothing masks it. That is a structural guard,
+    # not a list -- there is nothing left to add a word to.
     "at the dot",
-    "look at the dot on the map",
     "at 4 dot 30",
-    "she stared at the dot for a minute",
-    "look at that dot there",
     "I'm at home. See you at six.",
+    "we stopped at noon. Then we left",
+    "aim at the red dot",
+    "version 3 dot 12 at the latest",
 ])
-def test_a_function_word_domain_ending_on_a_function_word_stays_prose(prose):
+def test_a_sentence_the_parser_reads_nothing_out_of_stays_byte_identical(prose):
+    assert outbox.parse_address(prose) == ""
     assert outbox.mask_addresses(prose) == prose
 
 
-# EIGHT real country top levels are also English function words. A domain
-# that opens on a function word AND ends on one of these is read as prose,
-# so the address he said goes to the log raw. This is the KNOWN RESIDUAL:
-# it is pinned, not fixed.
-RESIDUAL_TLDS = ["at", "be", "in", "is", "it", "no", "so", "to"]
+# (w7) EIGHT real country top levels are also English function words --
+# .at .be .in .is .it .no .so .to -- and for two rounds "dana at my dot
+# in" was read as prose and written to the log raw while the parser
+# happily drafted dana@my.in and a yes mailed it. That residual is CLOSED,
+# and not by adding the eight to a list: the masker now reads the PARSER's
+# own regex, so there is no list left for a top level to be missing from.
+RESIDUAL_TLDS_NOW_CLOSED = ["at", "be", "in", "is", "it", "no", "so", "to"]
 
 
-@pytest.mark.parametrize("tld", RESIDUAL_TLDS)
-def test_the_known_residual_a_function_word_domain_on_a_function_word_ccTLD(tld):
-    """THE BOUNDARY, pinned so the next reader finds it instead of
-    re-deriving it. Measured on a 3552-row grid (96 function words x 37
-    top levels): the rule above cut leaking rows 3456 -> 864 and leaking
-    top levels 36 -> 8, and these are the 8 -- .at .be .in .is .it .no .so
-    .to, every one a real ccTLD and every one an English word. A word list
-    cannot tell "dana at my dot in" (an address) from "look at the dot in
-    the corner" (a sentence), and the sentence is far commoner; closing it
-    needs a public-suffix list, which is a bigger change than this one.
-    (Round 5's verdict put the residual at ONE top level, "in". Re-measured
-    here: it is eight. The grid it used carried only "in" of the eight.)"""
+@pytest.mark.parametrize("tld", RESIDUAL_TLDS_NOW_CLOSED)
+def test_the_function_word_ccTLDs_are_masked_now(tld):
+    """Round 6 pinned these eight as a KNOWN RESIDUAL that "only a
+    public-suffix list can close". It needed no list at all -- only the
+    admission that the parser had already decided. address_span drafts
+    dana@my.<tld> from every one of them, so every one of them is an
+    address, and the log gets d… ."""
     said = f"dana at my dot {tld}"
-    assert outbox.mask_addresses(said) == said, "still leaks -- see the docstring"
+    assert outbox.parse_address(said) == f"dana@my.{tld}"
+    assert outbox.mask_addresses(said) == f"d… at my dot {tld}"
+    assert outbox.mask_addresses(f"yes, to {said}") == f"yes, to d… at my dot {tld}"
 
 
-def test_the_residual_costs_only_the_both_ends_case():
-    """It takes a function word at BOTH ends, so the ordinary spoken
-    address on one of those eight is still masked, and the sentence the
-    residual is paid for is still prose."""
+def test_what_closing_the_residual_costs_prose():
+    """The price, paid knowingly and for the third time. "look at the dot
+    in the corner" is a sentence -- and it is also a sentence address_span
+    drafts look@the.in out of, which is the whole reason no word list
+    could ever split the two. So the log line loses ONE head word down to
+    one letter, and keeps every other byte. jarvis-v3 pays the same price
+    and does not keep the letter ("… at the dot in the corner")."""
     assert outbox.mask_addresses("dana at example dot in") == "d… at example dot in"
     assert outbox.mask_addresses("dana at example dot it") == "d… at example dot it"
     assert outbox.mask_addresses("look at the dot in the corner") == \
-        "look at the dot in the corner"
+        "l… at the dot in the corner"
+    assert v3_mask("look at the dot in the corner") == "… at the dot in the corner"
+    # and the sentences with no local part in front of the "at" pay nothing
+    assert outbox.mask_addresses("at 4 dot 30") == "at 4 dot 30"
+    assert outbox.mask_addresses("I'm at home. See you at six.") == \
+        "I'm at home. See you at six."
 
 
 def _leaks(records, *raw):
@@ -2012,3 +2042,337 @@ def test_the_stamp_carries_the_inode_so_a_rename_over_is_always_a_change(two_hea
     after = book_mod._stamp(two_heathers)
     assert after != before
     assert two_heathers.stat().st_ino in after
+
+
+# ======================================================================
+# (w7) PARSER-CONSISTENT MASKING -- the invariant, not a fourth word list
+#
+# Three rounds tuned the same two hand-written lists in outbox._one_said,
+# and every round a verdict found a class they let through raw into the
+# four jarvis.commander INFO lines: round 5 the unlisted top levels
+# (.site .xyz .info), round 6 the eight real ccTLDs that are also English
+# function words (.at .be .in .is .it .no .so .to -- "dana at my dot in").
+# The design was the problem, not the list.
+#
+# THE INVARIANT: an address he SAID never reaches a log line raw. It is
+# provable without any list, from two structural facts:
+#
+#   (1) the PARSER decides what an address is. If address_span drafts a
+#       recipient from a span, that span IS an address by definition, so
+#       the masker must mask AT LEAST every span the parser would draft
+#       from -- and the only way the two can never disagree about that is
+#       for the masker to use the parser's OWN regex object.
+#   (2) jarvis-v3 (d665b0f) is the FLOOR: whatever it masks today has to
+#       stay masked after the merge. Its masker IS that same parser regex,
+#       so (1) gives (2) by construction rather than by promise.
+#
+# Every name and domain below is invented.
+# ======================================================================
+
+# ---- the ORACLE: jarvis-v3 d665b0f's mask_addresses, copied in VERBATIM,
+#      so the floor is a fact this file can measure and not a claim about
+#      a branch the test cannot see.
+_V3_LOCAL_JOINER = r"(?:dot|period|full\s+stop|under\s*score|dash|hyphen)"
+_V3_DOMAIN_DOT = r"(?:dot|period|full\s+stop)"
+_V3_DOMAIN_DASH = r"(?:dash|hyphen)"
+_V3_LOCAL_LABEL = r"[A-Za-z0-9][\w+\-]*"
+_V3_DOMAIN_LABEL = r"[A-Za-z0-9][\w\-]*"
+_V3_SPOKEN_ADDR_RX = re.compile(
+    r"\b(" + _V3_LOCAL_LABEL + r"(?:\s+" + _V3_LOCAL_JOINER + r"\s+"
+    + _V3_LOCAL_LABEL + r")*)"
+    r"\s+at\s+"
+    r"(" + _V3_DOMAIN_LABEL + r"(?:\s+" + _V3_DOMAIN_DASH + r"\s+"
+    + _V3_DOMAIN_LABEL + r")*"
+    r"(?:\s+" + _V3_DOMAIN_DOT + r"\s+" + _V3_DOMAIN_LABEL
+    + r"(?:\s+" + _V3_DOMAIN_DASH + r"\s+" + _V3_DOMAIN_LABEL + r")*)+)", re.I)
+_V3_ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
+
+
+def v3_mask(text: str) -> str:
+    """jarvis-v3 d665b0f, jarvis/outbox.py mask_addresses(), verbatim."""
+    t = str(text or "")
+    if not t:
+        return t
+    t = _V3_ADDR_RX.sub(lambda m: mail_mod._mask_address(m.group(0).rstrip(".,;:"))
+                        + m.group(0)[len(m.group(0).rstrip(".,;:")):], t)
+    t = _V3_SPOKEN_ADDR_RX.sub(lambda m: "… at " + m.group(2), t)
+    return t
+
+
+def test_the_v3_oracle_is_the_branch_regex():
+    """The floor is only a floor if the oracle really is v3's rule: the
+    parser regex this branch masks WITH is byte-identical to v3's."""
+    assert _V3_SPOKEN_ADDR_RX.pattern == outbox._SPOKEN_ADDR_RX.pattern
+    assert _V3_ADDR_RX.pattern == outbox._ADDR_RX.pattern
+
+
+# ---- the grid: 7 locals x 20 domains x 40 top levels = 5600 rows, a
+#      finite product, walked inside one parametrize per top level.
+GRID_LOCALS = [
+    "dana", "heather", "marlowe99", "q",
+    "dana dot ruiz", "heather underscore smith", "kip dash vance",
+]
+GRID_DOMAINS = [
+    # domains that OPEN on an English function word -- the round-6 class
+    "my", "it", "in", "is", "no", "our", "their", "the dash board",
+    # ordinary ones, hyphenated and "dash"-spoken and multi-label
+    "example", "quillow", "brackenhall", "vexley", "zeph", "mandrake",
+    "nimbus", "mail dot tamu", "spark dash lab", "orbis hyphen works",
+    "kestrel dash co", "fenwick dot mail",
+]
+GRID_TLDS = (
+    # listed in _SAID_TLDS
+    ["com", "org", "net", "edu", "gov", "io", "co", "ai", "dev", "app",
+     "uk", "ca"]
+    # real, and simply absent from any hand-written list (round 5)
+    + ["site", "xyz", "info", "shop", "online", "cloud", "tech", "store",
+       "blog", "page", "email", "zone"]
+    # the eight real ccTLDs that are also English function words (round 6)
+    + ["at", "be", "in", "is", "it", "no", "so", "to"]
+    # junk: not a top level at all, and still drafted by the parser
+    + ["qqz", "frobnic", "wibble", "zzt", "nnn", "xyzzy", "blorp", "grib"]
+)
+
+
+def _rows(tld):
+    """(said, resolved) for every local x domain on one top level."""
+    for local in GRID_LOCALS:
+        for domain in GRID_DOMAINS:
+            said = f"{local} at {domain} dot {tld}"
+            yield local, said, outbox.parse_address(said)
+
+
+def _raw_local_stands(text, local):
+    """True when the local part as SAID still stands whole in front of an
+    "at" -- which is what "the log line carries the address raw" means."""
+    return bool(re.search(r"(?<![\w.\-…])" + re.escape(local) + r"\s+at\s",
+                          text, re.I))
+
+
+def _count_raw(text, local, addr):
+    """Raw disclosures in one line: the local part standing whole in front
+    of an "at", plus the resolved address anywhere. The same function is
+    run over this branch's output and over v3's, so P2 compares like with
+    like."""
+    n = len(re.findall(r"(?<![\w.\-…])" + re.escape(local) + r"\s+at\s",
+                       text, re.I))
+    return n + (text.lower().count(addr.lower()) if addr else 0)
+
+
+@pytest.mark.parametrize("tld", GRID_TLDS)
+def test_p1_every_span_the_parser_drafts_from_is_masked(tld):
+    """P1. If the parser drafts a recipient from a span, that span IS an
+    address, and no line may carry it: not the local part he said, not the
+    address it resolved to, and nothing the parser would draft from AGAIN.
+    Both doors (the send request and the correction at the confirm) get
+    the same sentence, because both write it to a log line."""
+    bad = []
+    for local, said, addr in _rows(tld):
+        if not addr:
+            continue
+        for line in (said, "email the handout to " + said, "yes, to " + said):
+            got = outbox.mask_addresses(line)
+            if _raw_local_stands(got, local):
+                bad.append(f"local raw: {line!r} -> {got!r}")
+            if addr.lower() in got.lower():
+                bad.append(f"address raw: {line!r} -> {got!r}")
+            if outbox.address_span(got) is not None:
+                bad.append(f"still draftable: {line!r} -> {got!r}")
+    assert not bad, f"{len(bad)} leaks on .{tld}: " + "; ".join(bad[:6])
+
+
+@pytest.mark.parametrize("tld", GRID_TLDS)
+def test_p2_the_branch_never_says_more_than_jarvis_v3(tld):
+    """P2. THE FLOOR. Anything v3 masks today stays masked: for every row,
+    this branch's line carries no more raw than v3's line does."""
+    worse = []
+    for local, said, addr in _rows(tld):
+        for line in (said, "email the handout to " + said, "yes, to " + said):
+            mine, theirs = outbox.mask_addresses(line), v3_mask(line)
+            if _count_raw(mine, local, addr) > _count_raw(theirs, local, addr):
+                worse.append(f"{line!r}: branch {mine!r} vs v3 {theirs!r}")
+    assert not worse, f"below the v3 floor on .{tld}: " + "; ".join(worse[:6])
+
+
+# ---- P3: what ordinary prose pays. The branch's own guards, plus the
+#      six sentences the verdict asked to be measured.
+PROSE_ROWS = [
+    "meet at noon",
+    "at the dot",
+    "look at the dot on the map",
+    "at 4 dot 30",
+    "meet me at 4 dot 30",
+    "the meeting is at 4 dot 30 pm",
+    "aim at the red dot",
+    "I'm at home. See you at six.",
+    "we stopped at noon. Then we left",
+    "polka dot at the dance",
+    "connect the dots at the end",
+    "version 3 dot 12 at the latest",
+    "she stared at the dot for a minute",
+    "look at that dot there",
+    "at dot",
+    "dot at",
+    "email the biosensors handout to Heather Smith",
+    "dana at example",
+    "stand at the hyphen. Then read on",
+    "what time is it",
+    "look at me. In the morning",
+    "I'm at home. In the morning",
+    "I'm at home. Info for you",
+    "look at the dot in the corner",
+    "look at the dot at the top",
+    "look at the dot to the left",
+    "meet at the dot to be safe",
+    "look at the dot com bubble",
+    "look at the dash board dot com",
+    "look at the dot marked X",
+    "the site is at example dot com",
+    "look at handout dot pdf",
+    "",
+]
+
+
+def letter_cost(row, masked):
+    """What one prose sentence paid: ("", "") when the line is
+    byte-identical, else (the word, what is left of it). Raises for ANY
+    other difference -- a second word eaten, a whole word gone, a byte of
+    the rest of the sentence changed -- because that is a bug in the mask,
+    not a trade."""
+    if masked == row:
+        return ("", "")
+    i = 0
+    while i < len(row) and i < len(masked) and row[i] == masked[i]:
+        i += 1
+    j, k = len(row), len(masked)
+    while j > i and k > i and row[j - 1] == masked[k - 1]:
+        j, k = j - 1, k - 1
+    lost, put = row[i:j], masked[i:k]
+    assert put == "…", f"{row!r} -> {masked!r}: put {put!r}, not one ellipsis"
+    assert lost and not any(c.isspace() for c in lost), \
+        f"{row!r} -> {masked!r}: a whole word or more was eaten ({lost!r})"
+    assert i >= 1 and row[i - 1].isalnum(), \
+        f"{row!r} -> {masked!r}: the head word lost its first letter too"
+    assert i == 1 or not row[i - 2].isalnum(), \
+        f"{row!r} -> {masked!r}: more than one letter of the head word kept"
+    return (row[i - 1] + lost, row[i - 1] + "…")
+
+
+@pytest.mark.parametrize("row", PROSE_ROWS)
+def test_p3_prose_pays_one_head_word_and_never_more(row):
+    """P3. A prose sentence is either byte-identical or loses ONE head
+    word down to its first letter, and nothing else of the sentence
+    changes. A sentence the parser does NOT draft from is byte-identical:
+    the mask only ever spends a letter where the parser would have drafted
+    an address out of the sentence too."""
+    masked = outbox.mask_addresses(row)
+    word, left = letter_cost(row, masked)          # raises on anything worse
+    if not outbox.parse_address(row):
+        assert masked == row, \
+            f"the parser drafts nothing from {row!r}, so it must not be masked"
+    else:
+        assert word, f"the parser DRAFTS {outbox.parse_address(row)!r} from " \
+                     f"{row!r} -- it has to be masked"
+
+
+@pytest.mark.parametrize("row", PROSE_ROWS)
+def test_p3b_prose_never_falls_below_the_v3_floor_either(row):
+    """And v3 spends the same letter on the same sentences -- it drops the
+    head word WHOLE ("… at the dot in the corner"); this branch keeps its
+    first letter. The trade is v3's, one letter cheaper."""
+    mine, theirs = outbox.mask_addresses(row), v3_mask(row)
+    if theirs != row:
+        assert mine != row, f"v3 masks {row!r} and this branch does not: {mine!r}"
+
+
+# ---- P4: end to end through the commander, both doors, DEBUG on every
+#      logger. The eight function-word ccTLDs (round 6's residual) and the
+#      three round-5 rows -- every one of them DRAFTED and MAILED.
+RESIDUAL_TLDS = ["at", "be", "in", "is", "it", "no", "so", "to"]
+W7_END_TO_END = ([(f"dana at my dot {t}", f"dana@my.{t}") for t in RESIDUAL_TLDS]
+                 + [("heather at the dash board dot site", "heather@the-board.site"),
+                    ("dana at my dot xyz", "dana@my.xyz"),
+                    ("dana at it dot info", "dana@it.info")])
+
+
+@pytest.mark.parametrize("said, addr", W7_END_TO_END)
+def test_p4_door_one_the_send_request(cmd_book, caplog, said, addr):
+    """Door one: he says the address in the send request itself. Nothing
+    on any logger, at DEBUG, may carry what he said or what it resolved
+    to -- and the file still goes to the right mailbox."""
+    with caplog.at_level(logging.DEBUG):
+        res = cmd_book.handle(f"email the biosensors handout to {said}",
+                              source="voice")
+        assert res.reply.endswith("Send it, sir?"), (said, res.reply)
+        assert f"to {said}" in res.reply, (said, res.reply)
+        assert not FakeSMTP.made
+        assert cmd_book.handle("yes", source="voice").ack
+    assert len(FakeSMTP.made) == 1, FakeSMTP.made
+    assert FakeSMTP.made[-1].sent[0]["To"] == addr
+    assert _leaks(caplog.records, said, addr) == []
+    lines = [r.getMessage() for r in caplog.records]
+    masked = said[:1] + "…" + said[len(said.split()[0]):]
+    assert any(ln.startswith("handle ") and masked in ln for ln in lines), lines
+
+
+# Door two cannot be walked for ".no": parse_send_answer("yes, to dana at
+# my dot no") is FALSE -- the sentence ends on the word "no" and the
+# confirm lane hears a decline. That is the commander's yes/no grammar,
+# not the mask (mask_addresses only ever feeds a log line; the routing
+# reads the unmasked sentence), and it is pinned on its own below.
+W7_DOOR_TWO = [(s, a) for s, a in W7_END_TO_END if not s.endswith(" no")]
+
+
+@pytest.mark.parametrize("said, addr", W7_DOOR_TWO)
+def test_p4_door_two_the_correction_at_the_confirm(cmd_book, caplog, said, addr):
+    """Door two, which jarvis-v3 masks and this branch did not: the
+    address arrives as a CORRECTION at the read-back ("yes, to ..."),
+    which put the raw form in the handle line AND the send read-back."""
+    with caplog.at_level(logging.DEBUG):
+        cmd_book.handle("email the biosensors handout to Heather Smith",
+                        source="voice")
+        res = cmd_book.handle(f"yes, to {said}", source="voice")
+        assert f"to {said}" in res.reply, (said, res.reply)
+        assert not FakeSMTP.made
+        assert cmd_book.handle("yes", source="voice").ack
+    assert len(FakeSMTP.made) == 1, FakeSMTP.made
+    assert FakeSMTP.made[-1].sent[0]["To"] == addr
+    assert _leaks(caplog.records, said, addr) == []
+    lines = [r.getMessage() for r in caplog.records]
+    masked = said[:1] + "…" + said[len(said.split()[0]):]
+    corrected = [ln for ln in lines if ln.startswith("send read-back:")
+                 and "corrects the draft" in ln]
+    assert corrected and all(masked in ln for ln in corrected), corrected
+    assert any(ln.startswith("handle ") and masked in ln for ln in lines), lines
+
+
+def test_a_correction_to_a_dot_no_address_is_heard_as_a_decline(cmd_book, caplog):
+    """MEASURED HERE, and NOT a masking bug -- named so the next reader
+    does not spend the round on it. "yes, to dana at my dot no" ends on the
+    word "no", parse_send_answer reads it as FALSE, and the confirm lane
+    declines instead of re-drafting. So he cannot correct a draft to a .no
+    address by voice at the read-back door. It is safe (nothing is sent,
+    and the handle line is still masked), it belongs to the yes/no grammar
+    and not to outbox, and door ONE takes the same address perfectly."""
+    assert cm_mod.parse_send_answer("yes, to dana at my dot no") is False
+    with caplog.at_level(logging.DEBUG):
+        cmd_book.handle("email the biosensors handout to Heather Smith",
+                        source="voice")
+        res = cmd_book.handle("yes, to dana at my dot no", source="voice")
+    assert res.reply == "Very good, sir; nothing sent."
+    assert not FakeSMTP.made
+    assert _leaks(caplog.records, "dana at my dot no", "dana@my.no") == []
+    lines = [r.getMessage() for r in caplog.records]
+    assert any(ln.startswith("handle ") and "d… at my dot no" in ln
+               for ln in lines), lines
+
+
+def test_the_masker_and_the_parser_read_the_same_regex_object():
+    """The structural claim, pinned: there is no second recognizer to fall
+    out of step with. mask_addresses masks with the parser's OWN compiled
+    regex, so a change to what the parser reads is a change to what the
+    log masks, in the same edit."""
+    import inspect
+    src = inspect.getsource(outbox.mask_addresses)
+    assert "_SPOKEN_ADDR_RX" in src, src
+    assert outbox._SPOKEN_ADDR_RX is outbox.address_span.__globals__["_SPOKEN_ADDR_RX"]

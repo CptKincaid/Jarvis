@@ -242,11 +242,14 @@ _ADDRESS_IN_TEXT_RX = re.compile(r"[^\s@<>,;]+@[^\s@<>,;]+")
 # will send to must be a shape this masks, or the log carries what the
 # mailbox gets. The domain is one or more labels (a label may carry a
 # said dash: "my dash host") and an alphabetic top level, said ("dot",
-# "period") or punctuated (". ", "."). Ordinary prose has the same
-# skeleton ("look at the dot on the map", "at 4 dot 30"), so a match is
-# then CHECKED: a domain that opens on a function word, or ends on a
-# number, is not an address; and a punctuated one has to end on a top
-# level actually in use, because "at home. See you" is not one either.
+# "period") or punctuated (". ", ".").
+#
+# This regex is now the SECOND of the two the masker runs, and it earns
+# its place on the punctuated shapes ALONE -- "Dana at gmail. com",
+# "dana.ruiz at example dot com" -- which address_span refuses to read and
+# _SPOKEN_ADDR_RX therefore does not match. Everything said with the word
+# "dot" is masked by the parser's own regex instead (see _one_drafted), so
+# no hand-written list decides whether an address is an address any more.
 _SAID_JOIN = (r"(?:\s+(?:dot|period|full\s+stop|under\s*score|dash|hyphen)\s+"
               r"|\.(?!\s))")
 _SAID_SEP = r"(?:\s+(?:dot|period|full\s+stop)\s+|\.\s*)"
@@ -258,59 +261,69 @@ _SAID_ADDR_RX = re.compile(
     r"(?P<domain>" + _SAID_LABEL + r"(?:" + _SAID_SEP + _SAID_LABEL + r")*"
     + _SAID_SEP + r"(?P<tld>[A-Za-z]{2,24})))"
     r"(?![\w\-])", re.I)
-_SAID_SEP_RX = re.compile(_SAID_SEP, re.I)
 _AT_HINT_RX = re.compile(r"\bat\b", re.I)
-_NOT_A_DOMAIN_WORD = frozenset("""
-    the a an this that these those my your his her our their its it
-    on in of to for from and or but is was are were be been so as at by
-    up out if then than there here what which who whom when where why how
-    not no yes now just also very too all any some each every both few
-    more most other such only own same do does did done can could will
-    would shall should may might must have has had am we you they he she
-    him them i
-""".split())
-# ("me" and "us" are not in that list: "dana at me dot com" is an address
-# -- me.com is a mail domain -- and no sentence says "at me dot".)
 # Top levels a PUNCTUATED domain may end on ("gmail. com", "example.edu").
 # English words that are also top levels (in, me, us, it, is, be, no, to,
 # at, so, info) are left out on purpose: after a full stop they are the
-# next sentence far more often than an address. Said with the word "dot"
-# they are still masked -- "dana at example dot in" is an address.
+# next sentence far more often than an address -- "we stopped at noon.
+# Then we left". Said with the WORD "dot" they need no list at all: the
+# parser reads them as an address, so the parser rule below masks them.
 _SAID_TLDS = frozenset("""
     com org net edu gov mil int io co ai dev app biz tv uk ca au de fr
     nl es ie ch eu nz jp cn br mx ru se fi dk pl cz pt gr tr za kr
 """.split())
 
 
+def _mask_local(local: str) -> str:
+    """A local part cut to its first letter -- "dana" -> "d…" -- and a
+    ONE-letter local part dropped whole, because keeping the first letter
+    of "q" keeps the whole of it. That single case is the only place this
+    mask could ever say more than jarvis-v3's, which drops every local
+    part; everywhere else the kept letter is what makes the log line
+    readable."""
+    return local[:1] + "…" if len(local) > 1 else "…"
+
+
+def _one_drafted(m) -> str:
+    """A run the PARSER would draft an address from, masked -- found with
+    the parser's OWN compiled regex (_SPOKEN_ADDR_RX), never a copy and
+    never a list.
+
+    THREE ROUNDS tuned hand-written word lists here and every round a
+    verdict found a class they let through raw into four jarvis.commander
+    INFO lines: round 5 the top levels no list contains (.site .xyz
+    .info), round 6 the eight real ccTLDs that are also English function
+    words (.at .be .in .is .it .no .so .to -- "dana at my dot in" drafted
+    dana@my.in, was mailed by a yes, and was logged verbatim). The design
+    was the problem. The invariant Hunter wants -- an address he SAID
+    never reaches a log line raw -- needs no list, because the PARSER
+    already decides what an address is: if address_span drafts a recipient
+    from a span, that span IS an address, so masking exactly what the
+    parser reads makes it impossible for the two to disagree. Anything the
+    parser learns to read tomorrow, this masks in the same edit.
+
+    It is also jarvis-v3's floor by construction: d665b0f's mask_addresses
+    is this same regex (its `"… at " + m.group(2)`), so nothing v3 masks
+    today can come out less masked here."""
+    return _mask_local(m.group(1)) + m.group(0)[len(m.group(1)):]
+
+
 def _one_said(m) -> str:
-    domain = m.group("domain")
-    labels = [x for x in _SAID_SEP_RX.split(domain) if x]
-    # The first WORD of the first label: "the dash board" opens on "the".
-    first, tld = labels[0].split()[0].lower(), m.group("tld").lower()
-    # THE RULE: a domain that opens on an English function word is prose
-    # only when its TOP LEVEL is a function word too ("look at the dot on
-    # the map"); anything else is an address.
-    # Keying prose on _SAID_TLDS alone leaked, because no hand-written
-    # list of top levels is ever finished: "site", "xyz" and "info" were
-    # all missing, so "heather at the dash board dot site" was drafted to
-    # heather@the-board.site, mailed by a yes, and written RAW into four
-    # jarvis.commander INFO lines. Reading the LAST word instead of a list
-    # cut a 3552-row grid (96 function words x 37 top levels) from 3456
-    # leaking rows to 864, and 36 leaking top levels to 8.
-    # THE RESIDUAL, which this does NOT close: eight real ccTLDs are also
-    # English function words -- at be in is it no so to -- so "dana at my
-    # dot in" is still read as prose and logged raw. A word list cannot
-    # split it from "look at the dot in the corner"; only a public-suffix
-    # list can, and masking those eight would eat the commoner sentence.
-    # The cost is the same trade the line already took for "look at the
-    # dot com bubble", one row wider: "look at the dot marked X" now loses
-    # its first letter in a log line. A letter is cheaper than an address.
-    if (first in _NOT_A_DOMAIN_WORD and tld not in _SAID_TLDS
-            and tld in _NOT_A_DOMAIN_WORD):
+    """The runs the parser does NOT read, and this still must: a domain
+    Whisper PUNCTUATED instead of spelling out "dot" -- "Dana at gmail.
+    com", "dana at gmail.com" -- and a local part joined the same way
+    ("dana.ruiz at example dot com"). address_span refuses these, so no
+    mail can go to them, but they are still the address he said and the
+    log is read by more eyes than the mailbox is.
+
+    Ordinary prose has the same skeleton ("we stopped at noon. Then we
+    left"), so a punctuated domain has to end on a top level actually in
+    use. That exemption is safe HERE and only here: it can never leave a
+    draftable span raw, because _one_drafted runs after it over every span
+    the parser reads, unconditionally and without consulting any list."""
+    if "." in m.group("domain") and m.group("tld").lower() not in _SAID_TLDS:
         return m.group(0)
-    if "." in domain and tld not in _SAID_TLDS:
-        return m.group(0)
-    return m.group("local")[:1] + "…" + m.group("rest")
+    return _mask_local(m.group("local")) + m.group("rest")
 
 
 def mask_addresses(text) -> str:
@@ -320,7 +333,17 @@ def mask_addresses(text) -> str:
     the way mail and this module already mask a single address, for a log
     line that carries what he said. The rest of the sentence is kept -- it
     is the line's whole point -- the domain stays as he put it, and a
-    trailing full stop stays outside the mask."""
+    trailing full stop stays outside the mask.
+
+    Three passes, in this order: the typed address; then the punctuated
+    shapes the parser cannot read (_one_said, which may exempt prose); then
+    -- last, and over everything -- every span the PARSER would draft from,
+    masked with the parser's own regex, so the exemption above can never
+    leave an address raw. Prose pays for that: a sentence the parser would
+    have drafted an address out of ("look at the dot in the corner" ->
+    "l… at the dot in the corner") loses its head word down to one letter
+    in a log line. That is the trade, taken deliberately and for the third
+    time: a letter is cheaper than an address."""
     text = str(text or "")
     if "@" in text:
         def _one(m):
@@ -333,6 +356,7 @@ def mask_addresses(text) -> str:
         text = _ADDRESS_IN_TEXT_RX.sub(_one, text)
     if _AT_HINT_RX.search(text):
         text = _SAID_ADDR_RX.sub(_one_said, text)
+        text = _SPOKEN_ADDR_RX.sub(_one_drafted, text)
     return text
 
 
