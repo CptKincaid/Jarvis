@@ -18,6 +18,7 @@ The sftp listing text parsed below is verbatim from the format measured on
 this box in ``jarvis/tools/remote.py`` (``sftp -D`` to the local
 sftp-server; no socket).
 """
+import dataclasses
 import errno
 import json
 import os
@@ -52,15 +53,32 @@ class Cfg:
 class FakeTransport:
     """A Windows far side in a dict.  ``inbox`` is writable, ``outbox`` is
     NOT -- the measured permission on the real box -- and this fake refuses
-    a write there so a puller that ever tries to tidy up fails a test."""
+    a write there so a puller that ever tries to tidy up fails a test.
+
+    The two write primitives behave the way they were MEASURED to behave
+    against HPCOMPUTER on 2026-09-05 (OpenSSH_for_Windows_9.5, SFTP 3):
+
+    * :meth:`send` is scp, and scp TRUNCATES.  It writes at the name it is
+      given whatever is there -- 10 of 10 rounds destroyed a 22222-byte
+      file, exit 0, no message.  There is no no-clobber flag on it.
+    * :meth:`claim` is ``rename -l``, and it REFUSES.  10 of 10 rounds
+      refused an existing name with both files byte-intact; two concurrent
+      sessions renaming onto the same name, 12 rounds, gave exactly one
+      winner every time.  That is the only operation on this link that can
+      say no.
+    """
 
     def __init__(self, inbox=None, outbox=None):
         self.dirs = {"inbox": dict(inbox or {}), "outbox": dict(outbox or {})}
         self.folders = {"inbox": set(), "outbox": set()}   # FOLDERS over there
         self.fail = ""            # a reason to return from every call
-        self.send_fail = {}       # {name: reason} -- this FILE, not the link
+        self.listing_fail = {}    # {key: reason} -- ONE folder, not the link
+        self.send_fail = {}       # {local name: reason} -- the FILE, not the link
         self.fetch_fail = {}      # {name: reason} -- likewise, inbound
+        self.claim_fail = {}      # {final: reason} -- the rename itself
         self.calls = []
+        self.claims = []          # every (temp, final) rename attempted
+        self.discarded = []       # every temp of OURS taken away again
         self.short_write = 0      # land this many bytes instead of the file's
         self.stamp = "Sep  5 13:45"
 
@@ -72,6 +90,8 @@ class FakeTransport:
         self.calls.append(("listing", key))
         if self.fail:
             return [], self.fail
+        if self.listing_fail.get(key):
+            return [], self.listing_fail[key]
         rows = [fs.Entry(n, s, t) for n, (s, t) in sorted(self.dirs[key].items())]
         rows += [fs.Entry(n, 4096, self.stamp, True)
                  for n in sorted(self.folders[key])]
@@ -83,12 +103,38 @@ class FakeTransport:
             return self.fail
         if key != "inbox":
             raise AssertionError("nothing may write outside the remote inbox")
-        if name in self.send_fail:
-            return self.send_fail[name]
+        if local.name in self.send_fail or name in self.send_fail:
+            return self.send_fail.get(local.name) or self.send_fail[name]
         if name in self.folders[key]:
             return "failed"       # scp onto a folder: what the regexes miss
         size = self.short_write or local.stat().st_size
-        self.dirs[key][name] = (size, self.stamp)
+        self.dirs[key][name] = (size, self.stamp)   # scp TRUNCATES
+        return ""
+
+    def claim(self, temp, final, key="inbox"):
+        """``rename -l``: it takes the name or it says it could not."""
+        self.calls.append(("claim", final))
+        self.claims.append((temp, final))
+        if self.fail:
+            return self.fail
+        if final in self.claim_fail:
+            return self.claim_fail[final]
+        if temp not in self.dirs[key]:
+            return "taken"        # generic "Failure" is all the wire says
+        if final in self.dirs[key] or final in self.folders[key]:
+            return "taken"        # measured: refused, both files intact
+        self.dirs[key][final] = self.dirs[key].pop(temp)
+        return ""
+
+    def discard(self, temp, key="inbox"):
+        """Only ever a temp of OURS -- anything else is a test failure."""
+        if not temp.startswith(remote.REMOTE_TEMP_PREFIX):
+            raise AssertionError(f"tried to delete {temp!r} on HPCOMPUTER")
+        self.calls.append(("discard", temp))
+        self.discarded.append(temp)
+        if self.fail:
+            return self.fail
+        self.dirs[key].pop(temp, None)
         return ""
 
     def fetch(self, key, name, dest):
@@ -328,8 +374,10 @@ def test_a_pushed_file_is_verified_then_moved_to_sent(home):
     assert not p.exists()                            # the Outbox empties
     assert (home / "Sent" / "quarterly.pdf").read_bytes() == b"a" * 4096
     assert t.dirs["inbox"]["quarterly.pdf"][0] == 4096
-    # The listing that VERIFIES came after the send, not instead of it.
-    assert [c[0] for c in t.calls] == ["listing", "send", "listing"]
+    # The listing that VERIFIES came after the send, not instead of it --
+    # and the bytes went at a temp name of ours, which a CLAIM then renamed
+    # onto the name he will see.  Nothing writes at his name.
+    assert [c[0] for c in t.calls] == ["listing", "send", "claim", "listing"]
 
 
 def test_a_short_write_on_the_far_side_leaves_his_file_where_it_is(home):
@@ -1356,3 +1404,449 @@ def test_measure_the_window_that_is_left_after_the_race_is_closed(tmp_path,
               f"\n      -- and a 0-byte file OF OURS holds the name for it, "
               f"so what\n      that window can cost is his WRITE, never his "
               f"file.")
+
+
+# ==========================================================================
+# ROUND 3.  The same shape as the pull race, found on the OTHER side.
+#
+# FINDING J: a push listed the remote Inbox ONCE at the top of a pass, chose
+# a free name, and then scp'd straight at it.  scp TRUNCATES -- measured
+# against the real box, a 22222-byte file replaced by 1111 bytes, exit 0, no
+# message -- so a file of his that appeared at that name between the listing
+# and the copy was destroyed, the pass said "sent", and his LOCAL original
+# was then moved into Sent.  Both copies ours, his gone.  And the window is
+# not milliseconds: the sends are sequential after ONE listing, so the tenth
+# file in a queue is written minutes after its name was checked.
+#
+# The fix is not a narrower window.  MEASURED on HPCOMPUTER 2026-09-05: the
+# sftp client's DEFAULT rename (posix-rename@openssh.com) silently replaces,
+# 10 of 10; `rename -l` (SSH2_FXP_RENAME) REFUSES, 10 of 10, both files
+# intact; and two sessions racing for one name, 12 rounds, produced exactly
+# one winner each time with zero losses.  So: scp to a temp name of OURS,
+# then claim the real name with a rename that can say no.
+# ==========================================================================
+def _plant_on_send(t, name, size):
+    """He saves a file of his into the Windows Inbox AFTER the listing at
+    the top of the pass and BEFORE our bytes land -- the exact window."""
+    real = t.send
+
+    def send(local, temp, key="inbox"):
+        t.dirs["inbox"].setdefault(name, (size, t.stamp))
+        return real(local, temp, key)
+
+    t.send = send
+
+
+def test_a_file_of_his_that_appears_on_hpcomputer_mid_push_is_never_overwritten(
+        home):
+    t = FakeTransport()
+    drop(home, "report.pdf", b"o" * 30)
+    s = syncer(home, t)
+    _plant_on_send(t, "report.pdf", 99999)
+
+    events = s.push_once()
+
+    assert t.dirs["inbox"]["report.pdf"] == (99999, t.stamp)   # HIS, intact
+    assert [(e.outcome, e.detail) for e in events] == [("sent", "report (2).pdf")]
+    assert t.dirs["inbox"]["report (2).pdf"][0] == 30          # ours, beside
+    assert not (home / "Outbox" / "report.pdf").exists()       # moved on
+    assert (home / "Sent" / "report.pdf").read_bytes() == b"o" * 30
+
+
+def test_the_push_writes_at_a_name_of_ours_and_never_at_his(home):
+    """Every byte scp puts on that machine goes at a name this module made
+    up; the name he will see is taken by a rename that can refuse."""
+    t = FakeTransport()
+    drop(home, "report.pdf", b"o" * 30)
+    s = syncer(home, t)
+    s.push_once()
+    written = [name for kind, name in t.calls if kind == "send"]
+    assert len(written) == 1
+    assert written[0].startswith(remote.REMOTE_TEMP_PREFIX)
+    assert written[0].endswith(".tmp")
+    assert t.claims == [(written[0], "report.pdf")]
+
+
+def test_the_tenth_file_in_a_queue_is_claimed_when_it_is_sent(home):
+    """Not when the pass started.  One listing, ten sequential copies: the
+    name of the last one was checked minutes before its bytes moved."""
+    t = FakeTransport()
+    for i in range(10):
+        drop(home, f"f{i}.txt", b"x" * (i + 1))
+    s = syncer(home, t)
+    sends = []
+    real = t.send
+
+    def send(local, temp, key="inbox"):
+        sends.append(temp)
+        if len(sends) == 10:                       # he saves his over it now
+            t.dirs["inbox"]["f9.txt"] = (99999, t.stamp)
+        return real(local, temp, key)
+
+    t.send = send
+    events = s.push_once()
+
+    assert t.dirs["inbox"]["f9.txt"] == (99999, t.stamp)       # HIS, intact
+    landed = {e.name: e.detail for e in events if e.outcome == "sent"}
+    assert landed["f9.txt"] == "f9 (2).txt"
+    assert len(landed) == 10                       # the other nine unaffected
+
+
+def test_a_claim_that_cannot_be_taken_leaves_nothing_of_ours_behind(home):
+    """Fifty names taken and the fifty-first too: his file stays in the
+    Outbox, he gets a note, and our temp is taken off his machine."""
+    t = FakeTransport()
+    drop(home, "notes.txt", b"a" * 10)
+    s = syncer(home, t)
+
+    def every_name_is_taken(temp, final, key="inbox"):
+        t.claims.append((temp, final))
+        return "taken"
+
+    t.claim = every_name_is_taken
+    events = s.push_once()
+
+    assert [e.outcome for e in events] == ["name-taken"]
+    assert (home / "Outbox" / "notes.txt").exists()            # his file stays
+    assert t.discarded and all(n.startswith(remote.REMOTE_TEMP_PREFIX)
+                               for n in t.discarded)
+    assert not [n for n in t.dirs["inbox"]
+                if n.startswith(remote.REMOTE_TEMP_PREFIX)]
+    assert (home / "Outbox" / ("notes.txt" + fs.NOTE_SUFFIX)).exists()
+
+
+def test_the_number_of_claim_attempts_is_bounded(home):
+    t = FakeTransport()
+    drop(home, "notes.txt", b"a" * 10)
+    s = syncer(home, t)
+    t.claim = lambda temp, final, key="inbox": (t.claims.append((temp, final))
+                                                or "taken")
+    s.push_once()
+    assert 0 < len(t.claims) <= fs.MAX_CLAIM_TRIES
+
+
+def test_a_leftover_temp_of_ours_is_taken_off_his_machine_next_pass(home):
+    """A process killed between the copy and the claim leaves a temp in his
+    Inbox.  It is ours, it is named ours, and it is the only thing this
+    module may ever delete over there."""
+    t = FakeTransport()
+    stale = remote.remote_temp_name(0)
+    t.dirs["inbox"][stale] = (10, t.stamp)
+    t.dirs["inbox"]["his report.pdf"] = (5, t.stamp)
+    drop(home, "new.txt", b"a")
+    s = syncer(home, t)
+    s.push_once()
+    assert stale in t.discarded
+    assert stale not in t.dirs["inbox"]
+    assert "his report.pdf" in t.dirs["inbox"]                 # untouched
+
+
+def test_the_verification_is_against_the_name_we_actually_took(home):
+    """His original moves only when the far side holds OUR bytes at OUR
+    size under the name the claim actually won -- not the name we asked
+    for first."""
+    t = FakeTransport()
+    t.put("inbox", "report.pdf", b"h" * 4)                     # his, already
+    drop(home, "report.pdf", b"o" * 30)
+    s = syncer(home, t)
+    real_listing = t.listing
+    calls = []
+
+    def listing(key):
+        calls.append(key)
+        if len(calls) > 1:                # the verify: our landing is short
+            t.dirs["inbox"]["report (2).pdf"] = (7, t.stamp)
+        return real_listing(key)
+
+    t.listing = listing
+    events = s.push_once()
+    assert [e.outcome for e in events] == ["verify-failed"]
+    assert (home / "Outbox" / "report.pdf").exists()           # not moved
+    assert t.dirs["inbox"]["report.pdf"] == (4, t.stamp)       # his, intact
+
+
+def test_a_claim_that_fails_because_the_box_went_away_is_the_link(home):
+    """A rename that fails is not always contention.  When the machine has
+    gone, that is the link -- the queue stops and his file is charged
+    nothing."""
+    t = FakeTransport()
+    drop(home, "one.txt", b"a")
+    drop(home, "two.txt", b"b")
+    s = syncer(home, t)
+
+    def claim(temp, final, key="inbox"):
+        t.calls.append(("claim", final))
+        t.fail = "asleep"
+        return "asleep"
+
+    t.claim = claim
+    events = s.run_pass()
+    assert [e.outcome for e in events] == ["link-down"]
+    assert len([c for c in t.calls if c[0] == "send"]) == 1
+    assert not [c for c in t.calls if c[0] == "fetch"]
+    assert not s.ledger.fails                       # an outage is never his
+
+
+# ==========================================================================
+# FINDING K: a missing folder is a CONFIGURATION problem, not a dead link.
+#
+# MEASURED over 6 passes with the far side healthy and answering: a missing
+# remote Inbox made the top-of-pass listing return "not-there", which went
+# straight to the link handler -- 0 fetches, the file waiting in the Windows
+# Outbox never arrived, the interval backed off 30s -> 300s, and status.txt
+# said "link DOWN ... not answering since 15:36".  A control with the same
+# transport and an empty local Outbox completed the pull, which proves the
+# box was answering the whole time.
+# ==========================================================================
+def test_a_missing_remote_folder_does_not_back_off(home):
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    for _ in range(6):
+        s.run_pass()
+    assert s.interval_s == s.conf.remote_interval_s
+
+
+def test_a_missing_inbox_does_not_stop_the_pull(home):
+    """The control test, in code: the box is answering and the OUTBOX is
+    fine.  The file waiting there must still arrive."""
+    t = FakeTransport(outbox={"from-him.txt": (3, "Sep  5 13:45")})
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    events = s.run_pass()
+    assert ("from-him.txt", "received") in {(e.name, e.outcome) for e in events}
+    assert (home / "Inbox" / "from-him.txt").exists()
+    assert (home / "Outbox" / "waiting.pdf").exists()          # still waiting
+
+
+def test_the_status_says_which_folder_it_could_not_find(home):
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert "jarvis-inbox" in text                   # the path it looked for
+    assert "remote.inbox" in text                   # the setting to fix
+    assert "not answering" not in text.lower()      # it IS answering
+    assert "link      DOWN" not in text
+
+
+def test_a_folder_that_comes_back_clears_the_complaint(home):
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    s.run_pass()
+    assert "NOT THERE" in (home / "status.txt").read_text()
+    t.listing_fail = {}
+    s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert "NOT THERE" not in text
+    assert not (home / "Outbox" / "waiting.pdf").exists()      # and it went
+
+
+def test_a_missing_folder_does_not_fill_the_record_either(home):
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    for _ in range(40):
+        s.run_pass()
+    rows = [json.loads(x) for x in s.history_path.read_text().splitlines()]
+    assert len(rows) == 1
+
+
+def test_a_missing_folder_says_so_in_the_log_once(home, caplog):
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    with caplog.at_level("WARNING", logger="jarvis.foldersync"):
+        for _ in range(20):
+            s.run_pass()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "jarvis-inbox" in warnings[0].getMessage()
+
+
+def test_a_setting_with_no_socket_behind_it_is_not_a_dead_link_either(home):
+    """"no-key" never opened a connection, so it cannot be evidence that
+    HPCOMPUTER is not answering, and it must not back off either."""
+    t = FakeTransport()
+    t.fail = "no-key"
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    for _ in range(4):
+        s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert s.interval_s == s.conf.remote_interval_s
+    assert "not answering" not in text.lower()
+    assert "key" in text.lower()
+
+
+# -------------------------------------------- caught before a socket opens
+def test_preflight_catches_a_pull_folder_that_is_not_configured(home):
+    rconf = remote.read_config(Cfg(**{"remote.local_roots": (str(home.parent),)}))
+    sconf = fs.SyncConfig(enabled=True, paths=paths_for(home),
+                          pull_from="outbxo")
+    problems = fs.preflight(rconf, sconf.paths, sconf)
+    assert any("pull_from" in p and "outbxo" in p for p in problems)
+
+
+def test_preflight_catches_an_empty_remote_inbox(home):
+    rconf = remote.read_config(Cfg(**{
+        "remote.local_roots": (str(home.parent),)}))
+    rconf = dataclasses.replace(rconf, inbox="")
+    sconf = fs.SyncConfig(enabled=True, paths=paths_for(home))
+    problems = fs.preflight(rconf, sconf.paths, sconf)
+    assert any("remote.inbox" in p for p in problems)
+
+
+def test_preflight_catches_a_remote_folder_it_could_never_quote(home):
+    rconf = remote.read_config(Cfg(**{
+        "remote.inbox": 'C:/Users/h2pey/"Inbox"',
+        "remote.local_roots": (str(home.parent),)}))
+    sconf = fs.SyncConfig(enabled=True, paths=paths_for(home))
+    problems = fs.preflight(rconf, sconf.paths, sconf)
+    assert any("remote.inbox" in p for p in problems)
+
+
+def test_preflight_catches_a_remote_folder_too_deep_for_windows(home):
+    rconf = remote.read_config(Cfg(**{
+        "remote.inbox": "C:/" + "x" * 300,
+        "remote.local_roots": (str(home.parent),)}))
+    sconf = fs.SyncConfig(enabled=True, paths=paths_for(home))
+    problems = fs.preflight(rconf, sconf.paths, sconf)
+    assert any("remote.inbox" in p for p in problems)
+
+
+def test_the_shipped_settings_pass_preflight(home):
+    """The default pull_from really is a key remote.pull_dirs has."""
+    rconf = remote.read_config(Cfg(**{"remote.local_roots": (str(home.parent),)}))
+    sconf = fs.read_config(Cfg())
+    assert fs.remote_folder_problems(rconf, sconf) == []
+
+
+def test_check_asks_the_box_which_folder_is_missing(home, monkeypatch, capsys):
+    """--check is his to run, and it is the one place that may ASK: an
+    offline check cannot tell a mistyped path from a right one."""
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    s = syncer(home, t)
+    monkeypatch.setattr(fs, "build", lambda cfg: (s, []))
+    monkeypatch.setattr("jarvis.assistant_config.AssistantConfig.load",
+                        staticmethod(lambda *a, **k: Cfg()))
+    assert fs.main(["--check"]) == 1
+    said = capsys.readouterr()
+    assert "jarvis-inbox" in said.out + said.err
+    assert "remote.inbox" in said.out + said.err
+
+
+# ==================================================== the sweep, as a test
+def test_no_remote_write_goes_at_a_name_of_his_without_a_claim(home):
+    """The shape itself, pinned.  Every name scp is given on that machine
+    is one this module made up; the only operation that ever touches a name
+    he could have chosen is the claim, and the claim can refuse."""
+    src = Path(fs.__file__).read_text()
+    assert "def claim" in src or "self.transport.claim" in src
+    t = FakeTransport(outbox={"in.txt": (2, "Sep  5 13:45")})
+    for i in range(3):
+        drop(home, f"f{i}.txt", b"x")
+    s = syncer(home, t)
+    s.run_pass()
+    for kind, name in t.calls:
+        if kind == "send":
+            assert name.startswith(remote.REMOTE_TEMP_PREFIX)
+        if kind == "discard":
+            assert name.startswith(remote.REMOTE_TEMP_PREFIX)
+
+
+def test_the_rename_is_the_one_that_refuses_not_the_one_that_replaces():
+    """MEASURED, and the single most breakable line in this change: the
+    sftp client's bare `rename` sends posix-rename@openssh.com, which this
+    server offers and which SILENTLY REPLACED the target 10 times out of
+    10.  `rename -l` forces SSH2_FXP_RENAME, which refused 10 out of 10.
+    Writing `rename` here reproduces Finding J exactly."""
+    seen = {}
+
+    def fake_sftp(conf, batch, **kw):
+        seen["batch"] = batch
+        return remote.SshResult(True)
+
+    conf = remote.read_config(Cfg(**{
+        "remote.enabled": True, "remote.host": "h", "remote.user": "u"}))
+    import jarvis.tools.remote as rmod
+    old = rmod.run_sftp
+    rmod.run_sftp = fake_sftp
+    try:
+        remote.sftp_rename(conf, "a/tmp.tmp", "a/final.pdf")
+    finally:
+        rmod.run_sftp = old
+    assert seen["batch"].split()[:2] == ["rename", "-l"]
+
+
+def test_measure_the_push_race_after_the_claim(home, capsys):
+    """NUMBERS for the far side, the way round 2 produced them for this one.
+
+    HONEST about what this measures and what it does not.  It measures the
+    SHAPE: a file of his is planted at the exact target name during every
+    single send, and if the push were still "list, pick a name, scp at it"
+    every round would destroy one.  It cannot measure the kernel underneath
+    -- that was measured against HPCOMPUTER itself on 2026-09-05 (two
+    concurrent sftp sessions renaming onto one name, 12 rounds, 6-6, zero
+    lost, zero both-moved), and the fake reproduces the two behaviours that
+    measurement established: scp truncates, `rename -l` refuses.
+    """
+    rounds = 300
+    t = FakeTransport()
+    s = syncer(home, t)
+    _plant_on_send(t, "notes.txt", 99999)
+    his_lost = 0
+    ours_wrong = 0
+    for i in range(rounds):
+        drop(home, "notes.txt", b"o" * 30)
+        events = s.push_once()
+        if t.dirs["inbox"].get("notes.txt") != (99999, t.stamp):
+            his_lost += 1
+        landed = [e.detail for e in events if e.outcome == "sent"]
+        if landed and t.dirs["inbox"].get(landed[0], (0,))[0] != 30:
+            ours_wrong += 1
+        for name in list(t.dirs["inbox"]):
+            if name != "notes.txt":
+                t.dirs["inbox"].pop(name)
+        for p in (home / "Sent").iterdir():
+            p.unlink()
+
+    assert his_lost == 0, f"{his_lost} of {rounds} pushes destroyed his file"
+    assert ours_wrong == 0
+    assert not [n for n in t.dirs["inbox"]
+                if n.startswith(remote.REMOTE_TEMP_PREFIX)]
+    with capsys.disabled():
+        print(f"\n  MEASURED, the push after the fix:"
+              f"\n    {rounds} pushes with a file of his appearing at the "
+              f"target name\n      during EVERY send -- {his_lost} of his "
+              f"destroyed, {ours_wrong} of ours wrong."
+              f"\n    Every one landed beside his as \"notes (2).txt\" and "
+              f"left no temp\n      behind.  The kernel underneath was "
+              f"measured on HPCOMPUTER itself:\n      `rename -l` refused "
+              f"10/10, and 12 racing rounds gave 6-6, 0 lost.")
+
+
+def test_a_real_outage_takes_the_folder_complaint_down_with_it(home):
+    """"That folder is not there" rested on the box having ANSWERED.  Once
+    it stops answering, that sentence is no longer supported and must not
+    sit in the status file beside "link DOWN"."""
+    t = FakeTransport()
+    t.listing_fail = {"inbox": "not-there"}
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    s.run_pass()
+    assert "NOT THERE" in (home / "status.txt").read_text()
+    t.fail = "asleep"
+    s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert "NOT THERE" not in text
+    assert "link      DOWN" in text

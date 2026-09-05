@@ -51,9 +51,30 @@ a way to see what happened.
    mtime, from a finished one.  Nothing short of an open-fd scan of /proc
    sees that, and a stall that long is a hung copy, not a slow one.
 
-2. **Verify before moving.**  An exit code is not evidence.  After the copy,
-   the far side is LISTED again and the landed name must be there at the
-   byte size we sent.  Only then does the local original MOVE to
+2. **Claim the name, then verify, then move.**  Three steps, and each one
+   exists because the step before it is not evidence.
+
+   The CLAIM is the part that took three rounds to get right.  **scp
+   truncates**, measured against HPCOMPUTER on 2026-09-05: a 22222-byte
+   file at the target name came back 1111 bytes, exit 0, nothing on
+   stderr -- in the default SFTP mode, under the legacy ``-O`` protocol,
+   and through ``sftp put`` alike, and there is no no-clobber flag on any
+   of them.  So choosing a free name from a listing and then writing at it
+   is a guess about the future, and the guess was wrong for minutes at a
+   time: the sends are sequential after ONE listing, so the tenth file in
+   a queue was written long after its name was checked.  Instead the bytes
+   go at a name of OURS (``jarvis-part-<pid>-<second>-<n>.tmp``) and the
+   real name is then taken with an sftp ``rename -l``, which the far side
+   REFUSES if anything holds it -- 10 refusals out of 10, both files
+   byte-intact, and two sessions racing for one name gave exactly one
+   winner in 12 of 12 rounds.  A refusal costs one round trip and the next
+   ``(2)``; it never costs a file.  ``rename`` WITHOUT ``-l`` is a
+   different call (posix-rename@openssh.com) that silently replaced the
+   target 10 times out of 10 -- see :data:`remote.RENAME_FLAG`.
+
+   Then the VERIFY: an exit code is not evidence either, so the far side
+   is LISTED again and the name WE ACTUALLY TOOK must be there at the byte
+   size we sent.  Only then does the local original MOVE to
    ``~/Desktop/Jarvis/Sent/`` -- visible, recoverable, and the Outbox
    visibly empties.  Nothing here ever deletes a file of his, in either
    direction.  On a size mismatch the file STAYS in the Outbox and a
@@ -76,12 +97,75 @@ a way to see what happened.
    nests ``Sent`` inside the Outbox.  Our own notes and in-flight part
    files are skipped by name as well, belt and braces.
 
-5. **The link being down.**  Backoff 30 s -> 60 -> 120 -> 240 -> 300 and
-   hold, reset on the first success; one WARNING on the way down and one
-   INFO on the way back up, never one per pass.  Nothing is lost -- his
-   files sit in the Outbox -- and ``~/Desktop/Jarvis/status.txt`` says so
-   in words, beside the folders, so the answer to "is it working?" does not
-   require a terminal.
+5. **The link being down -- and the three things that are NOT that.**
+   Backoff 30 s -> 60 -> 120 -> 240 -> 300 and hold, reset on the first
+   success; one WARNING on the way down and one INFO on the way back up,
+   never one per pass.  Nothing is lost -- his files sit in the Outbox --
+   and ``~/Desktop/Jarvis/status.txt`` says so in words, beside the
+   folders, so the answer to "is it working?" does not require a terminal.
+
+   The three impostors, each of which reached him as "link DOWN, not
+   answering since 15:36" while the box was answering every 30 seconds:
+
+   * ONE FILE that will not go.  Answered by :meth:`Syncer._probe_link`:
+     only the machine may speak for the machine, so it is asked again at
+     the moment of doubt.
+   * A missing or mistyped FOLDER.  A listing that comes back "not there"
+     is an ANSWER -- proof the box is up -- so it clears the link state,
+     never backs off, never stops the other direction, and says in
+     status.txt which path was not found and which setting holds it.
+     MEASURED over 6 passes: 0 fetches, the interval at 300 s, and a
+     control with an empty Outbox pulling fine over the same transport.
+   * A SETTING with no socket behind it (no key, no host, switched off).
+     It never asked, so it may claim neither that the box is up nor that
+     it is down.
+
+-------------------------------------------- every read-then-write, listed
+
+The shape that has now bitten this lane twice is: ask whether a name is
+free, and then write at it.  Round 2 swept for it and wrote "nothing else
+in the repo has either shape" -- which was FALSE, because that sweep looked
+only for a local ``os.replace`` and never at a REMOTE write.  So here is
+the whole list, both sides, with the width of each window.  A future sweep
+starts by checking this table is still true.
+
+  WHERE                          CHECK -> WRITE            WINDOW
+  ---------------------------------------------------------------------
+  foldersync push (F-J)          listing -> scp            WAS minutes
+                                 now: scp to OUR temp,     now NONE: the
+                                 then `rename -l`          kernel refuses
+  foldersync pull (F-F, rd 2)    listing -> land           NONE: os.link
+  foldersync _move_to_sent       (none) -> land_beside     NONE: os.link
+  land_beside, no-hardlink path  O_EXCL -> os.replace      ~0.011 ms, and
+    (FAT/exFAT only; his Desktop is ext4)                  over a 0-byte
+                                                           file OF OURS
+  remote.push (voice lane)       NONE AT ALL -> scp        WAS total; now
+                                 now: temp + `rename -l`   NONE
+  remote.pull (voice lane)       dest.exists() -> scp      WAS the whole
+                                 now: O_CREAT|O_EXCL       transfer; NONE
+  ledger.save                    read -> tmp + replace     ours, and one
+                                                           process holds a
+                                                           flock
+  history + status + notes       write at a fixed path     ours by name
+                                                           (status.txt,
+                                                           *.jarvis-cannot
+                                                           -send.txt); no
+                                                           read precedes
+                                                           them, so there
+                                                           is no window --
+                                                           but they DO
+                                                           overwrite their
+                                                           own path, which
+                                                           is why both
+                                                           names are ours
+                                                           and reserved
+  the remote part file           scp at a temp of ours     ours by name;
+                                                           deleted only
+                                                           through
+                                                           remote.sftp_
+                                                           remove, which
+                                                           refuses every
+                                                           other shape
 
 ------------------------------------------------------------------- privacy
 
@@ -129,7 +213,33 @@ SKIP_PREFIXES = (".", "~$", PART_PREFIX)
 # again as a question before anybody calls the link down.  See
 # :meth:`Syncer._probe_link`, and the two-in-one-pass defect it closes.
 FILE_REASONS = frozenset({"odd-name", "not-found", "too-big", "denied",
-                          "no-space", "exists", "not-there"})
+                          "no-space", "exists", "not-there", "name-taken",
+                          "too-many-copies", "name-too-long"})
+
+# A listing that came back with one of these has told us about a SETTING,
+# not about the link, and neither of them may be answered with a back-off
+# or by stopping the other half of the lane (F-K).  They differ in one
+# thing only, which is whether anything actually answered:
+#
+#   ANSWERED -- the far side took the connection and said the folder is not
+#   there.  That is proof the box is UP, so it also clears the link state.
+#   MEASURED 2026-09-05: with HPCOMPUTER healthy, a missing remote Inbox
+#   put "link DOWN ... not answering since 15:36" on his desk, took the
+#   interval from 30 s to 300 s and stopped the inbound half for 6 passes,
+#   while a control with an empty local Outbox pulled a file fine over the
+#   same transport, in the same state.
+#
+#   NEVER ASKED -- refused here, before a socket opened, because something
+#   in his settings is missing.  It says nothing about the box either way,
+#   so it must not claim the link is up OR down.
+CONFIG_ANSWERED = frozenset({"not-there", "wrong-os"})
+CONFIG_NEVER_ASKED = frozenset({"disabled", "no-host", "no-user", "no-key",
+                                "bad-key", "no-ssh"})
+CONFIG_REASONS = CONFIG_ANSWERED | CONFIG_NEVER_ASKED
+
+# Directions that describe the LANE rather than a file: kept out of the
+# record loops, which record files.
+NOT_A_FILE = ("link", "config")
 
 # errno values that mean "this filesystem has no hard links", as opposed to
 # "that name is taken" (EEXIST, which is the answer land_beside wants) or a
@@ -141,6 +251,8 @@ _NO_HARDLINK = frozenset(
     if e is not None)
 
 MAX_COPIES = 50          # "name (2)" .. "name (50)", then refuse
+MAX_CLAIM_TRIES = 8      # names TRIED on the far side, per file, per pass
+MAX_TEMP_SWEEP = 5       # leftover part files of ours cleared per pass
 MAX_ATTEMPTS = 5         # tries at ONE file before it is parked
 RETRY_AFTER_S = 3600.0   # ...and how long it is parked for
 HISTORY_LINES = 500      # the on-disk record, bounded
@@ -247,6 +359,13 @@ WHY = {
     "outside": "it is not inside the folders I am allowed to send from",
     "too-many-copies": "there are already fifty files by that name over there",
     "verify-failed": "it arrived the wrong size, so I have not moved yours",
+    # Every name we offered was taken at the instant we offered it.  This is
+    # what a refusal looks like when somebody is actively writing into that
+    # folder, and it is the SAFE outcome -- the alternative is the write
+    # that goes through and destroys what is there.
+    "name-taken": "every name I tried on HPCOMPUTER was taken at the moment "
+                  "I tried it, so I have written over nothing and yours is "
+                  "still here. I will try again",
     # The copy itself failed and the far side did not say anything either
     # end recognises.  It is about THIS file -- everything else in the
     # folder is still going, and HPCOMPUTER answered a listing either side
@@ -290,26 +409,45 @@ def path_problem(folder: str, name: str) -> str:
     return ""
 
 
+def name_series(name: str) -> list:
+    """``name``, then ``name (2).ext`` .. ``name (51).ext``.
+
+    The ONE place the "(2)" shape is written.  It used to be spelled out
+    three times -- in the local dedupe, in the landing and (differently) in
+    the caller -- which is how the two sides drifted apart in the first
+    place: the local landing was made race-free and the remote one was
+    still choosing a name minutes before it wrote it.
+    """
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    return [name] + [f"{stem} ({n})" + (f".{ext}" if dot else "")
+                     for n in range(2, MAX_COPIES + 2)]
+
+
 def dedupe_name(name: str, taken) -> str:
     """``name``, or the first free ``name (2).ext``; "" past
     :data:`MAX_COPIES`.
 
-    Both directions land through this, and neither ever overwrites: on the
-    far side that would be modifying a file of his on HPCOMPUTER, and on
-    this side it would be losing one of two things he was sent.  A suffix
-    keeps both and makes the newer one obvious, which is what a downloads
-    folder does and what he would expect.
+    A GUESS, everywhere it is now used, and never the decision.  What it is
+    for is skipping names that are already known to be taken so the claim
+    that follows usually succeeds first time.  On this side the decision is
+    :func:`land_beside`; on the far side it is a ``rename -l`` that can
+    refuse.  Reading this function's answer as "that name is free" is
+    exactly the mistake both Finding F and Finding J were.
     """
-    if name not in taken:
-        return name
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    for n in range(2, MAX_COPIES + 2):
-        candidate = f"{stem} ({n})" + (f".{ext}" if dot else "")
-        if candidate not in taken:
-            return candidate
-    return ""
+    return next((c for c in name_series(name) if c not in taken), "")
+
+
+def claim_candidates(name: str, taken, limit: int = 0) -> list:
+    """The names to TRY on the far side, best guess first, bounded.
+
+    Bounded because each try is an sftp round trip: a name being taken the
+    instant we try it is somebody actually writing there, and walking fifty
+    of those inside one pass would hold up every other file in the queue.
+    """
+    free = [c for c in name_series(name) if c not in taken]
+    return free[:max(1, int(limit or MAX_CLAIM_TRIES))]
 
 
 def land_beside(source: Path, folder: Path, name: str) -> str:
@@ -336,13 +474,8 @@ def land_beside(source: Path, folder: Path, name: str) -> str:
     byte of his.
     """
     source, folder = Path(source), Path(folder)
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    candidates = [name] + [f"{stem} ({n})" + (f".{ext}" if dot else "")
-                           for n in range(2, MAX_COPIES + 2)]
     hardlinks = True
-    for candidate in candidates:
+    for candidate in name_series(name):
         dest = folder / candidate
         if hardlinks:
             try:
@@ -492,7 +625,55 @@ def transfer_budget(rconf: remote.RemoteConfig, size_bytes: int) -> float:
     return min(need, remote.MAX_TRANSFER_S)
 
 
-def preflight(rconf: remote.RemoteConfig, paths: Paths) -> list:
+def remote_folder_problems(rconf: remote.RemoteConfig,
+                           sconf: SyncConfig) -> list:
+    """The far-side SETTINGS this lane cannot work without, checked here,
+    with no socket, before anything is waiting on them.
+
+    Finding K's other half.  A folder that is not there was being reported
+    as a dead link at the first send; the runtime half of the fix says so
+    properly, and this half catches the kinds that never needed asking:
+    a folder that is not configured at all, one this module would refuse to
+    put in an sftp line, one so deep that no filename fits under it on
+    Windows, and a ``pull_from`` that names a key ``remote.pull_dirs`` does
+    not have -- which is a typo that would otherwise look exactly like
+    HPCOMPUTER being asleep, for ever.
+
+    HONEST LIMIT, and it is why the runtime half exists: a path that is
+    merely WRONG -- spelled properly, quotable, short enough, and simply
+    not the folder that is there -- cannot be told from a right one without
+    asking the box.  ``--check`` asks; the service reports it as a folder
+    problem the first time it lists.
+    """
+    out = []
+    inbox = remote.remote_dir(rconf, "inbox")
+    hint = remote.CONFIG_HINT
+    if not inbox.strip():
+        out.append(f"remote.inbox is empty in {hint}, so I have nowhere on "
+                   f"{rconf.name} to put the files you drop in the Outbox")
+    elif remote._SFTP_UNQUOTABLE_RX.search(remote.scp_path(inbox)):
+        out.append(f"remote.inbox ({inbox}) has a quote or a newline in it; "
+                   f"I will not put that in an sftp line, so nothing can be "
+                   f"sent until it is renamed in {hint}")
+    elif len(remote.scp_path(inbox).rstrip("/")) + 2 > WINDOWS_MAX_PATH:
+        out.append(f"remote.inbox ({inbox}) is already longer than Windows "
+                   f"accepts for a whole path, so no file could land in it; "
+                   f"shorten it in {hint}")
+    key = (sconf.pull_from or "").strip()
+    if key not in remote.PULL_KEYS:
+        out.append(f"foldersync.pull_from is '{key}', which is not one of "
+                   f"the folders I am allowed to read "
+                   f"({', '.join(remote.PULL_KEYS)}); nothing would ever "
+                   f"come back from {rconf.name}. It is in {hint}")
+    elif not remote.remote_dir(rconf, key).strip():
+        out.append(f"foldersync.pull_from is '{key}' but remote.pull_dirs."
+                   f"{key} is empty in {hint}, so there is no folder on "
+                   f"{rconf.name} to bring files from")
+    return out
+
+
+def preflight(rconf: remote.RemoteConfig, paths: Paths,
+              sconf: Optional[SyncConfig] = None) -> list:
     """Everything that would make this unsafe to start, in his words.
 
     The local-roots check is the one to read twice.  ``remote.push`` refuses
@@ -529,6 +710,8 @@ def preflight(rconf: remote.RemoteConfig, paths: Paths) -> list:
             f"so every file in it would be refused. Add the folder's root to "
             f"remote.local_roots in ~/.config/jarvis/assistant.json -- I have "
             f"not widened it myself.")
+    if sconf is not None:
+        out += remote_folder_problems(rconf, sconf)
     return out
 
 
@@ -652,6 +835,53 @@ class SshTransport:
         if res.reason in ("unreachable", "timeout"):
             return remote.unreachable_reason(self.conf) or res.reason
         return res.reason or "failed"
+
+    def claim(self, temp: str, final: str, key: str = "inbox") -> str:
+        """Take the name ``final`` for the bytes already landed at ``temp``,
+        or say why not.  "" is the only success; "taken" means somebody
+        else holds that name and NOTHING was written.
+
+        This is the whole of the Finding J fix.  scp cannot refuse -- it
+        truncates, measured, in every mode this link offers -- so the file
+        goes at a name of ours first and the name he will see is taken by a
+        ``rename -l``, which the far side refuses if it is held.  Two
+        sessions racing for one name gave exactly one winner in 12 of 12
+        rounds, so this is a claim, not a smaller window.
+
+        The wire says only ``Failure``, for contention and for a bad path
+        alike, so every failure is read as "I did not get the name" and
+        never as done.  The reasons that mean the MACHINE (a timeout, a
+        refused connection) are passed straight back out instead, because
+        those are not this file's problem.
+        """
+        why = remote.missing_reason(self.conf)
+        if why:
+            return why
+        if key != "inbox":
+            return "denied"
+        if not remote.is_remote_temp(temp):
+            return "odd-name"     # we only ever rename OUR OWN part file
+        src, dst = self.target(temp), self.target(final)
+        if not src or not dst:
+            return "odd-name"
+        res = remote.sftp_rename(self.conf, src, dst)
+        if res.ok:
+            return ""
+        if res.reason in ("unreachable", "timeout"):
+            return remote.unreachable_reason(self.conf) or res.reason
+        return "taken" if res.reason in ("failed", "") else res.reason
+
+    def discard(self, temp: str, key: str = "inbox") -> str:
+        """Take one in-flight file OF OURS off his machine again.  Refuses
+        any other name here as well as in remote.sftp_remove -- the one
+        delete this lane can do is guarded at both ends."""
+        if key != "inbox" or not remote.is_remote_temp(temp):
+            return "denied"
+        dest = self.target(temp)
+        if not dest:
+            return "odd-name"
+        res = remote.sftp_remove(self.conf, dest)
+        return "" if res.ok else (res.reason or "failed")
 
     def fetch(self, key: str, name: str, dest: Path) -> str:
         why = remote.missing_reason(self.conf)
@@ -830,6 +1060,8 @@ class Syncer:
         self._last_pass = 0.0
         self._recent: list = []
         self._status_text = ""
+        self._config_problems: dict = {}     # {folder key: (path, reason)}
+        self._temp_seq = 0                   # our in-flight names, per pass
         self._skipped_names = False
         self._skipped_dirs = False
 
@@ -953,24 +1185,19 @@ class Syncer:
 
         entries, why = self.transport.listing("inbox")
         if why:
-            events.append(self._link_event(now, why, len(ready)))
+            events.append(self._listing_failed(now, "inbox", why, len(ready)))
             for e in events:
-                if e.direction != "link":
+                if e.direction not in NOT_A_FILE:
                     self.record(e)
             return events
-        self._mark_up(now)
+        self._mark_up(now, "inbox")
+        self._sweep_remote_temps(entries)
 
         taken = {e.name for e in entries}
         sent: list = []
         for p in ready:
-            landed = dedupe_name(p.name, taken)
-            if not landed:
-                self.note(p, "too-many-copies")
-                events.append(Event(now, "push", p.name, self._size(p),
-                                    "too-many-copies"))
-                continue
             size = self._size(p)
-            reason = self.transport.send(p, landed)
+            landed, reason = self._send_and_claim(p, taken)
             if reason:
                 # A FILE that will not go is not a LINK that is down.  The
                 # only thing that can speak for the machine is the machine,
@@ -982,13 +1209,19 @@ class Syncer:
                 fresh, why = ((None, "") if reason in FILE_REASONS
                               else self._probe_link("inbox"))
                 if why:
-                    events.append(self._link_event(now, why, len(ready)))
+                    events.append(
+                        self._listing_failed(now, "inbox", why, len(ready)))
                     break
                 if fresh is not None:
                     taken = {e.name for e in fresh} | {n for _, n, _ in sent}
-                n = self.ledger.bump(f"push:{p.name}|{stat_key(p)}",
-                                     reason, now)
-                self.note(p, reason, f"Attempt {n} of {MAX_ATTEMPTS}.")
+                if reason == "too-many-copies":
+                    # Not a failure that trying again can fix, so it is not
+                    # charged an attempt.
+                    self.note(p, reason)
+                else:
+                    n = self.ledger.bump(f"push:{p.name}|{stat_key(p)}",
+                                         reason, now)
+                    self.note(p, reason, f"Attempt {n} of {MAX_ATTEMPTS}.")
                 events.append(Event(now, "push", p.name, size, reason))
                 continue
             taken.add(landed)
@@ -997,10 +1230,87 @@ class Syncer:
         if sent:
             events += self._verify_and_move(sent, now)
         for e in events:
-            if e.direction != "link":
+            if e.direction not in NOT_A_FILE:
                 self.record(e)
         self.ledger.save()
         return events
+
+    def _send_and_claim(self, p: Path, taken) -> tuple:
+        """Put ONE file of his on HPCOMPUTER without ever writing at a name
+        that could be his.  ``(landed_name, "")`` or ``("", reason)``.
+
+        THIS IS THE WHOLE FIX for the push race, and the reason it is a
+        method rather than two lines in the loop.  The old shape listed the
+        remote Inbox once at the top of a pass, picked a free name with
+        dedupe_name, and then scp'd straight at it -- and **scp truncates**:
+        measured on his own box, a 22222-byte file replaced by 1111 bytes,
+        exit 0, nothing on stderr, in both scp protocol modes and through
+        sftp put alike.  A file of his that appeared at that name in between
+        was destroyed, the pass said "sent", and his LOCAL original was then
+        moved into Sent -- both copies ours, his gone, and the verify could
+        not catch it because the evidence it would have compared against was
+        what got destroyed.  The window was not milliseconds either: the
+        sends are sequential after ONE listing, so the tenth file in a queue
+        was written minutes after its name was checked.
+
+        So the bytes go at a name of OURS (:func:`remote.remote_temp_name` --
+        pid, second, counter) and the name he will see is then TAKEN with a
+        ``rename -l``, which the far side refuses if anything holds it.
+        MEASURED 2026-09-05 against HPCOMPUTER: refused 10 of 10 with both
+        files byte-intact, and two concurrent sessions racing for one name
+        gave exactly one winner in 12 of 12 rounds, zero losses.  A refusal
+        costs one more round trip and the next "(2)"; it never costs a file.
+
+        ``taken`` is only the first GUESS now -- the freshest listing we
+        have, used so the usual case claims first time.  It is not the
+        decision, and nothing here reads it as one.
+        """
+        candidates = claim_candidates(p.name, taken)
+        if not candidates:
+            return "", "too-many-copies"
+        folder = remote.remote_dir(self.rconf, "inbox")
+        temp = remote.remote_temp_name(self._temp_seq)
+        self._temp_seq += 1
+        if path_problem(folder, temp):
+            # His name fits and ours does not: the FOLDER is too deep for
+            # Windows, which is his to shorten and not this file's fault.
+            return "", "name-too-long"
+        reason = self.transport.send(p, temp)
+        if reason:
+            # A partial temp may be on the far side, but the far side has
+            # just failed us and this is not the moment to ask it for a
+            # delete.  It is ours, it is named ours, and the sweep at the
+            # top of a later pass takes it away.
+            return "", reason
+        for candidate in candidates:
+            why = self.transport.claim(temp, candidate)
+            if not why:
+                return candidate, ""
+            if why != "taken":
+                self._discard(temp)
+                return "", why
+        self._discard(temp)
+        return "", "name-taken"
+
+    def _discard(self, temp: str) -> None:
+        """One in-flight file OF OURS, off his machine again."""
+        why = self.transport.discard(temp)
+        if why:
+            log.info("foldersync: my part file %s is still on %s (%s); I "
+                     "will take it away on a later pass", temp,
+                     self.rconf.name, why)
+
+    def _sweep_remote_temps(self, entries) -> None:
+        """Part files left behind by a pass that died between the copy and
+        the claim.  They are ours by name -- pid, second and counter -- and
+        they are the ONLY thing on that machine this lane ever deletes;
+        :func:`remote.sftp_remove` refuses every other shape independently.
+        Bounded per pass so a folder full of them cannot eat a pass.
+        """
+        stale = [e.name for e in entries
+                 if not e.is_dir and remote.is_remote_temp(e.name)]
+        for name in stale[:MAX_TEMP_SWEEP]:
+            self._discard(name)
 
     def _verify_and_move(self, sent: list, now: float) -> list:
         """The far side is LISTED again and every landed name must be there
@@ -1027,7 +1337,7 @@ class Syncer:
             for p, _landed, size in sent:
                 events.append(Event(now, "push", p.name, size, "unverified",
                                     why))
-            events.append(self._link_event(now, why, len(sent)))
+            events.append(self._listing_failed(now, "inbox", why, len(sent)))
             return events
         # A FOLDER at that name is not the file we sent, and its 4096 must
         # never be read as a byte count -- excluded, so the check fails
@@ -1087,8 +1397,8 @@ class Syncer:
         events: list = []
         entries, why = self.transport.listing(self.conf.pull_from)
         if why:
-            return [self._link_event(now, why, 0)]
-        self._mark_up(now)
+            return [self._listing_failed(now, self.conf.pull_from, why, 0)]
+        self._mark_up(now, self.conf.pull_from)
 
         usable = []
         for e in entries:
@@ -1142,7 +1452,8 @@ class Syncer:
                 _fresh, why = ((None, "") if reason in FILE_REASONS
                                else self._probe_link(self.conf.pull_from))
                 if why:
-                    events.append(self._link_event(now, why, 0))
+                    events.append(self._listing_failed(
+                        now, self.conf.pull_from, why, 0))
                     break
                 self.ledger.bump(f"pull:{entry.key}", reason, now)
                 events.append(Event(now, "pull", entry.name, entry.size,
@@ -1179,7 +1490,7 @@ class Syncer:
             events.append(Event(now, "pull", entry.name, entry.size,
                                 "received", landed))
         for e in events:
-            if e.direction != "link":
+            if e.direction not in NOT_A_FILE:
                 self.record(e)
         self.ledger.save()
         return events
@@ -1205,6 +1516,56 @@ class Syncer:
         entries, why = self.transport.listing(key)
         return (None, why) if why else (entries, "")
 
+    def _listing_failed(self, now: float, key: str, why: str,
+                        waiting: int) -> Event:
+        """A listing that could not answer, sorted into the two different
+        things it can mean.  Only the MACHINE not answering is the link;
+        a folder that is not there is a setting (F-K), and so is a setting
+        that never let a socket open at all."""
+        if why in CONFIG_REASONS:
+            return self._config_event(now, key, why)
+        return self._link_event(now, why, waiting)
+
+    def _config_setting(self, key: str) -> str:
+        """The line in his settings file that this key comes from."""
+        return ("remote.inbox" if key == "inbox"
+                else f"remote.pull_dirs.{key}")
+
+    def _config_sentence(self, key: str, path: str, why: str) -> str:
+        if why in CONFIG_ANSWERED:
+            return (f"{self.rconf.name} answered, but the folder I was told "
+                    f"to use is not there: {path or '(not set)'}. That is "
+                    f"{self._config_setting(key)} in {remote.CONFIG_HINT}. "
+                    f"The link is fine, nothing is lost, and I am not "
+                    f"slowing down")
+        return remote.fail_line(self.rconf, why)
+
+    def _config_event(self, now: float, key: str, why: str) -> Event:
+        """A SETTING is wrong, which is not an outage.  No back-off -- the
+        cost of asking again is one listing and the box is right there --
+        and, crucially, ``_pass_down`` is left alone so the other direction
+        still runs: a mistyped inbox must not stop the files coming IN.
+        """
+        path = remote.remote_dir(self.rconf, key)
+        if why in CONFIG_ANSWERED:
+            # It answered.  That is what "that folder is not there" IS: an
+            # answer.  So the link is up, whatever it said before.
+            self._mark_up(now)
+        problem = (path, why)
+        first = self._config_problems.get(key) != problem
+        self._config_problems[key] = problem
+        event = Event(now, "config", key, 0, "config-problem", path or why)
+        if first:
+            self.record(event)
+            log.warning("foldersync: %s",
+                        self._config_sentence(key, path, why))
+        return event
+
+    def _config_clear(self, key: str) -> None:
+        if self._config_problems.pop(key, None) is not None:
+            log.info("foldersync: the %s folder on %s is there after all",
+                     key, self.rconf.name)
+
     def _link_event(self, now: float, why: str, waiting: int) -> Event:
         """Down, once.  The WARNING and the record entry are written on the
         transition only: a box asleep overnight must not fill either."""
@@ -1212,6 +1573,11 @@ class Syncer:
         if first:
             self._down_since = now
         self._down_reason = why
+        # "That folder is not there" rested on the box having ANSWERED.  It
+        # is not answering now, so that sentence is no longer supported and
+        # must come off the status file rather than sit there beside a
+        # contradiction.
+        self._config_problems.clear()
         self._pass_down = True
         event = Event(now, "link", "", 0, "link-down", why)
         if first:
@@ -1225,7 +1591,10 @@ class Syncer:
         self.interval_s = min(self.interval_s * 2, self.conf.max_backoff_s)
         return event
 
-    def _mark_up(self, now: float) -> None:
+    def _mark_up(self, now: float, key: Optional[str] = None) -> None:
+        """The far side answered.  ``key`` is the folder it answered ABOUT,
+        whose config complaint is thereby settled -- a listing that comes
+        back is the only evidence that the folder is there."""
         if self._logged_down:
             log.info("foldersync: HPCOMPUTER is answering again")
         self._logged_down = False
@@ -1233,6 +1602,36 @@ class Syncer:
         self._down_since = 0.0
         self.interval_s = self.conf.remote_interval_s
         self._last_ok = now
+        if key:
+            self._config_clear(key)
+
+    def check_far_side(self) -> list:
+        """ASK about both folders and say, in his words, what is not there.
+
+        Only ``--check`` calls this, deliberately: the service must not
+        open sockets to answer questions nobody asked, and a preflight that
+        dialled a sleeping box would turn a config check into a 12-second
+        wait.  But he runs ``--check`` precisely when something is wrong,
+        and the answer he needs -- "that folder is not on HPCOMPUTER" --
+        cannot be had any other way.
+        """
+        out: list = []
+        keys: list = []
+        for key in ("inbox", self.conf.pull_from):
+            if key and key not in keys:
+                keys.append(key)
+        for key in keys:
+            _entries, why = self.transport.listing(key)
+            if not why:
+                continue
+            path = remote.remote_dir(self.rconf, key)
+            if why in CONFIG_REASONS:
+                out.append(self._config_sentence(key, path, why))
+            else:
+                out.append(f"I could not look in {path or key} on "
+                           f"{self.rconf.name}: "
+                           f"{remote.fail_line(self.rconf, why)}")
+        return out
 
     # -------------------------------------------------------------- a pass
     def run_pass(self, now: Optional[float] = None) -> list:
@@ -1263,6 +1662,23 @@ class Syncer:
             # NEVER claim health that has not been measured.  A fresh
             # process has not spoken to HPCOMPUTER yet and must say so.
             lines.append("link      not checked yet")
+        # A folder that is not there is NOT the link being down, and saying
+        # so was the whole of Finding K: he was told the box was not
+        # answering while it was answering every 30 seconds, and told
+        # nothing at all about the one thing he could have fixed.
+        for key in sorted(self._config_problems):
+            path, why = self._config_problems[key]
+            if why in CONFIG_ANSWERED:
+                lines.append(f"folder    NOT THERE on {self.rconf.name}: "
+                             f"{path or '(not set)'}")
+                lines.append("          It answered; that folder is what "
+                             "is missing. Check")
+                lines.append(f"          {self._config_setting(key)} in "
+                             f"{remote.CONFIG_HINT}. Nothing is lost and I")
+                lines.append("          am still trying at the usual rate.")
+            else:
+                lines.append(f"setup     "
+                             f"{remote.fail_line(self.rconf, why)}")
         lines.append(f"outbox    {len(waiting)} waiting"
                      if waiting else "outbox    empty")
         for name in waiting[:10]:
@@ -1365,7 +1781,7 @@ def build(cfg) -> tuple:
     """(Syncer, problems) from a live AssistantConfig."""
     rconf = remote.read_config(cfg)
     sconf = read_config(cfg)
-    problems = preflight(rconf, sconf.paths)
+    problems = preflight(rconf, sconf.paths, sconf)
     return Syncer(rconf, sconf, SshTransport(rconf)), problems
 
 
@@ -1403,10 +1819,16 @@ def main(argv=None) -> int:
     for line in problems:
         print(f"problem: {line}", file=sys.stderr)
     if args.check:
+        # The one place that is allowed to ASK.  An offline check cannot
+        # tell a mistyped remote folder from a right one, and he is sitting
+        # in front of this command waiting for the answer.
+        live = [] if problems else syncer.check_far_side()
+        for line in live:
+            print(f"problem: {line}", file=sys.stderr)
         if not syncer.conf.enabled:
             print("foldersync.enabled is false in "
                   "~/.config/jarvis/assistant.json", file=sys.stderr)
-        return 1 if problems else 0
+        return 1 if (problems or live) else 0
     if problems:
         return 2
     if not syncer.conf.enabled:

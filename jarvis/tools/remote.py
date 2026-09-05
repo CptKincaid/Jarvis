@@ -88,11 +88,13 @@ repo can reach a network, a host key or a disk it did not make.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -861,6 +863,104 @@ def run_sftp(conf: RemoteConfig, batch: str,
     return SshResult(True, out=out or "", err=err or "")
 
 
+# ---- claiming a name on the far side (F-J, measured 2026-09-05) ----
+# scp TRUNCATES, and nothing that writes on this link can be made to refuse.
+# Measured against HPCOMPUTER itself (OpenSSH_for_Windows_9.5, SFTP protocol
+# 3): a 22222-byte file at the target name came back 1111 bytes, exit 0, no
+# message on stdout or stderr -- in the default SFTP mode, under the legacy
+# `-O` protocol, and through `sftp put` alike.  The complete flag set is
+# -346ABCOpqRrsTv plus -c -D -F -i -J -l -o -P -S -X; there is no no-clobber
+# among them.  So the refusal cannot come from the write and has to be a
+# separate step.
+#
+# That step is a RENAME, and the client offers two of them which behave
+# OPPOSITELY:
+#
+#   bare `rename`  -> SSH2_FXP_EXTENDED(posix-rename@openssh.com), which
+#                     SILENTLY REPLACES.  10 of 10 rounds destroyed the file
+#                     at the target name, exit status 0.  The client picks
+#                     this whenever the server advertises it, and this
+#                     server does.
+#   `rename -l`    -> SSH2_FXP_RENAME (opcode 18), which REFUSES.  10 of 10
+#                     rounds refused, exit status 1, `remote rename ...:
+#                     Failure` on stderr, BOTH files byte-intact.
+#
+# Both confirmed on the wire with -vvv, not inferred from the manual.  And
+# the measurement that actually decides it: two concurrent sftp sessions
+# each renaming its own temp onto the SAME name, 12 rounds -- 6 wins each,
+# zero rounds where both moved, zero corrupt, the loser's temp intact every
+# time.  That is an atomic claim, not a narrowed window.
+#
+# So RENAME_FLAG is not a nicety.  Dropping it reproduces the bug this
+# closes, silently, with no error anywhere to notice.  It is asserted in
+# tests/test_foldersync.py rather than left to a reader.
+RENAME_FLAG = "-l"
+
+# Our own in-flight file on the far side.  Every byte scp writes over there
+# goes at a name of THIS shape and never at a name he could have chosen, so
+# a write can never land on a file of his; and it is the only shape
+# :func:`sftp_remove` will delete, which is what keeps "this module cannot
+# delete anything of his" true by construction rather than by care.
+REMOTE_TEMP_PREFIX = "jarvis-part-"
+REMOTE_TEMP_SUFFIX = ".tmp"
+
+
+def remote_temp_name(seq: int = 0) -> str:
+    """A name in the remote inbox that is ours beyond argument: the pid, the
+    second, and a counter, so two passes and two processes cannot collide
+    even if the lock ever failed.  It satisfies SAFE_REMOTE_NAME_RX, so it
+    goes through the same vetting every other remote name does."""
+    return (f"{REMOTE_TEMP_PREFIX}{os.getpid()}-{int(time.time())}-"
+            f"{int(seq)}{REMOTE_TEMP_SUFFIX}")
+
+
+def is_remote_temp(name: str) -> bool:
+    """Is this basename one of ours?  Deliberately strict on both ends."""
+    base = os.path.basename(name or "")
+    return (base.startswith(REMOTE_TEMP_PREFIX)
+            and base.endswith(REMOTE_TEMP_SUFFIX)
+            and bool(SAFE_REMOTE_NAME_RX.match(base)))
+
+
+def sftp_rename(conf: RemoteConfig, src: str, dst: str) -> SshResult:
+    """CLAIM ``dst`` for the file at ``src``.  Succeeds only if nothing
+    holds that name; never replaces.
+
+    One line per session, deliberately: in ``sftp -b`` batch mode a failing
+    line ABORTS the rest of the batch unless it is prefixed with ``-``, so
+    a multi-line batch would hide which line failed and swallow the ones
+    after it.  One line, one exit status, no ambiguity.
+
+    The far side's refusal is the generic word ``Failure`` -- a malformed
+    path says the same thing -- so a caller must read any failure as "I did
+    not get that name", never as done.  What matters is that it is never a
+    silent success.
+    """
+    for path in (src, dst):
+        if not path or _SFTP_UNQUOTABLE_RX.search(path):
+            log.warning("remote: refusing a rename I won't put in an sftp "
+                        "batch line")
+            return SshResult(False, reason="odd-name")
+    return run_sftp(conf, f'rename {RENAME_FLAG} "{src}" "{dst}"')
+
+
+def sftp_remove(conf: RemoteConfig, path: str) -> SshResult:
+    """Delete ONE in-flight file OF OURS from the far side.
+
+    The guard is the point.  Nothing in Jarvis may delete a file of his on
+    HPCOMPUTER, so this refuses every name that is not one
+    :func:`remote_temp_name` made -- a caller that passes his report.pdf
+    gets "denied" and no session is opened at all.
+    """
+    if not path or not is_remote_temp(path):
+        log.warning("remote: refusing to delete a name that is not one of "
+                    "my own in-flight files")
+        return SshResult(False, reason="denied")
+    if _SFTP_UNQUOTABLE_RX.search(path):
+        return SshResult(False, reason="odd-name")
+    return run_sftp(conf, f'rm "{path}"')
+
+
 def sftp_listing(out: str) -> list:
     """Filenames out of an ``ls -ln`` batch's stdout: the echo skipped,
     directories dropped, the path prefix removed.  Names are NOT vetted
@@ -972,7 +1072,23 @@ def inbox_target(conf: RemoteConfig, name: str) -> str:
 
 
 def push(conf: RemoteConfig, local: Path) -> SshResult:
-    """Copy ONE local file into the remote inbox.  Confirmed before this."""
+    """Copy ONE local file into the remote inbox, at a name nothing holds.
+    Confirmed out loud before this is reached.
+
+    The two steps are not ceremony.  This used to be one scp straight at
+    ``inbox/<his name>``, with no check of any kind -- and **scp truncates**
+    (measured on HPCOMPUTER 2026-09-05: a 22222-byte file replaced by 1111
+    bytes, exit 0, nothing on stdout or stderr; the same in the legacy
+    ``-O`` protocol and through ``sftp put``, and there is no no-clobber
+    flag on any of them).  So a spoken "send that file" silently destroyed
+    whatever was at that name on his Windows machine and then said it had
+    arrived.
+
+    So the bytes land at a temp name of OURS and the real name is CLAIMED
+    with :func:`sftp_rename`, which refuses a name that is taken.  A refusal
+    is "exists" -- the line this module has always had for the pull side and
+    could never reach on this one -- and his file is untouched.
+    """
     why = missing_reason(conf)
     if why:
         return SshResult(False, reason=why)
@@ -981,14 +1097,33 @@ def push(conf: RemoteConfig, local: Path) -> SshResult:
     if bad:
         return SshResult(False, reason=bad)
     target = inbox_target(conf, local.name)
-    if not target:
+    staging = inbox_target(conf, remote_temp_name())
+    if not target or not staging:
         return SshResult(False, reason="odd-name")
-    res = run_copy(conf, str(local), target, push=True)
-    if not res.ok and res.reason in ("unreachable", "timeout"):
+    res = run_copy(conf, str(local), staging, push=True)
+    if not res.ok:
+        if res.reason in ("unreachable", "timeout"):
+            better = unreachable_reason(conf)
+            if better:
+                return SshResult(False, out=res.out, err=res.err,
+                                 reason=better)
+        return res
+    claim = sftp_rename(conf, staging, target)
+    if claim.ok:
+        return SshResult(True, out=res.out, err=res.err)
+    # Our own bytes are sitting in his inbox under a name of ours.  Take
+    # them away rather than leave litter; the guard in sftp_remove means
+    # this line can never reach anything else.
+    sftp_remove(conf, staging)
+    if claim.reason in ("unreachable", "timeout"):
         better = unreachable_reason(conf)
         if better:
-            return SshResult(False, out=res.out, err=res.err, reason=better)
-    return res
+            return SshResult(False, err=claim.err, reason=better)
+    # The wire says only "Failure", for a held name and for a malformed
+    # path alike, so any failure is read as "I did not get that name".
+    return SshResult(False, out=claim.out, err=claim.err,
+                     reason=("exists" if claim.reason in ("failed", "")
+                             else claim.reason))
 
 
 def pull_target(conf: RemoteConfig, name: str) -> Path:
@@ -1015,13 +1150,35 @@ def pull(conf: RemoteConfig, key: str, remote_name: str) -> SshResult:
     if not folder or not SAFE_REMOTE_NAME_RX.match(remote_name or ""):
         return SshResult(False, reason="not-there")
     dest = pull_target(conf, remote_name)
-    if dest.exists():
-        # Never clobber something of his without being told to.
+    # Never clobber something of his -- and never by ASKING first, either.
+    # ``dest.exists()`` followed by a copy is a check and then a write, and
+    # the gap between them is the whole transfer: a file he saved at that
+    # name in those seconds was destroyed, because the write that follows
+    # is an scp and scp truncates.  ``O_CREAT|O_EXCL`` is ONE syscall that
+    # either creates the name or refuses because somebody has it, so there
+    # is no gap at all; the copy then writes over a 0-byte file OF OURS.
+    # (The same shape, and the same fix, as land_beside in foldersync.)
+    try:
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
         return SshResult(False, reason="exists")
+    except OSError as exc:
+        return SshResult(False, reason=("not-there" if exc.errno in
+                                        (errno.ENOENT, errno.ENOTDIR)
+                                        else "denied"))
+    os.close(fd)
     src = f"{scp_path(folder).rstrip('/')}/{remote_name}"
     res = run_copy(conf, str(dest), src, push=False)
-    if not res.ok and res.reason in ("unreachable", "timeout"):
-        better = unreachable_reason(conf)
-        if better:
-            return SshResult(False, out=res.out, err=res.err, reason=better)
+    if not res.ok:
+        # Our own claim, and whatever half a file scp left in it.  Never
+        # anything of his: nothing was at that name a moment ago.
+        try:
+            os.unlink(dest)
+        except OSError:
+            log.debug("remote: cannot clear my own claim at %s", dest)
+        if res.reason in ("unreachable", "timeout"):
+            better = unreachable_reason(conf)
+            if better:
+                return SshResult(False, out=res.out, err=res.err,
+                                 reason=better)
     return res

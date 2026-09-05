@@ -458,19 +458,23 @@ def test_push_refuses_a_file_past_the_cap(tmp_path, desk, monkeypatch):
 
 def test_a_good_push_uses_the_inbox_and_the_local_basename(tmp_path, desk,
                                                            monkeypatch):
-    seen = {}
+    """Where it ENDS UP is still the inbox under the local basename -- that
+    is now the name the claim takes, not the name scp is given."""
+    seen, batches = {}, []
 
     def fake_copy(conf, local, rem, push):
         seen.update(local=local, remote=rem, push=push)
         return remote.SshResult(True)
 
     monkeypatch.setattr(remote, "run_copy", fake_copy)
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        (batches.append(batch), remote.SshResult(True))[1])
     conf = remote.read_config(ready_cfg(tmp_path))
     f = desk / "budget.xlsx"
     f.write_text("x")
     assert remote.push(conf, f).ok
     assert seen["push"] is True
-    assert seen["remote"] == "jarvis-inbox/budget.xlsx"
+    assert batches[-1].endswith('"jarvis-inbox/budget.xlsx"')
 
 
 # ==================================================== tier 2: pulling files
@@ -762,11 +766,16 @@ def wired(tmp_path, monkeypatch):
                        ("lab_report_final.pdf", b"F" * 400)):
         (desk / name).write_bytes(body)
 
-    copied = []
+    copied, renamed = [], []
     monkeypatch.setattr(remote, "run_copy",
                         lambda conf, local, rem, push:
                         (copied.append((local, rem, push)),
                          remote.SshResult(True))[1])
+    # A push is a copy at a temp name of ours and then a CLAIM: scp cannot
+    # refuse an existing name, so the rename is what keeps a file of his on
+    # that machine from being overwritten (F-J).
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        (renamed.append(batch), remote.SshResult(True))[1])
     monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
                         remote.SshResult(True, out="report_v1.pdf\n"
                                                    "report_v2.pdf\n"))
@@ -803,6 +812,7 @@ def wired(tmp_path, monkeypatch):
     svc.claude.active_project = "jarvis"
     c = Commander(svc)
     c.copied, c.spoken, c.statuses = copied, spoken, statuses
+    c.renamed = renamed          # the sftp batches: the claim lives here
     return c
 
 
@@ -921,7 +931,10 @@ def test_an_ambiguous_push_hears_its_answer(wired, answer, expect):
     assert res.reply == f"Send {expect} to HPCOMPUTER's inbox, sir?"
     assert wired.copied == [], "choosing a file confirms nothing"
     wired.handle("yes", source="voice")
-    assert wired.copied[-1][1] == f"jarvis-inbox/{expect}"
+    # scp carries a temp name of ours; the CLAIM carries his (F-J).
+    assert wired.copied[-1][1].startswith("jarvis-inbox/"
+                                          + remote.REMOTE_TEMP_PREFIX)
+    assert wired.renamed[-1].endswith(f'"jarvis-inbox/{expect}"')
 
 
 def test_an_ambiguous_pull_hears_its_answer(wired):
@@ -1504,3 +1517,140 @@ def test_a_polite_order_is_still_refused(said):
             assert cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
             return
     pytest.fail(f"{said!r} matched nothing")
+
+
+# ==========================================================================
+# The same shape, swept for on BOTH sides (round 3, 2026-09-05).
+#
+# The round-2 sweep looked for local ``os.replace`` and wrote "nothing else
+# in the repo has either shape".  That was false: it never looked at a
+# REMOTE write.  Both of the transfers this module owns had it.
+#
+#   push: no check at all -- scp straight at ``inbox/<his name>``, and scp
+#         TRUNCATES (measured on his box: 22222 bytes replaced by 1111,
+#         exit 0, nothing on stderr, in both scp protocol modes and through
+#         sftp put).  A spoken "send that file" destroyed whatever was at
+#         that name on Windows, silently, and said "it is on HPCOMPUTER".
+#   pull: ``dest.exists()`` and then a copy at that name -- a check-then-
+#         write whose window is the whole transfer, ending in a truncating
+#         write onto HIS Desktop.
+# ==========================================================================
+def test_a_push_writes_at_a_temp_name_and_claims_the_real_one(tmp_path, desk,
+                                                              monkeypatch):
+    seen, batches = {}, []
+    monkeypatch.setattr(remote, "run_copy", lambda conf, local, rem, push:
+                        (seen.update(local=local, remote=rem, push=push),
+                         remote.SshResult(True))[1])
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        (batches.append(batch), remote.SshResult(True))[1])
+    conf = remote.read_config(ready_cfg(tmp_path))
+    f = desk / "budget.xlsx"
+    f.write_text("x")
+
+    assert remote.push(conf, f).ok
+
+    assert seen["push"] is True
+    assert seen["remote"].startswith("jarvis-inbox/"
+                                     + remote.REMOTE_TEMP_PREFIX)
+    assert seen["remote"].endswith(remote.REMOTE_TEMP_SUFFIX)
+    assert batches[0].split()[:2] == ["rename", "-l"]        # the one that
+    assert batches[0].endswith('"jarvis-inbox/budget.xlsx"')  # refuses
+
+
+def test_a_push_onto_a_name_that_is_held_leaves_his_file_alone(tmp_path, desk,
+                                                               monkeypatch):
+    """The far side says only "Failure", for a held name and a bad path
+    alike, so it is read as "I did not get that name" -- never as done."""
+    batches = []
+
+    def sftp(conf, batch, **k):
+        batches.append(batch)
+        if batch.startswith("rename"):
+            return remote.SshResult(False, err="remote rename ...: Failure",
+                                    reason="failed")
+        return remote.SshResult(True)
+
+    monkeypatch.setattr(remote, "run_copy", lambda *a, **k:
+                        remote.SshResult(True))
+    monkeypatch.setattr(remote, "run_sftp", sftp)
+    conf = remote.read_config(ready_cfg(tmp_path))
+    f = desk / "budget.xlsx"
+    f.write_text("x")
+
+    res = remote.push(conf, f)
+
+    assert not res.ok and res.reason == "exists"
+    assert "There's already a file by that name" in \
+        remote.fail_line(conf, res.reason)
+    # and our own bytes are taken off his machine again
+    assert [b.split()[0] for b in batches] == ["rename", "rm"]
+    assert remote.REMOTE_TEMP_PREFIX in batches[1]
+
+
+def test_nothing_but_our_own_part_file_can_ever_be_deleted_over_there(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_sftp", lambda *a, **k:
+                        pytest.fail("opened a session to delete his file"))
+    conf = remote.read_config(ready_cfg(tmp_path))
+    for name in ("jarvis-inbox/report.pdf", "jarvis-inbox/notes.txt", "",
+                 "jarvis-inbox/jarvis-part-.txt", "jarvis-part-1-2-3.tmp.pdf"):
+        assert remote.sftp_remove(conf, name).reason == "denied"
+
+
+def test_our_own_part_name_is_ours_beyond_argument():
+    a, b = remote.remote_temp_name(0), remote.remote_temp_name(1)
+    assert a != b
+    assert remote.is_remote_temp(a) and remote.is_remote_temp(b)
+    assert str(os.getpid()) in a
+    # it goes through the same vetting every other remote name does
+    assert remote.SAFE_REMOTE_NAME_RX.match(a)
+    assert not remote.is_remote_temp("report.pdf")
+
+
+def test_a_pull_claims_the_local_name_before_a_single_byte_moves(
+        tmp_path, desk, monkeypatch):
+    """The name is HELD when the transfer starts, so there is no window in
+    which a file of his can appear at it."""
+    seen = {}
+
+    def fake_copy(conf, local, rem, push):
+        seen["held_when_the_copy_started"] = os.path.exists(local)
+        Path(local).write_bytes(b"pulled")
+        return remote.SshResult(True)
+
+    monkeypatch.setattr(remote, "run_copy", fake_copy)
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.pull(conf, "outbox", "notes.txt").ok
+    assert seen["held_when_the_copy_started"] is True
+    assert (desk / "notes.txt").read_bytes() == b"pulled"
+
+
+def test_the_pull_claims_atomically_and_never_asks_first(tmp_path, desk,
+                                                         monkeypatch):
+    """O_CREAT|O_EXCL is one syscall that either takes the name or refuses.
+    `dest.exists()` and then a write is two, with a window between them."""
+    flags = []
+    real_open = os.open
+
+    def watch(path, fl, *a, **k):
+        flags.append(fl)
+        return real_open(path, fl, *a, **k)
+
+    monkeypatch.setattr(os, "open", watch)
+    monkeypatch.setattr(remote, "run_copy", lambda conf, local, rem, push:
+                        remote.SshResult(True))
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.pull(conf, "outbox", "notes.txt").ok
+    assert any(f & os.O_EXCL for f in flags)
+
+
+def test_a_pull_that_fails_leaves_nothing_of_ours_on_his_desktop(
+        tmp_path, desk, monkeypatch):
+    monkeypatch.setattr(remote, "run_copy", lambda *a, **k:
+                        remote.SshResult(False, reason="timeout"))
+    # a timeout asks the tailnet where the box is; that seam is this test's
+    # to own, not the firewall's to refuse.
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf: "online")
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert not remote.pull(conf, "outbox", "notes.txt").ok
+    assert not (desk / "notes.txt").exists()
