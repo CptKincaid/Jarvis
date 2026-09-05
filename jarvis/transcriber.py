@@ -85,6 +85,12 @@ STREAMING_INTERVAL = 2.0
 # classes at one rung either -- but it is now a floor against degenerate
 # output, not the filter this table describes.
 MIN_AVG_LOGPROB = -2.90
+# What stands in for the words in the log line of a decode that may be a
+# secret (transcribe_quiet, for the owner gate's passphrase rescue). The
+# same word gate.REDACTED_TEXT uses, so a reader of the log sees the same
+# thing in both places -- spelled out here rather than imported, because
+# the transcriber must not depend on the gate.
+REDACTED_WORDS = "«passphrase»"
 
 # ------------------------------------------------------------------
 # The bound on the decode
@@ -698,8 +704,30 @@ class Transcriber:
         return LANG_MAP.get(CONFIG.language, "en")
 
     # -- full transcription --------------------------------------------
-    def transcribe(self, audio) -> TranscribeResult:
+    def transcribe_quiet(self, audio) -> TranscribeResult:
+        """``transcribe`` WITHOUT THE WORDS IN THE LOG, for the one decode
+        that may be a secret.
+
+        The owner gate's rescue (``JarvisApp._gate_rescue``) decodes a clip
+        the speaker filter dropped for one reason only: to see whether it
+        is the spoken passphrase. That decode happens in every mode, and
+        the line below writes what came back to jarvis.log at INFO --
+        upstream of every redaction the gate does, so the phrase he says
+        while testing in shadow would land in the log in plaintext
+        (verdict, 2026-09-05). This is the same decode with the text left
+        out of that one line; the numbers stay, because they are what the
+        line is read for.
+
+        Nothing else changes: the caller still gets the full result, and
+        the ordinary decode is untouched.
+        """
+        return self.transcribe(audio, redact=True)
+
+    def transcribe(self, audio, *, redact: bool = False) -> TranscribeResult:
         """Full transcription: beam 1, VAD, vocab prompt, confidence gate.
+
+        ``redact`` keeps the decoded words out of this module's log line
+        (see :meth:`transcribe_quiet`); it changes nothing else.
 
         Beam 1, not 5: measured 2026-08-31 on 12 of Hunter's real clips --
         byte-identical text and WER at beam 1 vs 5 (1.18% verified, 6/6
@@ -797,15 +825,16 @@ class Transcriber:
 
         text = collapse_repeats(text)
 
+        shown = REDACTED_WORDS if redact else text
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)
-            log.info("Transcribed: %r (avg_logprob=%.2f)", text, avg_conf)
+            log.info("Transcribed: %r (avg_logprob=%.2f)", shown, avg_conf)
             if avg_conf < MIN_AVG_LOGPROB:
                 log.info("Rejected: confidence too low (%.2f < %s)",
                          avg_conf, MIN_AVG_LOGPROB)
         else:
             avg_conf = 0.0
-            log.info("Transcribed: %r", text)
+            log.info("Transcribed: %r", shown)
         limit = loop_ratio_limit(seconds)
         if ratio > limit:
             # Says both numbers, because this is the gate that replaced the

@@ -75,6 +75,10 @@ from jarvis import passphrase as pp
 from jarvis import identity as identity_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
+# The one module in the package that may call the mail transport
+# (tests/test_send_file.py pins it); Knightfall's rotated code goes out
+# through outbox.send_notice.
+from jarvis import outbox
 from jarvis import relaunch
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
@@ -217,6 +221,14 @@ KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
 KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
 KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
 KNIGHTFALL_COOLDOWN_S = 60.0
+# ONE ROTATION AT A TIME. check -> open -> mail -> store is not atomic, and
+# the drawer runs each press on its own thread: two presses measured
+# (verdict, 2026-09-05) both passed the check against the OLD hash, both
+# mailed, and both said "a new code is in your inbox" -- one of which was
+# dead on arrival, with nothing to say which. Process-wide because there is
+# one keyboard and one drawer; held across the send, so the second press
+# reads the state the first one left rather than the state it found.
+_KNIGHTFALL_LOCK = threading.RLock()
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -4831,6 +4843,24 @@ class JarvisApp:
         self._last_guest_ts = now
         self._say(line)
 
+    def _gate_quiet_decode(self, audio):
+        """THE DECODE THAT MAY BE A SECRET, and the only one taken behind
+        the gate's back. ``transcribe_quiet`` is the same decode with the
+        words left out of jarvis/transcriber.py's INFO line -- which is
+        upstream of every redaction this module does, and so was where the
+        phrase he says in shadow actually landed (verdict, 2026-09-05).
+
+        Duck-typed on purpose: the transcriber is a seam (jarvis/intercom.py
+        hands clips in over the command socket, the tests stand in their
+        own), and a stand-in without the quiet decode still works -- it
+        simply logs what it logged before.
+        """
+        fn = getattr(self.transcriber, "transcribe_quiet", None)
+        if fn is None:
+            log.debug("owner-gate: this transcriber has no redacting decode")
+            fn = self.transcriber.transcribe
+        return fn(audio)
+
     def _gate_rescue(self, audio, stats, speculative):
         """A clip the speaker filter dropped: `(audio, stats, result)` to let
         it through after all, or None to keep today's behaviour.
@@ -4851,13 +4881,14 @@ class JarvisApp:
         if gate is None:
             return None
         try:
-            return self._gate_rescue_inner(gate, audio, stats)
+            return self._gate_rescue_inner(gate, audio, stats,
+                                           speculative=speculative)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: the rescue failed; the clip is "
                           "dropped exactly as it was before")
             return None
 
-    def _gate_rescue_inner(self, gate, audio, stats):
+    def _gate_rescue_inner(self, gate, audio, stats, speculative=False):
         face, running = self._eye_identity(), self._face_running()
         # THE PHRASE COSTS ONE DECODE, IN EVERY MODE, and only when an owner
         # has set one. It is the ONE thing that acts in shadow: a rejected
@@ -4866,12 +4897,13 @@ class JarvisApp:
         # logs. Judged once, with the words, so the gate can hear it.
         result, text = None, ""
         if self._owner_has_phrase():
-            result = self.transcriber.transcribe(audio)
+            result = self._gate_quiet_decode(audio)
             text = (getattr(result, "text", "") or "").strip()
         d = gate.judge("voice", text, stats=stats, rejected=True,
                        face=face, face_running=running)
         if d.consumed:
-            self._gate_consumed(d, getattr(result, "confidence", 0.0))
+            self._gate_consumed(d, getattr(result, "confidence", 0.0),
+                                speculative)
             return PHRASE_CONSUMED
         if gate.effective_mode() != gate_mod.MODE_ENFORCE:
             # SHADOW CHANGES NOTHING ELSE, and that has to include the
@@ -6283,14 +6315,16 @@ class JarvisApp:
         gate = getattr(self, "gate", None)
         if gate is None:
             return "Knightfall: the gate is not built; see the log"
-        who, why = gate_mod.check_override_code(gate.registry, code,
-                                                attempts=gate.code_attempts)
-        del code
-        if not who:
-            return "Knightfall: %s" % why
-        gate.open_window(who, gate_mod.HOW_CODE, now=now)
-        return self._knightfall_rotate(who, mail=mail, smtp=smtp,
-                                       accepted=True)
+        with _KNIGHTFALL_LOCK:
+            who, why = gate_mod.check_override_code(gate.registry, code,
+                                                    attempts=gate.code_attempts)
+            del code
+            if not who:
+                return "Knightfall: %s" % why
+            gate.open_window(who, gate_mod.HOW_CODE, now=now)
+            line, _mailed = self._knightfall_rotate(who, mail=mail,
+                                                    smtp=smtp, accepted=True)
+            return line
 
     def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
         """THE BOOTSTRAP: "Email me a new Knightfall code". The same
@@ -6308,25 +6342,48 @@ class JarvisApp:
         if gate is None:
             return "Knightfall: the gate is not built; see the log"
         t = time.monotonic() if now is None else float(now)
-        last = getattr(self, "_knightfall_new_ts", None)
-        if last is not None and t - last < KNIGHTFALL_COOLDOWN_S:
-            return KNIGHTFALL_COOLDOWN_LINE
-        try:
-            who = gate._owner_label()
-        except Exception:                          # noqa: BLE001 - no registry
-            who = ""
-        if not who:
-            return ("Knightfall: nobody is enrolled as an owner yet "
-                    "(scripts/jarvis_people.py add ... --role owner)")
-        self._knightfall_new_ts = t
-        return self._knightfall_rotate(who, mail=mail, smtp=smtp,
-                                       accepted=False)
+        with _KNIGHTFALL_LOCK:
+            last = getattr(self, "_knightfall_new_ts", None)
+            if last is not None and t - last < KNIGHTFALL_COOLDOWN_S:
+                return KNIGHTFALL_COOLDOWN_LINE
+            try:
+                who = gate._owner_label()
+            except Exception:                      # noqa: BLE001 - no registry
+                who = ""
+            if not who:
+                return ("Knightfall: nobody is enrolled as an owner yet "
+                        "(scripts/jarvis_people.py add ... --role owner)")
+            line, mailed = self._knightfall_rotate(who, mail=mail, smtp=smtp,
+                                                   accepted=False)
+            # THE CLOCK STARTS ON A CODE THAT ACTUALLY LEFT. It used to be
+            # stamped before the send, so a press that mailed nothing --
+            # no account configured, the transport refusing -- answered
+            # "one code a minute, sir" to the next press and made him wait
+            # for a minute to be told the same thing again (R8b).
+            if mailed:
+                self._knightfall_new_ts = t
+            return line
 
     def _knightfall_rotate(self, who, *, mail=None, smtp=None,
-                           accepted=False) -> str:
+                           accepted=False):
         """Generate -> mail FIRST -> store ONLY on a Message-ID. Returns
-        the line. ``mail`` is the mail module (a seam for the tests);
-        ``smtp`` is the transport class send_message takes."""
+        ``(line, mailed)``: the line to show, and whether a code actually
+        left this machine (the bootstrap's cooldown starts on that, not on
+        the press). ``mail`` is the mail module (a seam for the tests);
+        ``smtp`` is the transport class the mail module takes.
+
+        THE TRANSPORT IS REACHED THROUGH jarvis/outbox.py, like every other
+        send in this package, and by its narrowest door: send_notice takes
+        no recipient, so a Knightfall code can only ever go to his own
+        account's own address.
+
+        NOTHING THE TRANSPORT SAYS IS REPEATED. The reason in the line and
+        in the log is the exception's TYPE. It used to be str(exc), which
+        trusts a seam to be discreet about a body it was just handed: with
+        a transport whose error quoted the first line of the mail, the
+        freshly rotated code came back in the line the drawer toasts
+        (verdict, 2026-09-05, measured).
+        """
         head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
         keep = head + "the code stays as it is (mail: %s)."
         if mail is None:
@@ -6338,48 +6395,61 @@ class JarvisApp:
             log.exception("knightfall: the mail accounts could not be read")
             accounts = []
         if not accounts:
-            return keep % "no mail account is configured"
+            return keep % "no mail account is configured", False
         account = accounts[0]
         new = pp.new_code()
         body = "%s\n%s\n" % (new, KNIGHTFALL_BODY_LINE)
         try:
-            msgid = mail.send_message(account, to_addr=account["address"],
-                                      subject=KNIGHTFALL_SUBJECT, body=body,
-                                      smtp=smtp)
+            msgid = outbox.send_notice(account, KNIGHTFALL_SUBJECT, body,
+                                       smtp=smtp, mail=mail)
         except Exception as exc:                   # noqa: BLE001 - transport
             # MailSendFailed, or anything else the transport did: the old
-            # code stands. str(exc) is a host or an exception TYPE name
-            # (mail.send_message re-raises with the type only), never the
-            # credential and never the code.
+            # code stands, and only the TYPE of what went wrong is said.
             del new, body
+            why = type(exc).__name__
             log.warning("knightfall: the new code could not be mailed (%s); "
-                        "the old one stands", exc)
-            return keep % exc
+                        "the old one stands", why)
+            return keep % why, False
         del body
         if not msgid:
             del new
-            return keep % "no Message-ID came back"
+            return keep % "no Message-ID came back", True
         hashed = pp.hash_secret(new)
         del new
         registry = getattr(self.gate, "registry", None)
         person = registry.person(who) if registry is not None else None
         old = person.code_hash if person is not None else ""
-        ok, why = (registry.set_secret(who, "code_hash", hashed)
-                   if registry is not None else (False, "no registry"))
-        if ok and registry.save():
+        # EVERY FAILURE HERE IS A LINE, NOT AN EXCEPTION. Registry.save()
+        # catches OSError and nothing else, and this is documented to
+        # return a line -- the drawer's thread has no other way to tell him
+        # what happened, and an exception here would leave the mailed code
+        # stored in memory and not on disk (R7).
+        try:
+            ok, why = (registry.set_secret(who, "code_hash", hashed)
+                       if registry is not None else (False, "no registry"))
+            stored = bool(ok and registry.save())
+        except Exception as exc:                   # noqa: BLE001 - registry
+            log.exception("knightfall: storing the new code failed")
+            ok, why, stored = False, type(exc).__name__, False
+        if stored:
             log.info("knightfall: %s rotated the code at the keyboard; the "
                      "new one is in the mail", who)
-            return KNIGHTFALL_OK_LINE if accepted else KNIGHTFALL_NEW_OK_LINE
+            return (KNIGHTFALL_OK_LINE if accepted
+                    else KNIGHTFALL_NEW_OK_LINE), True
         # The mail went, the store did not. Put the old hash back so the
         # old code works in memory as it still does on disk: never a state
         # where no code works. The one in the inbox is dead, and he is told.
         if registry is not None:
-            registry.set_secret(who, "code_hash", old)
+            try:
+                registry.set_secret(who, "code_hash", old)
+            except Exception:                      # noqa: BLE001 - registry
+                log.exception("knightfall: the old hash could not be put "
+                              "back in memory; it is still on disk")
         log.error("knightfall: the new code was mailed but could not be "
                   "stored (%s); the old code stands",
                   why or "the registry could not be written")
         return head + ("the new code could not be stored, so the old one "
-                       "stands; the one in your inbox will not work.")
+                       "stands; the one in your inbox will not work."), True
 
     # ------------------------------------------------------------ UI hooks
     def ui_service_kwargs(self) -> dict:
@@ -6417,6 +6487,11 @@ class JarvisApp:
             # UI that does not declare them.
             restart=self.restart,
             code_status=self.code_status,
+            # Knightfall: the drawer's masked entry and its bootstrap
+            # button. Both return the one line the drawer toasts, and
+            # both run off the Tk thread (KnightfallControl).
+            knightfall_code=self.knightfall_code,
+            knightfall_new_code=self.knightfall_new_code,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,

@@ -307,3 +307,153 @@ def test_new_code_is_eight_readable_characters_from_secrets():
         assert pp.code_ok(code)[0] is True
     import inspect
     assert "secrets.choice" in inspect.getsource(pp.new_code)
+
+
+# ------------------------ round 2: the holes the verdict found (09-05)
+def _stub_mail(send_message):
+    return SimpleNamespace(mail_accounts=mail_mod.mail_accounts,
+                           send_message=send_message,
+                           MailSendFailed=mail_mod.MailSendFailed)
+
+
+def test_a_transport_that_quotes_the_body_cannot_reach_the_line_or_the_log(
+        tmp_path, caplog):
+    """R6b, measured: the status line was `keep % exc`, so a transport
+    whose exception text quotes the mail put the freshly rotated code in
+    the line the drawer toasts -- and in the WARNING record besides. The
+    line carries the exception's TYPE now, never its words."""
+    sent = []
+
+    def send_message(account, to_addr, subject, body, smtp=None, **kw):
+        sent.append(body.splitlines()[0])
+        raise RuntimeError("550 rejected: " + body.splitlines()[0])
+    a = _app(tmp_path)
+    with caplog.at_level(logging.DEBUG):
+        line = a.knightfall_code(FAKE_CODE, mail=_stub_mail(send_message))
+    assert line == ("Knightfall accepted, sir; the code stays as it is "
+                    "(mail: RuntimeError).")
+    assert len(sent) == 1
+    _clean(caplog, [line], sent[0], FAKE_CODE)
+    # and the old code still works, in memory and on disk
+    for reg in (a.gate.registry, _on_disk(tmp_path)):
+        assert gate_mod.check_override_code(reg, FAKE_CODE)[0] == "hunter"
+
+
+def test_a_save_that_raises_is_a_line_not_an_exception(tmp_path, caplog,
+                                                       monkeypatch):
+    """R7: Registry.save only catches OSError, so anything else came out
+    of a method documented `-> str` -- into the drawer thread, which has
+    no way to say what happened. Every failure ends in a line."""
+    def boom():
+        raise RuntimeError("the registry file is a directory")
+    a = _app(tmp_path)
+    monkeypatch.setattr(a.gate.registry, "save", boom)
+    with caplog.at_level(logging.DEBUG):
+        line = a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
+    new, _, _ = _mailed_code()
+    assert line.startswith("Knightfall accepted, sir; the new code could "
+                           "not be stored")
+    for reg in (a.gate.registry, _on_disk(tmp_path)):
+        assert gate_mod.check_override_code(reg, FAKE_CODE)[0] == "hunter"
+        assert gate_mod.check_override_code(reg, new)[0] == ""
+    _clean(caplog, [line], new, FAKE_CODE)
+
+
+def test_a_set_secret_that_raises_is_a_line_too(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no")
+    a = _app(tmp_path)
+    monkeypatch.setattr(a.gate.registry, "set_secret", boom)
+    line = a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
+    assert line.startswith("Knightfall accepted, sir; the new code could "
+                           "not be stored")
+    assert gate_mod.check_override_code(a.gate.registry, FAKE_CODE)[0] == "hunter"
+
+
+def test_two_presses_at_once_send_one_mail_and_only_one_says_inbox(tmp_path):
+    """R8a: check -> open -> mail -> store had no lock, so two presses both
+    passed the check against the OLD hash and both mailed. He ended up with
+    a dead code in his inbox and two lines saying it was there."""
+    import threading
+
+    inside = threading.Event()
+    lines, sent = [], []
+
+    def send_message(account, to_addr, subject, body, smtp=None, **kw):
+        sent.append(body.splitlines()[0])
+        inside.set()
+        time.sleep(0.3)              # long enough for the other press
+        return "<id@example.com>"
+    a = _app(tmp_path)
+    stub = _stub_mail(send_message)
+    start = threading.Barrier(2)
+
+    def press():
+        start.wait(2.0)
+        lines.append(a.knightfall_code(FAKE_CODE, mail=stub))
+    threads = [threading.Thread(target=press, name="press%d" % i)
+               for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10.0)
+        assert not t.is_alive()
+    assert len(sent) == 1, "one press, one mail"
+    assert sorted(lines) == sorted([OK_LINE,
+                                    "Knightfall: that is not a code I know"])
+    assert gate_mod.check_override_code(_on_disk(tmp_path), sent[0])[0] == "hunter"
+
+
+def test_a_failed_send_does_not_burn_the_minute(tmp_path):
+    """R8b: the cooldown was stamped BEFORE the send, so a press that
+    mailed nothing (no account configured) locked the button for a minute
+    and told him to wait. Only a code that actually left starts the clock."""
+    a = _app(tmp_path, code=False, cfg={})
+    first = a.knightfall_new_code(smtp=FakeSMTP, now=1000.0)
+    assert "no mail account is configured" in first
+    again = a.knightfall_new_code(smtp=FakeSMTP, now=1005.0)
+    assert again == first
+    assert again != app_mod.KNIGHTFALL_COOLDOWN_LINE
+    assert FakeSMTP.made == []
+
+
+def test_a_successful_send_still_starts_the_clock(tmp_path):
+    a = _app(tmp_path, code=False)
+    assert a.knightfall_new_code(smtp=FakeSMTP, now=1000.0).startswith(
+        "Knightfall: a new code")
+    assert a.knightfall_new_code(smtp=FakeSMTP, now=1030.0) == \
+        app_mod.KNIGHTFALL_COOLDOWN_LINE
+
+
+# ------------------------------------------------- one door to the transport
+def test_the_app_reaches_the_transport_only_through_the_outbox(tmp_path):
+    """R3: tests/test_send_file.py pins that the only caller of
+    mail.send_message in the package is jarvis/outbox.py -- a guard so an
+    irreversible send cannot be reached from a tool loop. The rotation
+    went round it and left that guard red."""
+    from pathlib import Path
+
+    src = Path(app_mod.__file__).read_text()
+    assert "send_message" not in src
+    assert "outbox.send_notice" in src
+
+
+def test_a_notice_goes_to_the_account_itself_and_nowhere_else(tmp_path):
+    """The new door is NARROWER than the file lane's: the recipient is not
+    a parameter at all."""
+    from jarvis import outbox
+
+    sent = []
+
+    def send_message(account, to_addr, subject, body, smtp=None, **kw):
+        sent.append((to_addr, subject))
+        return "<id@example.com>"
+    account = mail_mod.mail_accounts(FakeCfg(GMAIL_CFG))[0]
+    msgid = outbox.send_notice(account, "Knightfall", "body\n",
+                               mail=_stub_mail(send_message))
+    assert msgid == "<id@example.com>"
+    assert sent == [(account["address"], "Knightfall")]
+    with pytest.raises(mail_mod.MailSendFailed):
+        outbox.send_notice({"label": "x"}, "Knightfall", "body\n",
+                           mail=_stub_mail(send_message))
+    assert len(sent) == 1

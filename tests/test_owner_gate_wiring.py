@@ -65,6 +65,7 @@ def _stand_in(tmp_path, *, mode="enforce", phrase=False, said="hello there",
     a._eye_identity = app_mod.JarvisApp._eye_identity.__get__(a)
     a._face_running = app_mod.JarvisApp._face_running.__get__(a)
     a._refuse_politely = app_mod.JarvisApp._refuse_politely.__get__(a)
+    a._gate_quiet_decode = app_mod.JarvisApp._gate_quiet_decode.__get__(a)
     a._gate_rescue = app_mod.JarvisApp._gate_rescue.__get__(a)
     a._gate_rescue_inner = app_mod.JarvisApp._gate_rescue_inner.__get__(a)
     a._gate_admits = app_mod.JarvisApp._gate_admits.__get__(a)

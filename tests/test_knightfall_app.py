@@ -189,3 +189,126 @@ def test_the_code_window_in_shadow_only_says_it_would_have(tmp_path, caplog):
         assert a._gate_rescue(object(), MATCHED, False) is None
     assert "WOULD have rescued" in caplog.text and "code" in caplog.text
     assert a.transcriber.calls == 0
+
+
+# ------------------------ round 2: the holes the verdict found (09-05)
+def test_with_the_gate_off_the_phrase_turn_still_dispatches_nothing(
+        tmp_path, events):
+    """MEASURED BEFORE THE FIX: dispatched == [(the phrase, "voice")], with
+    Transcribed AND UserUtterance both carrying it. Off meant "admit
+    everything" and took the phrase along with it."""
+    a = _app(tmp_path, mode="off", said=FAKE_PHRASE)
+    a._process_audio(object())
+    assert a.dispatched == []
+    assert a.spoken == [gate_mod.PHRASE_OK_LINE]
+    kinds = [type(e).__name__ for e in events]
+    assert kinds == ["Transcribed"]
+    assert FAKE_PHRASE not in repr([getattr(e, "text", "") for e in events])
+    assert events[0].text == gate_mod.REDACTED_TEXT
+
+
+def test_with_the_gate_off_an_ordinary_turn_is_dispatched_exactly_as_before(
+        tmp_path, events):
+    a = _app(tmp_path, mode="off", said="what time is it")
+    a._process_audio(object())
+    assert a.dispatched == [("what time is it", "voice")]
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_the_wake_word_in_front_of_the_phrase_dispatches_nothing(
+        tmp_path, events, mode):
+    a = _app(tmp_path, mode=mode, said="Jarvis, %s." % FAKE_PHRASE)
+    a._process_audio(object())
+    assert a.dispatched == [] and a.spoken == [gate_mod.PHRASE_OK_LINE]
+    assert [type(e).__name__ for e in events] == ["Transcribed"]
+
+
+class _QuietTranscriber:
+    """A transcriber that offers the redacting decode the rescue must use."""
+
+    def __init__(self, text):
+        self.text = text
+        self.loud = 0
+        self.quiet = 0
+
+    def _result(self):
+        return SimpleNamespace(text=self.text, confidence=-0.2, accepted=True)
+
+    def transcribe(self, audio):
+        self.loud += 1
+        return self._result()
+
+    def transcribe_quiet(self, audio):
+        self.quiet += 1
+        return self._result()
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_the_rescue_decode_is_the_one_that_writes_no_words_down(tmp_path,
+                                                                mode):
+    """THE DECODE THE BRANCH ADDED IS NOT THE LEAK; THE LOG LINE IS.
+    jarvis/transcriber.py writes `Transcribed: %r` at INFO, upstream of
+    everything the gate redacts, so the clip the speaker filter dropped --
+    the one that carries the phrase -- was written to jarvis.log in
+    plaintext in all three modes. The rescue asks for the redacting decode
+    instead."""
+    a = _app(tmp_path, mode=mode, said=FAKE_PHRASE, rejected=True)
+    a.transcriber = _QuietTranscriber(FAKE_PHRASE)
+    a._process_audio(object())
+    assert (a.transcriber.quiet, a.transcriber.loud) == (1, 0)
+    assert a.dispatched == [] and a.spoken == [gate_mod.PHRASE_OK_LINE]
+
+
+def test_a_transcriber_without_the_quiet_decode_still_works(tmp_path):
+    """The seam is duck-typed: jarvis/intercom.py hands clips in over the
+    command socket and the tests stand in their own transcribers."""
+    a = _app(tmp_path, said=FAKE_PHRASE, rejected=True)
+    a._process_audio(object())
+    assert a.transcriber.calls == 1 and a.dispatched == []
+
+
+def test_a_speculative_phrase_turn_is_published_as_speculative(tmp_path,
+                                                               events):
+    """Cosmetic, and measured: _gate_rescue took a `speculative` argument
+    and never forwarded it, so a speculative phrase turn published
+    speculative=False."""
+    a = _app(tmp_path, said=FAKE_PHRASE, rejected=True)
+    a._take_speculation = lambda: SimpleNamespace(
+        audio=object(), stats=MATCHED, rejected=True, result=None,
+        started=0.0, finished=0.0)
+    a._process_audio(object())
+    assert [type(e).__name__ for e in events] == ["Transcribed"]
+    assert events[0].speculative is True
+
+
+def test_the_quiet_decode_writes_no_words_and_the_loud_one_still_does(
+        tmp_path, monkeypatch, caplog):
+    """THE REAL Transcriber, with a fake whisper model -- because the
+    branch's own tests could not see this hole: they stub _decode_clip and
+    stand in a transcriber that logs nothing. The redacting decode keeps
+    the NUMBERS (that is what the line is read for) and drops the words."""
+    import sys
+
+    import numpy as np
+
+    from jarvis.config import PATHS
+    from tests.test_decode_bounds import FakeGpuWhisper, _gpu
+
+    monkeypatch.setattr(PATHS, "VOCAB_FILE", tmp_path / "voice_vocab.txt")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=lambda: None)))
+    words = "xxx not a real phrase xxx"
+    tr = _gpu(FakeGpuWhisper(segments=[
+        {"text": words, "avg_logprob": -0.3, "compression_ratio": 1.2}]))
+    audio = np.zeros(16000, dtype=np.float32)
+
+    with caplog.at_level(logging.INFO, logger="jarvis.transcriber"):
+        quiet = tr.transcribe_quiet(audio)
+    assert quiet.text == words, "the caller still gets the words"
+    assert words not in caplog.text and "-0.30" in caplog.text
+    assert not any(words in str(r.args) for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="jarvis.transcriber"):
+        tr.transcribe(audio)
+    assert words in caplog.text, "the ordinary decode is unchanged"
