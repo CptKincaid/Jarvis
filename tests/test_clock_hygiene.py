@@ -202,3 +202,136 @@ def test_the_guard_can_see_both_shapes():
     assert _waived(["# clock-hygiene: why", "# more prose", "x = date.today()"], 3)
     assert not _waived(["# clock-hygiene: why", "", "x = date.today()"], 3)
     assert not _waived(["x = date.today()"], 1)
+
+
+
+# ----------------------------------------------------------------------
+# Shape 3: a time-of-day read inside a ZONE-PINNED scope.
+# ----------------------------------------------------------------------
+# Added 2026-09-05 after measuring a hole in the guard's own runtime half.
+# `pytest.mark.local_tz(zone)` pins the process's local zone for a file
+# whose fixtures are written in a particular place. That is right -- but
+# --clock-at simulates an hour BY SHIFTING THE ZONE, so the marker
+# overrides it and the pinned scope is invisible to the hour sweep.
+#
+# Measured on this branch at a real clock of 14:52: a deliberately
+# clock-dependent test added to tests/test_arc.py (module-pinned) PASSED
+# --clock-at=09:00, 13:00, 21:00, 23:59:30, 03:00 and --clock-tz=UTC --
+# every configuration scripts/clock_guard.sh runs -- while being plainly
+# red at any real hour outside the afternoon. The runtime half cannot see
+# into a pinned scope, so the static half has to.
+#
+# Scope is kept deliberately narrow, because a guard that cries wolf gets
+# waived and then written off, which is the failure this whole branch
+# exists to end:
+#   * only TIME-OF-DAY reads count. `time.time()` is an absolute epoch
+#     scalar and cannot by itself expose a local hour -- test_winddown
+#     uses `time.time() + 8 * 3600` to build relative instants for its
+#     fakes, which is hour-blind and correct.
+#   * only PINNED scope counts. A module-level `pytestmark` pins the whole
+#     file; a `@pytest.mark.local_tz` decorator pins only that test, and
+#     the rest of the file is still swept normally by --clock-at.
+#
+# Inside a pinned scope, take the instant from the file's own fixtures
+# rather than from the machine. A genuine exception says why on the line,
+# `# clock-hygiene: <reason>`, and owes its own evidence that it holds at
+# every hour.
+
+# time.time() is excluded: see the note above.
+_TIME_OF_DAY_CALLS = _CLOCK_CALLS - {("time", "time")}
+
+
+def _module_pinned(tree: ast.Module) -> bool:
+    """True if a module-level `pytestmark = pytest.mark.local_tz(...)`
+    pins the whole file."""
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark"
+                   for t in stmt.targets):
+            continue
+        if any(isinstance(n, ast.Attribute) and n.attr == "local_tz"
+               for n in ast.walk(stmt.value)):
+            return True
+    return False
+
+
+def _pinned_functions(tree: ast.Module):
+    """The functions carrying a @pytest.mark.local_tz decorator."""
+    return [n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(isinstance(d, ast.Attribute) and d.attr == "local_tz"
+                    or isinstance(d, ast.Call)
+                    and any(isinstance(x, ast.Attribute) and x.attr == "local_tz"
+                            for x in ast.walk(d.func))
+                    for d in n.decorator_list)]
+
+
+def _time_of_day_reads(node) -> list:
+    """Every time-of-day call anywhere under `node`, including inside a
+    test body -- which `_import_time_clock_reads` ignores on purpose."""
+    out = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            pair = _attr_pair(n.func)
+            if pair in _TIME_OF_DAY_CALLS:
+                out.append((n.lineno, ".".join(pair) + "()"))
+    return out
+
+
+def _pinned_clock_reads(tree: ast.Module):
+    if _module_pinned(tree):
+        return _time_of_day_reads(tree)
+    out = []
+    for fn in _pinned_functions(tree):
+        out.extend(_time_of_day_reads(fn))
+    return out
+
+
+def test_a_zone_pinned_scope_does_not_read_the_time_of_day():
+    """Shape 3. The runtime guard is blind inside a local_tz scope, so a
+    clock-dependent test written there passes every configuration of
+    scripts/clock_guard.sh and still goes red at some other hour."""
+    offenders = _scan(_pinned_clock_reads)
+    assert offenders == [], (
+        "these read the time of day inside a scope that pins the local zone "
+        "with pytest.mark.local_tz. --clock-at simulates an hour by shifting "
+        "the zone, so the marker overrides it and scripts/clock_guard.sh "
+        "CANNOT see these lines -- a clock bug here passes every "
+        "configuration the guard runs:\n  "
+        + "\n  ".join(offenders)
+        + "\nFix: take the instant from the file's own fixtures rather than "
+          "from the machine. If the read is genuinely safe at every hour, say "
+          "why on the line, with the evidence:  # clock-hygiene: <reason>")
+
+
+def test_the_guard_can_see_the_zone_pinned_shape():
+    """Shape 3's smoke test: the finder must fire, or the test above is
+    green because it looked at nothing."""
+    module_pinned = ast.parse(
+        "import pytest\n"
+        "pytestmark = pytest.mark.local_tz('UTC')\n"
+        "def test_x():\n"
+        "    return datetime.now()\n")
+    assert _module_pinned(module_pinned)
+    assert [w for _, w in _pinned_clock_reads(module_pinned)] == ["datetime.now()"]
+    # a per-test marker pins only that test ...
+    per_test = ast.parse(
+        "import pytest\n"
+        "@pytest.mark.local_tz('UTC')\n"
+        "def test_pinned():\n"
+        "    return datetime.now()\n"
+        "def test_free():\n"
+        "    return date.today()\n")
+    assert not _module_pinned(per_test)
+    assert [w for _, w in _pinned_clock_reads(per_test)] == ["datetime.now()"]
+    # ... and an unpinned file is not subject to this shape at all
+    plain = ast.parse("def test_x():\n    return datetime.now()\n")
+    assert _pinned_clock_reads(plain) == []
+    # time.time() is an epoch scalar, not a time of day
+    epoch = ast.parse(
+        "import pytest\n"
+        "pytestmark = pytest.mark.local_tz('UTC')\n"
+        "def test_x():\n"
+        "    return time.time() + 3600\n")
+    assert _pinned_clock_reads(epoch) == []

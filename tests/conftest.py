@@ -755,6 +755,7 @@ _owned_nodeids: set = set()
 # the import-time-capture class that those dates used to expose.
 #
 #   pytest --clock-at=09:00          # run as if the local clock said 09:00
+#   pytest --clock-at=23:59          # ... and let the run cross midnight
 #   pytest --clock-tz=UTC            # run as if the machine were in UTC
 #   scripts/clock_guard.sh           # sweep them all and diff the verdicts
 #
@@ -768,9 +769,9 @@ def _posix_tz_for_offset(seconds: int) -> str:
 
     POSIX counts the other way round (west is positive), hence the sign
     flip, and it needs no tzdata file -- which keeps the guard runnable on
-    a box with no zoneinfo installed. Seconds are honoured (measured: a
-    -5:30:20 offset lands on the second), which is what lets --clock-at
-    put a run a few seconds before midnight.
+    a box with no zoneinfo installed. Seconds are representable, but
+    --clock-at no longer produces them: see the note in _tz_for_local_time
+    about sub-minute offsets corrupting RFC 2822 timestamps.
     """
     west = -seconds
     sign = "-" if west < 0 else ""
@@ -789,7 +790,8 @@ def _tz_for_local_time(spec: str) -> str:
 
     `spec` is HH, HH:MM or HH:MM:SS. The offset is a fixed one, so the
     simulated clock ticks forward from there exactly as the real one does
-    -- 23:59:55 really does roll over into tomorrow five seconds later.
+    -- 23:59 really does roll over into tomorrow a minute later, which is
+    how the guard covers a run that crosses the date.
     """
     try:
         parts = [int(x) for x in str(spec).split(":")]
@@ -805,6 +807,22 @@ def _tz_for_local_time(spec: str) -> str:
     utc = _time.gmtime()
     have = utc.tm_hour * 3600 + utc.tm_min * 60 + utc.tm_sec
     east = (want - have) % _DAY_S           # seconds east of UTC
+    # Round the offset UP to a whole MINUTE. No real timezone has ever had a
+    # sub-minute offset, and simulating one is not harmless: an RFC 2822 date
+    # (email.utils.format_datetime) can only express +/-HHMM, so the odd
+    # seconds are truncated when a timestamp is serialised and it comes back
+    # up to 59 s adrift. Measured 2026-09-05: the guard reported three
+    # tests/test_notes_mail.py tests as clock-dependent at --clock-at=09:00,
+    # which produced the offset +12:08:12; they are green at all 24 hours
+    # under libfaketime, and green at a whole-hour offset on either date, so
+    # the finding was the instrument, not the suite. That is a false positive,
+    # and a guard that cries wolf gets ignored.
+    #
+    # Rounding UP (never down) keeps the simulated local time at or just
+    # after the time asked for -- within 59 s -- so --clock-at=09:00 is
+    # always inside hour 09, and --clock-at=23:59 is always still before
+    # midnight, which is what makes it cross the date during the run.
+    east += (-east) % 60
     if east > 14 * 3600:                    # prefer a western offset, so we
         east -= _DAY_S                      # ... stay inside -10h .. +14h
     return _posix_tz_for_offset(east)

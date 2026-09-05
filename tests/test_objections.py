@@ -355,6 +355,14 @@ def test_another_open_question_is_never_talked_over(rich, monkeypatch):
     utterance), so the guard is asserted where it lives."""
     c, svc, _ = rich
     _object_with(monkeypatch)
+    # clock-hygiene: the wall clock is the FIXTURE here, not the
+    # expectation -- `now` is handed straight to objection_for_alarm as
+    # its own clock, and every assertion is relative to it (is None /
+    # is not None), so no hour is written down anywhere. Measured
+    # 2026-09-05 under libfaketime at all 24 hours: 131 passed each
+    # time. This file is zone-pinned, so --clock-at cannot re-check
+    # that for you; re-measure by hand if this test grows an
+    # assertion about a particular time of day.
     now = datetime.now().astimezone()
     due = (now + timedelta(hours=3)).timestamp()
     c.stash_destructive(lambda: CommandResult(handled=True), "Cancel all three, sir?")

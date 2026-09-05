@@ -28,8 +28,20 @@ cd "$(dirname "$0")/.."
 #   PYTEST_ARGS=tests/test_claim_guard_memory.py scripts/clock_guard.sh
 # Unset, it sweeps the whole suite, which is the only form that proves the
 # merge gate.
-PYTEST=(~/.local/bin/memcap timeout 1800 "${JARVIS_PY:-$HOME/vss_env/bin/python}"
+PY="${JARVIS_PY:-$HOME/vss_env/bin/python}"
+PYTEST=(~/.local/bin/memcap timeout 1800 "$PY"
         -m pytest -q -p no:cacheprovider ${PYTEST_ARGS:-})
+
+# Re-run ONE test in ONE configuration. Used to confirm a finding before
+# the guard cries wolf -- see the confirmation step at the bottom.
+run_one() {   # run_one <nodeid> <cfg>   -> 0 pass, 1 fail
+  local node=$1 cfg=$2
+  if [ "$cfg" = real ]; then
+    ~/.local/bin/memcap timeout 300 "$PY" -m pytest -q -p no:cacheprovider "$node" >/dev/null 2>&1
+  else
+    ~/.local/bin/memcap timeout 300 "$PY" -m pytest -q -p no:cacheprovider "$node" "$cfg" >/dev/null 2>&1
+  fi
+}
 
 # The configurations that between them would have caught every clock bug
 # found on 2026-09-05: one in each greeting band (morning / afternoon /
@@ -37,7 +49,7 @@ PYTEST=(~/.local/bin/memcap timeout 1800 "${JARVIS_PY:-$HOME/vss_env/bin/python}
 # in the middle of the run, and one in a foreign zone. "real" is the
 # unsimulated clock, so a difference between real and simulated counts too.
 DEFAULT=(real --clock-at=09:00 --clock-at=13:00 --clock-at=21:00
-         --clock-at=23:59:30 --clock-tz=UTC)
+         --clock-at=23:59 --clock-tz=UTC)
 
 case "${1:-}" in
   --hours) CONFIGS=(real); for h in $(seq -w 0 23); do CONFIGS+=("--clock-at=$h:30"); done ;;
@@ -59,9 +71,10 @@ printf 'clock guard: %d configurations, real local time now %s\n\n' \
 # in every configuration. A test that fails in some hours and not others is
 # the bug this exists to find; a test that fails in all of them is somebody
 # else's problem and is reported separately.
-names=()
+names=(); declare -A CFG_OF
 for cfg in "${CONFIGS[@]}"; do
   tag=$(echo "$cfg" | tr -c 'A-Za-z0-9' '_')
+  CFG_OF[$tag]=$cfg
   log="$out/$tag.log"
   if [ "$cfg" = real ]; then "${PYTEST[@]}" >"$log" 2>&1; else "${PYTEST[@]}" "$cfg" >"$log" 2>&1; fi
   rc=$?
@@ -91,14 +104,71 @@ if [ "$moved" -eq 0 ]; then
   exit 0
 fi
 
+# A verdict that moved is not yet a finding. This suite carries known
+# flakes (measured 2026-09-05: test_brain_room's [3072] case fails about 1
+# run in 10 on a PRISTINE checkout), and a flake landing in one
+# configuration looks exactly like clock dependence. A guard that cries
+# wolf gets ignored, which is how "1 pre-existing time-of-day failure"
+# survived three days -- so every candidate is re-run before it is
+# reported: CONFIRM_N times in a configuration where it was green and
+# CONFIRM_N times in one where it was red. Only a verdict that holds every
+# single time is called clock-dependent.
+CONFIRM_N=${CONFIRM_N:-3}
+candidates=$(cat "$out"/*.fails | sort | uniq -c | sort -rn \
+             | awk -v n="${#CONFIGS[@]}" '$1 != n {print $2}')
+
+confirmed=(); flaky=()
+echo "confirming ${CONFIRM_N}x per side (a flake can imitate the clock) ..."
+for name in $candidates; do
+  okcfg=""; redcfg=""
+  for tag in "${names[@]}"; do
+    if grep -qxF "$name" "$out/$tag.fails"; then
+      [ -z "$redcfg" ] && redcfg="${CFG_OF[$tag]}"
+    else
+      [ -z "$okcfg" ] && okcfg="${CFG_OF[$tag]}"
+    fi
+  done
+  if [ -z "$redcfg" ] || [ -z "$okcfg" ]; then
+    # Cannot happen once the match is fixed-string, but an empty cfg would
+    # be handed to pytest as an empty argument and read as a failure, which
+    # would confirm a finding that was never measured. Refuse instead.
+    echo "  $name: cannot locate both a red and a green configuration -- skipped"
+    continue
+  fi
+  redfail=0; okpass=0
+  for _ in $(seq 1 "$CONFIRM_N"); do
+    run_one "$name" "$redcfg" || redfail=$((redfail + 1))
+    run_one "$name" "$okcfg"  && okpass=$((okpass + 1))
+  done
+  if [ "$redfail" -eq "$CONFIRM_N" ] && [ "$okpass" -eq "$CONFIRM_N" ]; then
+    confirmed+=("$name|$okcfg|$redcfg")
+  else
+    flaky+=("$name|$redcfg $redfail/$CONFIRM_N red|$okcfg $okpass/$CONFIRM_N green")
+  fi
+done
+
+if [ "${#flaky[@]}" -gt 0 ]; then
+  echo
+  echo "NOT clock-dependent -- verdict did not hold on re-run (flaky):"
+  for f in "${flaky[@]}"; do
+    IFS='|' read -r n a b <<<"$f"; printf '  %s\n        %s, %s\n' "$n" "$a" "$b"
+  done
+fi
+
+if [ "${#confirmed[@]}" -eq 0 ]; then
+  echo
+  echo "PASS: no test's verdict moved with the clock (candidates were flakes)."
+  exit 0
+fi
+
+echo
 echo "FAIL: a test changed its verdict with the clock."
 echo
-cat "$out"/*.fails | sort | uniq -c | sort -rn | while read -r count name; do
-  [ "$count" -eq "${#CONFIGS[@]}" ] && continue          # constant: not the clock
+for c in "${confirmed[@]}"; do
+  IFS='|' read -r name okcfg redcfg <<<"$c"
   echo "  $name"
-  for tag in "${names[@]}"; do
-    grep -qx "$name" "$out/$tag.fails" && echo "        RED  $tag" || echo "        ok   $tag"
-  done
+  echo "        RED  in $redcfg  ($CONFIRM_N/$CONFIRM_N)"
+  echo "        ok   in $okcfg   ($CONFIRM_N/$CONFIRM_N)"
 done
 cat <<'MSG'
 
