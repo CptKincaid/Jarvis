@@ -1792,9 +1792,11 @@ class _RoomBlock(tk.Frame):
                                fg=theme.FAINT, anchor="w", **flat)
         self.source.pack(side="left", padx=(px(8), 0))
 
-        self._presence_row, self.presence = self._line("radar")
-        self._camera_row, self.camera = self._line("camera")
-        self._why_row, self.why = self._line("")
+        _, self.presence = self._line("radar")
+        _, self.camera = self._line("camera")
+        _, self.why = self._line("")
+        # The fault row is the only one that comes and goes: it is packed by
+        # apply() when a leg had no opinion and forgotten when it does.
         self._fault_row, self.fault = self._line("", tone=theme.WARN)
         self._fault_row.pack_forget()
         self.bind("<Configure>", self._wrap, add=True)

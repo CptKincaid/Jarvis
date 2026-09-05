@@ -22,6 +22,31 @@ from jarvis.ui import widgets as wg
 
 FORBIDDEN_DISPLAYS = (":0", ":1")
 
+# select(2)'s fd_set, which libX11 still uses. An X connection whose socket
+# lands on a descriptor at or above this cannot be select()ed, and glibc's
+# fortify check turns that into a bare abort() -- the process dies with no
+# Python frame and no X error message.
+#
+# MEASURED 2026-09-05, and it is not hypothetical here: run under the WHOLE
+# suite in one process this file dumped core on the first test that builds a
+# root. The suite holds 1194 open descriptors by the time it reaches this
+# file (583 through tests/test_[a-m]*.py, where the same tests pass), and a
+# 12-line pytest file that opens 1100 /dev/null handles and then calls
+# tk.Tk() reproduces the abort on its own with nothing of Jarvis loaded.
+#
+# So the guard is a SKIP with the reason on it rather than a crash: the leak
+# is the suite's, the wall is libX11's, and neither is something a layout
+# test can fix. Run this file on its own (or with the other UI files) and it
+# measures; run it at the end of 11,000 tests and it says why it will not.
+FD_SETSIZE = 1024
+
+
+def _open_fds() -> int:
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:                                # not Linux; assume room
+        return 0
+
 
 @pytest.fixture(autouse=True)
 def _restore_look():
@@ -260,6 +285,12 @@ def root():
         pytest.skip("set JARVIS_UI_TEST_DISPLAY=:9N (a private Xvfb) to run "
                     "the measured layout tests")
     import tkinter as tk
+    fds = _open_fds()
+    if fds >= FD_SETSIZE - 32:                     # headroom for Tk's own
+        pytest.skip("this process already holds %d open descriptors; an X "
+                    "connection past select()'s FD_SETSIZE (%d) aborts the "
+                    "interpreter (see the note at the top of this file). Run "
+                    "this file on its own." % (fds, FD_SETSIZE))
     try:
         r = tk.Tk(screenName=display)
     except tk.TclError as exc:
