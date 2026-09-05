@@ -2,8 +2,8 @@
 
 One tool, ``screen_qa(question)``: grab the active display, shrink it to
 ``screen.max_width`` pixels wide, JPEG + base64, and ask Ollama's
-``screen.model`` (llama3.2-vision by default) for a short spoken answer;
-the brain's model turn then phrases the reply.  The active window title
+``screen.model`` for a short spoken answer, which goes STRAIGHT to the
+speaker (``speak=``) -- no model turn rephrases it.  The active window title
 (xdotool) rides along in the prompt as context, because a screenshot of a
 terminal says nothing about WHICH terminal.
 
@@ -23,7 +23,8 @@ Two live findings from 2026-08-31/09-01 shaped the rest of this module:
   tool said "My vision model isn't answering, sir." while the model had in
   fact described the screen perfectly inside ``message.thinking``.  So the
   payload sends ``think: false`` for any model whose capabilities include
-  thinking, exactly as brain.py does on the chat path.
+  thinking -- and for any model ollama will not describe -- much as brain.py
+  does on the chat path, which sends the field unconditionally.
 
 The payload also mirrors the brain's ``keep_alive: -1`` and ``num_ctx``
 when it is talking to the chat model: a request with a different num_ctx
@@ -75,7 +76,7 @@ DEFAULT_DISPLAY = ":1"             # the Spark's desktop; DISPLAY env wins
 DEFAULT_QUESTION = "what's on my screen"
 VISION_TIMEOUT_S = 25.0            # a cold projector load is ~9 s
 SHOW_TIMEOUT_S = 5.0               # /api/show reads a manifest; it is instant
-GRAB_TIMEOUT_S = 8.0               # the CLI screenshot fallbacks
+GRAB_TIMEOUT_S = 8.0               # the ImageMagick CLI grab (the only one)
 WINDOW_TIMEOUT_S = 2.0             # xdotool
 JPEG_QUALITY = 80
 MAX_SENTENCES = 3
@@ -350,7 +351,9 @@ def candidate_models(cfg) -> list:
 
 
 def setup_line(model: str, reason: str) -> str:
-    """The spoken excuse, naming the model and what is wrong with it."""
+    """The spoken excuse.  A SETUP failure names the model and what is wrong
+    with it; everything else falls through to NO_VISION_LINE, which names
+    neither -- see the comment on that constant."""
     spoken = normalise_model(model).replace(":latest", "")
     low = (reason or "").lower()
     if "not found" in low or "404" in low:
@@ -413,9 +416,10 @@ def vision_payload(model: str, b64: str, question: str, title: str,
     and returned an EMPTY ``content`` (measured 2026-09-01: done_reason
     "length", eval_count 200, a perfect description of the desktop stuck in
     the reasoning block) -- which surfaced as "My vision model isn't
-    answering, sir."  It is sent only for models whose capabilities include
-    thinking, since a build that rejects the field on a plain model would
-    turn a working model into a 400.
+    answering, sir."  ``ask_screen`` sends it for a model whose capabilities
+    include thinking AND for one whose capabilities ollama would not report;
+    it is withheld only from a model known NOT to think, since a build that
+    rejects the field on a plain model would turn a working model into a 400.
 
     ``resident`` means "this IS the brain's model": keep_alive -1 and the
     brain's num_ctx keep the SAME runner, so the screen question costs no
@@ -441,7 +445,9 @@ def vision_payload(model: str, b64: str, question: str, title: str,
 
 def tidy_answer(text, cap: int = ANSWER_WORD_CAP) -> str:
     """Plain prose, whitespace collapsed, at most ``cap`` words, cut at the
-    last sentence end that fits (the brain rephrases what is left)."""
+    last sentence end that fits.  What is left is SPOKEN AS IT STANDS: the
+    only caller is ``ask_screen``, whose answer becomes screen_qa's ``speak=``
+    line, and a speak= line ends the turn without a model round."""
     text = _MARKDOWN.sub(lambda m: m.group(1) or " ", str(text or ""))
     text = " ".join(text.split()).strip()
     if not text:
@@ -551,7 +557,10 @@ def look(question: str, b64: str, title: str, cfg) -> tuple:
     reason when none could.  A model that ollama REFUSES (404, or the 500
     "unknown model architecture: \'mllama\'" that llama3.2-vision gives on
     this build) is remembered in _UNUSABLE, so the wasted attempt is paid
-    once per process and every later question goes straight to the fallback.
+    once per CACHE_TTL_S -- the verdict EXPIRES, deliberately (see the
+    comment on that constant), so a model fixed by an ``ollama pull`` is
+    tried again -- and every question until then goes straight to the
+    fallback.
     """
     reason = "no vision model configured"
     model = ""
@@ -617,8 +626,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text=f"vision failed: {str(exc)[:60]}", ok=False,
                               speak=NO_VISION_LINE)
         if not same_model(model, wanted):
-            # Loud, once per process per model: the answer arrived, but the
-            # config is still pointing at something this ollama cannot use.
+            # Loud on EVERY question, not once: the wasted ATTEMPT is paid
+            # once per verdict TTL (_UNUSABLE, above), but nothing dedupes
+            # this line.  The answer arrived and the config still points at
+            # something this ollama cannot use, which is worth saying again.
             log.warning("screen: %s is unusable here, answered with %s "
                         "instead; %s", wanted, model, SETUP_HINT)
         # Sizes and timing only -- never the image, never the answer text.

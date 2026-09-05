@@ -760,3 +760,199 @@ def test_model_caps_reads_api_show_and_reports_a_missing_model(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", missing)
     caps, why = scr.model_caps("moondream")
     assert caps is None and "not found" in why
+
+
+# ------------------------------------------------------- the doc-truth sweep
+# This file has now shipped a FALSE SENTENCE TWICE.  jarvis-v3 removed the
+# gnome-screenshot path and left the prose that described it; the branch that
+# existed to delete that prose left "llama3.2-vision by default" standing five
+# lines above its own fix, in the same docstring it was editing.  So the whole
+# file was read claim by claim against the code, and every sentence that lost
+# its argument is pinned here.  A doc bug in THIS module is not cosmetic: the
+# 2026-08-31 incident in ``ask_screen`` is the record of a reader being sent
+# to the wrong place by a line that used to be true.
+
+
+def test_the_module_docstring_names_the_default_model_the_code_actually_has():
+    """``DEFAULT_MODEL = ""`` -- the docstring said llama3.2-vision.
+
+    Git settles which half is stale: d5a0e6e shipped
+    ``DEFAULT_MODEL = "llama3.2-vision:latest"`` together with the
+    parenthetical "(llama3.2-vision by default)"; 53f5da6 changed the
+    constant to ``""`` and left the prose behind.  The SAME docstring then
+    said, four lines lower, "The model is the CHAT model by default
+    (``screen.model: ""``)" -- so the file contradicted both itself and its
+    own constant, and the half that was wrong is the half this module spent
+    twenty lines explaining ollama cannot even load."""
+    assert scr.DEFAULT_MODEL == ""
+    doc = scr.__doc__ or ""
+    assert "llama3.2-vision by default" not in doc, \
+        "the docstring still names a default the constant does not have"
+    # ...and the true half must survive, so the fix is not a silent deletion.
+    assert 'screen.model: ""' in doc
+    # The one place llama3.2-vision may still appear is the FINDING about it.
+    for line in doc.splitlines():
+        if "llama3.2-vision" in line:
+            assert "cannot load" in doc, "keep the mllama finding, drop the default"
+
+
+def test_the_docstrings_do_not_promise_a_model_turn_the_tool_skips(wired):
+    """The answer goes STRAIGHT to the speaker; no model turn phrases it.
+
+    ``ToolResult.speak`` is documented in registry.py as "verbatim line;
+    skips the model turn", and brain.py's own post-mortem records that "the
+    loop's ``if result.speak: break`` ended the turn on it".  screen_qa sets
+    speak= on every successful answer, deliberately: the comment beside the
+    return says a second model turn "would be refused" because the vision
+    call can take 25 s against an 8 s tool-loop budget.  Two sentences still
+    described the OTHER design -- the module docstring's "the brain's model
+    turn then phrases the reply" and ``tidy_answer``'s "(the brain rephrases
+    what is left)" -- and ``tidy_answer`` is called from exactly one place,
+    ``ask_screen``, whose result is the speak= line.  Nothing rephrases it."""
+    vision, _ = wired
+    res = tool().call("screen_qa", {"question": "what is showing"})
+    assert res.ok
+    # Verbatim: what the vision model said is what gets spoken.
+    assert res.speak == vision.content
+    doc = f"{scr.__doc__ or ''}\n{scr.tidy_answer.__doc__ or ''}"
+    for claim in ("model turn then phrases", "brain rephrases"):
+        assert claim not in doc, f"docstring still promises {claim!r}"
+    # ...and the reason the tool skips it must stay in the source.
+    assert "goes straight to the speaker" in Path(scr.__file__).read_text()
+
+
+def test_a_model_whose_capabilities_are_unknown_is_still_told_not_to_think(wired,
+                                                                           monkeypatch):
+    """``vision_payload`` said think:false "is sent ONLY for models whose
+    capabilities include thinking".  ``ask_screen`` passes
+    ``suppress_thinking=caps is None or "thinking" in caps`` -- and the
+    comment five lines above that call says so out loud: "caps unknown
+    (ollama would not say) -> still send think:false".  Unknown is the third
+    case and it was the one nothing pinned: a thinking model that eats its
+    whole budget reasoning is the failure actually seen, so silence from
+    /api/show must not buy it back."""
+    vision, _ = wired
+    # /api/show refuses to answer -> model_caps returns (None, reason).
+    monkeypatch.setattr(scr, "_ollama_show", show(OSError("ollama is down")))
+    caps, why = scr.model_caps(scr.chat_model())
+    assert caps is None and why, "the premise: capabilities are unknown here"
+    res = tool().call("screen_qa", {})
+    assert res.ok
+    assert vision.payloads[-1]["think"] is False, \
+        "unknown capabilities must still suppress thinking"
+    doc = " ".join((scr.vision_payload.__doc__ or "").split())   # wrapped in source
+    assert "sent only for models whose capabilities include thinking" not in doc, \
+        "the docstring forgets the unknown case"
+
+
+def test_the_unusable_model_warning_fires_on_every_question_not_once(wired, caplog,
+                                                                     monkeypatch):
+    """The comment claimed "Loud, once per process per model".  It is not.
+
+    ``_UNUSABLE`` makes the wasted ATTEMPT once per process -- that is the
+    line above it, and ``test_an_unloadable_model_falls_back_to_the_chat_model``
+    pins it.  The warning that the config is still wrong has no guard of any
+    kind: ``if not same_model(model, wanted)`` is true on every screen
+    question for as long as assistant.json points at a model this ollama
+    cannot load.  Measured here, not read: two questions, two warnings."""
+    broken = "llama3.2-vision:latest"
+
+    def refuse_the_broken_one(payload, timeout=None):
+        vision, _ = wired
+        vision.payloads.append(payload)
+        if payload["model"] == broken:
+            raise urllib.error.HTTPError(
+                "u", 500, "Internal Server Error", {},
+                io.BytesIO(b'{"error":"unknown model architecture: \'mllama\'"}'))
+        return {"message": {"role": "assistant", "content": "A terminal."}}
+    monkeypatch.setattr(scr, "_ask_vision", refuse_the_broken_one)
+
+    reg = tool({"screen": {"model": broken}})
+    with caplog.at_level(logging.WARNING, logger="jarvis"):
+        assert reg.call("screen_qa", {}).ok
+        assert reg.call("screen_qa", {}).ok
+    unusable = [r for r in caplog.records if "is unusable here" in r.getMessage()]
+    assert len(unusable) == 2, \
+        f"expected one warning per question, got {len(unusable)}"
+    assert "once per process per model" not in Path(scr.__file__).read_text(), \
+        "the comment claims a dedupe the code does not do"
+
+
+def test_the_constant_comments_outlived_nothing(wired):
+    """``GRAB_TIMEOUT_S``'s comment said "the CLI screenshot fallbackS".
+
+    Plural was true when gnome-screenshot was a second CLI grabber.  There
+    is one now: ``shutil.which`` is called once in the whole module, for
+    ``import``, and GRAB_TIMEOUT_S bounds exactly one ``subprocess.run``.
+    The same residue, one word wide, in the same file."""
+    src = Path(scr.__file__).read_text()
+    assert src.count('shutil.which("import")') == 1
+    assert src.count("shutil.which") == 1, "one CLI grabber, not several"
+    line = next(ln for ln in src.splitlines() if ln.startswith("GRAB_TIMEOUT_S"))
+    assert "fallbacks" not in line, f"still plural: {line!r}"
+    assert "8.0" in line
+
+
+def test_setup_line_does_not_claim_to_name_a_model_it_cannot_name():
+    """``setup_line``'s docstring: "The spoken excuse, naming the model and
+    what is wrong with it."  Three of its four branches do.  The fourth --
+    the fallthrough, which is every timeout and every dead socket -- returns
+    ``NO_VISION_LINE``, which names neither, and the constant's OWN comment
+    twelve lines earlier says exactly that: "The generic line is for a model
+    that is present and simply did not answer".  The docstring over-claimed
+    the one line whose namelessness sent Hunter looking at the wrong thing
+    twice on 2026-08-31."""
+    generic = scr.setup_line("gemma4:26b", "TimeoutError")
+    assert generic == scr.NO_VISION_LINE
+    assert "gemma4" not in generic and "Timeout" not in generic
+    # the three that DO name it, so the fix cannot degrade into a deletion
+    assert "moondream" in scr.setup_line("moondream", 'model "moondream" not found')
+    assert "gemma4" in scr.setup_line("gemma4:26b", "gemma4 is not a vision model")
+    assert "llama3.2-vision" in scr.setup_line("llama3.2-vision:latest",
+                                               "HTTP 500: unknown architecture")
+    doc = scr.setup_line.__doc__ or ""
+    assert "naming the model and what is wrong with it" not in doc, \
+        "the docstring promises a name the generic line does not carry"
+
+
+def test_the_wasted_attempt_is_paid_once_per_TTL_not_once_per_process(wired,
+                                                                     monkeypatch):
+    """``look``'s docstring said the refused model is "paid once per process".
+
+    It is not, and the module says so twelve lines above ``_UNUSABLE``:
+    "Both caches expire.  A verdict that outlived the process would be right
+    for the wrong reason: ``ollama pull``, an ollama upgrade, or a restarted
+    server all change the answer, and Jarvis can run for days."
+    ``unusable_reason`` reads through ``_cached``, which drops any entry
+    older than ``CACHE_TTL_S``, and ``test_the_verdict_cache_expires``
+    already pins that.  So the file held the claim and its own refutation at
+    the same time.  Measured here end to end: two questions ten minutes
+    apart cost TWO wasted attempts on the broken model, not one."""
+    broken = "llama3.2-vision:latest"
+    asked = []
+
+    def refuse_the_broken_one(payload, timeout=None):
+        asked.append(payload["model"])
+        if payload["model"] == broken:
+            raise urllib.error.HTTPError(
+                "u", 500, "Internal Server Error", {},
+                io.BytesIO(b'{"error":"unknown model architecture: \'mllama\'"}'))
+        return {"message": {"role": "assistant", "content": "A terminal."}}
+    monkeypatch.setattr(scr, "_ask_vision", refuse_the_broken_one)
+
+    reg = tool({"screen": {"model": broken}})
+    assert reg.call("screen_qa", {}).ok
+    assert reg.call("screen_qa", {}).ok
+    # within the TTL the verdict holds: one wasted attempt, two answers
+    assert asked == [broken, scr.chat_model(), scr.chat_model()]
+
+    later = time.monotonic() + scr.CACHE_TTL_S + 1
+    monkeypatch.setattr(scr.time, "monotonic", lambda: later)
+    assert reg.call("screen_qa", {}).ok
+    assert asked == [broken, scr.chat_model(), scr.chat_model(),
+                     broken, scr.chat_model()], \
+        "past the TTL the refused model is tried again -- not once per process"
+
+    src = Path(scr.__file__).read_text()
+    assert "once per process" not in src, \
+        "both verdict caches expire; no memory here lasts a whole process"
