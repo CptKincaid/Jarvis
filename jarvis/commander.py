@@ -102,7 +102,15 @@ from jarvis.events import (ClearTranscript, JarvisReply, SensingChanged,
                            Status, bus)
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
-from jarvis.memory import parse_person_statement, parse_since
+from jarvis.memory import (
+    clean_spoken_fact,
+    fact_key,
+    is_spoken_pointer,
+    is_spoken_question,
+    parse_person_statement,
+    parse_since,
+    store_fact_from_speech,
+)
 from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
@@ -610,8 +618,19 @@ DESKTOP_ACTIONS = {
     "find": "find",
 }
 
-# "jarvis, <command>" prefixes (voice_input_gui.py 3041 / 3553)
-JARVIS_PREFIXES = ("jarvis ", "jarvis, ", "hey jarvis ", "hey jarvis, ")
+# "jarvis, <command>" prefixes (voice_input_gui.py 3041 / 3553).
+# 2026-09-04: Whisper also writes "Jarvis." (a full stop after the name)
+# and hears the wake word as "okay jarvis" / "ok jarvis"; none of those
+# were here, so the registry pass was skipped for "Okay Jarvis, remember
+# that ..." and "Jarvis. Remember that ..." and both reached the model
+# (measured). Every helper that strips the address iterates THIS tuple
+# (strip_jarvis_prefix, _raw_command, _raw_cmd_text, split_clauses), so
+# widening it here keeps them in step; strip_address is a separate regex
+# for the model's copy and is left alone.
+JARVIS_PREFIXES = ("jarvis ", "jarvis, ", "jarvis. ",
+                   "hey jarvis ", "hey jarvis, ", "hey jarvis. ",
+                   "okay jarvis ", "okay jarvis, ", "okay jarvis. ",
+                   "ok jarvis ", "ok jarvis, ", "ok jarvis. ")
 
 
 def _apply_voice_commands(text):
@@ -2044,22 +2063,168 @@ def _h_who_is(c, t, m):
     return CommandResult(handled=True, reply=line)
 
 
-def _h_remember(c, t, m):                                  # 3109-3118
-    note = m.group(1).strip()
-    # PERSISTENT store (jarvis.memory) — fixes the monolith's data loss.
-    # Key on the note text (monolith reused one "user_note" key, which
-    # silently overwrote every previous note). remember() also writes the
-    # semantic index, so a paraphrase finds it later.
+# ---- long-term memory: the remember family (settled 2026-09-04) --------
+#
+# THE FACT-VS-NOTE RULE. Two stores share these words: facts.json (long-
+# term memory, rendered into every prompt under "Known facts") and the
+# notes list (jarvis/tools/notes.py, read back by "what's on my notes").
+# Which one a sentence lands in is decided by its SHAPE, not its verb:
+#
+#   "that <clause>" introduces a FACT.
+#       remember that I graduate ...     note that my locker code is 4412
+#       jot down that I graduate ...     make a note that I graduate ...
+#   "of <thing>", a bare colon, "jot down <thing>", "take a note ..." are
+#   NOTES, exactly as before -- the notes rung ("take note", far below)
+#   keeps them because nothing here claims them:
+#       make a note of milk              note: buy milk
+#       jot down milk                    make a note: buy milk
+#   A bare head ("remember that", "note that down", "make a note of
+#   that", "put that in your memory please") stores NOTHING and asks.
+#   A question ("remember when ...?", "do you remember my ...", "what
+#   did I tell you to remember about ...") is a RECALL (_RECALL_RX).
+#
+# Measured on 7539478 (two refuters, 106 sentences): 24 of 55 must-store
+# shapes missed -- a comma or colon after the head, a leading "please" /
+# "can you", "okay jarvis" / "Jarvis.", a curly apostrophe, "do not
+# forget", "jot down" / "fyi" / "for the record" / "store this" -- and
+# 19 of 51 must-not shapes were filed: "remember that" stored the word
+# "that", "remember when we went to austin?" stored the question. Hence
+# the optional courtesy opener, the [,:] after the head, both
+# apostrophes, the negative lookahead, the two-word floor and the
+# question check below.
+#
+# A leading courtesy, the same set the other Tier-1 families accept.
+_MEM_COURTESY = (r"(?:(?:please|can you|could you|would you|will you|"
+                 r"i want you to|i need you to|i[’']d like you to|"
+                 r"i would like you to),?\s+)*")
+# Heads whose verb already means "file this": "that" is optional. The
+# memory forms go first in the alternation so "save this to your memory:"
+# is not read as the shorter "save this" with "to your memory:" as the fact.
+_MEM_FACT_HEADS = (
+    r"remember|keep in mind|bear in mind|(?:don[’']t|do not|never) forget|"
+    r"put (?:it|this|that) in (?:your )?memory|"
+    r"(?:save|add|store) (?:this|that|it) (?:to|in) (?:your )?memory|"
+    r"commit (?:this|that|it) to memory|commit to memory|"
+    r"store this|save this|for the record|fyi|memori[sz]e"
+)
+# Heads that also open a NOTE: "that" is REQUIRED here (the rule above).
+_MEM_NOTE_HEADS = (
+    r"take note|make a note|note|"
+    r"jot (?:this |that |it )?down|write (?:this |that |it )?down"
+)
+_MEM_HEADS = _MEM_FACT_HEADS + r"|" + _MEM_NOTE_HEADS
+# After the head, these are not the start of a fact: a to-do ("remember
+# to"), a question word (recall), "about" (recall), "down" (a bare
+# "note that down").
+_MEM_NOT_A_FACT = r"(?!(?:to|when|what|how|where|who|why|about|down|whether|if)\b)"
+# After the head: a comma/colon, or whitespace -- one of them, never
+# nothing, so the lookahead below sits on the first WORD of the fact. With
+# `\s*` it could sit on the space before "what" and "remember what i said
+# about the thesis" was filed as a fact (measured while building this).
+_MEM_SEP = r"(?:\s*[,:]\s*|\s+)"
+_MEM_FACT_RX = re.compile(
+    r"^" + _MEM_COURTESY +
+    r"(?:(?P<head>" + _MEM_FACT_HEADS + r")\b" + _MEM_SEP
+    + r"(?:(?:that|this)(?:\s*[,:]\s*|\s+))?"
+    r"|(?P<nhead>" + _MEM_NOTE_HEADS + r")\b" + _MEM_SEP + r"that(?:\s*[,:]\s*|\s+))"
+    + _MEM_NOT_A_FACT + r"(?P<fact>.+)$", re.I)
+# A head with nothing to file after it: that/this/it, "down", a courtesy.
+_MEM_ASK_RX = re.compile(
+    r"^" + _MEM_COURTESY + r"(?:" + _MEM_HEADS + r")\b"
+    r"\s*[,:]?\s*(?:(?:of|about)\s+)?(?:that|this|it)?\s*(?:down)?"
+    r"(?:[,\s]*(?:please|would you|will you|for me|jarvis|sir))*\s*[.!?]*$", re.I)
+# A matched fact is never split by _compound_hijack: the comma after the
+# head ("remember, my locker code is 4412"), the courtesy tail (", thanks")
+# and a coordinating "and" inside the fact ("my locker code is 4412 and my
+# parking spot is b14") are all the rung's own -- see the one-breath rule
+# in _compound_hijack.
+ASK_REMEMBER_LINE = "What shall I remember, sir?"
+
+
+class _RememberMatch:
+    """What _m_remember hands _h_remember: an ASK (bare head) or a FACT
+    with its cleaned text. Truthy either way, so the registry runs the
+    handler."""
+    __slots__ = ("kind", "fact")
+
+    def __init__(self, kind: str, fact: str = ""):
+        self.kind, self.fact = kind, fact
+
+    def __bool__(self):
+        return True
+
+
+def _m_remember(t):
+    if _MEM_ASK_RX.match(t):
+        return _RememberMatch("ask")
+    m = _MEM_FACT_RX.match(t)
+    if not m:
+        return None
+    raw_fact = m.group("fact")
+    if is_spoken_question(raw_fact):
+        return None                    # "remember i asked?" -- the model's
+    fact = clean_spoken_fact(raw_fact)
+    if is_spoken_pointer(fact):
+        return _RememberMatch("ask")   # "remember that for later" -- nothing
+    if len(fact.split()) < 2:          # to file yet, so ask, as a bare head does
+        return None                    # "remember me" -- not a fact
+    return _RememberMatch("fact", fact)
+
+
+def _h_remember(c, t, m):
+    if m.kind == "ask":
+        return CommandResult(handled=True, reply=ASK_REMEMBER_LINE, speak=True,
+                             status="Remember what?")
     memory = c._svc("memory")
-    memory.remember(note[:60], note)
-    # "remember that my advisor is Dr X" is a fact AND a contact (parsed
-    # from the raw casing: the title and the capital are the evidence).
-    rm = re.match(r"^remember (?:that )?(.+)$", _raw_command(c, t), re.I)
-    person = parse_person_statement(rm.group(1) if rm else note)
+    fact = m.fact
+    # The same match on the raw utterance keeps Whisper's casing (names,
+    # months) when the words agree with the lower-cased match.
+    rm = _MEM_FACT_RX.match(_raw_command(c, t))
+    if rm:
+        cased = clean_spoken_fact(rm.group("fact"))
+        if cased.lower() == fact.lower():
+            fact = cased
+    # ONE door to the store (jarvis.memory.store_fact_from_speech): clean,
+    # second person, six-word key. The remember TOOL calls the same helper.
+    stored = store_fact_from_speech(memory, fact)
+    # "remember that my advisor is Dr X" is a fact AND a contact.
+    person = parse_person_statement(fact)
     if person is not None and hasattr(memory, "add_person"):
         memory.add_person(person["alias"], person["name"], email=person["email"])
-    c._speak("Noted. I'll remember that.")
-    return CommandResult(handled=True, reply=f"Remembered: {note}")
+    key = fact_key(stored)
+    undo = None
+    if hasattr(memory, "forget"):
+        def undo() -> str:
+            memory.forget(key)
+            return "Forgotten, sir."
+    # The ack STATES the fact, spoken: a leaked "please" or a stray "that"
+    # is audible now, where "Noted. I'll remember that." hid it.
+    line = f"Noted, sir: {stored}."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"Remembered: {stored[:40]}", undo=undo)
+# REMAINING (stated, not built): a one-off heads-up -- "keep in mind I'm
+# on a call", "remember I'm not here tomorrow" -- is filed here as a
+# permanent fact and rendered into every future prompt. It wants a TTL'd
+# heads-up store instead: same helper, a `until` stamp (end of day by
+# default, "tonight"/"tomorrow"/"for an hour" parsed the way parse_since
+# parses the recall window), rendered under "Right now:" rather than
+# "Known facts" and dropped by format_for_context once expired. The rung
+# cannot yet tell a fact from a heads-up by shape alone.
+
+
+# "what did I tell you to remember (about X)?", "do you remember my locker
+# code?", "remember when we went to austin?", "recall X", "what did I say
+# about X". Every alternative is a question about the store; group "q" is
+# the topic, empty for "what did I tell you to remember" (read back the
+# latest facts). The remember matcher refuses these shapes (its negative
+# lookahead), so the order between the two entries is documentation.
+_RECALL_RX = re.compile(
+    r"^" + _MEM_COURTESY +
+    r"(?:recall"
+    r"|what did i (?:say|tell you|ask you)(?: to remember)?(?: about)?"
+    r"|do you remember(?: (?:what i (?:said|told you) about|when|that|about))?"
+    r"|remember (?:about|when|what i (?:said|told you) about|what|how|where|who|why))"
+    r"\b\s*(?P<q>.*?)[?.!]*$", re.I)
 
 
 # "When did I last talk to my advisor?" -- episodic recall over the activity
@@ -2126,8 +2291,18 @@ def _h_last_seen(c, t, m):
 
 
 def _h_recall(c, t, m):                                    # 3120-3133
-    query, since = parse_since(m.group(1).strip())
+    query, since = parse_since((m.group("q") or "").strip())
     memory = c._svc("memory")
+    if not query:
+        # "what did i tell you to remember": the latest three, read back.
+        facts = memory.get_all_facts() if hasattr(memory, "get_all_facts") else None
+        if not isinstance(facts, dict) or not facts:
+            return CommandResult(handled=True, speak=True,
+                                 reply="I have nothing stored yet, sir.")
+        latest = [str(e.get("value", "")) if isinstance(e, dict) else str(e)
+                  for _k, e in list(facts.items())[-3:]]
+        return CommandResult(handled=True, speak=True,
+                             reply="You told me: " + "; ".join(v for v in latest if v) + ".")
     results = memory.recall(query, since=since) if since is not None \
         else memory.recall(query)
     if results:
@@ -2517,9 +2692,14 @@ _ADJ_SCHEDULE_VERBS = frozenset(("extend", "shorten", "lengthen", "prolong", "po
 _ADJ_SOONER = frozenset((
     "shorten", "cut", "reduce", "take", "knock", "shave", "bring",
     "forward", "up", "earlier", "sooner", "shorter"))
+# "make a note of milk" is the note "milk", not "of milk" (it was, up to
+# 2026-09-04). "note that <clause>" / "make a note that <clause>" are FACTS
+# and never reach here: the memory family above claims them first (the
+# fact-vs-note rule at _m_remember); "that" is kept optional here for
+# "take a note that ...", which stays a note.
 _NOTE_RX = re.compile(
     r"^(?:take a note|make a note|note that|note down|jot down|write (?:this |that )?down|"
-    r"note)[:,]?\s+(?:that\s+)?(?P<text>.+?)[.!]*$", re.I)
+    r"note)[:,]?\s+(?:(?:that|of)\s+)?(?P<text>.+?)[.!]*$", re.I)
 _TODO_ADD_RX = re.compile(
     r"^(?:(?:add|put)\s+(?P<t1>.+?)\s+(?:to|on)\s+(?:my\s+)?(?:to-?do|todo|task|shopping)?\s*list"
     r"|(?:add|create|new)\s+(?:a\s+)?(?:to-?do|todo|task)(?:\s*:|\s+to|\s+for)?\s+(?P<t2>.+?)"
@@ -6739,8 +6919,15 @@ def _h_answer_question(c, t, m):                           # 3445-3452
 
 
 def _m_quick_command(t):                                   # 3454-3463
+    """A QUICK_COMMANDS phrase is a SHELL string, so its trigger is the
+    whole utterance ("commit", "please commit", "check gpu now"), never a
+    substring: at 7539478 `"commit" in t` fired `git add -A` on "jarvis
+    commit this to memory: i graduate december 10th 2026" (measured
+    2026-09-04 17:21)."""
+    s = (t or "").strip().lower().rstrip(".!")
     for phrase, shell_cmd in QUICK_COMMANDS.items():
-        if phrase in t:
+        if re.fullmatch(r"(?:please[,\s]+)?" + re.escape(phrase)
+                        + r"(?:[,\s]+(?:please|now))?", s):
             return (phrase, shell_cmd)
     return None
 
@@ -9022,40 +9209,38 @@ REGISTRY: list[Command] = [
     # membership without ever shadowing Spotify or the media keys.
     Command("read control", read_control_kind, _h_read_control,
             needs=("reader",)),
-    Command("workflow", lambda t: True, _h_workflow, needs=("workflows",)),
-    Command("suggest",
-            _m_contains("suggest", "what should i do", "any suggestions"),
-            _h_suggest, needs=("memory",)),
+    # ---- long-term memory, ABOVE "workflow" and "suggest" (2026-09-04).
+    # "suggest" is a bare substring test, so "remember that my advisor
+    # suggested I take the signals course" was answered with the habit
+    # line and stored nowhere; "workflow" takes every utterance and, far
+    # below, the QUICK_COMMANDS table fired a SHELL on "commit this to
+    # memory" (measured). Every matcher in this family is anchored at the
+    # start of the utterance, so the family shadows nothing itself.
     # People book ahead of the generic "remember": "my advisor is Dr X"
     # is a contact, not a free-text fact. The handler returns None (falls
     # through) unless the sentence is plainly about a person.
     Command("person", _m_re(r"(?:my|our) [a-z][a-z' -]{0,30}? is .+"),
             _h_add_person, needs=("memory",)),
-    # "remember to buy milk" is a to-do (the notes tool); only "remember
-    # (that) <fact>" lands in long-term memory.
+    # "remember to buy milk" is a to-do (the notes tool); "remember (that)
+    # <fact>", "note that <fact>", "put it in your memory that <fact>" and
+    # the rest of the family land in long-term memory. THE FACT-VS-NOTE
+    # RULE and the shapes are documented above _m_remember.
     # 2026-09-04: "Put it in your memory that I graduate December 10th" did not
     # match "remember", reached the model, and the model SAID "I have noted
     # that, sir" while nothing was stored; two days later he asked and Jarvis
     # searched his documents. The rung now takes the ways he says it.
-    Command("remember",
-            # 2026-09-04 19:20: "note that" and "make a note (that|of)" were
-            # here for six hours and never shipped -- measured, they pulled
-            # "make a note of milk" out of his NOTES list into long-term
-            # facts. The notes rung owns "note"; the fact-vs-note rule is
-            # branch memory-rung's to settle. Not before then.
-            _m_re(r"(?:remember(?: that)?|keep in mind(?: that)?|"
-                  r"don'?t forget(?: that)?|"
-                  r"put (?:it|this|that) in your memory(?: that)?) (?!to\b)(.+)"),
-            _h_remember, needs=("memory",)),
+    Command("remember", _m_remember, _h_remember, needs=("memory",)),
     # Before "recall": episodic ("when did I last …") vs semantic ("what did
     # I say about …"). Neither matcher claims the other's words, but the
     # pair is read together and the order records which owns "when".
     Command("last seen", _LAST_SEEN_RX.match, _h_last_seen, needs=("memory",)),
-    Command("recall",
-            _m_re(r"(?:recall|what did i (?:say|tell you) about|remember about)\s+(.+)"),
-            _h_recall, needs=("memory",)),
+    Command("recall", _RECALL_RX.match, _h_recall, needs=("memory",)),
     Command("who is", _m_re(r"who(?:'s| is) (my .+?)(?:'s)?$"),
             _h_who_is, needs=("memory",)),
+    Command("workflow", lambda t: True, _h_workflow, needs=("workflows",)),
+    Command("suggest",
+            _m_contains("suggest", "what should i do", "any suggestions"),
+            _h_suggest, needs=("memory",)),
     Command("recap", _RECAP_RX.match, _h_recap, needs=("brain",)),
     Command("windows",
             _m_exact("what's open", "whats open", "list windows",
@@ -13201,6 +13386,19 @@ class Commander:
         bare = strip_jarvis_prefix(text)
         if bare is None:
             bare = strip_address(text)
+        # A remembered fact is ONE breath, however many commas or "and"s
+        # it holds -- the rule split_clauses already states for "remind me
+        # to buy milk and eggs". Measured on 1641fb3: "remember that my
+        # locker code is 4412 and my parking spot is b14" was split here
+        # because the tail has the person rung's shape; the person rung
+        # then declined it and the second half vanished -- no store, no
+        # note, no model turn. (Before that, on 861e184, the comma after
+        # the head split "remember, my locker code is 4412" into an ask
+        # plus a people-book miss.) So the fact runs to the end of the
+        # utterance, courtesy tail aside, and a command after the "and" is
+        # filed inside it rather than run.
+        if cmd.name == "remember":
+            return False
         parts = split_clauses(bare)
         if len(parts) != MAX_CLAUSES:
             return False
