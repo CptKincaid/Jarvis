@@ -535,3 +535,29 @@ def test_the_page_builds_the_same_command_the_voice_path_hands_over():
     from jarvis import enrolentry as ee
     assert up.forget_face_command("pemberton") == \
         ee.command_line("pemberton", delete=True)
+
+
+def test_no_press_reaches_a_write_without_asking_the_gate_first():
+    """THE WHOLE PROMISE OF THE LOCK, checked structurally rather than one
+    button at a time. Every method that calls ``_write`` must call
+    ``_guard`` first -- the app seam refuses a BROKEN registry but it does
+    not know about this page's unlock dwell, so a press that skipped the
+    guard would simply be performed."""
+    import ast
+    tree = ast.parse(open(up.__file__).read())
+    page = [n for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef) and n.name == "UsersPage"][0]
+    callers = []
+    for fn in page.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        body = ast.unparse(fn)
+        if "self._write(" in body and fn.name != "_write":
+            callers.append((fn.name, body))
+    assert {n for n, _b in callers} == {"_forget_confirm", "_role_pressed",
+                                        "_role_confirm", "_create_pressed"}, \
+        [n for n, _b in callers]
+    for name, body in callers:
+        assert "self._guard(" in body, name
+        # ...and the guard comes FIRST, before anything is handed over
+        assert body.index("self._guard(") < body.index("self._write("), name

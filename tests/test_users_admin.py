@@ -262,3 +262,75 @@ def test_the_terminal_tool_refuses_to_write_over_a_corrupt_registry(tmp_path,
     ok, why = mod._authorise(Registry.load(bad))
     assert ok is False
     assert str(bad) in why
+
+
+# ================================ the terminal tool still takes consent
+def _cli():
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location(
+        "jarvis_people_consent", pathlib.Path(gt.__file__).parent.parent
+        / "scripts" / "jarvis_people.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Args:
+    def __init__(self, **kw):
+        self.label = kw.get("label", "pemberton")
+        self.name = kw.get("name", "Pemberton")
+        self.role = kw.get("role", ROLE_KNOWN)
+        self.face = kw.get("face", "")
+        self.face_dim = 0
+        self.voice = False
+        self.confirm_owner = kw.get("confirm_owner")
+
+
+def test_adding_a_guest_at_a_terminal_still_asks_them_to_type_their_name(
+        tmp_path, monkeypatch, capsys):
+    mod = _cli()
+    reg = _reg(tmp_path)
+    monkeypatch.setattr(cs, "_isatty", lambda _s: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: "no")
+    code = mod.do_add(reg, None, _Args())
+    out = capsys.readouterr().out
+    assert code == 2
+    assert reg.person("pemberton") is None
+    assert "CONSENT" in out
+    assert "pemberton" in out
+    # the words match what `add` actually stores: a row, not a face
+    assert "128" not in out
+
+
+def test_a_guest_who_types_their_own_name_is_enrolled_as_a_typed_consent(
+        tmp_path, monkeypatch, capsys):
+    mod = _cli()
+    reg = _reg(tmp_path)
+    monkeypatch.setattr(cs, "_isatty", lambda _s: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: "pemberton")
+    assert mod.do_add(reg, None, _Args()) == 0
+    person = reg.person("pemberton")
+    assert person is not None
+    assert person.consent == cs.HOW_TERMINAL
+    assert person.consent != cs.HOW_CONSOLE
+
+
+def test_a_pipe_still_cannot_give_a_guests_consent(tmp_path, monkeypatch,
+                                                   capsys):
+    mod = _cli()
+    reg = _reg(tmp_path)
+    monkeypatch.setattr(cs, "_isatty", lambda _s: False)
+    assert mod.do_add(reg, None, _Args()) == 2
+    assert reg.person("pemberton") is None
+    assert "terminal" in capsys.readouterr().out
+
+
+def test_the_owner_adding_himself_at_a_terminal_asks_nobody(tmp_path,
+                                                            monkeypatch):
+    mod = _cli()
+    path = tmp_path / "fresh.json"
+    reg = Registry.load(path)
+    monkeypatch.setattr(cs, "_isatty", lambda _s: True)
+    assert mod.do_add(reg, None, _Args(label="alderman", role=ROLE_OWNER)) == 0
+    assert reg.person("alderman").consent == cs.HOW_OWNER
