@@ -528,6 +528,53 @@ def test_a_dead_ollama_is_still_just_the_class_name(wired):
     assert "URLError" in res.text
 
 
+
+# ask_screen names FOUR classes at the transport seam (screen.py, the clause
+# under the HTTPError one): URLError, OSError, ValueError, TimeoutError.
+# MEASURED on this interpreter (CPython 3.12.3): socket.timeout IS
+# TimeoutError, TimeoutError is an OSError subclass, and URLError is one too
+# -- so that tuple is really (OSError, ValueError), and the two tests above
+# already inject HTTPError and URLError.  These are the classes nothing
+# pinned: a timeout, a bare socket error, and a body that is not JSON.
+@pytest.mark.parametrize("failure, name", [
+    (TimeoutError("timed out"), "TimeoutError"),      # == socket.timeout here
+    (OSError("connection reset by peer"), "OSError"),
+    (ValueError("body is not JSON"), "ValueError"),
+])
+def test_a_transport_failure_speaks_out_of_the_named_vision_path(wired, caplog,
+                                                                 failure, name):
+    """Not "does he get an excuse" -- he gets one either way, because
+    ``screen_qa`` has an ``except Exception`` at the tool boundary that also
+    returns NO_VISION_LINE.  What is pinned here is WHICH path produced it.
+
+    The named path (VisionUnavailable) puts the model and the setup hint in
+    ``res.text`` and logs one WARNING.  The tool-boundary catch-all puts
+    ``vision failed:`` there instead -- and for a bare ``TimeoutError()``,
+    whose ``str()`` is empty, that text is the word "failed" and nothing
+    else -- then logs a full traceback.  That difference is the whole of the
+    LIVE 2026-08-31 lesson two tests up: the excuse was spoken correctly and
+    the RECORD of why was a class name, so the one-line config fix was
+    invisible.  A 25 s call to a local vision model fails by timing out more
+    often than by any other route, and it was the one class in that tuple
+    with nothing holding it on the diagnosable path."""
+    vision, _grabbed = wired
+    vision.fail = failure
+    wanted = scr.candidate_models(None)[0]
+    with caplog.at_level(logging.DEBUG, logger="jarvis"):
+        res = tool().call("screen_qa", {})
+    assert res.ok is False
+    assert res.speak == scr.NO_VISION_LINE
+    # The reason and the fix ride in the recorded text; the catch-all can
+    # produce neither -- it never sees which model was asked.
+    assert name in res.text
+    assert wanted in res.text
+    assert scr.SETUP_HINT in res.text
+    assert "vision failed:" not in res.text
+    # ...and a transport failure is a warning with a hint, not a traceback.
+    assert any(r.levelno == logging.WARNING and scr.SETUP_HINT in r.getMessage()
+               for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
 def test_http_error_detail_survives_a_body_that_is_not_json():
     """A proxy's HTML page, or a body already read: never a second failure
     inside the error path."""
