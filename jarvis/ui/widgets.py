@@ -57,6 +57,23 @@ def px(v) -> int:
     return round(v * _SCALE[0])
 
 
+def canvas_size(c: tk.Canvas, w_min: int = 0, h_min: int = 0) -> tuple:
+    """A canvas' INTERIOR size in the coordinates its items are drawn in.
+
+    ``winfo_width()`` counts the highlight border on BOTH sides, and every
+    canvas here has one (the focus ring). Drawing to ``winfo_width() - k``
+    therefore aims k-1 px PAST the last visible column and the far edge is
+    clipped away -- MEASURED 2026-09-05 on the settings drawer: the holo
+    buttons' ring ended 1 px outside their own canvas while the toggles'
+    track ended 5 px inside theirs, which is the 6 px the control column
+    was out of true. An unmapped canvas reports 1, so the caller's own
+    requested size is the floor.
+    """
+    bd = 2 * (int(c.cget("highlightthickness") or 0) + int(c.cget("bd") or 0))
+    return (max(int(c.winfo_width()) - bd, w_min),
+            max(int(c.winfo_height()) - bd, h_min))
+
+
 def ui_font(size: int, weight: str = "normal") -> tuple:
     family = theme.font(size, weight)[0]
     return (family, -max(8, round(size * _FONT_SCALE[0])), weight)
@@ -631,8 +648,11 @@ class RoundButton(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
-        w = max(self.winfo_width(), self._btn_w)
-        h = max(self.winfo_height(), self._btn_h)
+        # INTERIOR size: the ring used to be laid out on winfo_width(), so
+        # every button drew its right and bottom edge outside its own
+        # canvas and had them clipped (measured 09-05: the ink ended 1 px
+        # PAST the widget while a toggle's ended 5 px inside it).
+        w, h = canvas_size(self, self._btn_w, self._btn_h)
         outline = self._spec.get("outline", "")
         if self._state == "disabled":
             fill, fg = ("" if outline else theme.RAISED), theme.FAINT
@@ -727,7 +747,10 @@ class Toggle(tk.Canvas):
         on_f = self._pos
         track = theme.CYAN_SOFT if on_f > 0.5 else theme.LINE
         knob = theme.CYAN if on_f > 0.5 else theme.MUTED
-        round_rect(self, px(1), px(3), self.W - px(2), self.H - px(4),
+        # The same inset the button's ring uses, so a toggle and a button
+        # in one control column share an ink edge (they were 6 px apart).
+        inset = max(1, px(1))
+        round_rect(self, inset, px(3), self.W - inset - 1, self.H - px(4),
                    radius=(self.H - px(7)) / 2, fill=track, outline="")
         r = (self.H - px(10)) / 2
         cx = px(4) + r + on_f * (self.W - 2 * (px(4) + r))
@@ -877,7 +900,7 @@ class Slider(tk.Canvas):
     def _span(self) -> tuple:
         """(x0, x1) of the track: the handle's centre never leaves it, so
         the knob cannot be half off the widget at either end."""
-        w = max(self.winfo_width(), self._len)
+        w = canvas_size(self, self._len)[0]
         r = px(type(self).KNOB)
         return r + 1, max(r + 2, w - r - 2)
 
@@ -916,7 +939,9 @@ class Slider(tk.Canvas):
     def _draw(self):
         self.delete("all")
         x0, x1 = self._span()
-        y = max(self.winfo_height(), self._h) / 2
+        # the INTERIOR centre: winfo_height() counts the focus ring on both
+        # sides, so a track laid out on it sits 2 px below the row's middle
+        y = canvas_size(self, self._len, self._h)[1] / 2
         stroke = max(1, px(type(self).TRACK))
         self.create_line(x0, y, x1, y, fill=theme.LINE, width=stroke)
         cx = x0 + (x1 - x0) * self._fraction()

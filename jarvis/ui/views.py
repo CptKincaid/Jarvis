@@ -2288,6 +2288,16 @@ class SettingsDrawer(tk.Frame):
         other row, which is what made the gap under "Calibrate noise"
         bigger than the gaps around it. Classic keeps the left-anchored
         button packed straight into the section box.
+
+        MEASURED off the rendered drawer at his window (1040x1760, S=2),
+        right edge of the INK: buttons 1005 and toggles 999 when that
+        sentence was first written -- widget geometry agreed and the
+        drawing did not, because RoundButton laid its ring out on
+        winfo_width() and had the far edge clipped (jarvis/ui/widgets.py,
+        canvas_size). Now: buttons 1001, toggles 1000, pickers 1000. The
+        slider VALUE ends at 1004 because that is where a mono digit's ink
+        ends, and the section rules run to 1007, which is the column they
+        are all measured against.
         """
         if theme.LOOK != "holo":
             btn = RoundButton(box, text=label, kind="default",
