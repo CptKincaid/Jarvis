@@ -296,14 +296,21 @@ def test_the_comma_whisper_puts_before_at_does_not_break_the_parse():
         == "qzvkbw7@example.com"
 
 
-def test_a_punctuated_domain_is_still_refused_and_that_is_deliberate():
-    """UNCHANGED, and out of this fix's scope: "example.com" said as a
-    punctuated domain rather than "example dot com" is refused by the
-    parser on purpose (see the _SAID_TLDS note in jarvis/outbox.py --
-    ordinary prose has the same skeleton). Folding the spelled half does
-    not and must not overturn that ruling; it is a separate decision."""
+def test_a_punctuated_domain_is_read_when_the_dot_is_tight_his_ruling_b():
+    """OVERTURNED BY HIM, 2026-09-05. This test used to pin the opposite
+    -- "example.com" said as one word was refused on purpose, because
+    ordinary prose has the same skeleton (the _SAID_TLDS note in
+    jarvis/outbox.py). He ruled that it must count as a domain: it is the
+    exact shape whisper wrote his own domain down in, and the refusal cost
+    him the RE-ASK as well as the draft, so he got nothing at all.
+
+    A SPACED punctuation is still refused, which is what keeps the prose
+    corpus in tests/test_contacts.py byte-identical: a sentence boundary
+    always has a space after the full stop."""
     from jarvis import outbox
-    assert outbox.parse_address("q-z-v, k-b-w-7, at example.com.") == ""
+    assert outbox.parse_address("q-z-v, k-b-w-7, at example.com.") \
+        == "qzvkbw7@example.com"
+    assert outbox.parse_address("dana at gmail. com") == ""
 
 
 def test_a_mixed_spelled_and_spoken_address_parses():
@@ -657,3 +664,69 @@ def test_ruling_a_the_dangling_letter_rule_is_kept_on_purpose(phrase):
     catches the first character of an address he is starting to spell.
     This is a decision, not a defect: do not "fix" it."""
     assert spelling.spelling_run(phrase) == 1
+
+
+# ---------------------- (9) HIS RULING (B): a run-together domain -------
+def test_a_run_together_domain_is_a_domain_now():
+    """"dana at example.com" -- whisper's own transcript of a said domain
+    -- was refused outright, which cost him not just the draft but the
+    RE-ASK: unresolved_address had nothing to hand back either."""
+    from jarvis import outbox
+    assert outbox.parse_address("dana at example.com") == "dana@example.com"
+
+
+def test_a_run_together_domain_reads_inside_a_sentence():
+    from jarvis import outbox
+    raw = "send it to dana at example.com please"
+    span = outbox.address_span(raw)
+    assert span is not None
+    addr, start, end = span
+    assert addr == "dana@example.com"
+    assert raw[start:end] == "dana at example.com"
+
+
+def test_a_run_together_domain_survives_a_trailing_full_stop():
+    from jarvis import outbox
+    assert outbox.parse_address("dana at example.com.") == "dana@example.com"
+
+
+def test_a_spelled_local_part_with_a_run_together_domain_parses():
+    """His fourth fragment as whisper actually wrote it: two spelled
+    groups, whisper's comma, and the domain as ONE WORD. Both rulings in
+    one string -- and it used to parse to nothing at all."""
+    from jarvis import outbox
+    assert outbox.parse_address("q-z-v, k-b-w-7, at example.com.") \
+        == "qzvkbw7@example.com"
+
+
+def test_the_read_back_of_a_run_together_domain_says_it_the_long_way():
+    """What he HEARS back is unchanged -- the read-back speaks an address
+    the same way it always did -- and the parser reads its own words."""
+    from jarvis import outbox
+    addr = outbox.parse_address("dana at example.com")
+    assert outbox.spoken_address(addr) == "dana at example dot com"
+    assert outbox.parse_address(outbox.spoken_address(addr)) == addr
+
+
+def test_a_run_together_domain_is_masked_out_of_a_log_line():
+    from jarvis import outbox
+    assert outbox.mask_addresses("send it to dana at example.com") == \
+        "send it to d… at example.com"
+
+
+@pytest.mark.parametrize("prose", [
+    "meet me at 4.30",
+    "the meeting is at 3.5 tomorrow",
+    "I'm at home. See you at six.",
+    "we stopped at noon. Then we left",
+    "look at me. In the morning",
+    "version 3 dot 12 at the latest",
+])
+def test_a_full_stop_in_prose_is_still_not_a_domain(prose):
+    """The guard on ruling (B): a domain read from a punctuated dot is
+    read only when the dot is TIGHT (no space on either side) and the top
+    level is alphabetic. A sentence boundary has a space after the stop,
+    and "4.30" has no top level, so prose is untouched."""
+    from jarvis import outbox
+    assert outbox.parse_address(prose) == ""
+    assert outbox.address_span(prose) is None
