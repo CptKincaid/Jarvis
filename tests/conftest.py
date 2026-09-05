@@ -155,7 +155,18 @@ _blocked_player.calls = []
 
 
 # CONFIG fields the suite must not read off his live box. Add a name here
-# when a setting he can flip changes what a test asserts.
+# when a setting he can flip changes what a test asserts. This is the ONE
+# such pin: the 09-05 integration brought a second autouse fixture setting
+# the same field to the same value (_config_defaults_not_his_settings, from
+# jarvis-v3), written the same day for the same incident. Harmless and
+# redundant -- and redundant suite-wide autouse state is how the third one
+# gets added without anybody noticing the first two. This one was kept
+# because it restores inside try/finally (a throw into the fixture at the
+# yield cannot leave his setting stamped on CONFIG for the rest of the
+# session) and because the field list is a named constant with this note on
+# it rather than a tuple buried in a body.
+# tests/test_filled_yes.py::test_exactly_one_autouse_fixture_pins_the_live_config
+# holds the line.
 _PINNED_CONFIG_FIELDS = ("filler_prompt_hint",)
 
 
@@ -172,6 +183,13 @@ def _pin_live_tuning_settings():
     and three in test_transcriber_prompt), each of them asserting the
     preview's initial_prompt equals the vocab prompt -- true only while
     the hint is off, which is how it ships.
+
+    Nothing was broken and he did nothing wrong: turning the hint on was a
+    correct change to his own box, made because the probe measured that the
+    filler hold does nothing without it. The fault is a test that reads his
+    settings, which is the same fault as a test that reads the wall clock,
+    and it makes the suite unusable as a merge gate for anyone whose
+    machine is configured differently from the author's.
 
     Pinned to the DATACLASS DEFAULT rather than to a literal, so the pin
     follows the shipped value instead of freezing today's. A test that

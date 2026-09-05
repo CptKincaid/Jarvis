@@ -1024,3 +1024,55 @@ def test_the_ast_sweep_finds_no_unstripped_answer_grammar_left():
 def cm_path():
     import jarvis.commander
     return jarvis.commander.__file__
+
+
+# ===================================================================
+# 13. ONE pin on CONFIG, not two (the integration collision)
+# ===================================================================
+def test_exactly_one_autouse_fixture_pins_the_live_config():
+    """The merge brought TWO autouse fixtures pinning the same field.
+
+    Both were written the same day for the same incident -- he turned
+    CONFIG.filler_prompt_hint on by hand at 11:5x on 2026-09-05 (a correct
+    change to his own box: the probe had measured that the filler hold
+    does nothing without it) and four tests in test_transcriber_prompt.py
+    and test_prompt_echo.py went red on a tree where nothing had been
+    committed. Two autouse fixtures setting one field to one value are
+    harmless and redundant, and redundant suite-wide autouse state is how
+    the NEXT one gets added without anybody noticing the first.
+
+    ``_pin_live_tuning_settings`` is the one kept, on two measurable
+    counts: it restores inside try/finally, so a throw into the fixture at
+    the yield cannot leave his setting stamped on CONFIG for the rest of
+    the session; and the field list is a NAMED module constant with the
+    instruction to extend it, rather than a tuple buried in the body.
+    """
+    import ast
+    import pathlib
+    tree = ast.parse((pathlib.Path(__file__).parent / "conftest.py").read_text())
+    pinners = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        autouse = any("autouse" in ast.unparse(d) for d in fn.decorator_list)
+        if autouse and "filler_prompt_hint" in ast.unparse(fn):
+            pinners.append(fn.name)
+    # the constant lives outside the function, so count that spelling too
+    src = ast.unparse(tree)
+    if "_PINNED_CONFIG_FIELDS" in src:
+        for fn in ast.walk(tree):
+            if (isinstance(fn, ast.FunctionDef)
+                    and any("autouse" in ast.unparse(d) for d in fn.decorator_list)
+                    and "_PINNED_CONFIG_FIELDS" in ast.unparse(fn)
+                    and fn.name not in pinners):
+                pinners.append(fn.name)
+    assert pinners == ["_pin_live_tuning_settings"], pinners
+
+
+def test_the_pin_is_the_shipped_default_while_a_test_runs():
+    """And it pins to the DATACLASS default, so it tracks the code rather
+    than freezing today's value."""
+    from dataclasses import fields
+    from jarvis.config import Config
+    default = {f.name: f.default for f in fields(Config)}["filler_prompt_hint"]
+    assert CONFIG.filler_prompt_hint == default
