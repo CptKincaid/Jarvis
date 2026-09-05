@@ -1066,10 +1066,17 @@ class Syncer:
         if self._down_reason:
             lines.append(f"link      DOWN: "
                          f"{remote.fail_line(self.rconf, self._down_reason)}")
-            lines.append("          Your files are safe where they are; I "
-                         "keep trying, more slowly.")
+            since = time.strftime("%H:%M:%S", time.localtime(self._down_since))
+            lines.append(f"          not answering since {since}. Your files "
+                         f"are safe where they are;")
+            lines.append("          I keep trying, more slowly.")
+        elif self._last_ok:
+            lines.append("link      OK, last answered " + time.strftime(
+                "%H:%M:%S", time.localtime(self._last_ok)))
         else:
-            lines.append("link      OK")
+            # NEVER claim health that has not been measured.  A fresh
+            # process has not spoken to HPCOMPUTER yet and must say so.
+            lines.append("link      not checked yet")
         lines.append(f"outbox    {len(waiting)} waiting"
                      if waiting else "outbox    empty")
         for name in waiting[:10]:

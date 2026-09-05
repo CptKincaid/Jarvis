@@ -861,3 +861,26 @@ def test_the_fail_counter_is_cleared_when_a_file_finally_goes(home):
     s.push_once()
     assert not [k for k in s.ledger.fails if k.startswith("push:flaky.pdf")]
     assert (home / "Sent" / "flaky.pdf").exists()
+
+
+def test_the_status_never_claims_a_link_it_has_not_checked(home):
+    """A fresh process has not spoken to HPCOMPUTER; saying "OK" there is
+    the confident-wrong-number failure this project has had twice."""
+    s = syncer(home, FakeTransport())
+    assert "not checked yet" in s.status_text()
+    assert "link      OK" not in s.status_text()
+    s.run_pass()
+    assert "link      OK, last answered" in s.status_text()
+
+
+def test_a_down_status_says_since_when(home):
+    t = FakeTransport()
+    t.fail = "unreachable"
+    drop(home, "waiting.pdf", b"a")
+    s = syncer(home, t)
+    s.run_pass()
+    first = s._down_since
+    for _ in range(3):
+        s.run_pass()
+    assert s._down_since == first          # the outage clock does not reset
+    assert "not answering since" in (home / "status.txt").read_text()
