@@ -6708,6 +6708,23 @@ class JarvisApp:
             return keep % "no Message-ID came back", True
         hashed = pp.hash_secret(new)
         del new
+        # RE-READ BEFORE WRITING. self.gate.registry is the copy loaded at
+        # BOOT, and the save below writes that whole object over the file --
+        # so anything added to the people book since this process started
+        # was silently overwritten by a memory that never knew about it.
+        # MEASURED 2026-09-05: one press of "Email me a new Knightfall code"
+        # DELETED a person enrolled at a terminal since boot, and REVERTED a
+        # passphrase set at a terminal to empty. The book has no history and
+        # no backup -- jarvis/ui/users_page.py says so on screen -- so the
+        # row was simply gone. Same rule the Users tab now follows: a write
+        # decides from the file as it is AT THE WRITE, never from a memory
+        # of it. Pinned by tests/test_knightfall_stale_registry.py.
+        try:
+            self.gate.reload()
+        except Exception:                          # noqa: BLE001 - a line, not a raise
+            log.exception("knightfall: the people book could not be re-read; "
+                          "not writing a stale copy over it")
+            return keep % "the people book could not be re-read", True
         registry = getattr(self.gate, "registry", None)
         person = registry.person(who) if registry is not None else None
         old = person.code_hash if person is not None else ""
