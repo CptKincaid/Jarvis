@@ -428,6 +428,27 @@ If the machine was off or Jarvis was closed when something was due: less
 than an hour late fires at once ("While I was down, sir: …"), later than
 that is announced as missed.
 
+### Restarting him from the settings drawer
+
+Every code merge and every `assistant.json` edit needs a restart to take
+effect. The **System** section of the settings drawer ends with a line that
+says whether one would change anything — `Running 7539478, on disk 7539478
+(up to date)`, or `Running ac934b0, on disk 7539478 (2 commits behind)`,
+with `, uncommitted changes` appended when the tree is dirty and `Running
+unknown` when there is no git — and a **Restart Jarvis** button under it.
+The button arms on the first press (it reads *Press again to restart* for
+5 s) and restarts on the second, so a stray tap in a scrolling drawer never
+costs you the assistant. He says "Back in a moment, sir.", a small
+detached helper (`python -m jarvis.relaunch`) waits for the old process to
+be gone — patiently for 20 s, then SIGTERM, then SIGKILL — and launches
+`python -m jarvis.app` once, from the checkout, with the same environment.
+The whole hand-over is written, one timestamped line per step, to
+`/tmp/vss_voice/relaunch.log`; if the new Jarvis did not come up, that file
+says why (a failed launch is logged and never retried). It is a plain
+`-m jarvis.app`, not the `scripts/jarvis-autostart` wrapper: that wrapper
+only exists to wait out the Breeze sidecar's first start at login, and by
+the time you press the button the sidecar is already up.
+
 ---
 
 ## 11. Spotify (music)
