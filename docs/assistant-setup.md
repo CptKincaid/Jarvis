@@ -4252,3 +4252,50 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
   face baseline needs three detections in the last five seconds.
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
+
+## 84. "Um" buys you time (the filler hold)
+
+He used to close the mic 0.8 s after your last sound (`endpoint_silence`),
+so a thinking pause after "set a timer for, um…" ended the capture
+mid-sentence and he acted on half a command. Now the live preview — the
+ghost card that types while you speak — reports its newest decode to the
+recorder, and when that decode **ends on a filler** (um, uh, hmm, er…) and
+nothing has been heard since, the stop waits longer. That extra wait is a
+*hold*. All four settings live in jarvis/config.py (`Config`), not in
+assistant.json:
+
+| setting | default | what it does |
+|---|---|---|
+| `filler_hold` | `true` | the feature; `false` is the old 0.8 s stop |
+| `filler_hold_s` | `1.5` | how much longer a pause after an um may last — 0.8 + 1.5 = 2.3 s |
+| `filler_max_holds` | `3` | holds per capture; after that the ordinary stop, so an "um… um… um…" cannot hold the mic forever |
+| `filler_prompt_hint` | `false` | adds "Um, uh, hmm, er." to the *preview's* Whisper prompt so it writes fillers down instead of dropping them. **Unmeasured — ships off; the probe below decides.** |
+
+The hint never reaches the final transcription: your commands stay clean
+of ums whatever the preview saw.
+
+What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
+per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one
+fired (the same field is in turns.jsonl), so a week of turns can say how
+often it happened without anyone reading a transcript.
+
+**The limit, stated plainly.** The preview re-decodes every 0.9 s and the
+stop is due at 0.8 s, so an um said right after the last preview may never
+be decoded before the stop is due — he does not decode it at that moment
+(that would add a decode to every turn); he stops as before. How often
+that race is lost is a number nobody has yet, and the only place to get
+it is a microphone:
+
+```bash
+~/vss_env/bin/python scripts/filler_probe.py            # 4 takes: hint off, on, off, on
+~/vss_env/bin/python scripts/filler_probe.py --show     # also print each transcript's words
+```
+
+Run it with Jarvis stopped (a live Jarvis would answer what you say to
+it). Before each take it tells you what to say; after each it prints the
+fillers the preview saw and when, the last speech second, the gap that
+ended the capture, holds fired, whether the tail was ever decoded, and the
+transcript's *length* — then asks whether you were cut off. It never
+saves audio and never prints the words unless you pass `--show`. Paste
+back the four summary lines at the end; they settle `filler_hold_s`,
+`filler_prompt_hint`, and whether the race above is worth fixing.
