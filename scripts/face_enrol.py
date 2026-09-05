@@ -273,8 +273,18 @@ def _isatty(stream) -> bool:
         return False
 
 
-def consent(label: str, owner: str, root, say, args) -> tuple:
+def consent(label: str, owner: str, root, say, args, lines=None) -> tuple:
     """``(ok, how)``. Enrolling somebody else takes THEIR agreement.
+
+    ``lines`` EXISTS SO THERE IS ONE CONSENT RULE AND NOT TWO. The RULE is
+    everything below -- no --json, no --auto, both ends must be a terminal,
+    and they type their own name -- and it is identical whatever is being
+    measured. The WORDING is not: ``CONSENT_LINES`` says "a measurement of
+    their FACE: 128 numbers", and printing that over a voice enrolment would
+    be a false statement of what is being stored, which is worse than a second
+    rule. So scripts/voice_enrol.py passes its own text through here rather
+    than copying this function; a second copy is two rules that can drift,
+    which is facegallery's own argument for not exporting ``_LABEL_RE``.
 
     NOT A COMMENT AND NOT A README LINE. Storing a second person's biometric
     data without them knowing is the failure this flow exists to prevent, so
@@ -326,6 +336,15 @@ def consent(label: str, owner: str, root, say, args) -> tuple:
     # The words, the prompt and the "type your own name" rule, from the one
     # file that holds them. The three refusals above are this taker's own
     # preconditions and stay here.
+    #
+    # RE-MERGE NOTE, 2026-09-05. This lane still carried the inline version
+    # -- print CONSENT_LINES, input(), compare, return "typed". jarvis-v3
+    # has since moved that ceremony into jarvis/consent.py so the Users tab
+    # and this script ask in the same words. The two are behaviourally the
+    # same, checked rather than assumed: consent.HOW_TERMINAL IS the string
+    # "typed", and nothing in the tree passes ``lines=`` to this function --
+    # the parameter is declared and never given. So the shared taker wins
+    # on factoring, not on behaviour, and no consent rule changed here.
     return shared_consent.take_at_terminal(
         label, what=shared_consent.WHAT_FACE, fields=fields, say=say,
         isatty=lambda _s: True)

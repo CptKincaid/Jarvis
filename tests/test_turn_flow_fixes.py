@@ -277,7 +277,7 @@ def _wire_dispatch(a, **over):
     a.commander = SimpleNamespace(handle=lambda t, s, **k: _result(**over))
     a._emit_result = lambda r: r
     a._turn_after_result = lambda r: None
-    a._after_dispatch = lambda t, s, r: None
+    a._after_dispatch = lambda t, s, r, addressee=None: None
 
 
 def test_a_quiet_cli_turn_mutes_only_its_own_answer(monkeypatch, tmp_path):
