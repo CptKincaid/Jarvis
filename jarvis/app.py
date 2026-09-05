@@ -224,6 +224,15 @@ KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
 KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
 KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
 KNIGHTFALL_COOLDOWN_S = 60.0
+# The rotation's failure lines carry the exception's TYPE, never its words,
+# because that text came from a transport that had just been handed a code.
+# This one is different in a way worth writing down: it is raised by
+# mail.notice_destination BEFORE anything reaches a transport, so it can be
+# a sentence he can act on. It is still a CONSTANT rather than str(exc), so
+# there is no channel from an exception's words to the toast -- and it names
+# no address, because the toast is on screen.
+KNIGHTFALL_BAD_DESTINATION = ("the notice address in your config is not an "
+                              "email address")
 # ONE ROTATION AT A TIME. check -> open -> mail -> store is not atomic, and
 # the drawer runs each press on its own thread: two presses measured
 # (verdict, 2026-09-05) both passed the check against the OLD hash, both
@@ -6580,6 +6589,45 @@ class JarvisApp:
                 self._knightfall_new_ts = t
             return line
 
+    def knightfall_status(self) -> dict:
+        """What the drawer's Knightfall caption needs, for
+        ui.views.format_knightfall_status. Three keys:
+
+        * ``to`` -- the MASKED destination the next code would go to, or
+          "" when there is none. Masked because the drawer is on screen
+          and a full address does not need to be.
+        * ``problem`` -- a fixed sentence when his configured destination
+          is not usable, "" otherwise.
+        * ``setup`` -- where to configure a mailbox, when there is none.
+
+        WHY IT EXISTS AT ALL. The caption under the button was the flat
+        sentence "Using it emails you the next one" -- which was false in
+        the state he was actually in (zero mail accounts configured,
+        measured 2026-09-05): the button mails nothing, and the promise
+        was made before he pressed. A read only: no socket, no code.
+        """
+        from jarvis.tools import mail as mail_mod
+        out = {"to": "", "problem": "", "setup": ""}
+        try:
+            accounts = mail_mod.mail_accounts(self.assistant)
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the mail accounts could not be read")
+            accounts = []
+        if not accounts:
+            try:
+                out["setup"] = mail_mod.setup_line(self.assistant)
+            except Exception:                      # noqa: BLE001 - config
+                log.exception("knightfall: the setup line could not be read")
+            return out
+        try:
+            out["to"] = mail_mod._mask_address(
+                mail_mod.notice_destination(accounts[0]))
+        except mail_mod.NoticeAddressInvalid:
+            out["problem"] = KNIGHTFALL_BAD_DESTINATION
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the notice destination is unreadable")
+        return out
+
     def _knightfall_rotate(self, who, *, mail=None, smtp=None,
                            accepted=False):
         """Generate -> mail FIRST -> store ONLY on a Message-ID. Returns
@@ -6602,8 +6650,11 @@ class JarvisApp:
         """
         head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
         keep = head + "the code stays as it is (mail: %s)."
+        # The REAL module either way: `mail` is the seam a test substitutes
+        # for the transport, but the destination and the refusal that goes
+        # with it are decided against the real one (see outbox.send_notice).
+        from jarvis.tools import mail as mail_mod
         if mail is None:
-            from jarvis.tools import mail as mail_mod
             mail = mail_mod
         try:
             accounts = mail.mail_accounts(self.assistant)
@@ -6618,6 +6669,17 @@ class JarvisApp:
         try:
             msgid = outbox.send_notice(account, KNIGHTFALL_SUBJECT, body,
                                        smtp=smtp, mail=mail)
+        except mail_mod.NoticeAddressInvalid:
+            # HIS CONFIG, not the transport: notice_destination refused a
+            # destination that is not an address, before a socket was
+            # opened. Nothing was sent and nothing is stored, so the old
+            # code stands -- and he is told what to fix rather than a
+            # class name, because these words are ours and never touched
+            # a mail server.
+            del new, body
+            log.warning("knightfall: the configured notice address is not "
+                        "an address; the old code stands")
+            return keep % KNIGHTFALL_BAD_DESTINATION, False
         except Exception as exc:                   # noqa: BLE001 - transport
             # MailSendFailed, or anything else the transport did: the old
             # code stands, and only the TYPE of what went wrong is said.
@@ -6708,6 +6770,7 @@ class JarvisApp:
             # both run off the Tk thread (KnightfallControl).
             knightfall_code=self.knightfall_code,
             knightfall_new_code=self.knightfall_new_code,
+            knightfall_status=self.knightfall_status,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,

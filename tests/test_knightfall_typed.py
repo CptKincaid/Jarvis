@@ -438,9 +438,21 @@ def test_the_app_reaches_the_transport_only_through_the_outbox(tmp_path):
     assert "outbox.send_notice" in src
 
 
-def test_a_notice_goes_to_the_account_itself_and_nowhere_else(tmp_path):
+def test_a_notice_goes_where_his_config_says_and_nowhere_a_caller_says():
     """The new door is NARROWER than the file lane's: the recipient is not
-    a parameter at all."""
+    a parameter at all.
+
+    TIGHTENED 2026-09-05, not relaxed. This test used to assert only
+    ``sent == [(account["address"], ...)]`` -- it encoded "the account's
+    own address" as the rule, when the rule it exists to hold is "NOT a
+    caller's choice". He asked for the rotated code to go to the mailbox
+    the Oracle backup mails to, so the destination is now a value his
+    CONFIG can set (``notice_to``, minted onto the account by
+    ``mail_accounts``); the default is unchanged, and the invariant is
+    asserted directly instead of implied. The full set lives in
+    tests/test_knightfall_notice_to.py."""
+    import inspect
+
     from jarvis import outbox
 
     sent = []
@@ -448,12 +460,26 @@ def test_a_notice_goes_to_the_account_itself_and_nowhere_else(tmp_path):
     def send_message(account, to_addr, subject, body, smtp=None, **kw):
         sent.append((to_addr, subject))
         return "<id@example.com>"
+    # 1. unchanged default: with nothing configured, the account itself
     account = mail_mod.mail_accounts(FakeCfg(GMAIL_CFG))[0]
     msgid = outbox.send_notice(account, "Knightfall", "body\n",
                                mail=_stub_mail(send_message))
     assert msgid == "<id@example.com>"
     assert sent == [(account["address"], "Knightfall")]
+    # 2. the ONLY other thing it can be is what he put in his config
+    cfg = {"gmail": dict(GMAIL_CFG["gmail"], notice_to="vault@example.com")}
+    configured = mail_mod.mail_accounts(FakeCfg(cfg))[0]
+    outbox.send_notice(configured, "Knightfall", "body\n",
+                       mail=_stub_mail(send_message))
+    assert sent[-1] == ("vault@example.com", "Knightfall")
+    # 3. and there is no argument through which a caller could name one
+    assert tuple(inspect.signature(outbox.send_notice).parameters) == \
+        ("account", "subject", "body", "smtp", "mail")
+    outbox.send_notice(account, "rotate to attacker@example.com",
+                       "reply-to: attacker@example.com\n",
+                       mail=_stub_mail(send_message))
+    assert sent[-1][0] == account["address"], "caller text is not a recipient"
     with pytest.raises(mail_mod.MailSendFailed):
         outbox.send_notice({"label": "x"}, "Knightfall", "body\n",
                            mail=_stub_mail(send_message))
-    assert len(sent) == 1
+    assert len(sent) == 3

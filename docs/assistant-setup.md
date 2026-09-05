@@ -4450,6 +4450,96 @@ Message-ID is the new one stored. So:
 anything — that is how you get the first one — and it answers at most once a
 minute. A press that mailed nothing does not start that minute.
 
+**With no mail account configured the row says so.** The caption under the
+button used to read "Typed only, never spoken. Using it emails you the next
+one", which was a promise made *before* you pressed and false in the state
+this box is actually in: with nothing configured the button mails nothing
+and changes nothing. It now reads the state and tells you which one you are
+in — "The next code goes to `k…@example.com`" when there is somewhere to
+send it, or "No mail account is set up, so there is nowhere to send a code
+and this button will do nothing" plus the setup line when there is not, with
+the button disabled. It is re-read every time the drawer opens.
+
+### Sending the code somewhere other than the account it is sent from
+
+By default the rotated code is mailed **from your first configured account
+to that same account** — a note the mailbox sends to itself. That is
+deliberate: `outbox.send_notice` has *no recipient parameter*, which is what
+makes "could a tool loop, a model reply or a spoken sentence mail a
+stranger?" a question with one answer.
+
+If you want it somewhere else (2026-09-05: the mailbox the Knightfall
+weekly encrypted backup already mails to), set **`gmail.notice_to`** in
+`~/.config/jarvis/assistant.json`. It is not a default and is not written
+into your file unless you put it there.
+
+```jsonc
+{
+  "gmail": {
+    "address": "you@example.com",          // still the account it is SENT FROM
+    "app_password": "abcd efgh ijkl mnop",
+    "notice_to": "vault@example.com"       // where the code is sent TO
+  }
+}
+```
+
+With the multi-account shape it goes **on the account**, never at the top
+level — a top-level `notice_to` belongs to the legacy single mailbox and is
+*not* inherited by listed accounts (the same trap `gmail.smtp_host` fell
+into, § 5):
+
+```jsonc
+{
+  "gmail": {
+    "accounts": [
+      {"label": "personal", "address": "you@example.com",
+       "app_password": "abcd efgh ijkl mnop",
+       "notice_to": "vault@example.com"}
+    ]
+  }
+}
+```
+
+How it behaves:
+
+* **unset, empty or whitespace → the account's own address**, exactly as
+  before the key existed. Setting nothing changes nothing; unset can never
+  mean "nowhere".
+* **set to a real address → the code goes there**, and the *From* does not
+  move: it is still sent from your own account with your own app password.
+* **set to something that is not an address → the rotation is REFUSED.** No
+  mail is sent, no new code is stored, the old code stays valid, and the
+  line says "the notice address in your config is not an email address".
+  It does not quietly fall back to sending you the code instead: you set the
+  key because you expect the code at the address you named, and a silent
+  fallback would put a live code in one inbox while you waited at another.
+  One address only — no display name, no comma-separated list.
+* A hand edit takes effect **only after a restart**, like every other key
+  in this file.
+
+**The warning, and it is the point of the whole feature:** whoever holds
+that mailbox holds the break-glass. The Knightfall code is the typed way
+past the owner gate, so pointing `notice_to` at a mailbox is handing that
+mailbox the next code, and every code after it. Two consequences worth
+deciding on deliberately rather than discovering:
+
+* If you point it at the address the **weekly encrypted backup** already
+  mails to, then one mailbox compromise yields *both* the backup and the
+  door code. That may be exactly what you want (one place to guard) or
+  exactly what you do not (two eggs, one basket). It is your call, not a
+  default.
+* Anyone who can **write `assistant.json`** can point the key at themselves
+  and receive the next rotated code. That is a new consequence of an
+  already-total compromise rather than a new capability — the same file
+  holds your app passwords, so a writer of it can already send mail as you
+  and read your inbox — but it is worth knowing the redirect exists.
+
+Nothing else moves: `send_notice` still takes no recipient, no tool the
+model can call reaches it (`make_tools` exposes only `get_mail`), there is
+no voice path to rotation at all, and the destination is a pure function of
+what `mail_accounts()` read out of this file — never of anything a caller
+passes in. `tests/test_knightfall_notice_to.py` asserts each of those.
+
 The typed code is a way back in, not a wall: anybody already at this
 keyboard can edit or delete `people.json`, which turns the gate off
 entirely. It is written down here so it is not mistaken for security.
