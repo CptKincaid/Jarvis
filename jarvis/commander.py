@@ -122,32 +122,35 @@ from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
 log = get_logger("commander")
 
 
-class _MaskTypedAddresses(logging.Filter):
-    """An address he TYPES ("yes, to hjones@example.com") reached the log
-    unmasked through the lines that echo the sentence ("handle ...", "send
-    read-back: ... corrects the draft"). outbox and mail mask theirs; this
-    masks the commander's at the logger, so every present and future line
-    that carries an utterance is covered, including the confirm lane's,
-    which another branch owns and this one does not touch."""
+class _MaskAddresses(logging.Filter):
+    """An address he TYPES ("yes, to hjones@example.com") or SAYS ("dana
+    at example dot com" -- how Whisper writes it) reached the log unmasked
+    through the lines that echo the sentence: "handle ...", "tier-1 match
+    ... bypasses the intent gate: ...", "send recipient: ... resolves",
+    "send read-back: ... corrects the draft" (measured with caplog, round
+    2b). outbox and mail mask theirs; this masks the commander's at the
+    logger -- every string argument and the format string, with no "@"
+    gate, since the spoken shape has none -- so every present and future
+    line that carries an utterance is covered, including the confirm
+    lane's, which another branch owns and this one does not touch."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and any(
-                isinstance(a, str) and "@" in a for a in args):
-            record.args = tuple(outbox.mask_addresses(a)
-                                if isinstance(a, str) and "@" in a else a
-                                for a in args)
+        if isinstance(args, tuple):
+            if any(isinstance(a, str) for a in args):
+                record.args = tuple(outbox.mask_addresses(a)
+                                    if isinstance(a, str) else a for a in args)
         elif isinstance(args, dict):
-            if any(isinstance(a, str) and "@" in a for a in args.values()):
+            if any(isinstance(a, str) for a in args.values()):
                 record.args = {k: outbox.mask_addresses(a)
-                               if isinstance(a, str) and "@" in a else a
+                               if isinstance(a, str) else a
                                for k, a in args.items()}
-        if isinstance(record.msg, str) and "@" in record.msg:
+        if isinstance(record.msg, str):
             record.msg = outbox.mask_addresses(record.msg)
         return True
 
 
-log.addFilter(_MaskTypedAddresses())
+log.addFilter(_MaskAddresses())
 
 # Fixed persona lines (spec 3.4) — prewarmed in the speech cache by the app.
 ALLOWED_LINE = "Allowed, sir."

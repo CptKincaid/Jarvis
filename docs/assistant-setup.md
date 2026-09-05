@@ -4072,7 +4072,9 @@ Three rules keep the file honest, and each is worth knowing:
   or "Smith" beside "Sam Smith", is refused on `add`; if you hand-edit
   both in, both rows are kept and flagged, and "Heather" becomes a
   question ("Which Heather, sir — Heather or Heather Jones?") rather than
-  a pick — so does "Dr Heather", whatever honorific either row carries.
+  a pick. "Dr Heather" is that same question when the one-word row carries
+  the Dr — the honorific narrows nothing and never picks the row — and
+  with the Dr on neither row, or only on "Heather Jones", it names nobody.
   Answer with the two-word name, or "the first one" / "1" / "number one"
   for the one-word row: the ordinal picks the row of the list you were
   read, never the name again. One miss gets the list once more; a second

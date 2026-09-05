@@ -1443,6 +1443,191 @@ def test_mask_addresses_masks_every_address_in_a_sentence():
     assert outbox.mask_addresses("") == ""
 
 
+# ---- (g) the address he SAYS is masked too. "dana at example dot com" is
+#      how an address is said, and how Whisper writes it far more often
+#      than it writes the symbols; the typed mask keyed on "@" and left
+#      every spoken address verbatim in the commander's INFO lines.
+#      Every name and domain here is invented.
+@pytest.mark.parametrize("said, want", [
+    ("dana at example dot com", "d… at example dot com"),
+    ("email the handout to dana at example dot com",
+     "email the handout to d… at example dot com"),
+    ("Dana at Example dot Com", "D… at Example dot Com"),
+    ("DANA AT EXAMPLE DOT COM", "D… AT EXAMPLE DOT COM"),
+    ("dana at gmail dot com", "d… at gmail dot com"),
+    ("it's dana at gmail dot com.", "it's d… at gmail dot com."),
+    ("dana at mail dot tamu dot edu", "d… at mail dot tamu dot edu"),
+    ("dana at example dot co dot uk", "d… at example dot co dot uk"),
+    ("dana at example period com", "d… at example period com"),
+    ("Dana at gmail. com", "D… at gmail. com"),
+    ("dana at gmail.com", "d… at gmail.com"),
+    ("dana dot ruiz at example dot com", "d… at example dot com"),
+    ("d dot ruiz at example dot com", "d… at example dot com"),
+    ("dana underscore ruiz at example dot com", "d… at example dot com"),
+    ("dana dash ruiz at example dot com", "d… at example dot com"),
+    ("dana_ruiz at example dot com", "d… at example dot com"),
+    ("dana99 at example dot com", "d… at example dot com"),
+    ("her address is dana at example dot com, please",
+     "her address is d… at example dot com, please"),
+    ("send it to dana at example dot com instead",
+     "send it to d… at example dot com instead"),
+    ("dana at example dot com and sam at example dot org",
+     "d… at example dot com and s… at example dot org"),
+    ("dana@example.com or dana at example dot com",
+     "d…@example.com or d… at example dot com"),
+    ("send read-back: 'dana at example dot com' corrects the draft",
+     "send read-back: 'd… at example dot com' corrects the draft"),
+    ("dana  at  example  dot  com", "d…  at  example  dot  com"),
+    ("to Dana, at dana at example dot com", "to Dana, at d… at example dot com"),
+    ("dana at example dot com.", "d… at example dot com."),
+    ("Dana at Gmail dot com", "D… at Gmail dot com"),
+])
+def test_mask_addresses_masks_the_spoken_shape(said, want):
+    assert outbox.mask_addresses(said) == want
+
+
+@pytest.mark.parametrize("prose", [
+    "meet at noon",
+    "at the dot",
+    "look at the dot on the map",
+    "at 4 dot 30",
+    "meet me at 4 dot 30",
+    "the meeting is at 4 dot 30 pm",
+    "aim at the red dot",
+    "look at the dot com bubble",
+    "I'm at home. See you at six.",
+    "we stopped at noon. Then we left",
+    "polka dot at the dance",
+    "connect the dots at the end",
+    "version 3 dot 12 at the latest",
+    "she stared at the dot for a minute",
+    "look at that dot there",
+    "at dot",
+    "dot at",
+    "email the biosensors handout to Heather Smith",
+    "dana at example",
+    "what time is it",
+    "",
+])
+def test_mask_addresses_leaves_ordinary_prose_alone(prose):
+    assert outbox.mask_addresses(prose) == prose
+
+
+@pytest.mark.parametrize("said, want", [
+    # a top level that is also an English word is still an address when
+    # it is SAID with "dot" ...
+    ("dana at example dot in", "d… at example dot in"),
+    ("dana at example dot me", "d… at example dot me"),
+    # ... but after a full stop it is the next sentence, so a punctuated
+    # domain has to end on a top level in use -- and "example.xyz" is
+    # left alone (a typed address has an "@" and is masked by that)
+    ("I'm at home. In the morning", "I'm at home. In the morning"),
+    ("I'm at home. Info for you", "I'm at home. Info for you"),
+    ("dana at example.xyz", "dana at example.xyz"),
+    # a website said in a sentence has the same skeleton and is masked
+    # too: a lost letter in a log line is cheaper than a leaked address
+    ("the site is at example dot com", "the site i… at example dot com"),
+    ("look at handout dot pdf", "l… at handout dot pdf"),
+])
+def test_mask_addresses_deliberate_calls(said, want):
+    """Where the rule is a trade-off, this is the side it takes."""
+    assert outbox.mask_addresses(said) == want
+
+
+def _leaks(records, *raw):
+    """Every captured record whose MESSAGE carries one of the raw forms."""
+    out = []
+    for r in records:
+        msg = r.getMessage()
+        if any(x.lower() in msg.lower() for x in raw):
+            out.append(f"{r.name}: {msg}")
+    return out
+
+
+def test_the_commander_log_masks_an_address_he_said(cmd_book, caplog):
+    """The send path: the address is said in the sentence itself."""
+    with caplog.at_level(logging.INFO):
+        res = cmd_book.handle("email the handout to dana at example dot com",
+                              source="voice")
+        assert "to dana at example dot com" in res.reply, res
+        cmd_book.handle("no", source="voice")
+        # and said as a CORRECTION at the read-back (the confirm lane's
+        # "corrects the draft" line, masked at the logger, not edited)
+        cmd_book.handle("email the biosensors handout to Heather Smith",
+                        source="voice")
+        res = cmd_book.handle("yes, to dana at example dot com", source="voice")
+        assert "to dana at example dot com" in res.reply, res
+        cmd_book.handle("no", source="voice")
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    assert any(ln.startswith("handle ") for ln in lines), lines
+    assert _leaks(caplog.records, "dana at example dot com", "dana@example.com") == []
+    handled = [ln for ln in lines if ln.startswith("handle ")]
+    assert any("d… at example dot com" in ln for ln in handled), handled
+    corrected = [ln for ln in lines if ln.startswith("send read-back:")
+                 and "corrects the draft" in ln]
+    assert corrected and all("d… at example dot com" in ln for ln in corrected), \
+        corrected
+    assert not FakeSMTP.made
+
+
+def test_the_commander_log_masks_the_address_he_says_after_a_book_miss(cmd_book,
+                                                                       caplog):
+    """The book path: Dana is not in the book, Jarvis asks, he says the
+    address, and the read-back carries it -- none of that reaches the log
+    raw, on any logger."""
+    with caplog.at_level(logging.INFO):
+        res = cmd_book.handle("email the biosensors handout to Dana", source="voice")
+        assert res.reply == "I've no address for Dana, sir. What is it?"
+        res = cmd_book.handle("dana at example dot com", source="voice")
+        assert "to Dana, at dana at example dot com" in res.reply, res
+        cmd_book.handle("no", source="voice")
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    assert any(ln.startswith("handle ") for ln in lines), lines
+    assert _leaks(caplog.records, "dana at example dot com", "dana@example.com") == []
+    assert any("d… at example dot com" in ln for ln in lines
+               if ln.startswith("handle ")), lines
+    assert not FakeSMTP.made
+
+
+def test_the_log_mask_covers_args_and_the_format_string_alike(caplog):
+    """The filter sits on the commander's logger, so a line written
+    tomorrow is covered too -- whichever way the address gets into it."""
+    from jarvis import commander as cm
+    with caplog.at_level(logging.INFO, logger="jarvis.commander"):
+        cm.log.info("probe one: %r", "dana at example dot com")
+        cm.log.info("probe two: %s and %s", "dana@example.com", "sam at example dot org")
+        cm.log.info("probe three: dana at example dot com in the template")
+        cm.log.info("probe four: %(who)s", {"who": "dana at example dot com"})
+    assert _leaks(caplog.records, "dana at example dot com", "dana@example.com",
+                  "sam at example dot org") == []
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "d… at example dot com" in text and "d…@example.com" in text
+    assert "s… at example dot org" in text
+
+
+# ---- (h) what "Dr Heather" does, pinned for the docs: it is the SAME
+#      question as "Heather" only when the one-word row carries that
+#      honorific; otherwise it is nobody, and it never picks the Dr row.
+def test_dr_heather_is_nobody_unless_the_one_word_row_carries_the_dr(book_file):
+    """The three books are written at three SIZES: a same-size rewrite in
+    the same filesystem tick has the same stamp and is not re-read (the
+    editor's rename-over that a real edit is would be)."""
+    write(book_file, [{"name": "Heather", "email": "h@example.com"},
+                      {"name": "Heather Jones", "email": "hj@example.com"}])
+    book = book_mod.current()
+    assert book.resolve("Heather").candidates == ["Heather", "Heather Jones"]
+    assert book.resolve("Dr Heather").unknown
+    write(book_file, [{"name": "Heather", "email": "h@example.com"},
+                      {"name": "Heather Jones", "email": "hj@example.com",
+                       "honorific": "Dr", "note": "the Dr is on this row"}])
+    assert book.resolve("Dr Heather").unknown, "the Dr on the two-word row is not this"
+    assert book.resolve("Dr Heather Jones").addr == "hj@example.com"
+    write(book_file, [{"name": "Heather", "email": "h@example.com", "honorific": "Dr"},
+                      {"name": "Heather Jones", "email": "hj@example.com"}])
+    assert book.resolve("Dr Heather").candidates == ["Heather", "Heather Jones"]
+    assert not book.resolve("Dr Heather").found, "never a pick of the Dr row"
+
+
 # ---- the stamp while broken: a fix that lands in the same tick as the
 #      last good write, byte-identical, must still be seen
 def test_a_fix_in_the_same_tick_as_the_last_good_write_is_still_seen(two_heathers,

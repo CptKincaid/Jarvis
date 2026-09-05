@@ -213,25 +213,79 @@ def spoken_address(addr: str) -> str:
 
 _ADDRESS_IN_TEXT_RX = re.compile(r"[^\s@<>,;]+@[^\s@<>,;]+")
 
+# The same address SAID -- "dana at example dot com", "d dot ruiz at mail
+# dot tamu dot edu", Whisper's "Dana at gmail. com" -- which is how it
+# reaches the commander far more often than the symbols do. The local part
+# may be joined the way spoken_address() reads one out (dot, underscore,
+# dash); the domain is one or more labels and an alphabetic top level, said
+# ("dot", "period") or punctuated (". ", "."). Ordinary prose has the same
+# skeleton ("look at the dot on the map", "at 4 dot 30"), so a match is
+# then CHECKED: a domain that opens on a function word, or ends on a
+# number, is not an address; and a punctuated one has to end on a top
+# level actually in use, because "at home. See you" is not one either.
+_SAID_JOIN = r"(?:\s+(?:dot|period|underscore|dash)\s+|\.(?!\s))"
+_SAID_SEP = r"(?:\s+(?:dot|period)\s+|\.\s*)"
+_SAID_ADDR_RX = re.compile(
+    r"(?<![\w@.\-])"
+    r"(?P<local>[A-Za-z0-9][\w+\-]*(?:" + _SAID_JOIN + r"[A-Za-z0-9][\w+\-]*)*)"
+    r"(?P<rest>\s+at\s+"
+    r"(?P<domain>[A-Za-z0-9][\w\-]*(?:" + _SAID_SEP + r"[A-Za-z0-9][\w\-]*)*"
+    + _SAID_SEP + r"(?P<tld>[A-Za-z]{2,24})))"
+    r"(?![\w\-])", re.I)
+_SAID_SEP_RX = re.compile(_SAID_SEP, re.I)
+_AT_HINT_RX = re.compile(r"\bat\b", re.I)
+_NOT_A_DOMAIN_WORD = frozenset("""
+    the a an this that these those my your his her our their its it
+    on in of to for from and or but is was are were be been so as at by
+    up out if then than there here what which who whom when where why how
+    not no yes now just also very too all any some each every both few
+    more most other such only own same do does did done can could will
+    would shall should may might must have has had am we you they he she
+    me him them us i
+""".split())
+# Top levels a PUNCTUATED domain may end on ("gmail. com", "example.edu").
+# English words that are also top levels (in, me, us, it, is, be, no, to,
+# at, so, info) are left out on purpose: after a full stop they are the
+# next sentence far more often than an address. Said with the word "dot"
+# they are still masked -- "dana at example dot in" is an address.
+_SAID_TLDS = frozenset("""
+    com org net edu gov mil int io co ai dev app biz tv uk ca au de fr
+    nl es ie ch eu nz jp cn br mx ru se fi dk pl cz pt gr tr za kr
+""".split())
+
+
+def _one_said(m) -> str:
+    domain = m.group("domain")
+    labels = [x for x in _SAID_SEP_RX.split(domain) if x]
+    first, tld = labels[0].lower(), m.group("tld").lower()
+    if first in _NOT_A_DOMAIN_WORD:
+        return m.group(0)
+    if "." in domain and tld not in _SAID_TLDS:
+        return m.group(0)
+    return m.group("local")[:1] + "…" + m.group("rest")
+
 
 def mask_addresses(text) -> str:
-    """"yes, to hjones@example.com" -> "yes, to h…@example.com": every
-    address-shaped token in a sentence masked the way mail and this
-    module already mask a single address, for a log line that carries
-    what he TYPED. The rest of the sentence is kept -- it is the line's
-    whole point -- and a trailing full stop stays outside the mask."""
+    """"yes, to hjones@example.com" -> "yes, to h…@example.com", and
+    "send it to dana at example dot com" -> "send it to d… at example dot
+    com": every address-shaped run in a sentence, typed or SAID, masked
+    the way mail and this module already mask a single address, for a log
+    line that carries what he said. The rest of the sentence is kept -- it
+    is the line's whole point -- the domain stays as he put it, and a
+    trailing full stop stays outside the mask."""
     text = str(text or "")
-    if "@" not in text:
-        return text
+    if "@" in text:
+        def _one(m):
+            token = m.group(0)
+            tail = ""
+            while token and token[-1] in ".,;:!?":
+                tail, token = token[-1] + tail, token[:-1]
+            return mail_mod._mask_address(token) + tail
 
-    def _one(m):
-        token = m.group(0)
-        tail = ""
-        while token and token[-1] in ".,;:!?":
-            tail, token = token[-1] + tail, token[:-1]
-        return mail_mod._mask_address(token) + tail
-
-    return _ADDRESS_IN_TEXT_RX.sub(_one, text)
+        text = _ADDRESS_IN_TEXT_RX.sub(_one, text)
+    if _AT_HINT_RX.search(text):
+        text = _SAID_ADDR_RX.sub(_one_said, text)
+    return text
 
 
 def account_words(account: dict) -> str:
