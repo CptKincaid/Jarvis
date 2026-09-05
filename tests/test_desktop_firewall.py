@@ -50,12 +50,20 @@ def test_remember_heathers_face_reaches_no_xclip(cmdr, services,  # noqa: F811
 
 def test_commit_this_to_memory_runs_no_shell(cmdr, services,  # noqa: F811
                                              desktop_attempts):
-    """The other 17:21 sentence. At 7539478 the word "commit" inside it fires
-    QUICK_COMMANDS["commit"] (a shell string with `git add -A` in it). Under
-    the firewall the shell is refused and the attempt recorded; the rung
-    branch then retires this into "no attempt at all" once the memory
-    family sits above the quick-command rung."""
-    cmdr.handle("jarvis commit this to memory: i graduate december 10th 2026")
+    """The other 17:21 sentence. At 7539478 the word "commit" inside it fired
+    QUICK_COMMANDS["commit"] (a shell string with `git add -A` in it) and
+    the firewall was what stopped it. Since the memory family moved above
+    the quick-command rung and the trigger became a whole-utterance match
+    (branch memory-rung, 2026-09-04) there is NO attempt to refuse: the
+    sentence is a fact, stored, and the shell string is never built."""
+    res = cmdr.handle("jarvis commit this to memory: i graduate december 10th 2026")
+    shells = [argv for owner, kind, _p, argv in desktop_attempts
+              if owner == "jarvis.commander" and kind == "run"]
+    assert shells == [], desktop_attempts
+    assert services.memory.remember.call_count == 1
+    assert res.reply == "Noted, sir: you graduate december 10th 2026."
+    # ...and the bare word still IS the quick command, refused inline
+    cmdr.handle("jarvis commit")
     shells = [argv for owner, kind, _p, argv in desktop_attempts
               if owner == "jarvis.commander" and kind == "run"]
     assert shells == [QUICK_COMMANDS["commit"]], desktop_attempts

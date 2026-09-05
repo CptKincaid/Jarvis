@@ -300,18 +300,105 @@ UNBACKED_NUDGE = ("[You described actions you did not perform. If I asked "
                   "only asked a question, answer it without saying you did "
                   "anything.]")
 UNBACKED_LINE = "I couldn't do that part, sir."
+# The MEMORY-shaped claim gets a line of its own, and an actionable one.
+# "I couldn't do that part, sir." was honest and useless for it (2026-09-04
+# refuter, probe a): "that part" named nothing he could identify and told
+# him nothing about how to phrase it so it lands. This names the way in.
+UNBACKED_MEMORY_LINE = ("I can't store that from here, sir — say 'remember "
+                        "that …' and I will.")
+_AUTHORED_LINES = (UNBACKED_LINE, UNBACKED_MEMORY_LINE)
+# The nudge for a memory claim. UNBACKED_NUDGE's "use the tools and do it
+# now" steers a store the model cannot make toward the notes tool -- a
+# write the recall path never reads (2026-09-04 refuter, probe c). This
+# one says there is no such tool and not to invent one. Whether gemma
+# obeys it is not measured here (no Ollama in the suite); the line above
+# stands in when it does not.
+UNBACKED_MEMORY_NUDGE = ("[You said you stored or would remember something, "
+                         "but you have no tool that stores facts, and notes, "
+                         "reminders and events are not that. Do not store it "
+                         "anywhere. Answer the rest of my request, and for the "
+                         "store say plainly that you cannot remember that from "
+                         "here.]")
+# A sentence that is ONLY an acknowledgement. Before a claim it is the yes
+# to that claim, and with the claim withheld it would stand as a yes to
+# nothing -- "Of course, sir." then a refusal, heard as one reply (probe
+# f). Held one sentence on the stream, dropped beside a replaced claim.
+# "Noted, sir." is deliberately not here: it is a claim of its own kind
+# and the notes tool's authored line, and this guard never sees the latter.
+_ACK_ONLY_RX = re.compile(
+    r"^\s*(?:(?:of course|certainly|very good|very well|right away|"
+    r"straight away|at once|absolutely|indeed|understood|as you wish|"
+    r"consider it done|by all means|with pleasure|gladly|naturally|"
+    r"but of course|yes|yes indeed)(?:,? sir)?[.!]*\s*)+$", re.I)
+
+
+# The memory shapes: "I have noted that, sir" (2026-09-02, his graduation),
+# "I'll remember that", "I've saved that to memory", and the promises the
+# refuter found still walking through (store, keep/bear in mind, make a
+# note, the have-less "I noted that already", "I've remembered that", the
+# negative promise "I won't forget that"). A claim to have remembered is a
+# claim to have acted, and nothing was stored: no tool in the registry
+# stores a fact (see CLAIM_BACKERS).
+#
+# Written as a function of ONE choice, measured in
+# tests/test_claim_guard_memory.py over 60 sentences: does "I have noted
+# that <the lab has no listed duration>" -- an observation wearing the
+# store's verb -- count? `observation_exempt=True` lets "that <clause>"
+# through and catches only "that, sir" / "that." / "that for you"; False
+# flags them all. The strict rule is the one compiled: it costs an
+# observation a retry (and, with the retry kept when honest, rarely more),
+# where the lookahead lets "I have noted that you graduate December 10th"
+# -- the incident's own sentence with its fact spelled out -- walk through.
+_MEMORY_OBJ = r" (?:that|it|this|all (?:of )?(?:that|it|this))"
+_MEMORY_ADV = (r"(?: just| now| already| duly| certainly| of course| definitely|"
+               r" gladly| also| always)?")
+
+
+def _memory_claim_src(observation_exempt=False):
+    obj = _MEMORY_OBJ
+    if observation_exempt:
+        obj += (r"(?=\s*(?:[,.;:!?]|$|(?:sir|for you|for later|already|now|"
+                r"then|too|as well|down)\b))")
+    return (
+        # done: "I have noted that", "I've remembered that", "I noted that already"
+        r"i(?:'ve| have)?" + _MEMORY_ADV + r" (?:noted|remembered|memori[sz]ed)" + obj
+        + r"|i(?:'ve| have)?" + _MEMORY_ADV + r" made a (?:mental )?note of" + obj
+        # done, into memory: "I've saved/stored/put/committed that to memory"
+        + r"|i(?:'ve| have)?" + _MEMORY_ADV
+        + r" (?:stored|saved|put|committed|added|filed|logged)" + _MEMORY_OBJ
+        + r" (?:in|to|into|away in) (?:my |your |long-term )?memory\b"
+        # doing: "I'm making a note of that now", "I am keeping that in mind"
+        + r"|i(?:'m| am)(?: now| just)? (?:noting|remembering|memori[sz]ing)" + obj
+        + r"|i(?:'m| am)(?: now| just)? making a (?:mental )?note of" + obj
+        + r"|i(?:'m| am)(?: now| just)? (?:keeping|bearing)" + _MEMORY_OBJ + r" in mind\b"
+        + r"|i(?:'m| am)(?: now| just)? (?:storing|saving|committing|filing)"
+        + _MEMORY_OBJ + r" (?:in|to|into|away in) (?:my |your |long-term )?memory\b"
+        # promised: "I'll remember that", "I shall store that for you",
+        # "I'll keep that in mind", "I'll make a note of that"
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV
+        + r" (?:remember|note|store|memori[sz]e|retain)" + obj
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV + r" (?:keep|bear)" + _MEMORY_OBJ + r" in mind\b"
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV + r" make a (?:mental )?note of" + obj
+        # the negative promise IS the promise: "I won't forget that, sir"
+        + r"|i (?:won['’]t|will not|shall not|shan['’]t)(?: ever)? forget" + obj
+        + r"|i(?:'ll| will| shall) never forget" + obj
+    )
+
+
+_MEMORY_CLAIM_SRC = _memory_claim_src(observation_exempt=False)
+# The claim text alone (what _sentence_claim returns), for claim_kind.
+_MEMORY_CLAIM_RX = re.compile(r"^(?:" + _MEMORY_CLAIM_SRC + r")$", re.I)
 _ACTION_CLAIM_RX = re.compile(
     r"\b(?:"
+    # The memory shapes come FIRST: alternation takes the first branch that
+    # matches at a position, and "I've saved that to memory" must be found
+    # by the memory branch, not cut to "I've saved" by the past-tense one.
+    + _MEMORY_CLAIM_SRC +
     # "I've added milk", "I have set a timer", "I've just started it"
-    r"i(?:'ve| have)(?: just| now| already)? (?:added|set|started|cancell?ed|"
+    r"|i(?:'ve| have)(?: just| now| already)? (?:added|set|started|cancell?ed|"
     r"removed|sent|queued|scheduled|saved|created|deleted|paused|resumed|"
     r"turned (?:on|off|up|down)|switched|moved|booked|cleared|stopped|"
     r"muted|skipped|dimmed|put)\b"
-    # "I have noted that, sir" (2026-09-02, his graduation): a claim to have
-    # remembered is a claim to have acted, and nothing was stored.
-    r"|i(?:'ve| have)(?: just| now| already)? noted (?:that|it|this)\b"
-    r"|i(?:'ll| will| shall)(?: certainly| of course)? (?:remember|note) (?:that|it|this)\b"
-    r"|i(?:'ve| have)(?: just| now)? (?:stored|saved|put|committed) (?:that|it|this) (?:in|to|into) (?:my )?memory\b"
     # "I'm starting your music now", "I am adding it to the list"
     r"|i(?:'m| am)(?: now| just)? (?:starting|playing|adding|setting|cancell?ing|"
     r"removing|sending|queuing|queueing|scheduling|saving|creating|"
@@ -345,13 +432,46 @@ _ACTION_CLAIM_RX = re.compile(
 # model round on a turn that had already answered, and if the retry says
 # the same true thing, UNBACKED_LINE replaces a TRUE sentence.
 #
-# 1. NEGATION earlier in the same sentence scopes the claim -- "Nothing has
+# 1. NEGATION earlier in the same CLAUSE scopes the claim -- "Nothing has
 #    been added to your list, sir." is the ANSWER to "what's on my list",
-#    and it was being called a lie.
+#    and it was being called a lie. The same CLAUSE, not the same
+#    sentence: judged over the whole sentence, the "No" of "No problem, I
+#    have noted that, sir." was read as governing a claim two clauses
+#    away, and on "Remember that I graduate December 10th 2026" that
+#    reply -- with "Not a problem, sir, I've saved that to memory", "No
+#    worries, I'll remember that", "Not at all, sir; I've made a note of
+#    that", "I can't store that, sir, but I've noted it", "I don't have a
+#    memory tool as such, but I'll keep that in mind" and the streamed
+#    form -- was spoken VERBATIM with nothing stored and no warning
+#    (2026-09-04 reviewer and verdict, measured on the FakeOllama
+#    harness). A negation's reach ends at a clause boundary (, ; : dash),
+#    and a lead-in idiom that wears a negation word and governs nothing
+#    ("no problem", "not to worry", "never fear", "I can't forget that")
+#    is no negation of what follows it, comma or no comma. The real veto
+#    -- "I have not noted", "I haven't saved", "Nothing has been added to
+#    your list" -- sits in the claim's own clause and still holds. The
+#    lead-in must OPEN its clause: "I'm not at all sure I've added milk"
+#    is a hedge, and its "not" stands.
 _CLAIM_NEGATED_RX = re.compile(
     r"\b(?:no|not|nothing|nobody|none|never|neither|nor|without|yet to|"
     r"(?:do|does|did|have|has|had|is|are|was|were|wo|ca|could|would|should)"
     r"n['’]t)\b", re.I)
+_CLAUSE_BOUNDARY_RX = re.compile(r"[,;:—–]|\s-\s")
+_NEGATED_LEAD_IN_RX = re.compile(
+    r"^\s*(?:no problem(?: at all)?|not a problem|no worries|"
+    r"no trouble(?: at all)?|not at all|not to worry|never fear|never mind|"
+    r"(?:do not|don['’]t) (?:worry|fret)|"
+    r"(?:i )?(?:can['’]t|cannot|could not|couldn['’]t|won['’]t|"
+    r"will not|shall not|shan['’]t) forget(?: that| it| this)?)\b", re.I)
+
+
+def _claim_negated(before):
+    """Does a negation govern the claim that begins where ``before``
+    ends? Only one in the claim's own clause counts, and a lead-in idiom
+    opening that clause is not one."""
+    clause = _CLAUSE_BOUNDARY_RX.split(before or "")[-1]
+    clause = _NEGATED_LEAD_IN_RX.sub(" ", clause)
+    return bool(_CLAIM_NEGATED_RX.search(clause))
 # 2. A HEDGE unsays it in the same breath: nothing was done and the model
 #    is not pretending otherwise.
 _CLAIM_HEDGE_RX = re.compile(
@@ -362,62 +482,145 @@ _CLAIM_HEDGE_RX = re.compile(
 #    "I'm stopping there". Matched against what FOLLOWS the claim, so the
 #    same verbs with a real object still count ("I'm turning on the
 #    lights", "I'm putting on some jazz", "I'm moving your three o'clock").
+#    Two more from the memory shapes (2026-09-04): "I've saved you twenty
+#    minutes" -- saved + a duration or an effort is a figure of speech,
+#    nothing was written anywhere -- and "I'll remember this evening" /
+#    "as I noted this morning", where the object is a TIME, not a fact.
 _CLAIM_IDIOM_RX = re.compile(
     r"^\s*(?:on(?:to|\s+to|\s+from)\b|on[\s,.;!]*$|onwards?\b|aside\b|"
     r"ahead\b|forwards?\b|afresh\b|anew\b|short\b|there\b|here\b|"
-    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b)", re.I)
+    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b|"
+    r"you\b(?:\s+\w+){0,3}?\s+(?:minutes?|hours?|seconds?|days?|weeks?|"
+    r"months?|years?|time|trip|trouble|bother|effort|hassle|journey|walk|"
+    r"drive|fortune|money|steps?)\b|"
+    r"(?:morning|afternoon|evening|night|week|weekend|month|year|day|time|"
+    r"moment|occasion|summer|winter|spring|autumn)\b)", re.I)
+# 4. REPORTED, not claimed: "As I noted this morning, ..." refers back to
+#    something said; the word before the claim decides.
+_CLAIM_REPORTED_RX = re.compile(r"(?:^|\s)(?:as|like|just as)\s*$", re.I)
 
 
-def _sentence_claim(sent):
-    """The action claim in ONE sentence, or None: a table hit that none of
-    the three vetoes above disqualifies."""
+def _sentence_claim(sent, ran=(), backers=None, kinds=None):
+    """The unbacked action claim in ONE sentence, or None: a table hit
+    that none of the vetoes above disqualifies, no tool in ``ran`` backs
+    (claim_backed), and whose kind is in ``kinds`` (None: any kind)."""
     if _CLAIM_HEDGE_RX.search(sent or ""):
         return None
     for m in _ACTION_CLAIM_RX.finditer(sent or ""):
-        if _CLAIM_NEGATED_RX.search(sent[:m.start()]):
+        if _claim_negated(sent[:m.start()]):
+            continue
+        if _CLAIM_REPORTED_RX.search(sent[:m.start()]):
             continue
         if _CLAIM_IDIOM_RX.match(sent[m.end():]):
+            continue
+        if kinds is not None and claim_kind(m.group(0)) not in kinds:
+            continue
+        if claim_backed(m.group(0), ran, backers):
             continue
         return m.group(0)
     return None
 
 
-def unbacked_claim(text):
+def claim_kind(claim):
+    """'memory' for a claim to have stored or to remember something,
+    'action' for every other shape in the table. The two are backed by
+    different things (CLAIM_BACKERS) and answered with different lines."""
+    return "memory" if _MEMORY_CLAIM_RX.match(claim or "") else "action"
+
+
+# WHAT BACKS A CLAIM: claim kind -> the tool names whose run this turn
+# makes the claim a report rather than an invention. None means any tool
+# at all -- the original rule, "a turn that ran a tool is trusted". A
+# memory claim is backed by a tool that STORES A FACT, and no registry
+# tool does: the remember rung is the commander's, which the model cannot
+# call, and notes/add_event/set_reminder write somewhere the recall path
+# never reads. So "I have noted that you graduate December 10th" beside a
+# real get_time result was as unbacked as it is alone, and the any-tool
+# exemption spoke it (2026-09-04 refuter, probe h). When a fact-storing
+# tool lands, name it HERE and nowhere else.
+CLAIM_BACKERS = {
+    "memory": frozenset(),
+    "action": None,
+}
+
+
+def claim_backed(claim, ran=(), backers=None):
+    """Does a tool in ``ran`` (the names run this turn) back ``claim``?"""
+    table = CLAIM_BACKERS if backers is None else backers
+    names = table.get(claim_kind(claim))
+    if names is None:
+        return bool(ran)
+    return bool(names.intersection(ran))
+
+
+def unbacked_claim(text, ran=(), backers=None, kinds=None):
     """The first first-person action claim in ``text`` ("I've added ...",
-    "I'm starting ..."), else None. Pure; the caller decides whether a
-    tool backs it. Judged one sentence at a time, because both the
-    negation that cancels a claim and the idiom that was never one live
-    inside the sentence that carries them."""
+    "I'm starting ...") that no tool in ``ran`` backs, else None. Pure.
+    Judged one sentence at a time, because both the negation that cancels
+    a claim (within the claim's own clause, _claim_negated) and the idiom
+    that was never one live inside the sentence that carries them. ``kinds`` narrows it to some claim kinds (claim_kind)."""
     for sent in split_sentences(text or ""):
-        claim = _sentence_claim(sent)
+        claim = _sentence_claim(sent, ran, backers, kinds)
         if claim:
             return claim
     return None
 
 
-def strip_unbacked_claims(text, n=None):
+# An utterance that asks for something to be STORED. The guard stands down
+# on a question because its retry executes; a memory claim can execute
+# nothing real (CLAIM_BACKERS: no tool stores a fact), so on a question
+# that also asks for a store -- "Tell me the time and put this in your
+# memory: ..." is a question by the router's `tell me` rule -- the guard
+# judges memory-shaped claims and only those. An action claim on the same
+# question stays the answer it is: the 2026-09-02 timer bug was a retry
+# writing what a question had only asked about.
+_MEMORY_REQUEST_RX = re.compile(
+    r"\b(?:remember|memory|memori[sz]e|keep (?:this |that |it )?in mind|"
+    r"bear (?:this |that |it )?in mind|make a note|note (?:that|this|down)|"
+    r"don['’]t forget|do not forget|never forget|jot (?:this |that |it )?down|"
+    r"write (?:this |that |it )?down|for the record)\b", re.I)
+
+
+def strip_unbacked_claims(text, n=None, ran=(), backers=None, kinds=None):
     """``text`` with every sentence that claims an action replaced by ONE
-    UNBACKED_LINE, in the place of the first, the other sentences kept:
-    the greeting survives, the invented actions do not. ``n`` is the
-    spoken-sentence cap the reply will meet later; the apology is kept
-    inside it, since it is the one sentence here that must be heard.
-    Unchanged text when nothing claims anything."""
-    kept, said = [], False
+    authored line per claim KIND -- UNBACKED_LINE for an action,
+    UNBACKED_MEMORY_LINE for a store -- in the place of the first of its
+    kind, the other sentences kept: the greeting survives, the invented
+    actions do not. A bare acknowledgement ("Of course, sir.") goes with
+    the claim it was the yes to. ``n`` is the spoken-sentence cap the
+    reply will meet later; the authored lines are kept inside it, since
+    they are the sentences here that must be heard. Unchanged text when
+    nothing claims anything."""
+    kept, said = [], []
     for sent in split_sentences(text):
-        if _sentence_claim(sent):
-            if not said:
-                kept.append(UNBACKED_LINE)
-                said = True
+        claim = _sentence_claim(sent, ran, backers, kinds)
+        if claim:
+            kind = claim_kind(claim)
+            if kind not in said:
+                kept.append(UNBACKED_MEMORY_LINE if kind == "memory"
+                            else UNBACKED_LINE)
+                said.append(kind)
             continue
         kept.append(sent)
     if not said:
         return text
+    kept = [s for s in kept if not _ACK_ONLY_RX.match(s)]
     if n is not None and len(kept) > n:
-        head = kept[:max(1, int(n))]
-        if UNBACKED_LINE not in head:
-            head = head[:-1] + [UNBACKED_LINE]
+        lines = [s for s in kept if s in _AUTHORED_LINES]
+        room, head = max(0, int(n) - len(lines)), []
+        for sent in kept:
+            if sent in _AUTHORED_LINES:
+                head.append(sent)
+            elif room > 0:
+                head.append(sent)
+                room -= 1
         kept = head
     return " ".join(kept)
+
+
+def authored_lines_in(text):
+    """The guard's own lines present in ``text``, in order."""
+    return [s for s in split_sentences(text or "") if s in _AUTHORED_LINES]
 
 
 # ----------------------------------------------------------------------
@@ -2896,22 +3099,75 @@ class JarvisBrain:
         # on; `plain_round` takes the retry off the stream, because the
         # first reply's honest sentences were already spoken and the
         # retry's words are either tool calls or discarded.
+        # A question that also asks for a store ("tell me the time and put
+        # this in your memory: ...") arms the guard for MEMORY claims only
+        # (_MEMORY_REQUEST_RX): the retry cannot store anything, so it
+        # cannot do the harm the question gate exists to prevent.
+        question = is_question(text)
+        memory_asked = bool(_MEMORY_REQUEST_RX.search(text or ""))
         unbacked_armed = (registry is not None and bool(tools)
-                          and not is_question(text))
+                          and (not question or memory_asked))
+        claim_kinds = {"memory"} if question else None
         unbacked_first = None
+        unbacked_ran_at = 0         # len(ran_results) when the retry was asked
         plain_round = False
+        # The retry on a QUESTION is offered no tools. A question that also
+        # asks for a store arms the guard for memory claims (above), and
+        # "Don't you remember that I graduate December 10th?" answered
+        # "Of course, sir. I'll remember that." earned a retry that still
+        # had the tools and called notes(add, ...) -- the guard itself
+        # writing on a question, the one thing the question gate exists
+        # to prevent (2026-09-04 verifier, M15's kin). With no tools the
+        # retry can only answer; a tool call it makes anyway is dropped,
+        # the way the render round drops them, and a retry that then says
+        # nothing is answered with the first reply, its claims replaced.
+        # An order's retry keeps its tools: that is where the work gets
+        # done.
+        unarmed_retry = False
+
+        def ran_names():
+            # the tools that ran this turn, forced path included: what a
+            # claim is judged against (CLAIM_BACKERS)
+            return [name for name, _ in ran_results]
+
+        # A bare acknowledgement held back one sentence while the guard is
+        # armed: "Of course, sir." is the yes to whatever follows, and if
+        # what follows is a withheld claim it must not stand alone (probe
+        # f). Released with the next honest sentence, or when the round
+        # ends with nothing to veto it (release_ack).
+        held_ack = []
 
         def guard(sentence):
             # The guards _finish_spoken applies to the whole reply, per
             # sentence: a streamed sentence is spoken before the reply
             # exists, so it must not carry an ungrounded clock claim or
             # a leaked context line the full reply would have lost.
-            if unbacked_armed and not tool_texts and unbacked_claim(sentence):
-                # Withheld, not spoken: with no tool run yet, "I'm starting
-                # your music now" is a claim the round has not earned. The
-                # whole reply is judged once the round ends -- the retry or
-                # UNBACKED_LINE speaks for this sentence, never the model.
-                return ""
+            if unbacked_armed:
+                if unbacked_claim(sentence, ran_names(), kinds=claim_kinds):
+                    # Withheld, not spoken: with no backing tool run yet,
+                    # "I'm starting your music now" is a claim the round
+                    # has not earned. The whole reply is judged once the
+                    # round ends -- the retry or the authored line speaks
+                    # for this sentence, never the model. The lead-in that
+                    # said yes to it goes with it.
+                    held_ack.clear()
+                    return ""
+                if not held_ack and _ACK_ONLY_RX.match(sentence):
+                    held_ack.append(sentence)
+                    return ""
+            line = clean(sentence)
+            if held_ack:
+                return [clean(held_ack.pop()), line]
+            return line
+
+        def release_ack(streamed):
+            # the round ended with the lead-in still held and nothing
+            # spoken against it: it is the reply, or its start
+            if held_ack and not self._stale(gen):
+                self._emit_sentence(held_ack.pop(), cap, on_sentence,
+                                    streamed, clean)
+
+        def clean(sentence):
             line = clean_ollama_reply(strip_markdown(clean_ollama_reply(sentence)))
             guarded = guard_clock_claims(
                 line, "\n".join([ctx_text, mem_text] + tool_texts), text)
@@ -2938,7 +3194,8 @@ class JarvisBrain:
                 # is also TOLD, here in the per-turn messages, that the
                 # results are all it will get (LIVE 15:14: the reserved
                 # round came back with a tool call and no words at all).
-                round_tools = [] if render_only else tools
+                unarmed_round, unarmed_retry = unarmed_retry, False
+                round_tools = [] if (render_only or unarmed_round) else tools
                 if render_only and not render_told:
                     render_told = True
                     told = RENDER_NOW_LINE
@@ -2957,6 +3214,7 @@ class JarvisBrain:
                         data, content, calls = self._stream_round(
                             messages, round_tools, cap, on_sentence,
                             round_sentences, guard, gen=gen)
+                        release_ack(round_sentences)
                     finally:
                         # kept even when the stream dies: they were spoken
                         streamed_sentences.extend(round_sentences)
@@ -2989,47 +3247,139 @@ class JarvisBrain:
                     log.warning("chat: render round asked for %d more tools; "
                                 "writing the answer instead", len(calls))
                     calls = []
+                if unarmed_round and calls:
+                    log.warning("brain: the retry on a question asked for %d "
+                                "tools; it may only answer", len(calls))
+                    calls = []
                 if not calls or registry is None:
                     final = content
-                    if unbacked_armed and not tool_texts:
-                        # ZERO tools ran this turn and the model is done
-                        # talking: did it claim to have done something?
-                        claim = unbacked_claim(final)
+                    if unbacked_armed:
+                        # The model is done talking: did it claim to have
+                        # done something no tool this turn backs? (For a
+                        # memory claim that is every tool there is today.)
+                        ran_now = ran_names()
+                        claim = unbacked_claim(final, ran_now, kinds=claim_kinds)
                         if claim and unbacked_first is None:
-                            log.warning("brain: unbacked action claim %r "
-                                        "(no tool ran)", claim)
+                            if ran_now:
+                                log.warning("brain: unbacked %s claim %r "
+                                            "(%s ran; nothing that ran "
+                                            "stores a fact)", claim_kind(claim),
+                                            claim, ", ".join(ran_now))
+                            else:
+                                log.warning("brain: unbacked action claim %r "
+                                            "(no tool ran)", claim)
                             unbacked_first = final
+                            unbacked_ran_at = len(ran_results)
                             messages.append({"role": "assistant",
                                              "content": content})
                             messages.append({"role": "user",
-                                             "content": UNBACKED_NUDGE})
+                                             "content": (UNBACKED_MEMORY_NUDGE
+                                                         if claim_kind(claim) == "memory"
+                                                         else UNBACKED_NUDGE)})
                             # ONE retry, with a round of its own: the
                             # reply that earned it was the model's whole
                             # answer, and max_rounds counted it.
                             rounds_left = max(rounds_left, 1)
                             plain_round = True
+                            unarmed_retry = question
                             continue
-                        if unbacked_first is not None:
-                            # The retry ran no tool either. Its words are
-                            # not trusted over the first reply's -- the
-                            # same model, the same nothing behind it -- so
-                            # the FIRST reply is what he hears, with the
-                            # claims taken out and the rest (the greeting)
-                            # left standing.
-                            log.warning("brain: unbacked action claim stands "
-                                        "after the retry (no tool ran); "
-                                        "replacing it")
-                            final = strip_unbacked_claims(unbacked_first, cap)
+                        # A retry that said NOTHING and ran nothing -- a
+                        # question's unarmed retry that tried to act
+                        # instead of answering -- is answered the same
+                        # way a second claim is: he asked, and the first
+                        # reply minus its claim is the answer he has.
+                        silent = (unbacked_first is not None and not claim
+                                  and not (final or "").strip()
+                                  and len(ran_results) == unbacked_ran_at)
+                        if unbacked_first is not None and (claim or silent):
+                            # The retry claims again with nothing behind
+                            # it: the FIRST reply is what he hears, with
+                            # the claims taken out and the rest (the
+                            # greeting) left standing -- its honest
+                            # sentences are the ones already streamed.
+                            # Unless a tool DID run since the retry was
+                            # asked and this is its render round claiming
+                            # afresh: then the render is the reply, and
+                            # the first would drop the tool's answer.
+                            if silent:
+                                log.warning("brain: the retry said nothing "
+                                            "(no tool ran); replacing the "
+                                            "claim in the first reply")
+                            else:
+                                log.warning("brain: unbacked action claim "
+                                            "stands after the retry (no "
+                                            "tool ran); replacing it")
+                            source = (final if len(ran_results) > unbacked_ran_at
+                                      else unbacked_first)
+                            # Judged against the same tools the claim was
+                            # judged against: without ``ran`` here, "I've
+                            # set your reminder for five" -- BACKED by the
+                            # set_reminder that ran -- was unbacked at
+                            # strip time and became "I couldn't do that
+                            # part, sir." beside the memory line, a
+                            # denial of a thing that was done, with the
+                            # reminder's own line confirming it after
+                            # (2026-09-04 verifier, M05/M05b).
+                            final = strip_unbacked_claims(source, cap,
+                                                          ran=ran_names(),
+                                                          kinds=claim_kinds)
                             if on_sentence is not None and \
                                     not self._stale(gen):
                                 # the honest sentences were streamed as they
                                 # landed and the claims withheld: the line
                                 # standing in for them is spoken now, once
-                                streamed_sentences.append(UNBACKED_LINE)
-                                try:
-                                    on_sentence(UNBACKED_LINE)
-                                except Exception:
-                                    log.exception("on_sentence failed")
+                                # per kind
+                                for line in authored_lines_in(final):
+                                    streamed_sentences.append(line)
+                                    try:
+                                        on_sentence(line)
+                                    except Exception:
+                                        log.exception("on_sentence failed")
+                        elif unbacked_first is not None:
+                            # A retry that claims nothing and ran no tool
+                            # is KEPT. This used to discard it for the
+                            # first reply's honest sentences, on the
+                            # reasoning that the retry's words came from
+                            # the same model with the same nothing behind
+                            # them. That reason no longer holds: the retry
+                            # is judged by the same table (a second lie
+                            # lands above), so a claim-free retry is the
+                            # model answering the nudge as written -- and
+                            # for a memory claim, where no tool exists to
+                            # make good on it, it is the ONLY path to an
+                            # honest sentence in the model's own words.
+                            # Discarding it threw away "I'm afraid I have
+                            # no way to store that, sir" for "I couldn't
+                            # do that part, sir." (2026-09-04 refuter,
+                            # probe b). On the stream the retry was a
+                            # plain round, so it is spoken here, after
+                            # what already went out, minus any sentence
+                            # that did.
+                            log.info("brain: the retry claims nothing; "
+                                     "speaking it")
+                            if not streaming and streamed_sentences and \
+                                    on_sentence is not None and \
+                                    not self._stale(gen):
+                                # clean(), not guard(): the retry claims
+                                # nothing (that is why it is here), so
+                                # there is no claim for a lead-in to be
+                                # the yes to and nothing to hold one for.
+                                # guard() would hold "Certainly, sir."
+                                # and hand the next sentence back as a
+                                # pair -- a list in the join below -- or
+                                # keep a trailing "Very well." for ever.
+                                for sent in split_sentences(final):
+                                    if len(streamed_sentences) >= cap:
+                                        break
+                                    line = clean(sent)
+                                    if not line or line in streamed_sentences:
+                                        continue
+                                    streamed_sentences.append(line)
+                                    try:
+                                        on_sentence(line)
+                                    except Exception:
+                                        log.exception("on_sentence failed")
+                                final = " ".join(streamed_sentences)
                     if render_only and tool_texts and not (final or "").strip():
                         # the reserved round produced no words at all: say
                         # WHAT is in hand rather than only that something is
@@ -3377,16 +3727,21 @@ class JarvisBrain:
         if len(streamed) >= cap:
             return                            # the spoken cap still holds
         if guard is not None:
-            line = guard(sentence)
+            lines = guard(sentence)           # a str, or a released lead-in + it
         else:
-            line = trim_spoken(strip_markdown(sentence).strip())
-        if not line:
-            return
-        streamed.append(line)
-        try:
-            on_sentence(line)
-        except Exception:
-            log.exception("on_sentence failed")
+            lines = trim_spoken(strip_markdown(sentence).strip())
+        if isinstance(lines, str):
+            lines = [lines]
+        for line in lines:
+            if not line:
+                continue
+            if len(streamed) >= cap:
+                return
+            streamed.append(line)
+            try:
+                on_sentence(line)
+            except Exception:
+                log.exception("on_sentence failed")
 
     # ------------------------------------------------------------------
     # Tier 3: Claude CLI (deep reasoning)
