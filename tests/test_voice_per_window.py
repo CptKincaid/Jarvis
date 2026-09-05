@@ -490,8 +490,17 @@ def test_a_second_person_is_refused_until_the_owner_is_in_the_gallery():
     # nobody in the gallery, a voiceprint on disk: a guest must wait
     ok, why = ve.owner_ready(g, "hunter", "mara", True)
     assert ok is False and "--migrate" in why and "hunter" in why
-    # the owner himself is always allowed
-    assert ve.owner_ready(g, "hunter", "hunter", True) == (True, "")
+    # THE OWNER HIMSELF USED TO BE "ALWAYS ALLOWED" AND THAT WAS HALF THE
+    # 2026-09-05 BLOCKER: whoever stood at the microphone got his name for
+    # typing it. With a voiceprint that has never been migrated, fresh takes
+    # under his name would not match it (0.896-0.937 against the 0.98 line)
+    # and speaker._owner_pools would disown them, so the script refuses to
+    # spend eight takes building a pool the runtime will not read as his.
+    ok, why = ve.owner_ready(g, "hunter", "hunter", True)
+    assert ok is False and "--migrate" in why
+    # With no voiceprint at all there is nothing to measure against and the
+    # gallery is the only anchor identity has: the bootstrap still works.
+    assert ve.owner_ready(g, "hunter", "hunter", False) == (True, "")
     # no voiceprint and nobody enrolled: a guest FIRST would leave the box
     # listening for her and nobody else -- the round-3 review measured him
     # woken 0/50 and admitted 0/50 in that layout. Refused, with the fix.
@@ -501,9 +510,10 @@ def test_a_second_person_is_refused_until_the_owner_is_in_the_gallery():
     _enrol(g, world, "heather", 10)
     ok, why = ve.owner_ready(g, "hunter", "mara", False)
     assert ok is False and "hunter" in why
-    # migrated: fine
+    # migrated: fine -- for a guest, and for him topping his own pool up
     _enrol(g, world, "hunter", 14)
     assert ve.owner_ready(g, "hunter", "mara", True) == (True, "")
+    assert ve.owner_ready(g, "hunter", "hunter", True) == (True, "")
 
 
 def test_main_refuses_before_touching_the_microphone(tmp_path, monkeypatch,

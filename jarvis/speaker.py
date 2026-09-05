@@ -109,26 +109,24 @@ VOICEPRINT_FORMAT = 2
 # minted from it, where pooling would have named a stranger as him.
 KNOWN_VOICEPRINT_FORMATS = (1, 2)
 
-# THE OWNER'S TWO POOLS ARE ONE POOL. ``voiceprint.npz`` has no label, and
-# ``--migrate`` copies its vectors unchanged into the gallery under his label,
-# so a window of his voice scores the two centroids identically up to float
-# rounding and the maximum lands on whichever came first. Identity is decided
-# PER WINDOW now (see filter_segments), and a clip of his that split between
-# "the voiceprint" and "hunter" would have half its windows dropped as
-# somebody else's. So a gallery label is folded into the voiceprint's pool
-# when it IS the owner's label (``owner_label``, set by the app from
-# identity.owner_label) -- or, when nobody told this verifier who the owner
-# is, when its centroid is this close to the voiceprint's. Measured
-# 2026-09-04 on synthetic vectors (tests/test_voice_per_window.py): a
-# migrated copy sits at cos 1.000, the same pool after two passive samples
-# (PASSIVE_CAP) at 0.99, and a DIFFERENT synthetic person's centroid
-# (10 takes against his 14, five seeds each) at 0.00-0.17 / 0.41-0.53 /
-# 0.70-0.77 / 0.81-0.85 for apart 0.3 / 1.0 / 2.0 / 3.0 -- under the
-# analytic apart^2/(apart^2+1) because a finite pool keeps some noise, and
-# every one under this line; 3.0 is a separation scripts/voice_enrol.py
-# refuses to enrol at all. The explicit label is the mechanism; the number
-# is the fallback for a process that never set it.
-MIGRATED_ALIAS_COSINE = 0.98
+# THE OWNER'S TWO POOLS ARE ONE POOL, AND THE MEASUREMENT IS WHAT SAYS SO.
+# ``voiceprint.npz`` has no label, and ``--migrate`` copies its vectors
+# unchanged into the gallery under his label, so a window of his voice scores
+# the two centroids identically up to float rounding and the maximum lands on
+# whichever came first. Identity is decided PER WINDOW (see filter_segments),
+# and a clip of his that split between "the voiceprint" and "hunter" would
+# have half its windows dropped as somebody else's. So a gallery label is
+# folded into the voiceprint's pool when its centroid MEASURES as that pool.
+#
+# IT USED TO BE FOLDED FOR THE LABEL STRING ALONE -- ``if label ==
+# self.owner_label`` with no cosine, no provenance and no consent -- and that
+# was the hole the 2026-09-05 review reproduced at 100/100 through two routes:
+# anybody's takes recorded under his name WERE him. His name is not a
+# credential; ``voiceprint.npz`` is. See voicegallery.OWNER_POOL_COSINE for
+# the number and the measurement behind it. The one thing the label string is
+# still trusted for is BOOTSTRAP: with no voiceprint at all there is nothing
+# to measure against, and the gallery is the only anchor identity has.
+MIGRATED_ALIAS_COSINE = vgal.OWNER_POOL_COSINE
 
 
 def _frame_rms(audio_16k, n):
@@ -216,6 +214,7 @@ class SpeakerVerifier:
         self._model_loaded = False
         self._device = None         # resolved by _resolve_device()
         self._warned_fail_open = False   # one Status(warn) per session
+        self._warned_disowned = False    # one warning per session
         self._model_failed = False       # a failed load is not retried
         # "" or one plain sentence naming the format on disk that this build
         # refused to read. Held rather than only logged so a startup line and
@@ -339,6 +338,16 @@ class SpeakerVerifier:
             except Exception:  # noqa: BLE001
                 log.warning("voice gallery centroids unreadable; matching "
                             "against the voiceprint alone", exc_info=True)
+        if matchable:
+            # AND A LABEL WEARING HIS NAME THAT IS NOT HIS POOL MATCHES
+            # NOBODY -- the same rule a provisional label already lives
+            # under, for the same reason. It cannot be folded into his pool
+            # (``_owner_pools``), and leaving it matchable would hand the
+            # gate a ``matched_label`` spelled like the owner, which
+            # ``gate._voice_leg`` compares to his label as a STRING. Dropping
+            # it is what makes the fix hold at the gate as well as here.
+            for label in self._disowned(out):
+                out.pop(label, None)
         return out
 
     # Legacy alias (voice_input_gui / hotword_daemon used .enrolled)
@@ -718,20 +727,64 @@ class SpeakerVerifier:
         return None if best is None else best[1]
 
     def _owner_pools(self, cents):
-        """The gallery labels that are HIS pool under another name -- see
-        MIGRATED_ALIAS_COSINE. ``cents`` is the dict ``_all_centroids``
-        built, so this costs one cosine per label and no lock."""
+        """The gallery labels that ARE the voiceprint's pool -- his, whatever
+        they are called. ``cents`` is the dict ``_all_centroids`` built, so
+        this costs one cosine per label and no lock.
+
+        ONE QUESTION, ASKED OF EVERY LABEL INCLUDING HIS OWN: does this
+        centroid measure as the voiceprint's pool? The previous version asked
+        a second question first -- "is this label spelled like the owner?" --
+        and answered YES with no measurement at all, which made his name a
+        credential anybody at the microphone could type. Measured 2026-09-05,
+        that admitted a guest with owner scope 100/100 by name and 100/100
+        again through the abstention fail-open (tests/
+        test_voice_owner_label_guard.py). There is no label test here now.
+
+        THE BOOTSTRAP IS THE ONE EXCEPTION AND IT IS NOT A LOOPHOLE. With no
+        voiceprint there is no pool to measure against, so the gallery is the
+        only anchor identity has and his label is it -- the layout a box has
+        after ``enroll_voice.py --reset``, and refusing it would silence him.
+        Nothing can be stolen there, because there is nothing yet to steal.
+        """
         out = set()
         mine = cents.get("")
         for label, c in cents.items():
             if not label:
                 continue
-            if label == self.owner_label:
-                out.add(label)
-            elif mine is not None and \
-                    self._cosine_similarity(c, mine) >= MIGRATED_ALIAS_COSINE:
+            if mine is None:
+                if label and label == self.owner_label:
+                    out.add(label)
+            elif self._cosine_similarity(c, mine) >= MIGRATED_ALIAS_COSINE:
                 out.add(label)
         return out
+
+    def _disowned(self, cents):
+        """The gallery labels that CLAIM the owner's name without measuring
+        as his pool. Everything below must refuse to read one as him.
+
+        A frozenset, so the empty case -- which is every healthy box -- costs
+        nothing. ``cents`` must be the UNFILTERED dict: a disowned label is
+        dropped from the matchable set by ``_all_centroids`` and cannot be
+        used to look itself up afterwards.
+        """
+        mine = cents.get("")
+        if mine is None or not self.owner_label:
+            return frozenset()          # bootstrap: nothing to measure against
+        c = cents.get(self.owner_label)
+        if c is None:
+            return frozenset()
+        score = float(self._cosine_similarity(c, mine))
+        if score >= MIGRATED_ALIAS_COSINE:
+            return frozenset()
+        if not self._warned_disowned:
+            self._warned_disowned = True
+            log.warning(
+                "voice gallery: the label %r does not match voiceprint.npz "
+                "(cos %.3f, needs %.2f) -- it is NOT being read as the owner. "
+                "Takes recorded under his name by somebody else look exactly "
+                "like this. Check with: scripts/voice_enrol.py --status",
+                self.owner_label, score, MIGRATED_ALIAS_COSINE)
+        return frozenset({self.owner_label})
 
     def _pool_of_label(self, label):
         """Which pool a gallery label belongs to: "" when it is the owner's
@@ -798,6 +851,7 @@ class SpeakerVerifier:
             log.exception("voice gallery identify failed; naming nobody")
             return None, ("the voice gallery could not identify: %s"
                           % type(exc).__name__)
+        verdict = self._strip_disowned(verdict)
         if verdict.who:
             log.info("voice gallery: %s (%.3f%s)", verdict.who, verdict.score,
                      "" if verdict.margin is None
@@ -809,6 +863,46 @@ class SpeakerVerifier:
         elif verdict.why and not verdict.abstained:
             log.info("voice gallery: naming nobody -- %s", verdict.why)
         return verdict, ""
+
+    def _strip_disowned(self, verdict):
+        """His name, taken back off a pool that is not his.
+
+        ``identify`` ranks GALLERY LABELS and knows nothing of
+        ``voiceprint.npz``, so it will happily name a disowned label -- his
+        name, on somebody else's voice. The escalation itself is already shut
+        by ``_all_centroids`` (a disowned label cannot be ``matched_label``,
+        which is the only thing ``gate._voice_leg`` turns into scope), so this
+        is not the lock; it is the LIE. A rejected clip still carries the
+        gallery's opinion into ``stats`` and into the log, and "probably
+        hunter" said about a stranger is exactly the sentence that would get
+        the guard hand-waved away as a false alarm next time.
+
+        ``score``, ``second`` and ``margin`` are left alone deliberately.
+        They feed only the accept bar and the near-miss test, and both of
+        those can only ever WITHHOLD a name downstream -- never grant one --
+        so a stale number there is conservative in the safe direction.
+
+        The lock is taken here and is never held by a caller: all three
+        ``_who`` call sites release it before asking.
+        """
+        if verdict is None:
+            return verdict
+        with self._lock:
+            gone = self._disowned(self._all_centroids())
+        if not gone:
+            return verdict
+        scores = tuple((lab, sc) for lab, sc in (verdict.scores or ())
+                       if lab not in gone)
+        who = "" if verdict.who in gone else verdict.who
+        prov = "" if verdict.provisional in gone else verdict.provisional
+        if (who == verdict.who and prov == verdict.provisional
+                and len(scores) == len(verdict.scores or ())):
+            return verdict
+        log.warning("voice gallery: withholding %r -- that label does not "
+                    "match voiceprint.npz and is not the owner",
+                    verdict.who or verdict.provisional or self.owner_label)
+        return dataclasses.replace(verdict, who=who, provisional=prov,
+                                   scores=scores)
 
     def _reconcile(self, verdict, pool):
         """The gallery's NAME must agree with the POOL the bar was cleared

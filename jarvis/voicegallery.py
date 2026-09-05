@@ -176,6 +176,40 @@ ACCEPT_DEFAULT = 0.30
 MARGIN = 0.20
 MARGIN_IS_PROVISIONAL = True
 
+# THE OWNER'S NAME IS NOT A CREDENTIAL, AND THIS IS THE NUMBER THAT SAYS SO.
+# A gallery label is the owner's pool when its centroid MEASURES as the
+# voiceprint's -- never because the label happens to spell his name. The
+# review of 2026-09-05 reproduced the alternative at 100/100 through two
+# separate routes: takes recorded under his own label by anybody at the
+# microphone WERE him, because speaker._owner_pools folded the label string
+# with no check of any kind and every guard in scripts/voice_enrol.py let it
+# be built. The mirror of that hole (--migrate --label mara, HIS takes under
+# HER name) had already been closed; this is the direction that was left open.
+#
+# ONE NUMBER, TWO ENFORCERS. speaker._owner_pools applies it at runtime and
+# scripts/voice_enrol.pool_ok applies it before writing, so the script can
+# never store a pool the runtime would refuse to read as his.
+#
+# MEASURED 2026-09-05 on synthetic vectors (tests/synthvoice.py), 8 seeds,
+# centroid cosine against the voiceprint, at apart 0.3 / 1.0 / 2.0 / 3.0 --
+# `apart` is a dial with no real-world referent, so this is a measurement of
+# the CODE and not of two humans:
+#
+#     migrated copy + 2 passive takes       0.9953 - 0.9962   his
+#     migrated 14 + 8 fresh takes of his    0.9856 - 0.9880   his
+#     POISONED   his 14 with her 10 added   0.8091 - 0.9717   not his
+#     IMPOSTOR   her 10 alone, his name    -0.0020 - 0.8422   not his
+#     his own fresh takes, never migrated   0.8963 - 0.9372   not his
+#
+# The narrowest gap is at apart 3.0 (0.9856 against 0.9717), a separation
+# pool_ok refuses to enrol at all; at 2.0, the closest it does admit, the gap
+# is 0.9856 against 0.9556. The last row is the one COST and it is stated
+# rather than hidden: a pool of his own takes filed under his own name without
+# --migrate first is not read as his. That is not a lockout -- voiceprint.npz
+# still carries him, measured 60/60 -- and pool_ok now refuses to create the
+# layout, pointing at --migrate.
+OWNER_POOL_COSINE = 0.98
+
 # A label with fewer than this many takes SCORES AND LOGS BUT NEVER NAMES.
 # Measured 2026-09-04 on his pool: the cosine between a centroid built from k
 # random takes and the converged 14-take centroid runs k=2 0.841, k=5 0.943,
@@ -1457,10 +1491,18 @@ class VoiceGallery:
             out["generation"] = self.save(
                 reason=reason or ("migrated %d takes from voiceprint.npz "
                                   "format 2" % len(staged)))
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 - ANY failure rolls back
+            # ANY exception, not only ValueError. Measured 2026-09-05: an
+            # OSError from save() escaped with the fourteen staged takes still
+            # in memory, disk_labels() still empty so the "never over an
+            # existing enrolment" guard did not fire, and the retry stored
+            # TWENTY-EIGHT -- his pool doubled and every later margin quietly
+            # wrong. voiceprint.npz is byte-identical either way, so this was
+            # never his identity at risk; it was his margins.
             self._pool, self._takes, self._consent = before
-            out["why"] = str(exc)
-            log.warning("voice gallery: migration refused -- %s", exc)
+            out["why"] = str(exc) or type(exc).__name__
+            log.warning("voice gallery: migration refused -- %s: %s",
+                        type(exc).__name__, exc)
             return out
         out["migrated"] = len(staged)
         out["ok"] = True

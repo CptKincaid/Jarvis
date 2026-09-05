@@ -191,9 +191,31 @@ def owner_ready(gallery, owner, label, voiceprint_exists):
        runtime now reads that gallery as no instrument for him, but the
        script must not build it in the first place.
 
-    Enrolling the OWNER himself is always allowed.
+    ENROLLING THE OWNER HIMSELF IS ALLOWED, BUT NOT OVER AN UN-MIGRATED
+    VOICEPRINT. That short-circuit used to be unconditional ("enrolling the
+    owner is always allowed") and it was half of the 2026-09-05 blocker:
+    whoever was at the microphone got his name for typing it. The refusal
+    here is not the identity check -- that needs the takes, and ``pool_ok``
+    does it -- it is the one part that can be decided BEFORE eight takes and
+    somebody's consent, and it is decided the same way the runtime decides
+    it. A fresh pool under his name would not match ``voiceprint.npz``
+    (measured 0.896-0.937 against the 0.98 line), so ``speaker._owner_pools``
+    would not read it as him: the script must not spend eight takes building
+    a pool the runtime will disown. ``--migrate`` is the supported way his
+    label comes to exist, and it needs no microphone.
     """
-    if label == owner or owner in gallery.labels():
+    if label == owner:
+        if voiceprint_exists and owner not in gallery.labels():
+            return False, (
+                "the owner (%s) has a voiceprint that has never been carried "
+                "into the voice gallery, and fresh takes under his name would "
+                "NOT be read as his (they do not match voiceprint.npz). Carry "
+                "it in first -- no microphone needed:\n    %s %s --migrate\n"
+                "If somebody else is at the microphone, enrol them under "
+                "their own name: --label <their-name>."
+                % (owner, sys.executable, __file__))
+        return True, ""
+    if owner in gallery.labels():
         return True, ""
     if voiceprint_exists:
         return False, (
@@ -279,15 +301,46 @@ def separation_margins(mine, theirs):
     return _loo(mine, vg.centroid(theirs)), _loo(theirs, vg.centroid(mine))
 
 
-def pool_ok(gallery, label, vectors):
+def voiceprint_vectors(path):
+    """The owner's stored embeddings, as a list, or [] when there is nothing
+    this script may anchor to.
+
+    NUMBERS ONLY, AND NOTHING IS WRITTEN. Format 1 returns [] for
+    ``migrate_voiceprint``'s reason: those vectors were pooled before silence
+    trimming and score low against trimmed probes, so anchoring to them would
+    refuse HIM. [] means "no anchor", and every check below stands down.
+    """
+    try:
+        path = Path(path)
+        if not path.exists():
+            return []
+        data = np.load(path)
+        names = list(data.files)
+        fmt = int(data["_format"][0]) if "_format" in names else 1
+        if fmt != 2:
+            return []
+        return [np.asarray(data[k], dtype=np.float32).ravel()
+                for k in sorted(n for n in names if n.startswith("emb_"))]
+    except Exception:  # noqa: BLE001 - an unreadable voiceprint is no anchor
+        return []
+
+
+def pool_ok(gallery, label, vectors, owner="", owner_vectors=None):
     """``(ok, why not)`` for a FINISHED pool, before it is saved.
 
-    Two refusals, and each one prints its number, because "that did not work"
+    Four refusals, and each one prints its number, because "that did not work"
     is not something anybody can act on at eleven at night.
 
     1. COHESION. A median pairwise cosine above 0.90 is one take recorded
        several times. His own fourteen-take pool measures 0.485.
-    2. SEPARATION. If the MARGIN this pool's takes would clear against
+    2. THE SAME NAME IS THE SAME PERSON. Topping up a label compares the new
+       takes against THE ONES ALREADY UNDER IT -- the comparison this loop
+       used to skip outright (``if other == label: continue``), which is how
+       a stranger's takes could be recorded under anybody's name and never
+       measured against the person whose name it was. Same quantity as
+       refusal 3, opposite sense: if the two pools ARE separable by the margin
+       bar they are two people, and one name cannot hold both.
+    3. SEPARATION. If the MARGIN this pool's takes would clear against
        somebody already enrolled -- or theirs against this pool -- has a
        median under ``vg.MARGIN``, ``identify`` would fail to name that
        person more often than not: every such verdict comes back UNKNOWN on
@@ -295,6 +348,15 @@ def pool_ok(gallery, label, vectors):
        to say so now, with the number, than to store it and let them both
        quietly stop working. See ``separation_margins`` for why this is the
        margin itself and not the centroids' cosine.
+    4. THE OWNER'S ANCHOR. Under HIS label, the pool that would be stored is
+       measured against ``voiceprint.npz`` itself on
+       ``vg.OWNER_POOL_COSINE`` -- THE SAME NUMBER speaker._owner_pools
+       applies at runtime, so this script can never write a pool the runtime
+       would refuse to read as his. It is what makes refusal 2 hold at the
+       separations where the margin bar cannot: measured 2026-09-05, her ten
+       takes added to his migrated fourteen leave the label's centroid at
+       0.809-0.972 against the 0.98 line and are refused at every separation,
+       including the ones where she is too confusable for a margin to notice.
     """
     if len(vectors) < 2:
         return False, "a pool needs at least two takes"
@@ -304,9 +366,52 @@ def pool_ok(gallery, label, vectors):
                        "above %.2f -- that is one take recorded several times, "
                        "not several takes. A real pool measures around 0.485."
                        % (len(vectors), med, vg.COLLAPSED_MEDIAN_COSINE))
+
+    # 2. the same name is the same person
+    already = gallery.embeddings(label)
+    if len(already) >= 2:
+        m_new, m_old = separation_margins(vectors, already)
+        if min(m_new, m_old) >= vg.MARGIN:
+            return False, (
+                "%r already holds %d take(s), and these %d are a DIFFERENT "
+                "voice: they clear that pool by a median margin of %.3f and "
+                "it clears them by %.3f, where anything at or above %.2f is "
+                "two people Jarvis can tell apart. One name cannot hold two "
+                "people -- Jarvis would answer whoever it heard as %r. Use "
+                "--label for the person actually at the microphone."
+                % (label, len(already), len(vectors), m_new, m_old,
+                   vg.MARGIN, label))
+
+    # 4. the owner's anchor -- the same number the runtime applies
+    if owner and label == owner and owner_vectors is not None \
+            and len(owner_vectors) >= 1:
+        mine = vg.centroid(list(owner_vectors))
+        would_be = vg.centroid(list(already) + list(vectors))
+        if mine is not None and would_be is not None:
+            sim = vg.cosine(would_be, mine)
+            if sim < vg.OWNER_POOL_COSINE:
+                if not already:
+                    return False, (
+                        "%r would be a NEW pool under the owner's name that "
+                        "does not match voiceprint.npz (cosine %.3f, needs "
+                        "%.2f), so Jarvis would not read it as him anyway. "
+                        "Carry his existing voiceprint in first -- no "
+                        "microphone needed:\n    %s %s --migrate\n"
+                        "If somebody else is at the microphone, enrol them "
+                        "under their own name with --label."
+                        % (label, sim, vg.OWNER_POOL_COSINE,
+                           sys.executable, __file__))
+                return False, (
+                    "these %d takes would pull %r away from voiceprint.npz "
+                    "(the pool would sit at cosine %.3f, and %.2f is where "
+                    "Jarvis stops reading it as the owner). Either they are "
+                    "not his voice, or they were recorded somewhere his "
+                    "voiceprint would not recognise. Nothing was written."
+                    % (len(vectors), label, sim, vg.OWNER_POOL_COSINE))
+
     for other in sorted(gallery.labels()):
         if other == label:
-            continue
+            continue                # refusal 2 above is this label's own test
         theirs = gallery.embeddings(other)
         if len(theirs) < 2:
             continue
@@ -557,7 +662,8 @@ def main(argv=None) -> int:
 
     # --------------------------------------------------- the pool's own bars
     vectors = [e for e, _s, _r, _h in staged]
-    good, why = pool_ok(gallery, args.label, vectors)
+    good, why = pool_ok(gallery, args.label, vectors, owner=owner,
+                        owner_vectors=voiceprint_vectors(PATHS.VOICEPRINT))
     if not good:
         print("\nREFUSED, and nothing was written:\n  %s" % why, file=sys.stderr)
         return 4
