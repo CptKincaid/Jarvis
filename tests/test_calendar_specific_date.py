@@ -25,11 +25,20 @@ THE RULES THIS FILE PINS (each decision is stated where it is tested):
   point;
 * a future-worded question resolves FORWARD (the next occurrence at or
   after today), a past-worded one BACKWARD;
-* a date outside the fortnight the cache actually holds is REFUSED by name,
-  never answered "nothing on it";
+* a date outside the window the cache actually holds is REFUSED by name,
+  never answered "nothing on it" (the window is 45 days since 2026-09-05;
+  see tests/test_calendar_window_widening.py for why it could not simply be
+  widened);
 * a date that cannot be read -- the 31st of September, the 32nd, 13/5, a
   weekday that does not fall on the day named -- is ASKED ABOUT.  Nothing
   unrecognised may become "today" again.
+
+ROUND TWO (same day, after a 180-phrasing grid): a bare ordinal became a
+date in twenty of thirty-six NON-date rows, an explicit year was dropped, an
+offset phrase was silently ignored, word ordinals and dash dates were still
+silently today, and the two doors disagreed on eight of his own words.  All
+four are pinned at the end of this file, as CLASSES rather than examples --
+the round before pinned four ordinal phrases and shipped twenty.
 
 THE CLOCK: every test injects its own ``now``.  Nothing here reads the wall
 clock, and ``test_any_hour_any_date_any_timezone`` re-runs the whole
@@ -50,8 +59,9 @@ from jarvis.tools.registry import ToolRegistry
 
 CHI = ZoneInfo("America/Chicago")           # he is in Texas
 # Saturday 5 September 2026, 9:00 am.  The reachable window from here is
-# 2026-09-04 (yesterday) through 2026-09-18 -- CalendarSource._window
-# anchors at yesterday-midnight and reaches WINDOW_DAYS + 1 days.
+# 2026-09-04 (yesterday) through 2026-10-19 -- CalendarSource._window
+# anchors at yesterday-midnight and reaches WINDOW_DAYS + 1 days, and
+# WINDOW_DAYS is 45.
 NOW = datetime(2026, 9, 5, 9, 0, tzinfo=CHI)
 TODAY = NOW.date()
 
@@ -239,23 +249,38 @@ def test_a_past_date_beyond_the_cache_is_refused_by_name():
 
 # ------------------------------------------------- the reachable window
 #
-# DECISION: the cache holds yesterday through today+13 and nothing else, so
-# a date outside it is refused with its own name and the edge date, never
-# answered empty.  Widening WINDOW_DAYS is a live-system decision (it moves
-# what calwatch reads as a new booking) and is deliberately NOT taken here.
+# DECISION: the cache holds yesterday through today + WINDOW_DAYS - 1 and
+# nothing else, so a date outside it is refused with its own name and the
+# edge date, never answered empty.  WINDOW_DAYS went 14 -> 45 on 2026-09-05
+# so that a date a month out -- "what about october 3rd", which he asked --
+# is ANSWERED rather than honestly refused; see
+# tests/test_calendar_window_widening.py for the calwatch burst that had to
+# be made impossible first.
+def test_the_date_a_month_out_is_answered_now_not_refused():
+    """The whole point of the widening: 2026-10-03 was 28 days away, inside
+    no 14-day cache and inside this one."""
+    assert calendar.WINDOW_DAYS >= 45
+    text = format_events([], coerce_range("what about october 3rd", NOW), NOW)
+    assert text == "Nothing on Saturday the 3rd of October, sir."
+    day = datetime(2026, 10, 3, 11, 0, tzinfo=CHI)
+    assert "ADVISOR" in format_events([_ev(day, "ADVISOR")],
+                                      coerce_range("what about october 3rd", NOW), NOW)
+
+
 def test_a_future_date_beyond_the_cache_is_refused_by_name():
-    text = format_events([], "2026-10-03", NOW)
+    text = format_events([], "2026-12-03", NOW)
     assert "Nothing" not in text
-    assert "Saturday the 3rd of October" in text
-    assert "Friday the 18th" in text            # the far edge, named
+    assert "Thursday the 3rd of December" in text
+    assert "Monday the 19th of October" in text          # the far edge, named
     # His own words land here, and get a straight answer about reach.
-    assert format_events([], coerce_range("what about october 3rd", NOW), NOW) == text
+    assert format_events([], coerce_range("what about december 3rd", NOW), NOW) == text
 
 
 def test_the_edges_of_the_window_are_inclusive():
     assert "Nothing on Friday the 4th, sir." == format_events([], "2026-09-04", NOW)
-    assert "Nothing on Friday the 18th, sir." == format_events([], "2026-09-18", NOW)
-    for out in ("2026-09-03", "2026-09-19"):
+    assert "Nothing on Monday the 19th of October, sir." == \
+        format_events([], "2026-10-19", NOW)
+    for out in ("2026-09-03", "2026-10-20"):
         assert "Nothing on" not in format_events([], out, NOW), out
 
 
@@ -462,9 +487,9 @@ def test_an_unreadable_date_asks_instead_of_answering(tmp_path, monkeypatch):
 
 def test_a_date_past_the_window_reaches_him_as_a_refusal(tmp_path, monkeypatch):
     reg, _src = _registry(tmp_path, monkeypatch, [], NOW)
-    res = reg.call("get_calendar", {"range": "2026-10-03"})
+    res = reg.call("get_calendar", {"range": "2026-12-03"})
     assert res.ok is False
-    assert "Saturday the 3rd of October" in res.text
+    assert "Thursday the 3rd of December" in res.text
     assert "Nothing" not in res.text
 
 
@@ -562,3 +587,349 @@ def test_the_day_named_is_the_day_listed(now):
         text = format_events([_ev(start, "BIOSENSORS", 50)], rng, now,
                              window_days=4000)
         assert "BIOSENSORS" in text, f"{said!r} at {now}: {text}"
+
+
+# ============================================================ round two
+#
+# Four holes measured on a 180-phrasing grid at this same injected Saturday,
+# after the build above shipped.  Each is another instance of the ONE failure
+# that matters -- a confident answer about the wrong day -- so none of them
+# is cosmetic.
+
+
+# ------------------------------- (1) a non-date must not become a date
+#
+# TWENTY of thirty-six non-date rows were read as dates.  The mechanism was
+# ``_D_ORD_RX``: it took a bare ordinal as a date after "on", "for" or "the",
+# and "the" there is the ARTICLE.  "when is the 2nd lab on my calendar" was
+# answered "I only hold the calendar out to Friday the 18th, sir; Friday the
+# 2nd of October is past that."
+#
+# The build pinned FOUR such phrases and shipped twenty, which is what
+# pinning examples instead of a class buys.  This is the class: ranks, rooms
+# and floors, gates and flights, versions, quantities, durations, and plain
+# numbers that were never ordinals at all.  A rank is "the Nth <noun>"; a
+# date is a bare ordinal with nothing after it but punctuation or a word that
+# cannot be the noun a rank counts.
+NOT_DATES = [
+    # -- ranks -----------------------------------------------------------
+    "what's my 2nd class",
+    "when is the 2nd lab on my calendar",
+    "how long is my 1st meeting",
+    "when is the 3rd lecture",
+    "what's the 4th session about",
+    "what's the 2nd item on my list",
+    "is the 1st period cancelled",
+    "read me the 5th question",
+    "it worked on the 2nd try",
+    "that's for the 3rd time",
+    "the 2nd half starts soon",
+    "where's the 1st draft",
+    "the 21st century",
+    "how were the 3rd quarter results",
+    "who came in 2nd",
+    "the 6th man award",
+    "what's the 2nd best option",
+    "the 1st amendment",
+    "the 7th grade parents evening",
+    "the 3rd person in line",
+    # -- rooms, floors, gates, flights -----------------------------------
+    "the 3rd floor conference room",
+    "meet me on the 2nd floor",
+    "boarding at the 4th gate",
+    "the 12th floor lab",
+    "room 12 on the 3rd level",
+    "gate 5 for the 1st flight",
+    "the 1st flight out",
+    "the 2nd leg of the trip",
+    "flight 1204 lands tonight",
+    "room 305 is booked",
+    "gate 12 closes early",
+    # -- versions --------------------------------------------------------
+    "the 2nd version of the doc",
+    "open the 3rd revision",
+    "python 3 the 2nd edition",
+    "version 2 of the plan",
+    # -- quantities and durations ----------------------------------------
+    "the 2nd of three parts",
+    "the 1st of many",
+    "3 hours on the 2nd shift",
+    "i need the 4th copy",
+    "the 1st hour of the meeting",
+    "for the 3rd week running",
+    "the 2nd day of class",
+    "the 90th minute",
+    "the 100th day of term",
+    "wait a second",
+    "give me one second",
+    # -- a month word doing a month word's other job ---------------------
+    # Found on this round's own grid, and the same class: "may 3 people
+    # come" was answered about the 3rd of May.  A month name beside a BARE
+    # number obeys the tail rule too; an ordinal or a year settles it.
+    "may 3 people come",
+    "march 3 people in",
+    "maybe 3 things",
+    "he finished 2nd of 40",
+    "chapter 3 of 12",
+    "page 2 of 5",
+]
+
+
+@pytest.mark.parametrize("said", NOT_DATES)
+def test_a_non_date_never_becomes_a_date(said):
+    """No row here names a day, so none may resolve to one -- and none may
+    ASK either: a question on "what's my 2nd class" is its own wrong answer."""
+    rng = coerce_range(said, NOW)
+    assert as_date(rng) is None, f"{said!r} -> {rng!r}"
+    assert not is_ask(rng), f"{said!r} -> {rng!r}"
+
+
+def test_the_non_date_table_covers_the_classes_it_claims_to():
+    """A guard on the guard: forty-odd rows, and the shapes named above."""
+    assert len(NOT_DATES) >= 40
+    assert len(set(NOT_DATES)) == len(NOT_DATES)
+
+
+@pytest.mark.parametrize("said,want", [
+    ("what's on the 12th of this month", "2026-09-12"),
+    ("what do i have on the 1st of next month", "2026-10-01"),
+    ("what did i have on the 3rd of last month", "2026-08-03"),
+    ("anything on the 12th of the month", "2026-09-12"),
+    ("what's on the day after the 12th of this month", "2026-09-13"),
+])
+def test_a_month_named_without_naming_it(said, want):
+    """Also found on this round's grid, also a silent TODAY: "the 12th of
+    this month" carries a month the tail rule reads as a rank ("the 2nd of
+    three parts") and _D_DM_RX cannot see, because there is no month NAME."""
+    assert coerce_range(said, NOW) == want, said
+
+
+def test_a_month_name_beside_a_bare_number_still_reads_as_a_date():
+    """The tail rule on _D_MD_RX must not cost him the phrasing he used."""
+    for said, want in [("do i have anything on sept 12", "2026-09-12"),
+                       ("anything on sep. 12", "2026-09-12"),
+                       ("what's on september 12 at 3", "2026-09-12"),
+                       ("anything on september 12 2027", "2027-09-12"),
+                       ("what about september 12th class", "2026-09-12")]:
+        assert coerce_range(said, NOW) == want, said
+
+
+def test_the_ordinal_phrasings_he_actually_used_still_read_as_dates():
+    """The tail rule must not buy the table above with his own sentences."""
+    for said, want in HIS_PHRASINGS:
+        assert coerce_range(said, NOW) == want, said
+    for said, want in [("anything on the 12th at 3", "2026-09-12"),
+                       ("what's on the 12th and the 13th", "2026-09-12"),
+                       ("is there anything on the 12th please", "2026-09-12"),
+                       ("what's on the 12th, sir", "2026-09-12"),
+                       ("anything on the 12th this month", "2026-09-12")]:
+        assert coerce_range(said, NOW) == want, said
+
+
+# --------------------------- (2) a date must not resolve to another day
+def test_an_explicit_year_after_a_month_name_is_not_eaten_as_the_day():
+    """MEASURED before the fix: "on 12 september 2027" -> 2026-09-20.  The
+    day regex ate the first two digits of the YEAR ("20"), the ordinal and
+    the year were both optional, and the year he said was dropped."""
+    assert coerce_range("on 12 september 2027", NOW) == "2027-09-12"
+    assert coerce_range("what do i have on 12 september 2027", NOW) == "2027-09-12"
+    assert coerce_range("anything on september 12 2027", NOW) == "2027-09-12"
+    assert coerce_range("anything on 12th september 2027", NOW) == "2027-09-12"
+    # and the year-less forms still resolve by the one-rule year inference
+    assert coerce_range("on 12 september", NOW) == "2026-09-12"
+    assert coerce_range("anything on september 2027", NOW) != "2026-09-20"
+
+
+@pytest.mark.parametrize("said,want", [
+    ("what's on the day after the 12th", "2026-09-13"),
+    ("what's on the day before the 12th", "2026-09-11"),
+    ("anything a week after the 12th", "2026-09-19"),
+    ("anything a week before the 12th", "2026-09-05"),
+    ("what's on two days after the 12th", "2026-09-14"),
+    ("what's on three days before september 12th", "2026-09-09"),
+    ("what's on the day after tomorrow", "2026-09-07"),
+    ("what's on the day before yesterday", "2026-09-03"),
+    ("what's on the day after today", "2026-09-06"),
+    ("what's on the day after monday", "2026-09-08"),
+    ("what did i have the day before the 3rd", "2026-09-02"),
+    ("what's on 2 weeks after the 12th", "2026-09-26"),
+])
+def test_an_offset_is_understood_not_dropped(said, want):
+    """MEASURED before the fix: "the day after the 12th" -> the 12th.  The
+    offset was found by no rule and silently discarded, which is the whole
+    complaint in miniature -- a confident answer about a day he had just
+    stepped away from."""
+    assert coerce_range(said, NOW) == want, said
+
+
+@pytest.mark.parametrize("said", [
+    "what's on the day after the exam",
+    "anything two days before the deadline",
+    "what's on the week after next",
+])
+def test_an_offset_whose_base_is_unnameable_asks(said):
+    """Understood as an offset, unable to name what it is an offset FROM.
+    An ask; never the base day, and never today."""
+    rng = coerce_range(said, NOW)
+    assert is_ask(rng), f"{said!r} -> {rng!r}"
+    assert ask_words(rng).endswith("?")
+
+
+# ------------------- (3) an unreadable date must not still be today
+@pytest.mark.parametrize("said,want", [
+    ("what do i have on september twelfth", "2026-09-12"),
+    ("anything on the twelfth", "2026-09-12"),
+    ("what about october third", "2026-10-03"),
+    ("what is on my calendar on the twentieth", "2026-09-20"),
+    ("anything on the twenty-third", "2026-09-23"),
+    ("anything on the twenty third", "2026-09-23"),
+    ("what's on the thirty-first of october", "2026-10-31"),
+    ("anything on the first", "2026-10-01"),
+    ("what did i have on the second", "2026-09-02"),
+    ("what's on september twenty-ninth", "2026-09-29"),
+])
+def test_an_ordinal_said_as_a_word_reads_as_a_date(said, want):
+    """MEASURED before the fix: "on september twelfth" -> today, answered
+    "Today: ...".  Every date regex wanted digits."""
+    assert coerce_range(said, NOW) == want, said
+
+
+@pytest.mark.parametrize("said,want", [
+    ("what do i have on 9-12", "2026-09-12"),
+    ("what do i have on 9.12", "2026-09-12"),
+    ("anything on 9-12-2027", "2027-09-12"),
+    ("what's on 12-9", "2026-12-09"),
+])
+def test_a_dash_separated_date_reads_as_a_date(said, want):
+    """MEASURED before the fix: "on 9-12" -> today.  A bare "9-12" really is
+    a time range more often than a date; one he put "on" in front of is not."""
+    assert coerce_range(said, NOW) == want, said
+
+
+@pytest.mark.parametrize("said", [
+    "i'm free 9-12",                  # no date cue: a time range, left alone
+    "the lab runs 2-4",
+    "on 3-4 hours of sleep",          # the tail rule: a duration, not a date
+])
+def test_a_dash_pair_that_is_not_a_date_is_not_one(said):
+    rng = coerce_range(said, NOW)
+    assert as_date(rng) is None, f"{said!r} -> {rng!r}"
+    assert not is_ask(rng), f"{said!r} -> {rng!r}"
+
+
+def test_a_dash_pair_that_could_be_a_clock_asks():
+    rng = coerce_range("what do i have on 9-12 from nine", NOW)
+    assert is_ask(rng), rng
+    assert "9-12" in ask_words(rng) and ask_words(rng).endswith("?")
+
+
+@pytest.mark.parametrize("said", [
+    "what do i have on september thirty-first",   # September has 30 days
+    "anything on february thirtieth",
+    "what about the 32nd",
+    "anything on 13-13",
+])
+def test_a_word_or_dash_date_that_cannot_be_read_still_asks(said):
+    rng = coerce_range(said, NOW)
+    assert is_ask(rng), f"{said!r} -> {rng!r}"
+    assert rng != "today"
+    assert ask_words(rng).endswith("?")
+
+
+def test_the_one_line_that_may_answer_today_is_still_the_only_one():
+    """Re-run of the grep guard, after the round-two rewrite: coerce_range
+    may return "today" from exactly ONE line, still behind the date guard."""
+    import inspect
+
+    src = inspect.getsource(calendar.coerce_range)
+    assert src.count('return "today"') == 1
+    body = src.split('return "today"')[0]
+    assert "_DATEISH_RX" in body, "the last line must be guarded by the date guard"
+
+
+# ------------------------------ (4) the two doors must not disagree
+#
+# MEASURED before the fix: "what was on my calendar yesterday" was the 4th
+# through the forced door (commander.calendar_range -> coerce_range) and
+# TODAY through the model door, on the same eight words.  The CAUSE was two
+# readers: the model door's deriver called ``_explicit_date``, which knows
+# nothing of "yesterday" or of an offset, so it derived nothing and the
+# model's own wrong ``range`` stood.  There is now ONE reader,
+# ``calendar.sentence_date``, and this pins that both doors use it.
+DOOR_ROWS = HIS_PHRASINGS + [
+    ("what was on my calendar yesterday", "2026-09-04"),
+    ("what did i have yesterday", "2026-09-04"),
+    ("what's on the day after the 12th", "2026-09-13"),
+    ("what do i have on september twelfth", "2026-09-12"),
+    ("what do i have on 9-12", "2026-09-12"),
+    ("on 12 september 2027", "2027-09-12"),
+    ("what did i have on the 3rd", "2026-09-03"),
+]
+
+
+def _deriver(monkeypatch):
+    monkeypatch.setattr(calendar, "now_local", lambda tz=None: NOW)
+    spec = [t for t in make_tools(_Cfg(), SimpleNamespace())
+            if t.name == "get_calendar"][0]
+    return spec.derive
+
+
+@pytest.mark.parametrize("said,want", DOOR_ROWS)
+def test_both_doors_read_the_same_day_off_the_same_words(said, want, monkeypatch):
+    from jarvis.commander import calendar_range
+
+    derive = _deriver(monkeypatch)
+    assert calendar_range(said, NOW) == want, f"forced: {said!r}"
+    assert derive(said) == {"range": want}, f"model: {said!r}"
+
+
+@pytest.mark.parametrize("said", NOT_DATES + [
+    "what do i have on september 31st", "anything on 13/5", "what about the 32nd",
+    "what's on the day after the exam", "whats on my calendar",
+    "what's on my calendar tmrw", "and the next day", "what's on monday",
+])
+def test_the_doors_agree_on_every_row_of_the_table(said, monkeypatch):
+    """The invariant, stated over the whole non-date table plus the asks and
+    the word ranges: whenever the forced door names a DAY or asks a
+    QUESTION, the model door derives exactly that; and whenever the model
+    door derives anything at all, the forced door agrees with it."""
+    from jarvis.commander import calendar_range
+
+    derive = _deriver(monkeypatch)
+    forced = calendar_range(said, NOW)
+    derived = derive(said)
+    if as_date(forced) is not None or is_ask(forced):
+        assert derived == {"range": forced}, f"{said!r}: {forced!r} vs {derived!r}"
+    if derived:
+        assert derived["range"] == forced, f"{said!r}: {forced!r} vs {derived!r}"
+
+
+def test_yesterday_reaches_the_tool_the_same_way_through_the_model_door(
+        tmp_path, monkeypatch):
+    """End to end, the exact eight words that disagreed: one event on
+    yesterday, and the model sending the wrong range."""
+    ev = _ev(datetime(2026, 9, 4, 10, 0, tzinfo=CHI), "Dentist")
+    reg, _src = _registry(tmp_path, monkeypatch, [ev], NOW)
+    said = "what was on my calendar yesterday"
+    fixed = reg.call("get_calendar", {"range": "today"}, from_model=True,
+                     utterance=said)
+    assert "Dentist" in fixed.text and "Friday the 4th" in fixed.text
+    assert fixed.text == format_events([ev], coerce_range(said, NOW), NOW)
+
+
+@pytest.mark.parametrize("now", CLOCKS)
+def test_the_doors_agree_at_every_instant(now, monkeypatch):
+    """The clock axis, restated for round two: the agreement is not a
+    property of Saturday afternoon in Chicago."""
+    from jarvis.commander import calendar_range
+
+    monkeypatch.setattr(calendar, "now_local", lambda tz=None: now)
+    spec = [t for t in make_tools(_Cfg(), SimpleNamespace())
+            if t.name == "get_calendar"][0]
+    for said in [r[0] for r in DOOR_ROWS] + NOT_DATES:
+        forced = calendar_range(said, now)
+        derived = spec.derive(said)
+        if as_date(forced) is not None or is_ask(forced):
+            assert derived == {"range": forced}, f"{said!r} at {now}"
+        if derived:
+            assert derived["range"] == forced, f"{said!r} at {now}"

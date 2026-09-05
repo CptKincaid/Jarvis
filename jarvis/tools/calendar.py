@@ -48,7 +48,18 @@ FETCH_TIMEOUT = 8
 # once an hour; ONE success clears it.
 SOURCE_BACKOFF_S = REFRESH_S
 MAX_SOURCE_BACKOFF_S = 3600
-WINDOW_DAYS = 14                # how far ahead the cache reaches
+# How far ahead the cache reaches.  14 until 2026-09-05, which made "what
+# about october 3rd" -- a day he genuinely has -- land on the right date and
+# then be refused for reach, which is honest and still not an answer.  45
+# covers the rest of a term.  MEASURED 2026-09-05 on two synthetic feeds of
+# one event a day: a refresh goes 8.4 ms -> 9.7 ms and the cache file 5.1 KB
+# -> 15.6 KB (28 events -> 90), once per ten minutes.  Nothing.
+# The real cost was never the bytes: calwatch diffs two
+# snapshots, so the first refresh after the widening could announce every
+# event past the old edge as a new booking -- 31 of them, measured, in
+# tests/test_calendar_window_widening.py.  CalendarSource.covered_window()
+# is what makes that impossible; do not widen this without it.
+WINDOW_DAYS = 45
 # Named weekdays are ranges too. Without them "what's on my agenda for
 # Monday?" had nowhere to land and the model fell back to "next", which
 # answers with a single event -- seen 2026-08-28 when Monday held four.
@@ -397,23 +408,76 @@ _MONTH = rf"(?P<mon>{_MONTH_ALT})(?:\.|\b)"
 _ORD = r"(?:st|nd|rd|th)"
 _YEAR = r"(?:,?\s+(?P<y>\d{4}))?"
 _D_ISO_RX = re.compile(r"\b(?P<y>\d{4})-(?P<m>\d{1,2})-(?P<d>\d{1,2})\b")
-_D_MD_RX = re.compile(rf"\b{_MONTH}\s+(?P<d>\d{{1,2}}){_ORD}?{_YEAR}", re.I)
+# (?!\d) on the DAY.  Without it "september 2027" read as SEPTEMBER THE 20th:
+# \d{1,2} ate the first two digits of the year, the ordinal and the year were
+# both optional, and the explicit year he had just said was dropped.  MEASURED
+# 2026-09-05: "on 12 september 2027" -> 2026-09-20, wrong in both fields.
+_D_MD_RX = re.compile(
+    rf"\b{_MONTH}\s+(?P<d>\d{{1,2}})(?!\d)(?P<ord>{_ORD})?{_YEAR}", re.I)
 _D_DM_RX = re.compile(
-    rf"\b(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}?\s+(?:of\s+)?{_MONTH}{_YEAR}", re.I)
-# Month-first, because he is in Texas.  "-" is deliberately NOT a separator:
-# "9-12" is a time range far more often than it is a date.
+    rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d)(?P<ord>{_ORD})?\s+(?:of\s+)?"
+    rf"{_MONTH}{_YEAR}", re.I)
+# Month-first, because he is in Texas.
 _D_NUM_RX = re.compile(
     r"\b(?P<a>\d{1,2})\s*/\s*(?P<b>\d{1,2})(?:\s*/\s*(?P<y>\d{2,4}))?\b")
-# A BARE ordinal is only a date after on / for / the, which is how all four
-# of his ordinal phrasings say it.  Without that guard "my 2nd class" and
-# "my 1st meeting" become the 2nd and the 1st of the month.
-_D_ORD_RX = re.compile(rf"\b(?:on|for|the)\s+(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}\b",
-                       re.I)
+# THE TAIL RULE, the fix for the biggest hole of the 2026-09-05 build.
+#
+# "the" in "on / for / the" is the ARTICLE as often as it is a date cue, so
+# the old guard let TWENTY of thirty-six non-date phrasings become dates:
+# "when is the 2nd lab on my calendar" was answered "I only hold the calendar
+# out to Friday the 18th, sir; Friday the 2nd of October is past that."  The
+# build pinned ONE such phrase ("my 2nd class") and shipped twenty, which is
+# what pinning an example instead of a class buys.
+#
+# The class: "the Nth <noun>" is a RANK -- a lab, a floor, a flight, a
+# version, a try, an hour.  A bare ordinal is a DATE only when nothing
+# follows it but punctuation or one of the small set of words below, none of
+# which can be the noun a rank counts.  "of" is deliberately NOT in the set:
+# "the 12th of October" is matched by _D_DM_RX before this regex is reached,
+# so leaving it out costs nothing and keeps "the 2nd of three parts" a rank.
+_ORD_TAIL = (r"at|on|in|and|or|for|to|this|next|please|sir|then|too|instead|"
+             r"is|was|are|were|do|does|did|i|my|me|we|you|there|anything|"
+             r"something|else|yet|still|though|but|if|so|that|it|ok|okay|"
+             r"look|looks")
+_TAIL_OK = rf"(?!\s+(?!(?:{_ORD_TAIL})\b)\w)"
+# The same test applied to a string rather than inline in a pattern.
+_NOT_TAIL_RX = re.compile(rf"\s+(?!(?:{_ORD_TAIL})\b)\w", re.I)
+
+
+def _tail_ok(rest: str) -> bool:
+    """True when what follows a bare number cannot be the noun of a rank."""
+    return _NOT_TAIL_RX.match(rest or "") is None
+_D_ORD_RX = re.compile(
+    rf"\b(?:on|for|the)\s+(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}\b{_TAIL_OK}", re.I)
+# "the 12th OF this month" names a month without naming it.  It has its own
+# rule because the tail rule above deliberately treats a following "of" as a
+# rank ("the 2nd of three parts"), and _D_DM_RX only fires on a month NAME --
+# so without this "what's on the 12th of this month" was silently TODAY,
+# measured on the same grid as the four blockers.
+_D_REL_MONTH_RX = re.compile(
+    rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d){_ORD}?\s+of\s+"
+    r"(?P<rel>this|next|last|the)\s+month\b", re.I)
+# "on 9-12" was silently TODAY: the dash was left out on the grounds that
+# "9-12" is a time range more often than a date, which is true of a bare
+# "9-12" and not of one he put "on" in front of.  So: a dash- or dot-separated
+# pair is a date only after on / for, only when the same tail rule holds ("on
+# 3-4 hours" stays a duration), and when the sentence ALSO carries a clock
+# word the reading is genuinely ambiguous and Jarvis asks instead of guessing.
+_DASH_PAIR = (r"\b(?:on|for)\s+(?P<a>\d{1,2})\s*[-.]\s*(?P<b>\d{1,2})"
+              r"(?:\s*[-.]\s*(?P<y>\d{2,4}))?\b")
+_D_DASH_RX = re.compile(_DASH_PAIR + _TAIL_OK, re.I)
+# The same pair without the tail rule: a clock word can only follow ("on
+# 9-12 from nine"), so the ambiguity has to be looked for where the date
+# reading has already been ruled out.
+_D_DASH_ANY_RX = re.compile(_DASH_PAIR, re.I)
+_TIMEISH_RX = re.compile(
+    r"\b(?:from|between|till|until|thru|through|am|pm|a\.m|p\.m|o'?clock|"
+    r"noon|midnight)\b|\d\s*:\s*\d", re.I)
 # The guard on the LAST line of coerce_range: shapes that can only be a
 # date.  A bare ordinal is deliberately absent (see _D_ORD_RX).
 _DATEISH_RX = re.compile(
-    rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*\d|\b\d{{1,2}}\s*/\s*\d{{1,2}}\b|"
-    r"\b\d{4}-\d{1,2}-\d{1,2}\b", re.I)
+    rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*\d{{1,2}}{_ORD}?{_TAIL_OK}|"
+    rf"\b\d{{1,2}}\s*/\s*\d{{1,2}}\b|\b\d{{4}}-\d{{1,2}}-\d{{1,2}}\b", re.I)
 # "what DID I have on the 3rd" is a different question from "what DO I
 # have on the 3rd" -- one looks back, one looks forward.
 _PAST_RX = re.compile(r"\b(?:did|was|were|had)\b", re.I)
@@ -422,6 +486,58 @@ _YESTERDAY_RX = re.compile(r"\byesterday\b", re.I)
 # and every day 1..31 falls in some month inside twelve.
 _YEAR_SCAN = 12
 _MONTH_SCAN = 24
+
+# ------------------------------------------------- ordinals said as WORDS
+#
+# "on september twelfth" was silently TODAY as well: every date regex above
+# wants digits.  Rather than teach five regexes to read English, the words
+# are rewritten to digits ONCE, up front -- "twelfth" -> "12th",
+# "twenty-third" -> "23rd" -- and every rule downstream, the tail rule
+# included, then applies unchanged.  Nothing above 31 is rewritten, so
+# "thirty-second" stays the time unit it usually is.
+_ORD_UNITS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+              "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9}
+_ORD_WORDS = dict(_ORD_UNITS)
+_ORD_WORDS.update({"tenth": 10, "eleventh": 11, "twelfth": 12, "twelth": 12,
+                   "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
+                   "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
+                   "nineteenth": 19, "twentieth": 20, "thirtieth": 30})
+for _tens, _tval in (("twenty", 20), ("thirty", 30)):
+    for _unit, _uval in _ORD_UNITS.items():
+        if _tval + _uval <= 31:
+            _ORD_WORDS[f"{_tens} {_unit}"] = _tval + _uval
+# Longest first so "twenty first" wins over "first"; [-\s]+ accepts the
+# hyphen he types and the space the transcriber hears.
+_ORD_WORD_RX = re.compile(
+    r"\b(?:" + "|".join(sorted(_ORD_WORDS, key=len, reverse=True))
+    .replace(" ", r"[-\s]+") + r")\b", re.I)
+
+
+def digit_ordinals(text: str) -> str:
+    """"the twenty-third" -> "the 23rd"; everything else untouched."""
+    def swap(match):
+        n = _ORD_WORDS[re.sub(r"[-\s]+", " ", match.group(0).lower())]
+        return f"{n}{_suffix(n)}"
+    return _ORD_WORD_RX.sub(swap, text or "")
+
+
+# ------------------------------------------------------- offset phrases
+#
+# "the day after the 12th" resolved to the 12th: the offset was found by no
+# rule and silently dropped, so he was answered confidently about a day he
+# had explicitly stepped away from.  DECIDED 2026-09-05: an offset is
+# UNDERSTOOD when its base day is one Jarvis can name, and ASKED ABOUT when
+# it is not.  It is never ignored.
+_COUNT_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                "ten": 10, "couple": 2, "few": 3}
+_OFFSET_RX = re.compile(
+    r"\b(?:the\s+)?(?:(?P<n>a|an|one|two|three|four|five|six|seven|eight|"
+    r"nine|ten|couple(?:\s+of)?|few|\d{1,2})\s+)?"
+    r"(?P<unit>days?|weeks?|fortnights?)\s+"
+    r"(?P<dir>after|before|following|preceding|prior\s+to|"
+    r"later\s+than|earlier\s+than|ahead\s+of)\b\s*", re.I)
+_BACKWARD_DIRS = re.compile(r"before|preceding|prior|earlier", re.I)
 
 
 def is_ask(range) -> bool:
@@ -550,35 +666,140 @@ def _explicit_date(text: str, today: date, backward: bool = False) -> Optional[s
         return got.isoformat() if got is not None else \
             _ask_impossible(int(match.group("m")), int(match.group("d")))
     match = _D_MD_RX.search(text) or _D_DM_RX.search(text)
+    # A month name beside a BARE number ("may 3", "march 3") is a date only
+    # under the same tail rule as a bare ordinal: "may 3 people come" was
+    # answered about the 3rd of May, which is the non-date class of blocker
+    # (1) wearing a month name.  An ordinal suffix or an explicit year
+    # settles it on its own ("september 12th class", "september 12 2027").
+    if match and not match.group("ord") and not match.group("y") \
+            and not _tail_ok(text[match.end():]):
+        match = None
     if match:
         year = int(match.group("y")) if match.group("y") else None
         return _dated(text, _MONTHS[match.group("mon").rstrip(".").lower()],
                       int(match.group("d")), year, today, backward)
     match = _D_NUM_RX.search(text)
     if match:
-        a, b = int(match.group("a")), int(match.group("b"))
-        raw_year = match.group("y")
-        year = None
-        if raw_year:
-            year = int(raw_year) + (2000 if len(raw_year) == 2 else 0)
-        if a > 12:
-            # AMBIGUITY, decided 2026-09-05: slashed dates are month-first
-            # because he is in Texas, so 9/12 is September 12th.  13/5
-            # cannot be month-first -- and quietly switching convention for
-            # one input is exactly the "looks handled and is not" trap that
-            # made "friday the 20th" the worst case of this bug.  Name the
-            # day-month reading and ask.
-            if 1 <= b <= 12 and 1 <= a <= 31:
-                return _ask(f"{a}/{b} isn't a date I can read month-first, sir "
-                            f"— did you mean the {a}{_suffix(a)} of "
-                            f"{_month_name(b)}?")
-            return _ask(f"I couldn't read {a}/{b} as a date, sir — which day "
-                        "did you mean?")
-        return _dated(text, a, b, year, today, backward)
+        return _separated(text, match, "/", today, backward)
+    match = _D_REL_MONTH_RX.search(text)
+    if match:
+        step = {"next": 1, "last": -1}.get(match.group("rel").lower(), 0)
+        month = today.month + step
+        year = today.year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        return _dated(text, month, int(match.group("d")), year, today, backward)
+    timeish = bool(_TIMEISH_RX.search(text))
+    match = _D_DASH_RX.search(text)
+    if match and not timeish:
+        return _separated(text, match, _sep_of(match), today, backward)
+    match = _D_DASH_ANY_RX.search(text)
+    if match and timeish:
+        # "on 9-12 from nine" is a date and a clock at once. Guessing
+        # either is the failure he reported; say both and ask.
+        return _ask(f"I couldn't tell whether {match.group('a')}"
+                    f"{_sep_of(match)}{match.group('b')} was a date or a time "
+                    "there, sir — which day did you mean?")
     match = _D_ORD_RX.search(text)
     if match:
         return _dated(text, None, int(match.group("d")), None, today, backward)
     return None
+
+
+def _sep_of(match) -> str:
+    """The separator he actually used, so the question quotes his words."""
+    return "-" if "-" in match.group(0) else "."
+
+
+def _separated(text: str, match, sep: str, today: date, backward: bool) -> str:
+    """A 9/12, 9-12 or 9.12 pair, read month-first."""
+    a, b = int(match.group("a")), int(match.group("b"))
+    raw_year = match.group("y")
+    year = None
+    if raw_year:
+        year = int(raw_year) + (2000 if len(raw_year) == 2 else 0)
+    if a > 12:
+        # AMBIGUITY, decided 2026-09-05: separated dates are month-first
+        # because he is in Texas, so 9/12 is September 12th.  13/5
+        # cannot be month-first -- and quietly switching convention for
+        # one input is exactly the "looks handled and is not" trap that
+        # made "friday the 20th" the worst case of this bug.  Name the
+        # day-month reading and ask.
+        if 1 <= b <= 12 and 1 <= a <= 31:
+            return _ask(f"{a}{sep}{b} isn't a date I can read month-first, sir "
+                        f"— did you mean the {a}{_suffix(a)} of "
+                        f"{_month_name(b)}?")
+        return _ask(f"I couldn't read {a}{sep}{b} as a date, sir — which day "
+                    "did you mean?")
+    return _dated(text, a, b, year, today, backward)
+
+
+def _base_day(text: str, today: date, backward: bool) -> Optional[str]:
+    """The day an OFFSET is measured from: an explicit date, "today",
+    "tomorrow", "yesterday" or a weekday.  None when it names none."""
+    got = _explicit_date(text, today, backward)
+    if got:
+        return got                          # an ISO date, or an ask
+    if _TOMORROW_RX.search(text):
+        return (today + timedelta(days=1)).isoformat()
+    if _YESTERDAY_RX.search(text):
+        return (today - timedelta(days=1)).isoformat()
+    if re.search(r"\btoday\b|\btonight\b", text):
+        return today.isoformat()
+    for i, word in enumerate(WEEKDAYS):
+        if re.search(rf"\b{word}\b", text):
+            return (today + timedelta(days=(i - today.weekday()) % 7)).isoformat()
+    return None
+
+
+def _offset_date(text: str, today: date, backward: bool) -> Optional[str]:
+    """"the day after the 12th" -> the 13th; an ISO date or an ask, and
+    None when the sentence carries no offset phrase at all."""
+    match = _OFFSET_RX.search(text)
+    if match is None:
+        return None
+    raw = (match.group("n") or "one").lower().removesuffix(" of").strip()
+    count = _COUNT_WORDS.get(raw)
+    if count is None:
+        try:
+            count = int(raw)
+        except ValueError:                  # pragma: no cover - regex-bounded
+            count = 1
+    unit = match.group("unit").lower()
+    step = 7 if unit.startswith("week") else 14 if unit.startswith("fortnight") else 1
+    sign = -1 if _BACKWARD_DIRS.match(match.group("dir")) else 1
+    base = _base_day(text[match.end():], today, backward)
+    if base is None:
+        # Understood as an offset, unable to name its base: ASK.  Dropping
+        # the offset and answering about the base is the bug itself.
+        return _ask(f"Which day is that {'before' if sign < 0 else 'after'}, sir?")
+    if is_ask(base):
+        return base
+    return (date.fromisoformat(base) +
+            timedelta(days=sign * count * step)).isoformat()
+
+
+def sentence_date(text, today: date, backward=None) -> Optional[str]:
+    """The specific DAY this sentence names -- an ISO date or an ask -- and
+    None when it names no specific day.
+
+    THE ONE READER BOTH DOORS USE.  The forced path (commander.calendar_range
+    -> coerce_range) and the model path (get_calendar's ``derive``) used to
+    read the sentence with two different functions, and MEASURED 2026-09-05
+    they disagreed: "what was on my calendar yesterday" was the 4th through
+    one door and TODAY through the other, on the same eight words.  Word
+    ranges ("tomorrow", "monday") are deliberately NOT resolved here -- the
+    model door must leave those to the model, which can resolve a follow-up
+    from the conversation that this function cannot see.
+    """
+    raw = digit_ordinals(_clean(text).lower())
+    if backward is None:
+        backward = bool(_PAST_RX.search(raw))
+    got = _offset_date(raw, today, backward)
+    if got:
+        return got
+    if _YESTERDAY_RX.search(raw):
+        return (today - timedelta(days=1)).isoformat()
+    return _explicit_date(raw, today, backward)
 
 
 def coerce_range(value, now: datetime = None) -> str:
@@ -595,13 +816,12 @@ def coerce_range(value, now: datetime = None) -> str:
     if text in RANGES:
         return text
     today = (now or now_local()).date()
-    # The one past day the cache genuinely holds (window() is anchored at
-    # yesterday-midnight), and "today" for it was the same silent bug.
-    if _YESTERDAY_RX.search(text):
-        return (today - timedelta(days=1)).isoformat()
     # BEFORE the weekday loop, or "friday the 20th" is a Friday he did not
     # ask for -- that is exactly how the worst case of this bug happened.
-    dated = _explicit_date(text, today, bool(_PAST_RX.search(text)))
+    # sentence_date covers offsets, "yesterday" (the one past day the cache
+    # genuinely holds) and every explicit date, and is the SAME reader the
+    # model path uses, so the two doors cannot drift apart again.
+    dated = sentence_date(text, today)
     if dated:
         return dated
     # "on monday", "for Monday", "this monday"
@@ -614,7 +834,7 @@ def coerce_range(value, now: datetime = None) -> str:
         return "week"
     if "next" in text or "upcoming" in text or "soon" in text or "coming up" in text:
         return "next"
-    if _DATEISH_RX.search(text):
+    if _DATEISH_RX.search(digit_ordinals(text)):
         # Date-shaped and unreadable. ASK; do not assume.
         return _ask("I couldn't work out which date you meant, sir — "
                     "which day did you want?")
@@ -675,10 +895,9 @@ def out_of_reach(day: date, today: date, window_days: int = WINDOW_DAYS) -> str:
     DECIDED 2026-09-05: a day outside the window is REFUSED BY NAME, never
     answered "nothing on it".  Those events are missing from the CACHE, not
     from his calendar, and "Nothing on the 3rd of October, sir" would be
-    the same confident wrong answer he reported, in a new coat.  Widening
-    WINDOW_DAYS is his call, not this function's: it changes what
-    jarvis/calwatch.py reads as a new booking, so every day past the old
-    edge would announce itself once.
+    the same confident wrong answer he reported, in a new coat.  The window
+    is now 45 days rather than 14 (see WINDOW_DAYS), so this refusal is
+    rare; it still has to be right when it fires.
     """
     lo, hi = reachable(today, window_days)
     if day < lo:
@@ -839,6 +1058,21 @@ class Snapshot:
     down: list = field(default_factory=list)   # SourceDown per dead feed
 
 
+def _window_words(window) -> Optional[list]:
+    """A (start, end) pair as two ISO strings, for the cache file."""
+    if not window:
+        return None
+    return [window[0].isoformat(), window[1].isoformat()]
+
+
+def _window_from(words) -> Optional[tuple]:
+    """The pair back, or None when it is missing or unreadable."""
+    try:
+        return (datetime.fromisoformat(words[0]), datetime.fromisoformat(words[1]))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
 def _default_dav_client(url: str, username: str, password: str):
     import caldav
     return caldav.DAVClient(url=url, username=username, password=password,
@@ -916,6 +1150,12 @@ class CalendarSource:
             try:
                 loaded[sid] = {
                     "fetched_at": float(entry.get("fetched_at") or 0),
+                    # The window this source's events were GATHERED over.
+                    # Absent from every cache file written before 2026-09-05:
+                    # None then means "unknown", which holds calwatch's diff
+                    # back for one cycle rather than letting it invent
+                    # bookings (covered_window).
+                    "window": _window_from(entry.get("window")),
                     "events": [Event.from_dict(d, self.tz) for d in entry.get("events", [])]}
             except Exception as exc:  # noqa: BLE001 - skip a broken source
                 log.warning("calendar cache source %s skipped: %s", sid, exc)
@@ -928,6 +1168,7 @@ class CalendarSource:
             payload = {"version": CACHE_VERSION,
                        "fetched_at": stamp,
                        "sources": {sid: {"fetched_at": e["fetched_at"],
+                                         "window": _window_words(e.get("window")),
                                          "events": [ev.to_dict() for ev in e["events"]]}
                                    for sid, e in self._sources.items()}}
         try:
@@ -1057,6 +1298,34 @@ class CalendarSource:
         midnight."""
         return self._window(now)
 
+    def covered_window(self, now: datetime = None) -> Optional[tuple]:
+        """The window the cached events were actually GATHERED over, or None
+        when that is not knowable yet.
+
+        ``window()`` is a PROMISE -- what the next fetch will ask for.  A
+        source that failed or is in back-off keeps the events of its last
+        fetch, gathered over the window it had THEN, so after a widening (or
+        across a midnight slide) the promise over-states what the cache
+        holds.  jarvis/calwatch.py diffs two snapshots and calls anything
+        inside the window that is new an ADDED event, so handing it the
+        promise while a feed catches up announces that feed's whole far half
+        as new bookings.  MEASURED 2026-09-05 widening 14 -> 45 days with one
+        of two feeds missing the first wide fetch: 31 spurious "has been
+        added" lines; 0 with this window
+        (tests/test_calendar_window_widening.py).
+
+        None -- any source that has never told us its reach -- costs calwatch
+        one silent cycle, which is the right price.
+        """
+        promise = self._window(now)
+        with self._lock:
+            windows = [entry.get("window") for entry in self._sources.values()]
+        if not windows or any(w is None for w in windows):
+            return None
+        start = max([promise[0]] + [w[0] for w in windows])
+        end = min([promise[1]] + [w[1] for w in windows])
+        return (start, end) if start < end else None
+
     def _window(self, now: datetime = None) -> tuple:
         now = now or now_local(self.tz)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
@@ -1157,7 +1426,11 @@ class CalendarSource:
                 if sid not in wanted:
                     del self._sources[sid]
             for sid, events in fresh.items():
-                self._sources[sid] = {"fetched_at": stamp, "events": events}
+                # The window is stored WITH the events it produced: a source
+                # in back-off keeps yesterday's reach, and covered_window()
+                # needs to know that rather than trust the promise.
+                self._sources[sid] = {"fetched_at": stamp, "events": events,
+                                      "window": (start, end)}
             self._record_outcomes(wanted, set(fresh), failed, stamp)
         self.errors = errors
         if fresh:
@@ -1503,15 +1776,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     def _range_from_words(said: str) -> dict:
         """The date off HIS words, for a model call that named one.
 
-        Returns {} unless the utterance carries an explicit date, so the
-        model keeps every range it can still get right -- including the
-        ones it resolves from the conversation rather than from the
-        sentence in hand.
+        Returns {} unless the utterance names a specific day, so the model
+        keeps every range it can still get right -- including the ones it
+        resolves from the conversation rather than from the sentence in
+        hand.  ``sentence_date`` is the SAME reader the forced path uses:
+        it used to be ``_explicit_date`` here and the whole of
+        ``coerce_range`` there, and the two disagreed on "what was on my
+        calendar yesterday" -- the 4th forced, TODAY from the model.
         """
         try:
-            got = _explicit_date(_clean(said).lower(),
-                                 now_local(source.tz).date(),
-                                 bool(_PAST_RX.search(said or "")))
+            got = sentence_date(said, now_local(source.tz).date())
         except Exception:                    # noqa: BLE001 - tool boundary
             log.debug("calendar range derive failed", exc_info=True)
             return {}

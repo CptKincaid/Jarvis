@@ -295,7 +295,15 @@ class CalendarWatch:
             if not cal.refresh():
                 return []
             events = list(cal.events())
-            window = cal.window()
+            # The window the events were GATHERED over, not the one the
+            # source promises to fetch next time. They differ whenever a
+            # feed is behind -- in back-off, or simply slower than the
+            # widening of WINDOW_DAYS -- and the difference is the whole of
+            # the 2026-09-05 burst: 31 far-out events arriving at once from
+            # a recovered feed, every one of them shaped like a new booking.
+            # None means "not knowable yet" and costs one silent cycle.
+            covered = getattr(cal, "covered_window", None)
+            window = covered() if callable(covered) else cal.window()
         except Exception:  # noqa: BLE001 - source boundary
             log.exception("calwatch: refresh failed")
             return []
