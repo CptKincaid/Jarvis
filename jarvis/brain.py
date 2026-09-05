@@ -2684,13 +2684,21 @@ class JarvisBrain:
         ([("BRIEFING", json)] when a card was produced, then ("SPEAK",
         line)). ``addressee`` is ``(name, honorific)`` when the caller
         knows who the turn is for (``scope.OWNER`` for a proactive call);
-        None reads the per-turn attribution once, inside _chat_sync."""
+        None reads the per-turn attribution once, HERE."""
         if not self._acquire_busy():
             if callback:
                 callback([("SPEAK",
                            "Still on the last one, sir. One moment.")])
             return None
         gen = self._job_gen                   # this job's identity, for cancel()
+        # THE ONE READING FOR THIS WHOLE JOB, taken on the CALLER'S thread
+        # and before the worker starts, then carried as a value to the
+        # prompt/schemas (_chat_sync) AND to the filing (_remember). It used
+        # to be taken inside _chat_sync, which was still correct for the
+        # prompt but left _remember with nothing at all -- so the tail of a
+        # guest's job wrote her sentence into his ring, his journal and his
+        # habits (round-3 blocker, measured 09-05).
+        turn_addr = scope_mod.reading(addressee)
 
         def _live():
             # cancel() then a new job: the new acquire resets _cancelled,
@@ -2707,11 +2715,11 @@ class JarvisBrain:
                                        force_args=force_args,
                                        max_rounds=max_rounds,
                                        on_sentence=on_sentence, gen=gen,
-                                       addressee=addressee)
+                                       addressee=turn_addr)
                 if not _live():
                     log.info("chat cancelled; dropping result")
                     return
-                self._remember(text, tags)
+                self._remember(text, tags, addressee=turn_addr)
                 if callback:
                     callback(tags)
             except Exception:
@@ -2737,11 +2745,20 @@ class JarvisBrain:
         return classify_route(text, timeout=timeout)
 
     def web_answer(self, question, callback=None, model="haiku",
-                   timeout=WEB_TIMEOUT_S):
+                   timeout=WEB_TIMEOUT_S, addressee=None):
         """Answer a question from the web through a one-shot `claude -p` on
         a worker thread; the callback gets [("SPEAK", line)] like chat().
         Returns the thread, or None when the CLI is missing or the brain is
-        busy (the busy line is spoken through the callback)."""
+        busy (the busy line is spoken through the callback).
+
+        ``addressee`` is the turn's reading, as for ``chat``. No guest
+        reaches here today -- ``commander._handle_known`` step 5 goes to
+        ``chat`` and says so in as many words ("no web one-shot carrying
+        his recent conversation") -- so this is default-deny rather than a
+        measured leak. It is worth having twice over: the tail files the
+        exchange in his record, and the prompt itself carries his recent
+        conversation OFF THIS MACHINE.
+        """
         if not MACHINE.claude_bin:
             return None
         if not self._acquire_busy():
@@ -2749,6 +2766,8 @@ class JarvisBrain:
                 callback([("SPEAK", "Still on the last one, sir. One moment.")])
             return False                  # busy: already spoken (None = no CLI)
         gen = self._job_gen               # this job's identity, for cancel()
+        turn_addr = scope_mod.reading(addressee)   # ONE reading, before the job
+        his_turn = not turn_addr[0]
 
         # "Look it up" needs a referent: the one-shot has no history unless
         # it is handed some.
@@ -2757,7 +2776,8 @@ class JarvisBrain:
             # The last exchanges only. format_for_prompt() also carries the
             # git state, the active window title and the session log, and
             # this prompt leaves the machine.
-            if self._context and hasattr(self._context, "recent_conversation_text"):
+            if his_turn and self._context and \
+                    hasattr(self._context, "recent_conversation_text"):
                 recent = self._context.recent_conversation_text() or ""
         except Exception:
             log.debug("web answer: context unavailable", exc_info=True)
@@ -2783,7 +2803,7 @@ class JarvisBrain:
                 log.info("web answer (%s): %.80s", model, line)
                 tags = [("SPEAK", line)]
                 try:
-                    self._remember(question, tags)
+                    self._remember(question, tags, addressee=turn_addr)
                 except Exception:
                     log.debug("web answer remember failed", exc_info=True)
                 if callback:
@@ -2825,14 +2845,22 @@ class JarvisBrain:
     def read_syllabus(self, text, today="", timeout=SYLLABUS_TIMEOUT_S):
         return read_syllabus(text, today=today, timeout=timeout)
 
-    def think(self, user_input, callback=None):
+    def think(self, user_input, callback=None, addressee=None):
         """Legacy entry (deploy/autonomous era): a local question goes to
-        the tool loop, anything else to Claude's tag protocol."""
+        the tool loop, anything else to Claude's tag protocol.
+
+        ``addressee`` is the turn's reading, as for ``chat``.
+        ``commander._handle_known`` step 5 falls back here when the brain
+        in play has no ``chat`` (a stand-in, or an older build), so a
+        guest's sentence CAN arrive -- and the tail files it in his
+        record through the same ``_remember``.
+        """
         if not self._acquire_busy():
             if callback:
                 callback([("SPEAK",
                            "Still on the last one, sir. One moment.")])
             return
+        turn_addr = scope_mod.reading(addressee)   # ONE reading, before the job
 
         def _process():
             bus.publish(BrainState(state="thinking"))
@@ -2846,7 +2874,7 @@ class JarvisBrain:
                     log.info("think cancelled; dropping result")
                     return
 
-                self._remember(user_input, actions)
+                self._remember(user_input, actions, addressee=turn_addr)
                 if callback:
                     callback(actions)
             except Exception:
@@ -2972,7 +3000,43 @@ class JarvisBrain:
             self._job_gen = getattr(self, "_job_gen", 0) + 1
             return True
 
-    def _remember(self, user_input, tags):
+    def _remember(self, user_input, tags, addressee=None):
+        """File the turn in HIS record -- and only if it was his.
+
+        ``addressee`` is the turn's reading, taken by the caller on the
+        caller's thread and carried here as a VALUE (jarvis/scope.py). It
+        is not looked up here on purpose: this runs at the END of a model
+        job, minutes of wall clock after the words were attributed, so an
+        ambient read would file the turn under whoever the gate happens to
+        be naming when the worker lands.
+
+        ROUND-3 BLOCKER, MEASURED 09-05. ``app._after_dispatch`` gated the
+        SYNCHRONOUS half; this is the asynchronous one, and it was
+        ungated. ``commander._handle_known`` step 5 -- the door every
+        guest question that is not the clock or arithmetic goes through --
+        hands the words to ``chat``, and the tail of that job wrote three
+        of his things at once:
+
+          * ``memory.log_habit`` learned her sentence as one of his habits;
+          * ``context.add_exchange`` appended it to his conversation ring;
+          * that call ``_journal_write``s it to his plaintext day file --
+            recorded ('exchange', {'user': "what's the weather like",
+            'jarvis': "Ten degrees, ma'am."}).
+
+        And it was never write-only: the ring ``add_exchange`` appends to
+        is the ring ``_dynamic_context`` renders into HIS next prompt.
+        Measured on the tip, his next payload carried "about the spare
+        key\n  Jarvis: Ten degrees, ma'am." -- her question read back to
+        him as his own background.
+
+        Nothing of his is DISCLOSED by any of this. His record is still
+        his: a turn that was not his leaves no trace in it.
+        """
+        who = scope_mod.reading(addressee)[0]
+        if who:
+            # Not a refusal -- her turn was answered. Only the filing stops.
+            log.info("scope: %s's turn is not filed in his record", who)
+            return
         spoken = " ".join(d for t, d in tags if t == "SPEAK")
         if self._memory:
             try:
