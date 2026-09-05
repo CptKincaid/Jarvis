@@ -6697,10 +6697,31 @@ class JarvisApp:
             return None, "the people file could not be read; see the log"
 
     def _people_unlock_left(self, now=None) -> float:
-        """Seconds the typed code still buys. Zero is locked."""
+        """Seconds the typed code still buys. Zero is locked.
+
+        0.0 IS A SENTINEL AND IS TESTED AS ONE, never subtracted from. This
+        used to be a bare ``max(0.0, until - t)``, and with ``until`` left
+        at 0.0 while the tab is locked, any NEGATIVE ``now`` made a dwell
+        out of nothing: ``0.0 - (-1.0)`` is 1.0, so
+        ``people_forget(..., now=-1.0)`` deleted a row from his people book
+        with no override code ever presented, and the book has no history
+        and no backup (verdict, 2026-09-05, measured).
+
+        The verdict called this robustness rather than a boundary crossing,
+        and it was right: ``now=`` is not on the Services dataclass, and no
+        socket, phone or voice rung reaches it, so whoever can pass it
+        already holds the app object. It is fixed anyway because a guard
+        that decides whether his people book may be written should not be
+        forgeable by the clock it is handed. A clock BEFORE the grant is
+        also refused, so a negative ``now`` cannot stretch a dwell that is
+        genuinely open either. Pinned by
+        tests/test_people_dwell_forgery.py.
+        """
         t = time.monotonic() if now is None else float(now)
         with _PEOPLE_LOCK:
             until = float(getattr(self, "_people_unlock_until", 0.0) or 0.0)
+        if until <= 0.0 or t < 0.0:
+            return 0.0
         return max(0.0, until - t)
 
     def _people_open_unlock(self, now=None) -> None:
