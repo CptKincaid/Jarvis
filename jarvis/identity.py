@@ -413,11 +413,23 @@ class Registry:
                            "or none, and it is never inferred from a name"
                            % (person.honorific,))
         if person.voice and person.role != ROLE_OWNER:
-            # THE INVARIANT THAT STOPS THE VOICE LEG NAMING THE WRONG
-            # PERSON. jarvis/speaker.py holds ONE voiceprint and ONE
-            # centroid and has no notion of a label at all, so "matched"
-            # can only ever mean the owner. A second row marked
-            # voice-enrolled would make every match come back as them.
+            # THE INVARIANT THAT STOPPED THE VOICE LEG NAMING THE WRONG
+            # PERSON, AND THE PREMISE UNDER IT HAS CHANGED. It was written
+            # because jarvis/speaker.py held ONE voiceprint and ONE centroid
+            # with no notion of a label, so "matched" could only ever mean
+            # the owner and a second voice-enrolled row would make every
+            # match come back as them.
+            #
+            # The voice-multispeaker lane ended that: speaker.py now carries
+            # a LABELLED gallery and gate._voice_leg names whoever it named.
+            # The refusal is KEPT ANYWAY at the integration merge (09-05),
+            # deliberately and not by oversight. Nothing reads
+            # ``Person.voice`` as an input to a decision -- it is written by
+            # scripts/jarvis_people.py, rendered in to_json and __repr__,
+            # and read nowhere else -- so the guard costs nothing, and
+            # loosening an enrolment invariant inside a merge is how a hole
+            # gets opened by somebody who was only trying to reconcile two
+            # branches. Widening it is Hunter's call.
             return False, ("only the owner can be voice-enrolled: there is "
                            "one voiceprint on this machine, and marking a "
                            "second person voice-enrolled would make the "

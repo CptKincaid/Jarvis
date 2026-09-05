@@ -98,13 +98,28 @@ SAYING YOUR NAME IS A NARROWING INPUT, NOT A PASSWORD
     behind it produces the SAME empty verdict an unrelated sentence does.
     All it buys is a kinder refusal.
 
-    THE HONEST LIMITATION, said out loud rather than discovered: the
-    confirming leg for anybody but Hunter is the CAMERA, because
-    ``jarvis/speaker.py`` holds one voiceprint and one centroid and
-    ``identity.Registry.add_person`` therefore refuses ``voice=True`` on a
-    non-owner row. So Mara and Heather can sign in only where the camera
-    can see them -- the office, camera on, outside the 9pm-7am curfew. At
-    night their sign-in cannot complete, and SIGNIN_NO_LEG_LINE says so.
+    THE LIMITATION THIS WAS WRITTEN UNDER, AND WHAT THE MERGE DID TO IT.
+    The paragraph that stood here said the confirming leg for anybody but
+    Hunter is the CAMERA, because ``jarvis/speaker.py`` held one voiceprint
+    and one centroid -- so Mara and Heather could sign in only where the
+    camera could see them, and at night their sign-in could not complete
+    at all. THAT IS NO LONGER TRUE (integration merge, 09-05): the
+    voice-multispeaker lane gives ``speaker.py`` a LABELLED gallery, so
+    ``_voice_leg`` can now name a guest, in the dark, on the leg that runs
+    all the time. Both legs confirm a sign-in; only one of them has a
+    curfew. tests/test_signin_voice_together.py pins that junction.
+
+    ONE THING THE MERGE DELIBERATELY DID NOT WIDEN.
+    ``identity.Registry.add_person`` still refuses ``voice=True`` on a
+    non-owner row, and its stated reason -- one voiceprint, one centroid --
+    is the premise the voice lane removed. It is left alone because
+    nothing reads ``Person.voice`` as an input to any decision (the voice
+    leg reads the GALLERY, and the role is what scopes anybody), so the
+    guard costs nothing today; loosening an enrolment invariant is Hunter's
+    call and not a merge author's. Same for SIGNIN_NO_LEG_LINE's wording,
+    which still names the camera: it is chosen only when the camera is in
+    fact off, so it is not false -- but it is narrower than it reads now
+    that a voice can confirm, and it is his sentence to reword.
 
 WHAT A KNOWN PERSON MAY ASK FOR, AND THE ONE THING THAT WIDENED
     Unchanged and default-deny: _HIS vetoes settings, his data and
