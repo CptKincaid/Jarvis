@@ -3019,3 +3019,201 @@ def test_a_late_no_is_a_no(cmd, said):
 @pytest.mark.parametrize("said", ["no worries, send it", "yes, no doubt"])
 def test_a_no_word_that_is_not_a_no_still_sends(said):
     assert parse_send_answer(said) is True, said
+
+
+# ==================================================================
+# 25. Round 4 (09-05): a spoken address with a joiner in its local part
+# is read WHOLE or asked again -- never cut to its tail and sent there
+# ==================================================================
+# Attack 1 reproduced one breach class, typed == voice, 16 rows: "yes,
+# send it to heather underscore smith at example dot com" was read back
+# "to smith at example dot com" and the next yes SENT To=smith@example.com.
+# The parser knew "dot" as the only spoken joiner, so the match began at
+# the last word before "at" and the joiner and everything in front of it
+# were dropped in silence. Worse, spoken_address() itself speaks "_" as
+# "underscore", so Jarvis's OWN read-back of heather_smith@example.com,
+# said back to it word for word, went to a stranger.
+
+# ---- (a) the parser reads every joiner the speaker speaks ---------------
+@pytest.mark.parametrize("addr", [
+    "heather_smith@example.com", "heather-smith@example.com",
+    "h.peyrovi@tamu.edu", "h_p-q.r@my-host.example.com",
+    "heather+lab@example.com",
+])
+def test_a_spoken_address_round_trips(addr):
+    """parse_address(spoken_address(x)) == x for a local part with _ - . +
+    -- the read-back's own words are an address the parser reads."""
+    assert outbox.parse_address(outbox.spoken_address(addr)) == addr
+
+
+@pytest.mark.parametrize("said,want", [
+    ("heather underscore smith at example dot com", "heather_smith@example.com"),
+    ("heather under score smith at example dot com", "heather_smith@example.com"),
+    ("heather dash smith at example dot com", "heather-smith@example.com"),
+    ("heather hyphen smith at example dot com", "heather-smith@example.com"),
+    ("h underscore peyrovi at tamu dot edu", "h_peyrovi@tamu.edu"),
+    ("h period peyrovi at tamu dot edu", "h.peyrovi@tamu.edu"),
+    ("h dot peyrovi at tamu dot edu", "h.peyrovi@tamu.edu"),
+    ("heather at my dash host dot com", "heather@my-host.com"),
+    ("yes, send it to heather underscore smith at example dot com", "heather_smith@example.com"),
+])
+def test_a_joiner_inside_the_local_part_is_read(said, want):
+    assert outbox.parse_address(said) == want, said
+
+
+# ---- (b) a local part the parser cannot read is never cut to its tail ---
+@pytest.mark.parametrize("said,heard", [
+    ("heather tilde smith at example dot com", "heather tilde smith at example dot com"),
+    ("yes, send it to heather slash smith at example dot com",
+     "heather slash smith at example dot com"),
+    ("h star heather tilde smith at example dot com",
+     "h star heather tilde smith at example dot com"),
+    # "plus" is the second-recipient connector ("send it to her, plus
+    # Dana"); read as "+" it makes an address out of two people, so it is
+    # heard and handed back, never resolved.
+    ("heather plus lab at example dot com", "heather plus lab at example dot com"),
+    ("yes, send it to her plus dana at example dot com",
+     "her plus dana at example dot com"),
+    # typed, with a character in front an address cannot carry
+    ("send it to heather~smith@example.com", "heather~smith at example dot com"),
+])
+def test_an_unreadable_local_part_is_no_address_and_is_heard_whole(said, heard):
+    assert outbox.parse_address(said) == "", said
+    assert outbox.address_span(said) is None, said
+    assert outbox.unresolved_address(said) == heard, said
+
+
+@pytest.mark.parametrize("said", [
+    "heather at example dot com", "heather underscore smith at example dot com",
+    "yes, send it to heather@example.com", "Heather", "to Heather at heather at gmail dot com",
+    "<heather@example.com>", "mailto:heather@example.com", "no, to dana@example.com.",
+])
+def test_a_readable_address_or_a_name_is_not_unresolved(said):
+    assert outbox.unresolved_address(said) == "", said
+
+
+def test_prepare_says_what_it_heard_when_it_cannot_read_the_address(roots):
+    cfg = cfg_with_roots(roots, **{"send_file.from": "school"})
+    prep = outbox.prepare(cfg, None, "the biosensors handout",
+                          "heather tilde smith at example dot com")
+    assert prep.draft is None and prep.status == "No address"
+    assert prep.ask == outbox.HEARD_LINE.format(
+        heard="heather tilde smith at example dot com")
+    assert "@" not in prep.ask and prep.ask.endswith("?")
+
+
+# ---- (c) the 16 attack rows: read back AS SAID, or asked again ----------
+_ATTACK_JOINER_ROWS = [
+    ("yes, send it to heather underscore smith at example dot com",
+     "heather_smith@example.com", "smith at"),
+    ("yes, send it to heather dash smith at example dot com",
+     "heather-smith@example.com", "smith at"),
+    ("yes, send it to h underscore peyrovi at tamu dot edu",
+     "h_peyrovi@tamu.edu", "peyrovi at"),
+    ("yes, send it to heather hyphen smith at example dot com",
+     "heather-smith@example.com", "smith at"),
+    ("send it to heather underscore smith at example dot com instead",
+     "heather_smith@example.com", "smith at"),
+    ("no, to heather dash jones at example dot com",
+     "heather-jones@example.com", "jones at"),
+]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said,to,cut", _ATTACK_JOINER_ROWS)
+def test_a_joined_spoken_address_is_read_back_whole_and_the_yes_goes_there(
+        cmd, said, to, cut, source):
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(said, source=source)
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert outbox.spoken_address(to) in res.reply, (said, res.reply)
+    assert f"to {cut}" not in res.reply, (said, res.reply)
+    assert "@" not in res.reply
+    cmd.handle("yes", source=source)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == to, said
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_the_read_back_of_an_underscored_address_said_back_sends_there(cmd, source):
+    """Jarvis's own words: heather_smith@example.com is read back "to
+    heather underscore smith at example dot com", and saying exactly that
+    back is the read-back said back -- it sends THERE, not to smith@."""
+    res = cmd.handle("email the biosensors handout to heather_smith@example.com",
+                     source=source)
+    assert res.reply.endswith("Send it, sir?")
+    assert "heather underscore smith at example dot com" in res.reply, res.reply
+    res = cmd.handle("yes, send it to heather underscore smith at example dot com",
+                     source=source)
+    assert res is not None and res.ack, res
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather_smith@example.com"
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said,heard", [
+    ("yes, send it to heather tilde smith at example dot com",
+     "heather tilde smith at example dot com"),
+    ("yes, send it to heather plus lab at example dot com",
+     "heather plus lab at example dot com"),
+    ("no, to heather slash jones at example dot com",
+     "heather slash jones at example dot com"),
+])
+def test_an_unreadable_spoken_address_is_asked_again_and_a_yes_then_sends_nothing(
+        cmd, said, heard, source):
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(said, source=source)
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.speak, (said, res)
+    assert res.reply == outbox.HEARD_LINE.format(heard=heard), (said, res.reply)
+    assert "@" not in res.reply
+    assert cmd._pending_send is None, "the draft to Heather is spent, not kept"
+    assert cmd.question_open(), "the question left a slot behind it"
+    res = cmd.handle("yes", source=source)
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.reply and "@" not in res.reply, res
+    # the address said properly is read back to IT, and the yes goes there
+    res = cmd.handle("heather underscore smith at example dot com", source=source)
+    assert not FakeSMTP.made and res.reply.endswith("Send it, sir?"), res
+    assert "heather underscore smith at example dot com" in res.reply
+    cmd.handle("yes", source=source)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather_smith@example.com"
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_first_sentence_with_an_unreadable_address_is_asked_not_armed(cmd, source):
+    res = cmd.handle("email the biosensors handout to heather tilde smith at example dot com",
+                     source=source)
+    assert not FakeSMTP.made
+    assert res is not None and res.reply == outbox.HEARD_LINE.format(
+        heard="heather tilde smith at example dot com"), res
+    assert cmd._pending_send is None and cmd.question_open()
+    res = cmd.handle("heather tilde smith at example dot com", source=source)
+    assert not FakeSMTP.made and res.reply == outbox.HEARD_LINE.format(
+        heard="heather tilde smith at example dot com"), res
+    res = cmd.handle("yes", source=source)
+    assert not FakeSMTP.made and res is not None and res.reply, res
+
+
+# ---- (d) attack 2: the no-address line never speaks a raw "@" -----------
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said,who", [
+    ("yes, send it to heather@example", "heather at example"),
+    ("yes, to heather@", "heather at"),
+])
+def test_the_no_address_line_speaks_a_half_address(cmd, said, who, source):
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(said, source=source)
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.speak, (said, res)
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who=who), (said, res.reply)
+    assert "@" not in res.reply
+    assert cmd.question_open()
+    cmd.handle("yes", source=source)
+    assert not FakeSMTP.made
+
+
+def test_spoken_who_leaves_a_name_alone_and_speaks_an_address():
+    assert outbox.spoken_who("Heather Jones") == "Heather Jones"
+    assert outbox.spoken_who("Mary-Jane") == "Mary-Jane"
+    assert outbox.spoken_who("heather@example") == "heather at example"
+    assert outbox.spoken_who("h_p@example.com") == "h underscore p at example dot com"

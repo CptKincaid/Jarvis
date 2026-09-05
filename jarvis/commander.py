@@ -5836,7 +5836,10 @@ def _send_names_someone(said: str, cfg=None, memory=None) -> bool:
     t = " ".join(str(said or "").split())
     if not t:
         return False
-    if outbox.parse_address(t):
+    # An address the parser cannot read WHOLE ("heather tilde smith at
+    # example dot com") still names somebody of his own: it goes to
+    # outbox.prepare, which hands it back as heard (round 4, 09-05).
+    if outbox.parse_address(t) or outbox.unresolved_address(t):
         return True
     tm = _SEND_CORRECT_TO_RX.search(t)
     if not tm:
@@ -11720,8 +11723,13 @@ class Commander:
             ask.reasked = True
             self._pending_sendask = ask
             self._answered_pending = True
+            # An address said with a word in it the parser does not read
+            # is handed back as heard, so he knows which word it was.
+            heard = outbox.unresolved_address(who)
+            line = (outbox.HEARD_LINE.format(heard=heard) if heard
+                    else outbox.ADDRESS_REASK_LINE)
             return CommandResult(handled=True, speak=True, status="No address",
-                                 reply=outbox.ADDRESS_REASK_LINE)
+                                 reply=line)
         self._answered_pending = True
         log.info("send recipient: %r resolves", outbox.mask_addresses(said)[:40])
         prep = outbox.prepare(cfg, memory, ask.said_file, who,

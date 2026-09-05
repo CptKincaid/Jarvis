@@ -78,6 +78,10 @@ CHANGED_LINE = ("That file has changed since I read it back, sir; "
 GONE_LINE = "That file has gone, sir; nothing was sent."
 EMPTY_LINE = "{what} is empty, sir; there'd be nothing to attach."
 NO_RECIPIENT_LINE = "I've no address for {who}, sir. What is it?"
+# An address he SAID that the parser cannot read whole -- "heather tilde
+# smith at example dot com" (round 4, 09-05). Said back as heard and asked
+# for again; never cut to the part after the word it did not know.
+HEARD_LINE = "I heard {heard}, sir — I can't make an address of that. What is it?"
 WHO_LINE = "Who should I send it to, sir?"
 WHICH_FILE_LINE = "Which file, sir?"
 # The answers to the two questions above, when they miss (F21). One re-ask
@@ -212,6 +216,15 @@ def spoken_address(addr: str) -> str:
                 .replace("_", " underscore ").replace("-", " dash "))
 
 
+def spoken_who(who: str) -> str:
+    """A recipient as he said it, fit to be said back: an address, or the
+    half of one ("heather@example", "heather@"), is spoken; a name --
+    "Mary-Jane" included -- is left alone. Attack 2 (round 4): the
+    no-address line echoed a typed half-address with its "@" in it."""
+    w = " ".join(str(who or "").split())
+    return spoken_address(w).strip() if "@" in w else w
+
+
 def pronoun_for(gender: Optional[str]) -> str:
     """"her" / "him" for a known gender, "them" for none."""
     return {"f": "her", "m": "him"}.get(str(gender or "").lower(), "them")
@@ -314,34 +327,133 @@ def refusal_line(match, said: str = "", cap_mb: float = MAX_ATTACHMENT_MB) -> st
 # peyrovi@tamu.edu -- a DIFFERENT, possibly real address, and the one class
 # of mistake the read-back is least likely to catch, because it sounds
 # almost right.
+#
+# Round 4 (09-05) found the same mistake one joiner over: "dot" was the
+# only spoken joiner the parser knew, so "heather underscore smith at
+# example dot com" matched from "smith" and the file went to
+# smith@example.com -- and spoken_address() itself says "_" as
+# "underscore", so Jarvis's OWN read-back of heather_smith@... said back
+# to it word for word went to a stranger. Every joiner the speaker speaks
+# is read here, and a local part with a word in it that is NOT read is
+# never cut to its tail: address_span refuses it and unresolved_address
+# hands it back as heard, for the re-ask.
+_SPOKEN_JOINERS = {"dot": ".", "period": ".", "fullstop": ".",
+                   "underscore": "_", "dash": "-", "hyphen": "-"}
+_LOCAL_JOINER = r"(?:dot|period|full\s+stop|under\s*score|dash|hyphen)"
+_DOMAIN_DOT = r"(?:dot|period|full\s+stop)"
+_DOMAIN_DASH = r"(?:dash|hyphen)"
+_LOCAL_LABEL = r"[A-Za-z0-9][\w+\-]*"
+_DOMAIN_LABEL = r"[A-Za-z0-9][\w\-]*"
 _SPOKEN_ADDR_RX = re.compile(
-    r"\b([A-Za-z0-9][\w+\-]*(?:\s+dot\s+[A-Za-z0-9][\w+\-]*)*)"
+    r"\b(" + _LOCAL_LABEL + r"(?:\s+" + _LOCAL_JOINER + r"\s+" + _LOCAL_LABEL + r")*)"
     r"\s+at\s+"
-    r"([A-Za-z0-9][\w\-]*(?:\s+dot\s+[A-Za-z0-9][\w\-]*)+)", re.I)
-_DOT_RX = re.compile(r"\s+dot\s+", re.I)
+    r"(" + _DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
+    r"(?:\s+" + _DOMAIN_DOT + r"\s+" + _DOMAIN_LABEL
+    + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*)+)", re.I)
+_JOINER_RX = re.compile(
+    r"\s+(dot|period|full\s+stop|under\s*score|dash|hyphen)\s+", re.I)
+# Words that name a character an address cannot carry, or one this parser
+# does not read -- and "plus": it IS a character an address can carry, but
+# it is also the second-recipient connector ("send it to her, plus Dana"),
+# and read as "+" it makes one address out of two people. A local part
+# with any of these in it is handed back as heard, never resolved.
+_SPOKEN_SYMBOLS = frozenset((
+    "plus", "minus", "point", "tilde", "squiggle", "apostrophe", "slash",
+    "backslash", "star", "asterisk", "hash", "hashtag", "pound", "ampersand",
+    "percent", "equals", "colon", "semicolon", "comma", "space", "caret",
+    "pipe", "bang", "exclamation", "quote", "quotes", "bracket", "brace",
+    "paren", "parenthesis", "dollar", "sign"))
 _ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
+# What may stand directly in front of a TYPED address: a space, a bracket,
+# a quote, "mailto:", a comma. Anything else ("heather~smith@example.com")
+# is a character the address cannot carry, and the match is its tail.
+_ADDR_LEAD_OK = frozenset(" \t\n\r<([{\"':;,=>")
+
+
+def _joined(m: "re.Match") -> str:
+    word = re.sub(r"\s+", "", m.group(1).lower())
+    return _SPOKEN_JOINERS.get(word, "_" if word == "underscore" else ".")
+
+
+def _spoken_lead(raw: str, start: int) -> Optional[int]:
+    """Where a spoken local part REALLY starts when the parser's match at
+    ``start`` has ``<word> <symbol word>`` in front of it -- the start of
+    the earliest such pair -- or None when the match stands on its own."""
+    at = None
+    pre = raw[:start]
+    while True:
+        m = re.search(r"(\S+)\s+(\S+)\s+$", pre)
+        if not m or m.group(2).lower().strip(",.") not in _SPOKEN_SYMBOLS:
+            return at
+        if not re.fullmatch(_LOCAL_LABEL, m.group(1)):
+            return at
+        at = m.start(1)
+        pre = raw[:at]
+
+
+def _typed_lead(raw: str, start: int) -> Optional[int]:
+    """The start of the word a typed address match at ``start`` is the
+    tail of, when the character in front of it is one an address cannot
+    carry; None when the match stands on its own."""
+    if start == 0 or raw[start - 1] in _ADDR_LEAD_OK:
+        return None
+    j = start
+    while j > 0 and not raw[j - 1].isspace():
+        j -= 1
+    return j
 
 
 def address_span(text: str) -> Optional[tuple]:
     """(address, start, end) of the first address in the text, typed or
     spoken, or None. The span is in the text AS GIVEN (no whitespace
     normalising), so a caller can cut the address out of the sentence --
-    which is how the commander's fold keeps its hands off one."""
+    which is how the commander's fold keeps its hands off one.
+
+    A match that is only the TAIL of what he said (a joiner word the
+    parser does not read in front of it, a character an address cannot
+    carry) is no address at all: None, and unresolved_address says what
+    was heard."""
     raw = str(text or "")
     if not raw.strip():
         return None
     m = _ADDR_RX.search(raw)
     if m:
+        if _typed_lead(raw, m.start()) is not None:
+            return None
         addr = m.group(0).rstrip(".,;:")
         return addr, m.start(), m.start() + len(addr)
     m = _SPOKEN_ADDR_RX.search(raw)
     if m:
-        local = _DOT_RX.sub(".", " ".join(m.group(1).split())).strip()
-        domain = _DOT_RX.sub(".", " ".join(m.group(2).split())).strip()
+        if _spoken_lead(raw, m.start()) is not None:
+            return None
+        local = _JOINER_RX.sub(_joined, " ".join(m.group(1).split())).strip()
+        domain = _JOINER_RX.sub(_joined, " ".join(m.group(2).split())).strip()
         addr = f"{local}@{domain}".replace(" ", "")
         if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
             return addr, m.start(), m.end()
     return None
+
+
+def unresolved_address(text: str) -> str:
+    """The address he SAID, when it has an address's shape and a local
+    part this parser cannot read whole -- "heather tilde smith at example
+    dot com", "heather~smith@example.com" -- as words fit to be said back
+    (never an "@" in it), or "" when there is no such thing."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return ""
+    m = _ADDR_RX.search(raw)
+    if m:
+        lead = _typed_lead(raw, m.start())
+        if lead is None:
+            return ""
+        return spoken_address(raw[lead:m.end()].rstrip(".,;:")).strip()
+    m = _SPOKEN_ADDR_RX.search(raw)
+    if m:
+        lead = _spoken_lead(raw, m.start())
+        if lead is not None:
+            return raw[lead:m.end()]
+    return ""
 
 
 def parse_address(text: str) -> str:
@@ -614,7 +726,11 @@ def prepare(cfg, memory, file_query: str, recipient: str,
 
     addr, who = resolve_recipient(cfg, memory, recipient)
     if not addr:
-        line = NO_RECIPIENT_LINE.format(who=who) if who else WHO_LINE
+        heard = unresolved_address(recipient)
+        if heard:
+            line = HEARD_LINE.format(heard=heard)
+        else:
+            line = NO_RECIPIENT_LINE.format(who=spoken_who(who)) if who else WHO_LINE
         return Prepared(ask=line, status="No address")
 
     account, why = mail_mod.choose_account(
