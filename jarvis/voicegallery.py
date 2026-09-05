@@ -321,18 +321,76 @@ class VoiceVerdict:
     takes. It is there so the caller can say "I think that's Mara, but I've
     only heard her a few times" instead of silently saying nothing -- and it
     is never ``who``, so it can never grant scope.
+
+    THERE IS ONE MEASUREMENT IN HERE AND EVERY NUMBER IS READ OFF IT.
+    ``scores`` is the ranking; ``score``, ``top_label``, ``second``,
+    ``second_score`` and ``margin`` are DERIVED PROPERTIES over it, not
+    fields kept in step by hand. That is a fix, and the bug it closes was
+    measured 2026-09-05:
+
+    ``speaker._strip_disowned`` takes his name back off a gallery label that
+    does not measure as his pool. It filtered ``scores`` and left the scalars
+    alone, on the stated argument that a stale number there could only ever
+    WITHHOLD a name downstream. It could do more than withhold. Paired in
+    ``speaker._ident`` with a label read out of the FILTERED list --
+
+        if verdict.scores and float(verdict.score) >= self.threshold:
+            who_top = str(verdict.scores[0][0] or "")
+
+    -- the two halves described different rows and INVENTED one: the guest's
+    name carrying his score. At apart 0.3 on his own drifted box the gate was
+    handed ``top='mara'`` where mara measured 0.008 against a 0.30 bar, and
+    ``gate._voice_leg``'s "the gallery's best guess is somebody else" refused
+    him for it, 30 of 30. Re-judging the identical stats with ``top`` read
+    off its own row admitted him 30 of 30.
+
+    So the fields are gone. ``dataclasses.replace(v, scores=...)`` now
+    recomputes every scalar, and a caller cannot construct a disagreement
+    even deliberately. ``__post_init__`` sorts the ranking too, because
+    "``score`` is rank 1" has to be a fact about the tuple rather than a
+    promise about whoever built it.
     """
 
     who: str = ""
-    score: float = 0.0
-    second: str = ""
-    second_score: float = 0.0
-    margin: Optional[float] = None
     speech_s: float = 0.0
     why: str = ""
     provisional: str = ""
     abstained: bool = False
     scores: Tuple[Tuple[str, float], ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "scores", tuple(sorted(
+            ((str(k), float(v)) for k, v in (self.scores or ())),
+            key=lambda kv: kv[1], reverse=True)))
+
+    @property
+    def top_label(self) -> str:
+        """The label ``score`` IS THE SCORE OF. Read from the same row, so
+        the pair cannot come apart."""
+        return self.scores[0][0] if self.scores else ""
+
+    @property
+    def score(self) -> float:
+        """Rank 1's cosine. 0.0 when nothing was scored at all -- which is
+        every abstention, and is why the accept bar is a ``>=`` on a positive
+        number rather than a truth test."""
+        return self.scores[0][1] if self.scores else 0.0
+
+    @property
+    def second(self) -> str:
+        return self.scores[1][0] if len(self.scores) > 1 else ""
+
+    @property
+    def second_score(self) -> float:
+        return self.scores[1][1] if len(self.scores) > 1 else 0.0
+
+    @property
+    def margin(self) -> Optional[float]:
+        """None when only one label was ranked -- "the bar did not apply",
+        which is not "the bar was cleared by 0.0"."""
+        if len(self.scores) < 2:
+            return None
+        return self.scores[0][1] - self.scores[1][1]
 
     def as_dict(self) -> dict:
         return {"who": self.who, "score": self.score, "second": self.second,
@@ -654,14 +712,17 @@ class VoiceGallery:
         if why_bad:
             return VoiceVerdict(speech_s=speech_s,
                                 why="no usable embedding: %s" % why_bad)
+        # ONE RANKING, AND EVERY NUMBER BELOW IS READ OFF IT. ``score``,
+        # ``second``, ``second_score`` and ``margin`` are properties over
+        # ``scores`` (see VoiceVerdict), so nothing here can hand out a
+        # scalar that describes a different row than the label beside it --
+        # which is the fault this shape replaced.
         ranked = sorted(((label, cosine(vec, c)) for label, c in cents.items()),
                         key=lambda kv: kv[1], reverse=True)
         top, top_s = ranked[0]
         second, second_s = ranked[1] if len(ranked) > 1 else ("", 0.0)
         margin = (top_s - second_s) if second else None
-        common = {"score": float(top_s), "second": second,
-                  "second_score": float(second_s), "margin": margin,
-                  "speech_s": speech_s,
+        common = {"speech_s": speech_s,
                   "scores": tuple((k, float(v)) for k, v in ranked)}
 
         if top_s < bar:
@@ -1439,44 +1500,16 @@ class VoiceGallery:
         # more copies of the same takes, which would double the label's weight
         # in its own centroid and quietly make every later margin wrong.
         if label in self.disk_labels():
-            out["why"] = ("%s already has embeddings in the voice gallery; "
-                          "migrating again would store the same takes twice"
-                          % label)
-            return out
-        try:
-            data = np.load(src)
-            names = list(data.files)
-            fmt = int(data["_format"][0]) if "_format" in names else 1
-        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
-            out["why"] = "%s could not be read (%s)" % (src, type(exc).__name__)
-            return out
-        out["format"] = fmt
-        if fmt != 2:
             out["why"] = (
-                "%s is format %d and only format 2 migrates. Format 1 predates "
-                "silence trimming: those embeddings were pooled with the "
-                "silence of fixed-length takes and score low against trimmed "
-                "probes, so they would arrive here already broken. Re-enrol "
-                "with scripts/enroll_voice.py --reset instead." % (src, fmt))
-            log.warning("voice gallery: %s", out["why"])
+                "%s already has embeddings in the voice gallery; migrating "
+                "again would store the same takes twice. If his pool has come "
+                "APART from voiceprint.npz -- which passive learning used to "
+                "do on its own, and which stops Jarvis reading his own label "
+                "as his -- that is a re-anchor, not a second migration: "
+                "scripts/voice_enrol.py --reanchor" % label)
             return out
-        keys = sorted(k for k in names if k.startswith("emb_"))
-        out["found"] = len(keys)
-        if not keys:
-            out["why"] = "%s holds no embeddings" % src
-            return out
-        staged = []
-        for key in keys:
-            arr = np.asarray(data[key], dtype=np.float32).ravel()
-            why = degenerate_reason(arr, self.model)
-            if why:
-                out["dropped"] += 1
-                log.warning("voice gallery migration: dropping %s (%s)",
-                            key, why)
-                continue
-            staged.append(arr)
-        if not staged:
-            out["why"] = "%s holds no usable embeddings" % src
+        staged = self._stage_voiceprint(src, out)
+        if staged is None:
             return out
         before = dict(self._pool), dict(self._takes), dict(self._consent)
         for arr in staged:
@@ -1509,6 +1542,193 @@ class VoiceGallery:
         log.info("voice gallery: migrated %d take(s) from %s as %r into "
                  "generation %d; %s is untouched and stays the rollback",
                  len(staged), src.name, label, out["generation"], src.name)
+        return out
+
+    def _stage_voiceprint(self, src: Path, out: dict):
+        """The usable format-2 vectors in ``src``, or None with ``out["why"]``
+        set. Shared by ``migrate_voiceprint`` and ``reanchor_voiceprint`` so
+        the two cannot come to disagree about what a readable voiceprint is.
+        """
+        try:
+            data = np.load(src)
+            names = list(data.files)
+            fmt = int(data["_format"][0]) if "_format" in names else 1
+        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
+            out["why"] = "%s could not be read (%s)" % (src, type(exc).__name__)
+            return None
+        out["format"] = fmt
+        if fmt != 2:
+            out["why"] = (
+                "%s is format %d and only format 2 migrates. Format 1 predates "
+                "silence trimming: those embeddings were pooled with the "
+                "silence of fixed-length takes and score low against trimmed "
+                "probes, so they would arrive here already broken. Re-enrol "
+                "with scripts/enroll_voice.py --reset instead." % (src, fmt))
+            log.warning("voice gallery: %s", out["why"])
+            return None
+        keys = sorted(k for k in names if k.startswith("emb_"))
+        out["found"] = len(keys)
+        if not keys:
+            out["why"] = "%s holds no embeddings" % src
+            return None
+        staged = []
+        for key in keys:
+            arr = np.asarray(data[key], dtype=np.float32).ravel()
+            why = degenerate_reason(arr, self.model)
+            if why:
+                out["dropped"] += 1
+                log.warning("voice gallery migration: dropping %s (%s)",
+                            key, why)
+                continue
+            staged.append(arr)
+        if not staged:
+            out["why"] = "%s holds no usable embeddings" % src
+            return None
+        return staged
+
+    def reanchor_voiceprint(self, label: str, path: Optional[Path] = None,
+                            reason: str = "") -> dict:
+        """THE WAY BACK. Refill his gallery label from the voiceprint he
+        already has -- no microphone, no takes, no file deleted by hand.
+
+        WHY THIS HAS TO EXIST. ``speaker._disowned`` stops reading his gallery
+        label as his once it measures under ``OWNER_POOL_COSINE`` against
+        ``voiceprint.npz``, and once that happens every other door was shut:
+        ``migrate_voiceprint`` refuses ("already has embeddings"), ``pool_ok``
+        refuses fresh takes ("would pull hunter away from voiceprint.npz"),
+        and what was left was deleting a generation by hand and enrolling
+        again. This lane's one hard rule is that he never pays for
+        multi-speaker with a re-enrolment; a recovery that costs one is the
+        same bill arriving later.
+
+        IT IS ``--migrate`` OVER THE TOP, WITH THE GUARDS THAT MAKES NECESSARY.
+        The label's pool is REPLACED rather than appended to -- appending is
+        what the migrate guard exists to prevent, and it would leave the
+        drifted takes in the centroid it is trying to move.
+
+        FOUR REFUSALS, and they are MISTAKE-CATCHERS rather than a lock. The
+        honest threat model says so out loud: whoever can write
+        ``voiceprint.npz`` is ALREADY the owner as far as ``_owner_pools`` is
+        concerned -- a match on the voiceprint's pool is his by construction,
+        gallery or no gallery -- so this grants a takeover exactly nothing it
+        did not already have. What it can do is destroy his pool because he
+        pointed it at the wrong file, and that is what these stop.
+
+        1. HIS LABEL MUST ALREADY EXIST. A re-anchor REPAIRS; ``--migrate``
+           creates. Letting this one create would put a second door beside the
+           one the owner guard was built on.
+        2. THERE MUST BE SOMETHING TO REPAIR. A pool still at or above
+           ``OWNER_POOL_COSINE`` is refused, so a healthy box cannot spend a
+           generation on this by accident.
+        3. IT MUST STILL BE THE SAME VOICE, at that pool's OWN measured floor
+           -- ``genuine_floor``, the smallest leave-one-out cosine across his
+           stored takes, which is the same instrument ``passive_ok`` bars a
+           passive sample on (0.570 on his real fourteen-take pool, 2026-09-04).
+           Measured 2026-09-05 on synthetic vectors: a voiceprint drifted by
+           24 passive samples measures 0.975-0.999 against his pool and is
+           allowed; a different speaker's voiceprint measures far under the
+           floor at apart 0.3 and 1.0 and is refused. AND THE LIMIT IS STATED:
+           at apart 2.0 two synthetic speakers' centroids sit around 0.8 by
+           construction, over any floor this pool can produce -- the same
+           separation at which ``pool_ok`` refuses to enrol a second person at
+           all and at which the single-speaker verifier's own false-accept
+           rate is 100%. No bar in this file closes that, and pretending
+           otherwise is how a guard gets hand-waved away later.
+        4. THE POOL IT WRITES MUST NOT BE COLLAPSED -- ``save`` applies that,
+           unchanged.
+
+        REVERSIBLE, like every other write here: the generation before it
+        stays on disk and ``rollback()`` restores it. ``allow_shrink`` is
+        passed because a re-anchor is a deliberate REPLACEMENT and the
+        voiceprint may legitimately hold fewer takes than the pool it
+        replaces; the shrink guard's own case (a silent 6 -> 2) is still
+        covered by the generation it did not delete.
+
+        ``voiceprint.npz`` is READ AND NOT WRITTEN, exactly as in
+        ``migrate_voiceprint``. It stays the rollback.
+        """
+        src = Path(path) if path is not None else PATHS.VOICEPRINT
+        out = {"ok": False, "label": str(label), "source": str(src),
+               "format": 0, "found": 0, "migrated": 0, "dropped": 0,
+               "replaced": 0, "generation": 0, "cosine": None, "floor": None,
+               "why": ""}
+        if not _LABEL_RE.match(str(label or "")):
+            out["why"] = ("%r is not a label the registry, the face gallery "
+                          "and this store can all hold" % (label,))
+            return out
+        label = str(label)
+        if self.root is None:
+            out["why"] = "this gallery has no root; it cannot be saved"
+            return out
+        if not src.exists():
+            out["why"] = "there is no voiceprint at %s to re-anchor to" % src
+            return out
+        existing = list(self._pool.get(label, []))
+        if len(existing) < 2:
+            out["why"] = (
+                "%s has no pool in the voice gallery to re-anchor (a "
+                "re-anchor repairs an existing one). Carry his voiceprint in "
+                "first -- no microphone needed: scripts/voice_enrol.py "
+                "--migrate" % label)
+            return out
+        staged = self._stage_voiceprint(src, out)
+        if staged is None:
+            return out
+
+        mine = centroid(existing)
+        theirs = centroid(staged)
+        sim = cosine(theirs, mine)
+        out["cosine"] = sim
+        if sim >= OWNER_POOL_COSINE:
+            out["why"] = (
+                "%s already measures as %s at cosine %.4f, and %.2f is where "
+                "Jarvis stops reading it as his -- there is nothing to "
+                "re-anchor. Nothing was written."
+                % (label, src.name, sim, OWNER_POOL_COSINE))
+            return out
+        floor = self.genuine_floor(label)
+        out["floor"] = floor
+        if floor is not None and sim < floor:
+            out["why"] = (
+                "%s measures %.3f against %s's stored takes, below that "
+                "pool's own genuine floor of %.3f (the weakest its own takes "
+                "score against each other). That is not drift, it is a "
+                "different voice -- check which voiceprint you pointed at. "
+                "Nothing was written." % (src.name, sim, label, floor))
+            log.warning("voice gallery: re-anchor refused -- %s", out["why"])
+            return out
+
+        before = dict(self._pool), dict(self._takes), dict(self._consent)
+        keep_consent = self.consent(label)
+        self._pool[label] = []
+        self._takes[label] = []
+        for arr in staged:
+            self.add(label, arr, src="legacy",
+                     note="re-anchored from voiceprint.npz format 2")
+        if keep_consent:
+            self._consent[label] = keep_consent
+        elif not self.consent(label):
+            self.set_consent(label, "owner")
+        try:
+            out["generation"] = self.save(
+                reason=reason or ("re-anchored %s to voiceprint.npz (was cos "
+                                  "%.4f of it over %d take(s))"
+                                  % (label, sim, len(existing))),
+                allow_shrink=True)
+        except Exception as exc:  # noqa: BLE001 - ANY failure rolls back
+            self._pool, self._takes, self._consent = before
+            out["why"] = str(exc) or type(exc).__name__
+            log.warning("voice gallery: re-anchor refused -- %s: %s",
+                        type(exc).__name__, exc)
+            return out
+        out["replaced"] = len(existing)
+        out["migrated"] = len(staged)
+        out["ok"] = True
+        log.info("voice gallery: re-anchored %r to %s -- %d take(s) replaced "
+                 "%d, generation %d (was cos %.4f of the voiceprint, needs "
+                 "%.2f); %s is untouched and stays the rollback",
+                 label, src.name, len(staged), len(existing),
+                 out["generation"], sim, OWNER_POOL_COSINE, src.name)
         return out
 
     def provenance(self) -> dict:

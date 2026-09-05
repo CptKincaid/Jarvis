@@ -215,6 +215,7 @@ class SpeakerVerifier:
         self._device = None         # resolved by _resolve_device()
         self._warned_fail_open = False   # one Status(warn) per session
         self._warned_disowned = False    # one warning per session
+        self._warned_anchored = False    # one warning per session
         self._model_failed = False       # a failed load is not retried
         # "" or one plain sentence naming the format on disk that this build
         # refused to read. Held rather than only logged so a startup line and
@@ -758,6 +759,24 @@ class SpeakerVerifier:
                 out.add(label)
         return out
 
+    def _owner_alias_cosine(self, cents):
+        """How well his GALLERY label measures as the voiceprint's pool, or
+        None when the question does not apply (bootstrap, or no label of his).
+
+        PURE, AND SPLIT OUT FOR EXACTLY ONE REASON: ``add_sample`` has to be
+        able to ask this question about a centroid it has NOT committed yet.
+        The bar that bounds passive drift and the bar that shuts the door are
+        then the same predicate over the same numbers rather than two
+        constants somebody has to keep equal.
+        """
+        mine = cents.get("")
+        if mine is None or not self.owner_label:
+            return None                 # bootstrap: nothing to measure against
+        c = cents.get(self.owner_label)
+        if c is None:
+            return None
+        return float(self._cosine_similarity(c, mine))
+
     def _disowned(self, cents):
         """The gallery labels that CLAIM the owner's name without measuring
         as his pool. Everything below must refuse to read one as him.
@@ -767,14 +786,8 @@ class SpeakerVerifier:
         dropped from the matchable set by ``_all_centroids`` and cannot be
         used to look itself up afterwards.
         """
-        mine = cents.get("")
-        if mine is None or not self.owner_label:
-            return frozenset()          # bootstrap: nothing to measure against
-        c = cents.get(self.owner_label)
-        if c is None:
-            return frozenset()
-        score = float(self._cosine_similarity(c, mine))
-        if score >= MIGRATED_ALIAS_COSINE:
+        score = self._owner_alias_cosine(cents)
+        if score is None or score >= MIGRATED_ALIAS_COSINE:
             return frozenset()
         if not self._warned_disowned:
             self._warned_disowned = True
@@ -877,10 +890,16 @@ class SpeakerVerifier:
         hunter" said about a stranger is exactly the sentence that would get
         the guard hand-waved away as a false alarm next time.
 
-        ``score``, ``second`` and ``margin`` are left alone deliberately.
-        They feed only the accept bar and the near-miss test, and both of
-        those can only ever WITHHOLD a name downstream -- never grant one --
-        so a stale number there is conservative in the safe direction.
+        FILTERING THE RANKING IS ALL IT DOES, AND THAT IS NOW ENOUGH. This
+        used to leave ``score``, ``second`` and ``margin`` alone on the
+        argument that a stale number there could only ever WITHHOLD a name
+        downstream. Measured 2026-09-05, it could also INVENT one: paired in
+        ``_ident`` with a label read out of the filtered list, his score
+        arrived at the gate wearing the guest's name (top='mara' at 0.008
+        against a 0.30 bar) and the gate refused him 30 of 30. Those scalars
+        are properties over ``scores`` now (see ``voicegallery.VoiceVerdict``),
+        so ``dataclasses.replace`` recomputes every one of them here and a
+        stale scalar is not a thing that can exist.
 
         The lock is taken here and is never held by a caller: all three
         ``_who`` call sites release it before asking.
@@ -964,8 +983,17 @@ class SpeakerVerifier:
             scores = dict(verdict.scores)
             who = str(verdict.who or "")
             provisional = str(verdict.provisional or "")
-            if verdict.scores and float(verdict.score) >= self.threshold:
-                who_top = str(verdict.scores[0][0] or "")
+            # ONE ROW, READ ONCE. ``top`` is a label AND the claim that its
+            # score cleared the bar, so both halves come off the same row of
+            # the same ranking (``VoiceVerdict.top_label`` is the label
+            # ``score`` is the score of). This used to be two reads --
+            # ``verdict.score`` beside ``verdict.scores[0][0]`` -- and after
+            # ``_strip_disowned`` filtered the ranking they described
+            # different rows: measured 2026-09-05 at apart 0.3, the gate was
+            # told top='mara' where mara scored 0.008 against a 0.30 bar, and
+            # refused him 30 of 30 for it.
+            if verdict.score >= self.threshold:
+                who_top = verdict.top_label
             near_miss = bool(not who and not provisional and not abstained
                              and verdict.margin is not None
                              and who_top
@@ -1123,21 +1151,94 @@ class SpeakerVerifier:
                 return False
 
         with self._lock:
+            pool = self._trimmed(self._embeddings + [embedding])
+            cand = np.mean(pool, axis=0)
+            why = self._would_leave_his_own_pool(cand)
+            if why:
+                if not self._warned_anchored:
+                    self._warned_anchored = True
+                    log.warning("passive sample refused: %s", why)
+                else:
+                    log.info("passive sample refused: %s", why)
+                return False
             self._passive_added += 1
-            self._embeddings.append(embedding)
-            # Trim oldest if over limit (keep first 10 enrollment + newest)
-            if len(self._embeddings) > MAX_EMBEDDINGS:
-                # Keep first 10 (original enrollment) + newest
-                keep_first = min(10, len(self._embeddings) // 2)
-                keep_recent = MAX_EMBEDDINGS - keep_first
-                self._embeddings = (
-                    self._embeddings[:keep_first]
-                    + self._embeddings[-keep_recent:]
-                )
-            self._recompute_centroid()
+            self._embeddings = pool
+            self._centroid = cand
 
         self.save()
         return True
+
+    @staticmethod
+    def _trimmed(pool):
+        """``pool`` capped at ``MAX_EMBEDDINGS``, keeping the first ten (the
+        original enrolment) and the newest. Lifted out of ``add_sample`` so
+        the candidate centroid measured below is the one that would actually
+        be stored, trim and all -- a projection that skipped the trim would
+        bound a pool nobody keeps."""
+        if len(pool) <= MAX_EMBEDDINGS:
+            return list(pool)
+        keep_first = min(10, len(pool) // 2)
+        keep_recent = MAX_EMBEDDINGS - keep_first
+        return list(pool[:keep_first]) + list(pool[-keep_recent:])
+
+    def _would_leave_his_own_pool(self, candidate):
+        """"" when the voiceprint may move to ``candidate``, else the
+        sentence saying why not.
+
+        THE LOCKOUT THIS CLOSES NEEDS NO COMMAND, NO ATTACKER AND NO MISTAKE.
+        ``add_sample`` moves ``voiceprint.npz``'s centroid; the gallery's
+        migrated copy of him does not move; ``_disowned`` compares the two on
+        ``MIGRATED_ALIAS_COSINE``. So ordinary use walks the two apart until
+        his own gallery label stops being read as his and the gate refuses
+        him. Measured 2026-09-05 on synthetic vectors, two passive samples
+        per restart, seed 3, and the same shape at apart 0.3 / 1.0 / 2.0::
+
+            passive   0     2     4     8    12    16 | 18    20    40
+            cosine  1.0000 .9951 .9925 .9869 .9840 .9821| .9809 .9787 .9750
+            admits    30    30    30    30    30    30 |  0     0     0
+                                          nine restarts ^ LOCKED
+
+        THE BOUND IS THE DOOR'S OWN PREDICATE, ASKED OF A CENTROID NOT YET
+        COMMITTED. Not a second constant, not a headroom margin, not a step
+        size: ``_owner_alias_cosine`` over a centroid dict whose "" entry is
+        the candidate. Committed only if the answer would still be at or
+        above the line, so the invariant is exact rather than approximate --
+        the stored voiceprint centroid is never on the far side of the bar
+        the runtime disowns on, however many samples arrive or in what order.
+
+        WHY THE MOVER IS THE ONE THAT GETS BOUNDED. Both pools could in
+        principle drift; only one of them does so by itself. Gallery passive
+        learning is off (``voicegallery.MAX_PASSIVE`` is 0) and every other
+        write to the gallery is an operator running the enrol script, which
+        applies ``OWNER_POOL_COSINE`` itself (``pool_ok``). Passive learning
+        into the voiceprint is the single automatic mover, so it is the one
+        that must not be allowed to walk out of the pair.
+
+        AND NOTHING CHANGES ON A SINGLE-SPEAKER BOX. With no label of his in
+        the gallery there is no pair to hold together, ``_owner_alias_cosine``
+        answers None, and the sample is taken exactly as it was before this
+        feature existed. A box that never asked for multi-speaker does not
+        pay for it.
+
+        The recovery for a box that ALREADY drifted -- and the reason this is
+        a refusal rather than a silent re-anchor -- is
+        ``voicegallery.reanchor_voiceprint`` and ``voice_enrol.py
+        --reanchor``: an operator's decision with the numbers printed, never
+        something the runtime does to his identity behind his back.
+
+        Callers hold ``self._lock``.
+        """
+        cents = dict(self._all_centroids())
+        cents[""] = candidate
+        score = self._owner_alias_cosine(cents)
+        if score is None or score >= MIGRATED_ALIAS_COSINE:
+            return ""
+        return ("it would move voiceprint.npz to cos %.4f of the voice "
+                "gallery's %r, under the %.2f line that label is read as his "
+                "on -- Jarvis would stop answering him. Nothing was added. If "
+                "his pool and his voiceprint have genuinely come apart, "
+                "re-anchor them: scripts/voice_enrol.py --reanchor"
+                % (score, self.owner_label, MIGRATED_ALIAS_COSINE))
 
     # ------------------------------------------------ segment filtering
     def _dump_reject(self, audio_16k, windows, scores):

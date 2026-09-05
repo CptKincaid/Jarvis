@@ -406,8 +406,13 @@ def pool_ok(gallery, label, vectors, owner="", owner_vectors=None):
                     "(the pool would sit at cosine %.3f, and %.2f is where "
                     "Jarvis stops reading it as the owner). Either they are "
                     "not his voice, or they were recorded somewhere his "
-                    "voiceprint would not recognise. Nothing was written."
-                    % (len(vectors), label, sim, vg.OWNER_POOL_COSINE))
+                    "voiceprint would not recognise. Nothing was written.\n"
+                    "If his pool has ALREADY come apart from voiceprint.npz, "
+                    "more takes cannot close it and this refusal is the "
+                    "dead end that used to follow: re-anchor the two instead, "
+                    "no microphone needed:\n    %s %s --reanchor"
+                    % (len(vectors), label, sim, vg.OWNER_POOL_COSINE,
+                       sys.executable, __file__))
 
     for other in sorted(gallery.labels()):
         if other == label:
@@ -523,6 +528,9 @@ def main(argv=None) -> int:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--migrate", action="store_true",
                     help="carry the owner's voiceprint.npz in; no microphone")
+    ap.add_argument("--reanchor", action="store_true",
+                    help="his pool has drifted from voiceprint.npz -- refill "
+                         "it from the voiceprint; no microphone")
     ap.add_argument("--delete", action="store_true",
                     help="destroy one person's embeddings, everywhere")
     ap.add_argument("--yes", action="store_true",
@@ -533,9 +541,17 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     owner = owner_label(CONFIG)
-    if args.migrate:
+    if args.migrate and args.reanchor:
+        print("REFUSED: --migrate creates his pool and --reanchor repairs "
+              "one; they are different runs. Ask --status which you need.",
+              file=sys.stderr)
+        return 2
+    if args.migrate or args.reanchor:
         # Refused BEFORE the gallery is opened: nothing read, nothing
-        # written, under a label that is not his.
+        # written, under a label that is not his. A re-anchor lives under
+        # the SAME rule as a migration and for the same reason -- the
+        # voiceprint has no label in it, and the only one it may ever be
+        # filed under is his.
         ok, why = migrate_label_ok(args.label, owner)
         if not ok:
             print("REFUSED: %s" % why, file=sys.stderr)
@@ -557,6 +573,35 @@ def main(argv=None) -> int:
         print("migrated %d take(s) from %s into generation %d as %r."
               % (out["migrated"], PATHS.VOICEPRINT.name, out["generation"], label))
         print("%s is untouched and stays the rollback." % PATHS.VOICEPRINT)
+        if out["dropped"]:
+            print("%d vector(s) were dropped as unusable." % out["dropped"])
+        print()
+        show_status(gallery)
+        return 0
+
+    if args.reanchor:
+        # THE WAY BACK, and it takes no microphone. See
+        # voicegallery.reanchor_voiceprint for the four refusals and for the
+        # honest note on what they are and are not: whoever can write
+        # voiceprint.npz is already the owner as far as the runtime is
+        # concerned, so these catch a MISTAKE, not a takeover.
+        out = gallery.reanchor_voiceprint(owner)
+        if not out["ok"]:
+            print("re-anchor refused: %s" % out["why"], file=sys.stderr)
+            if out["cosine"] is not None:
+                print("  %s measures %.4f against %r's stored takes "
+                      "(the line is %.2f)."
+                      % (PATHS.VOICEPRINT.name, out["cosine"], owner,
+                         vg.OWNER_POOL_COSINE), file=sys.stderr)
+            return 1
+        print("re-anchored %r to %s: %d take(s) replaced %d, generation %d."
+              % (owner, PATHS.VOICEPRINT.name, out["migrated"],
+                 out["replaced"], out["generation"]))
+        print("it was at cosine %.4f of the voiceprint and the line is %.2f; "
+              "it is 1.0000 now." % (out["cosine"], vg.OWNER_POOL_COSINE))
+        print("%s is untouched and stays the rollback. Generation %d is still "
+              "on disk if you want it back." % (PATHS.VOICEPRINT,
+                                                out["generation"] - 1))
         if out["dropped"]:
             print("%d vector(s) were dropped as unusable." % out["dropped"])
         print()
