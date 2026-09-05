@@ -60,6 +60,25 @@ The cost of being wrong in each direction is the same asymmetry the
 filler hold was built on: a wrong hold costs one ``spell_hold_s`` once,
 on one turn; a missed one chops his address into four pieces.
 
+THE DANGLING CASE CONTINUES (measured on this branch, 09-05)
+------------------------------------------------------------
+The two-letter floor above, applied on its own, has a hole the verdict's
+eight spelled cases could not show: they are all q-z-v / k-b-w-7 shapes,
+and MEASURED on 24 invented first names, 17 have "a" or "i" as their
+SECOND letter. "send it to d a" (dana), "m i" (mike), "k a" (kate) is a
+run with only ONE counting letter, so the capture would close after the
+second character -- the dangling rule buying him the first character and
+the floor throwing it away.
+
+So a run that OPENS on a real letter directly after one of DANGLING_WORDS
+is held as well: it is not a new rule, it is the dangling case one
+character later. It re-admits none of the five phrases the verdict named,
+because every one of them opens its run on a digit ("gate 4 b") or on "a"
+("he got a c"), and neither can open a spelling. What it does cost is a
+grid or seat reference whose letter follows a function word ("it's in
+b 4") -- ~1.8 s once, the same trade and the same size as ruling (A), and
+pinned in the tests rather than hidden.
+
 WHAT THE NARROWING DELIBERATELY DOES NOT REMOVE (Hunter, 09-05)
 ---------------------------------------------------------------
 After the digit repair, 9 of the 20 measured false holds remain, and
@@ -185,6 +204,15 @@ def spelling_run(text) -> int:
         letters = sum(1 for c in run
                       if c.isalpha() and c.lower() not in _NOT_A_DANGLING_LETTER)
         if letters >= MIN_RUN_LETTERS:
+            return n
+        # ...or the DANGLING CASE CONTINUING: a run that opens on a real
+        # letter directly after a word that cannot end a sentence is the
+        # same utterance one character later. Without this, the narrowing
+        # buys him the first character and throws it away on the second.
+        first = run[-1]                       # run was collected in reverse
+        before = toks[-n - 1].lower() if len(toks) > n else ""
+        if (first.isalpha() and first.lower() not in _NOT_A_DANGLING_LETTER
+                and before in DANGLING_WORDS):
             return n
         return 0
     if n != 1:

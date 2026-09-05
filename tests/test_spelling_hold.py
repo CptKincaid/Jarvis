@@ -730,3 +730,58 @@ def test_a_full_stop_in_prose_is_still_not_a_domain(prose):
     from jarvis import outbox
     assert outbox.parse_address(prose) == ""
     assert outbox.address_span(prose) is None
+
+
+# ==================== (10) THE HOLE THE NARROWING OPENED, and the clause
+#                           that closes it. MEASURED HERE, not handed down.
+#
+# The verdict sized the digit repair as "zero cost to any of 8 spelled-
+# address cases", and that is TRUE -- all eight are q-z-v / k-b-w-7
+# shapes. It is also narrower than it sounds, and a probe on this branch
+# measured what the eight do not cover: of 24 INVENTED first names, 17
+# have "a" or "i" as their SECOND letter, so the run "d a" (dana), "m i"
+# (mike), "k a" (kate) has only ONE letter that counts and the capture
+# closes after the second character. The dangling rule buys him the first
+# character and the narrowing then throws it away -- which is the exact
+# outcome his ruling (A) exists to prevent.
+#
+# THE CLAUSE: a run that BEGINS on a real letter directly after one of the
+# closed-class words that cannot end a sentence is the dangling case
+# CONTINUING -- the same utterance one character later -- and is held.
+# It is not a new rule and it re-admits none of the five phrases the
+# verdict named: every one of those begins its run on a digit or on "a".
+NAMES_WITH_AN_A_OR_I_SECOND = ["d a", "m i", "k a", "l i", "r a", "n i"]
+
+
+@pytest.mark.parametrize("first_two", NAMES_WITH_AN_A_OR_I_SECOND)
+def test_the_dangling_case_continues_into_the_second_character(first_two):
+    assert spelling.spelling_run("send it to " + first_two) == 2
+
+
+def test_the_clause_carries_a_digit_in_the_third_position_too():
+    assert spelling.spelling_run("send it to d a 4") == 3
+
+
+@pytest.mark.parametrize("phrase", DIGIT_FALSE_HOLDS)
+def test_the_clause_re_admits_none_of_the_five_the_verdict_named(phrase):
+    """Each of the five begins its run on a digit ("gate 4 b") or on "a"
+    ("he got a c"), and neither can open a spelling."""
+    assert spelling.spelling_run(phrase) == 0
+
+
+@pytest.mark.parametrize("phrase", [
+    "we are in row b 4",       # "row" is a noun, not a function word
+    "put it on plan b 2",      # his own counter-example, one char longer
+    "he got a c",              # the run opens on "a"
+    "gate 4 b",                # ...or on a digit
+])
+def test_the_clause_needs_the_function_word_in_front_of_the_run(phrase):
+    assert spelling.spelling_run(phrase) == 0
+
+
+def test_what_the_clause_costs_and_it_is_pinned_not_hidden():
+    """The price, said out loud: a grid or seat reference whose letter
+    follows a function word IS held, and costs ~1.8 s once on that turn.
+    That is the same trade as his ruling (A) and the same size."""
+    assert spelling.spelling_run("it's in b 4") == 2
+    assert spelling.spelling_run("he's at c 5") == 2
