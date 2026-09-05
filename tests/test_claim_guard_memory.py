@@ -25,6 +25,7 @@ which is also true of the live registry today.
 import pytest
 
 import jarvis.brain as brain_mod
+from jarvis import arc as arc_mod
 from jarvis.router import is_question
 from tests.test_brain_tools import (FakeContext, FakeMemory, FakeOllama,  # noqa: F401
                                     brain, make_registry, text_reply, tool_reply)
@@ -32,6 +33,30 @@ from tests.test_brain_tools import (FakeContext, FakeMemory, FakeOllama,  # noqa
 GRADUATE = ("Do not forget that I graduate December 10th 2026 with an "
             "electrical engineering degree")
 NOTED = "I have noted that, sir."
+
+
+@pytest.fixture(autouse=True)
+def _pin_the_greeting_hour(monkeypatch):
+    """These tests are about the CLAIM GUARD, not about the greeting.
+
+    brain.ground_greeting rightly rewrites a stale "Good evening" to the
+    word the clock says (the bands live in jarvis/arc.py: morning 05-11,
+    afternoon 12-16, evening 17-04). Four of the streamed cases below put
+    a greeting in front of the honest line and then asserted the whole
+    spoken list, so they were asserting a greeting they did not control:
+    measured 2026-09-05, they passed 17:00-04:59 and failed 05:00-16:59,
+    which is how a suite came to be green at 03:50 and red at 09:48 on one
+    commit.
+
+    The feature is NOT weakened, and no coverage is lost. ground_greeting
+    still runs on every line in this file; it is simply told which hour it
+    is, through arc.greeting_word -- the seam it already reads -- so it
+    finds nothing stale and leaves the text alone. The rewrite itself was
+    never this file's subject: it is owned by
+    tests/test_found_stale_greeting.py, which pins `now=` and walks the
+    real bands, and which is hour-independent already.
+    """
+    monkeypatch.setattr(arc_mod, "greeting_word", lambda now=None: "evening")
 
 
 @pytest.fixture
