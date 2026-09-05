@@ -207,6 +207,9 @@ def test_a_reminder_whose_tail_names_a_class_stays_a_reminder():
 
 
 # ------------------------------------------------------- the answer layer
+# clock-hygiene: the events below are positioned relative to the real clock
+# that timekeeper and commander read, so a pinned NOW would put every fixture
+# in the past the moment the two drifted apart.
 NOW = datetime.now().astimezone()
 WISENBAKER = "College Station Wisenbaker Engineering Bldg 049"
 ETB = "College Station Emerging Technologies Building 1003"

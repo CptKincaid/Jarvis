@@ -8,6 +8,7 @@ sentences containing "off" and "stop"), and handler tests that assert the
 SPOKEN line states what actually happened.
 """
 import types
+from datetime import datetime
 
 import pytest
 
@@ -29,9 +30,31 @@ class FakeCfg:
         return True
 
 
+# 2026-09-05: _clock pins the fixture's day to 2026-09-02, but the
+# commander computes a hold's end from ITS OWN clock (commander.datetime.
+# now(), in _h_sensing_hold). The two were unrelated, so
+# "st.until > _clock(12)" was only true because the calendar had moved
+# past 2026-09-02 -- red on every back-dated run, and green afterwards for
+# a reason that had nothing to do with the code under test.
+#
+# One clock now drives both, so the test can say what it actually means:
+# a two-hour hold ends two hours later.
+_DAY = (2026, 9, 2)
+
+
 def _clock(hour: int, minute: int = 0):
     import datetime as _dt
-    return _dt.datetime(2026, 9, 2, hour, minute).timestamp()
+    return _dt.datetime(*_DAY, hour, minute).timestamp()
+
+
+class _FixedNow(datetime):
+    """datetime with now() pinned to noon on _DAY, for the commander --
+    which reads its own clock and has no seam to inject."""
+
+    @classmethod
+    def now(cls, tz=None):
+        at = datetime(*_DAY, 12, 0)
+        return at if tz is None else at.astimezone(tz)
 
 
 @pytest.fixture
@@ -411,11 +434,12 @@ def test_the_timed_offline_matches_and_captures_its_when(phrase, mode):
     assert C._sensing_hold_when(m).strip(), phrase
 
 
-def test_a_timed_offline_sets_an_end_and_says_it(policy):
+def test_a_timed_offline_sets_an_end_and_says_it(policy, monkeypatch):
+    monkeypatch.setattr(C, "datetime", _FixedNow)
     res = _run("sensing hold", _commander(policy), "no cameras for the next two hours")
     assert policy.allowed(sensing.CAMERA) is False
     st = policy.state()
-    assert st.until is not None and st.until > _clock(12)
+    assert st.until is not None and st.until == _clock(14)      # two hours
     assert "until" in res.reply.lower()
 
 
