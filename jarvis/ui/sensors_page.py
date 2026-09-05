@@ -2820,7 +2820,8 @@ class SensorsPage(tk.Frame):
             try:
                 self.setup = SetupSheet(self.host, services=self.services,
                                         directory=self.profile_dir,
-                                        on_saved=self._setup_saved)
+                                        on_saved=self._setup_saved,
+                                        box=self.place_box)
             except Exception:             # noqa: BLE001 - a page must survive
                 log.exception("sensors page: the setup sheet would not build")
                 self._note.configure(text="the setup sheet could not be "

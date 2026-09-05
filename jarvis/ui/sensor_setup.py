@@ -592,11 +592,17 @@ class SetupSheet(tk.Frame):
                  post: Optional[Callable] = None,
                  run: Optional[Callable] = None,
                  sleep: Optional[Callable] = None,
-                 cover=()):
+                 box: Optional[Callable] = None):
         super().__init__(host, bg=theme.TV_BG)
         self.host = host
         self.services = services
-        self.cover = tuple(w for w in (cover or ()) if w is not None)
+        # WHERE IT LANDS. A callable returning place() kwargs -- the SENSORS
+        # page hands over its own place_box, so the sheet covers exactly what
+        # the page covers. Without it the sheet took the WHOLE window and the
+        # wordmark, the status pill, the sensing badge and the tab row all
+        # went with it (photographed at 1040x1760). This is a page-level
+        # surface, not a takeover.
+        self._box = box
         self._dir = directory
         self._on_saved = on_saved
         self._get, self._post_fn, self._run = get, post, run
@@ -610,6 +616,9 @@ class SetupSheet(tk.Frame):
         self._preset_btn: Dict[str, Any] = {}
         self._buttons: Dict[str, Any] = {}      # the foot only
         self._board_btn = None
+        # Every label that can be longer than the sheet. _rewrap walks THIS,
+        # so a paragraph added later is wrapped without anyone remembering.
+        self._wrapped: List[Any] = []
         self._canvas = None
         self._body = None
         self._thumb = None
@@ -644,9 +653,10 @@ class SetupSheet(tk.Frame):
         # THE THREE SWITCHES LIVE IN THE FOOT, not at the end of the form.
         # They are what makes the whole exercise worth anything -- "poll this
         # room" is the difference between a saved file and a sensor Jarvis
-        # reads -- and the body below scrolls by 598 px at his own 1040x1760
-        # window (measured on :94, S=2), which is exactly where a control
-        # goes to be missed.
+        # reads -- and the body below still scrolls, by 534 px at his own
+        # 1040x1760 window and 755 px at 920x1440 (measured on :94, S=2). It
+        # was 598 and 819 with these three rows still in it, which is where a
+        # control goes to be missed.
         switches = tk.Frame(foot, bg=bg)
         switches.pack(fill="x", pady=(0, px(6)))
         self._switches: Dict[str, Toggle] = {}
@@ -692,6 +702,7 @@ class SetupSheet(tk.Frame):
                                 fg=theme.FAINT, bg=bg, anchor="w",
                                 justify="left", bd=0, padx=0, pady=0)
         self._result.pack(fill="x", pady=(px(6), 0))
+        self._wrapped.append(self._result)
 
         # ---- the scrolling body
         view = tk.Frame(self, bg=bg)
@@ -739,6 +750,7 @@ class SetupSheet(tk.Frame):
                                fg=theme.MUTED, bg=bg, anchor="w",
                                justify="left", bd=0, padx=0, pady=0)
         self._mount.pack(fill="x", padx=pad, pady=(px(2), px(4)))
+        self._wrapped.append(self._mount)
 
         row = self._row(body, "watches")
         self._field["nearest_m"] = self._entry(row, width=NUM_W)
@@ -768,6 +780,7 @@ class SetupSheet(tk.Frame):
                                fg=theme.CYAN_DIM, bg=bg, anchor="w", bd=0,
                                padx=0, pady=0)
         self._gates.pack(fill="x", padx=pad, pady=(px(2), px(6)))
+        self._wrapped.append(self._gates)
 
         row = self._row(body, "address")
         self._field["ip"] = self._entry(row, width=ENTRY_W)
@@ -796,6 +809,7 @@ class SetupSheet(tk.Frame):
                               fg=theme.CYAN_DIM, bg=bg, anchor="w",
                               justify="left", bd=0, padx=0, pady=0)
         self._addr.pack(fill="x", padx=pad, pady=(px(2), px(6)))
+        self._wrapped.append(self._addr)
 
         row = self._row(body, "wi-fi")
         self._field["ssid"] = self._entry(row, width=ENTRY_W)
@@ -838,9 +852,12 @@ class SetupSheet(tk.Frame):
         row = self._row(self._board, "usb port")
         self._field["serial_port"] = self._entry(row, width=ENTRY_W)
         self._field["serial_port"].pack(side="left")
-        tk.Label(self._board, text=WIRING, font=ui_display(theme.SIZE_CAPTION),
-                 fg=theme.FAINT, bg=bg, anchor="w", justify="left", bd=0,
-                 padx=0, pady=0).pack(fill="x", padx=pad, pady=(px(2), px(6)))
+        wiring = tk.Label(self._board, text=WIRING,
+                          font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
+                          bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                          pady=0)
+        wiring.pack(fill="x", padx=pad, pady=(px(2), px(6)))
+        self._wrapped.append(wiring)
 
         row = self._row(body, "notes")
         self._field["notes"] = self._entry(row, width=ENTRY_W * 2)
@@ -848,18 +865,21 @@ class SetupSheet(tk.Frame):
 
         tk.Frame(body, bg=theme.LINE, height=max(1, px(1))).pack(
             fill="x", padx=pad, pady=px(6))
-        tk.Label(body, text=("poll this room — Jarvis reads it for presence; "
-                             "primary — where he is by default; zone ladder — "
-                             "one band, so a reading in this room can be "
-                             "placed. The three switches are beside SAVE."),
-                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
-                 anchor="w", justify="left", bd=0, padx=0,
-                 pady=0).pack(fill="x", padx=pad, pady=(px(2), px(4)))
+        switch_note = tk.Label(
+            body, text=("poll this room — Jarvis reads it for presence; "
+                        "primary — where he is by default; zone ladder — one "
+                        "band, so a reading in this room can be placed. The "
+                        "three switches are beside SAVE."),
+            font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
+            anchor="w", justify="left", bd=0, padx=0, pady=0)
+        switch_note.pack(fill="x", padx=pad, pady=(px(2), px(4)))
+        self._wrapped.append(switch_note)
         self._cannot = tk.Label(body, text=CANNOT,
                                 font=ui_display(theme.SIZE_CAPTION),
                                 fg=theme.FAINT, bg=bg, anchor="w",
                                 justify="left", bd=0, padx=0, pady=0)
         self._cannot.pack(fill="x", padx=pad, pady=(px(8), px(10)))
+        self._wrapped.append(self._cannot)
 
     def _row(self, parent, caption: str) -> tk.Frame:
         bg = theme.TV_BG
@@ -871,8 +891,13 @@ class SetupSheet(tk.Frame):
         return row
 
     def _entry(self, parent, width: int = ENTRY_W) -> tk.Entry:
+        # disabledbackground/foreground EXPLICITLY: Tk's defaults are a
+        # light-grey box with grey text, which is a white hole in a dark
+        # console (photographed on the locked room name at 1040x1760).
         return tk.Entry(parent, width=width, font=ui_mono(theme.SIZE_CAPTION),
                         fg=theme.INK, bg=theme.SURFACE,
+                        disabledbackground=theme.SURFACE,
+                        disabledforeground=theme.MUTED,
                         insertbackground=theme.CYAN, relief="flat",
                         highlightthickness=1, highlightbackground=theme.LINE,
                         highlightcolor=theme.CYAN_DIM, bd=0)
@@ -901,8 +926,17 @@ class SetupSheet(tk.Frame):
                  bd=0, padx=0, pady=0).pack(side="left", padx=(px(6), 0))
 
     def _rewrap(self, event=None) -> None:
+        """Wrap every paragraph to the sheet's width.
+
+        BY WALKING, not by name. The first version listed four labels and
+        the fifth -- the line explaining the three switches -- ran off the
+        right edge mid-word at 1040x1760 ("...zone ladd"), photographed on
+        :94. A list is a thing to forget to add to; ``_wrapped`` is the set
+        of labels that were built as paragraphs, and every one of them is
+        wrapped here.
+        """
         width = max(px(200), int(self.winfo_width()) - 2 * theme.PAD)
-        for label in (self._mount, self._cannot, self._result, self._addr):
+        for label in self._wrapped:
             try:
                 label.configure(wraplength=width)
             except Exception:             # noqa: BLE001 - torn down
@@ -929,11 +963,17 @@ class SetupSheet(tk.Frame):
                     kind="accent" if not self._room else "ghost",
                     size=theme.SIZE_CAPTION, bg=bg, pad_x=8, pad_y=4,
                     command=lambda: self.select("")).pack(side="left")
-        line = " · ".join("%s: %s" % (s.room, state_line(s)) for s in states)
-        tk.Label(self._picker, text=line or "no room sensors configured yet",
-                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
-                 anchor="w", justify="left", bd=0, padx=0,
-                 pady=0).pack(fill="x", pady=(px(3), px(6)))
+        # ONE ROOM PER LINE. Joined with the same "·" the facts inside a
+        # room use, two rooms read as one run-on list of nine things --
+        # photographed at 1040x1760 on :94.
+        line = "\n".join("%s: %s" % (s.room, state_line(s)) for s in states)
+        note = tk.Label(self._picker,
+                        text=line or "no room sensors configured yet",
+                        font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
+                        bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                        pady=0)
+        note.pack(fill="x", pady=(px(3), px(6)))
+        self._wrapped.append(note)
 
     # -------------------------------------------------------- the form
     def select(self, room: str) -> None:
@@ -1249,7 +1289,14 @@ class SetupSheet(tk.Frame):
         if self._open:
             return
         self._open = True
-        self.place(in_=self.host, x=0, y=0, relwidth=1.0, relheight=1.0)
+        box = dict(x=0, y=0, relwidth=1.0, relheight=1.0)
+        if callable(self._box):
+            try:
+                box = dict(self._box())
+            except Exception:             # noqa: BLE001 - an unmapped page
+                log.debug("sensor setup: the page's box is unreadable",
+                          exc_info=True)
+        self.place(in_=self.host, **box)
         self.lift()
         self.select(self._room)
         self._sync_view()

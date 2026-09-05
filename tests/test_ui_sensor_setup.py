@@ -510,6 +510,29 @@ HIS_W, HIS_H, SCALE = 1040, 1760, 2.0      # the window he actually runs
 SMALL_W, SMALL_H = 920, 1440
 
 
+FONT_GLOBALS = ("_FAMILY", "_FAMILY_MONO", "_HAS_DISPLAY", "_DISPLAY")
+
+
+@pytest.fixture(autouse=True)
+def _restore_look():
+    """theme.resolve_fonts() is a ONE-WAY DOOR and select_look() is global.
+
+    Without this, the size tokens this file leaves behind fail
+    tests/test_theme_look.py's oracle comparison in the NEXT file of the
+    same run -- which is how a green file makes a green file red. The same
+    fixture tests/test_ui_classic_frozen.py carries, for the same reason.
+    """
+    from jarvis.ui import theme
+    from jarvis.ui import widgets as wg
+    fonts = {k: getattr(theme, k) for k in FONT_GLOBALS}
+    yield
+    theme.apply_scale(1.0)
+    wg.set_scale(1.0)
+    theme.select_look(theme.DEFAULT_LOOK)
+    for k, v in fonts.items():
+        setattr(theme, k, v)
+
+
 @pytest.fixture
 def root():
     from jarvis.ui import theme
@@ -535,9 +558,6 @@ def root():
     wg.set_scale(SCALE)
     theme.select_look("holo")
     yield r
-    theme.apply_scale(1.0)
-    wg.set_scale(1.0)
-    theme.select_look(theme.DEFAULT_LOOK)
     try:
         r.destroy()
     except Exception:                      # noqa: BLE001 - teardown
@@ -956,7 +976,6 @@ def test_the_sensors_page_offers_setup_in_holo_and_never_in_classic(root,
             assert page.setup_btn.master is page._save_btn.master
             assert page.setup_btn.winfo_rootx() < page._save_btn.winfo_rootx()
         host.destroy()
-    theme.select_look("holo")
 
 
 def test_pressing_setup_opens_the_sheet_over_the_page(root, tmp_path):
@@ -1047,3 +1066,95 @@ def test_a_dhcp_room_with_no_address_yet_is_not_claimed_to_be_polled():
     assert any("no address" in n for n in notes)
     assert any("cannot poll" in n for n in notes)
     assert "restart" not in ss.saved_line("den", polled=False)
+
+
+# =========================== defects found by LOOKING at the rendered frame
+def test_every_wrapping_paragraph_actually_wraps(root, tmp_path):
+    """PHOTOGRAPHED at 1040x1760 on :94: the line explaining the three
+    switches ran off the right edge mid-word -- "...primary — where he is by
+    default; zone ladd". It was not in the rewrap list. Every label that can
+    be longer than the sheet is wrapped to the sheet's width, and this test
+    walks the tree rather than naming them, so the next one added is covered
+    too."""
+    _write_raw(tmp_path, "office")
+    sheet, _ = _sheet(root, tmp_path)
+    sheet.select("office")
+    root.update_idletasks()
+    width = sheet.winfo_width()
+    assert width > 200
+    import tkinter.font as tkfont
+    stack, long = [sheet], []
+    while stack:
+        w = stack.pop()
+        stack.extend(w.winfo_children())
+        try:
+            text = str(w.cget("text"))
+            wrap = int(w.cget("wraplength"))
+        except Exception:                  # noqa: BLE001 - not a Label
+            continue
+        if not text or wrap:
+            continue
+        font = tkfont.Font(font=w.cget("font"))
+        if font.measure(text) > width:
+            long.append(text[:60])
+    assert long == [], long
+
+
+def test_the_picker_line_does_not_run_two_rooms_together(root, tmp_path):
+    """PHOTOGRAPHED: "kitchen: no profile · polled · ladder · office: profile
+    · polled · ladder · primary" -- the separator between ROOMS was the same
+    dot as the separator between a room's own facts, so it read as one
+    run-on list of nine things."""
+    _write_raw(tmp_path, "office")
+    _write_raw(tmp_path, "kitchen")
+    sheet, _ = _sheet(root, tmp_path)
+    sheet.select("office")
+    root.update_idletasks()
+    labels = [w for w in sheet._picker.winfo_children()
+              if w.winfo_class() == "Label"]
+    assert labels
+    text = labels[-1].cget("text")
+    assert text.count("\n") >= 1          # one room per line
+    for line in text.splitlines():
+        assert line.count(":") == 1, line
+
+
+def test_the_sheet_covers_the_page_and_not_the_header_and_tabs(root, tmp_path):
+    """PHOTOGRAPHED: the sheet took the WHOLE window -- wordmark, status
+    pill, sensing badge and the tab row all gone. It is a page-level surface,
+    not a takeover, so it lands on exactly the box the SENSORS page is
+    placed in and the console's own furniture stays visible."""
+    import tkinter as tk
+    from jarvis.ui import sensors_page as page_mod
+    _write_raw(tmp_path, "office")
+    host = tk.Frame(root, width=HIS_W, height=HIS_H)
+    host.pack_propagate(False)
+    host.pack()
+    strip = tk.Frame(host, height=200, bg="#123")   # stands in for the header
+    strip.pack(fill="x")
+    stage = tk.Frame(host, bg="#000")
+    stage.pack(fill="both", expand=True)
+    page = page_mod.SensorsPage(host, services=_Services(),
+                                profile_dir=tmp_path, cover=(stage,))
+    page.place(in_=host, **page.place_box())
+    root.update_idletasks()
+    page.open_setup()
+    root.update_idletasks()
+    sheet = page.setup
+    assert sheet.winfo_rooty() == page.winfo_rooty()
+    assert sheet.winfo_height() == page.winfo_height()
+    assert sheet.winfo_rooty() > host.winfo_rooty()   # the header survives
+    sheet.hide()
+
+
+def test_a_locked_room_box_keeps_the_consoles_own_colours(root, tmp_path):
+    """PHOTOGRAPHED: the disabled room entry came back in Tk's default
+    light-grey, a white box in a dark console."""
+    _write_raw(tmp_path, "office")
+    sheet, _ = _sheet(root, tmp_path)
+    sheet.select("office")
+    root.update_idletasks()
+    entry = sheet._field["room"]
+    assert str(entry.cget("state")) == "disabled"
+    assert str(entry.cget("disabledbackground")) == str(entry.cget("bg"))
+    assert str(entry.cget("disabledforeground")) != "" 
