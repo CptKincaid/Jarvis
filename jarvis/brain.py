@@ -3078,6 +3078,19 @@ class JarvisBrain:
         unbacked_first = None
         unbacked_ran_at = 0         # len(ran_results) when the retry was asked
         plain_round = False
+        # The retry on a QUESTION is offered no tools. A question that also
+        # asks for a store arms the guard for memory claims (above), and
+        # "Don't you remember that I graduate December 10th?" answered
+        # "Of course, sir. I'll remember that." earned a retry that still
+        # had the tools and called notes(add, ...) -- the guard itself
+        # writing on a question, the one thing the question gate exists
+        # to prevent (2026-09-04 verifier, M15's kin). With no tools the
+        # retry can only answer; a tool call it makes anyway is dropped,
+        # the way the render round drops them, and a retry that then says
+        # nothing is answered with the first reply, its claims replaced.
+        # An order's retry keeps its tools: that is where the work gets
+        # done.
+        unarmed_retry = False
 
         def ran_names():
             # the tools that ran this turn, forced path included: what a
@@ -3148,7 +3161,8 @@ class JarvisBrain:
                 # is also TOLD, here in the per-turn messages, that the
                 # results are all it will get (LIVE 15:14: the reserved
                 # round came back with a tool call and no words at all).
-                round_tools = [] if render_only else tools
+                unarmed_round, unarmed_retry = unarmed_retry, False
+                round_tools = [] if (render_only or unarmed_round) else tools
                 if render_only and not render_told:
                     render_told = True
                     told = RENDER_NOW_LINE
@@ -3200,6 +3214,10 @@ class JarvisBrain:
                     log.warning("chat: render round asked for %d more tools; "
                                 "writing the answer instead", len(calls))
                     calls = []
+                if unarmed_round and calls:
+                    log.warning("brain: the retry on a question asked for %d "
+                                "tools; it may only answer", len(calls))
+                    calls = []
                 if not calls or registry is None:
                     final = content
                     if unbacked_armed:
@@ -3230,8 +3248,17 @@ class JarvisBrain:
                             # answer, and max_rounds counted it.
                             rounds_left = max(rounds_left, 1)
                             plain_round = True
+                            unarmed_retry = question
                             continue
-                        if claim and unbacked_first is not None:
+                        # A retry that said NOTHING and ran nothing -- a
+                        # question's unarmed retry that tried to act
+                        # instead of answering -- is answered the same
+                        # way a second claim is: he asked, and the first
+                        # reply minus its claim is the answer he has.
+                        silent = (unbacked_first is not None and not claim
+                                  and not (final or "").strip()
+                                  and len(ran_results) == unbacked_ran_at)
+                        if unbacked_first is not None and (claim or silent):
                             # The retry claims again with nothing behind
                             # it: the FIRST reply is what he hears, with
                             # the claims taken out and the rest (the
@@ -3241,9 +3268,14 @@ class JarvisBrain:
                             # asked and this is its render round claiming
                             # afresh: then the render is the reply, and
                             # the first would drop the tool's answer.
-                            log.warning("brain: unbacked action claim stands "
-                                        "after the retry (no tool ran); "
-                                        "replacing it")
+                            if silent:
+                                log.warning("brain: the retry said nothing "
+                                            "(no tool ran); replacing the "
+                                            "claim in the first reply")
+                            else:
+                                log.warning("brain: unbacked action claim "
+                                            "stands after the retry (no "
+                                            "tool ran); replacing it")
                             source = (final if len(ran_results) > unbacked_ran_at
                                       else unbacked_first)
                             final = strip_unbacked_claims(source, cap,

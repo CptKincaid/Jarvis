@@ -68,6 +68,9 @@ def _warnings(caplog):
     # a pin, not a fix: "don't" never matched `do\b`, so it was already an
     # order -- kept here so the family is tested as one
     "Don't forget that I graduate December 10th 2026",
+    # a pin (green before the pronoun rule below): the emphatic "don't
+    # you <verb>" is an order too, and no '?' or wh-word makes it ask
+    "Don't you forget that I graduate December 10th",
 ])
 def test_an_imperative_do_is_an_order_not_a_question(text):
     assert is_question(text) is False, text
@@ -645,3 +648,176 @@ def test_strict_is_the_rule_compiled_and_this_is_what_it_costs():
     assert "I have noted that you graduate December 10th." in missed
     assert "I've noted that Heather prefers email, sir." in missed
     assert len(missed) == 5
+
+
+# ------------------------------------------ the finisher's pass (2026-09-04, r2)
+# The round-2b verifier reproduced two holes on bd978cf, on this harness.
+# Each is pinned below by the probe that found it, and each pin was run
+# red against bd978cf's sources before the fix was written.
+
+# BLOCKER 1 (M15). _IMPERATIVE_DO_RX exempted only "don't you", so "Don't
+# I have milk on my list already?" -- a QUESTION about the list -- became
+# an order: the guard armed, the retry called notes(add, milk) and he
+# heard "Noted, sir." The question performed the write it asked about,
+# the 09-02 bug the question gate exists to prevent. On v3 he heard the
+# answer and nothing was written.
+#
+# The rule, finished: a negative auxiliary before a SUBJECT PRONOUN asks
+# ("don't I", "didn't you", "isn't it", "haven't we"), with or without the
+# '?' the voice path drops; only "don't you <verb>" keeps an imperative
+# reading ("don't you forget") and stays with the '?' rule. An imperative
+# "do" before a verb orders. Twenty of each, measured on is_question and
+# -- the questions -- on the brain, where the answer is what matters.
+QUESTIONS_20 = [
+    "Don't I have milk on my list already?",
+    "Don't I have a meeting at ten",                  # no '?': the voice path
+    "Do I have anything on tomorrow?",
+    "Do I have milk on my list",
+    "Don't you think it's late?",
+    "Don't you remember that I graduate December 10th?",
+    "Do we have a dentist appointment tomorrow?",
+    "Do we have milk",
+    "Didn't I ask you to add milk?",
+    "Didn't I tell you about the lab move",
+    "Didn't you set my timer for ten minutes",
+    "Don't we have a dentist appointment tomorrow?",
+    "Don't they close at six on Sundays?",
+    "Doesn't it rain tomorrow",
+    "Isn't it late",
+    "Aren't we meeting at ten?",
+    "Haven't I got a reminder set for five",
+    "Jarvis, don't I have milk on my list already",
+    "Do you know what time it is?",
+    "Do notes sync to my phone?",
+]
+ORDERS_20 = [
+    GRADUATE,
+    "Don't forget that I graduate December 10th 2026",
+    "Do remember that Heather prefers email",
+    "Do keep in mind that the lab moved to room 049",
+    "Do note that my locker code is 4412",
+    "Do make a note that I graduate December 10th",
+    "Do bear in mind that I graduate December 10th",
+    "please do not forget that I graduate December 10th",
+    "Please, do remember that I graduate December 10th",
+    "Jarvis, do not forget that I graduate December 10th",
+    "Jarvis, don't forget that I graduate December 10th",
+    "Don't you forget that I graduate December 10th",   # the emphatic imperative
+    "Don't ever forget that I graduate December 10th",
+    "Don't forget to add milk to my list",
+    "Do not add milk to my list twice",
+    "Don't add milk to my list",
+    "Do not set a reminder for five",
+    "Don't set my alarm for six",
+    "Do not tell Heather about the surprise",
+    "Don't remember that, it was a joke",
+]
+
+
+def test_twenty_of_each():
+    assert len(set(QUESTIONS_20)) == 20 and len(set(ORDERS_20)) == 20
+    assert not set(QUESTIONS_20) & set(ORDERS_20)
+
+
+@pytest.mark.parametrize("text", QUESTIONS_20)
+def test_a_question_in_each_of_twenty_shapes_asks(text):
+    assert is_question(text) is True, text
+
+
+@pytest.mark.parametrize("text", ORDERS_20)
+def test_an_order_in_each_of_twenty_shapes_orders(text):
+    assert is_question(text) is False, text
+
+
+YOU_DO = "You do, sir. I've added it to your list already."
+
+
+@pytest.mark.parametrize("asked", QUESTIONS_20)
+def test_a_question_in_each_of_twenty_shapes_is_never_acted_on(setup, caplog, asked):
+    """He asked. The model's answer claims an add it never made; that is
+    a possibly-wrong ANSWER, not an order, and the retry that would make
+    it true must never run -- so nothing is written and no round is
+    spent, whatever shape the question took."""
+    b, fake, record = setup
+    fake.replies = [text_reply(YOU_DO),
+                    tool_reply(("notes", {"action": "add", "text": "milk"}))]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(asked)
+    assert record == [], asked
+    assert tags == [("SPEAK", YOU_DO)]
+    assert len(fake.chat_payloads()) == 1
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize("ordered", ORDERS_20)
+def test_an_order_in_each_of_twenty_shapes_arms_the_guard(setup, caplog, ordered):
+    """The mirror: every order arms the guard, so "I have noted that,
+    sir." twice over is never what he hears."""
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), text_reply(NOTED)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(ordered)
+    spoken = dict(tags)["SPEAK"]
+    assert "noted that" not in spoken.lower(), (ordered, spoken)
+    assert record == []
+    assert _warnings(caplog), "the guard never armed"
+    assert len(fake.chat_payloads()) == 2
+
+
+# A question that also asks for a store arms the guard for MEMORY claims
+# only (test_a_question_that_asks_for_a_store_judges_memory_claims_only),
+# and its retry still had the tools: "Don't you remember that I graduate
+# December 10th?" answered "Of course, sir. I'll remember that." earned a
+# retry that could call notes(add, ...) -- the guard itself writing on a
+# question. The retry on a question is offered NO tools: it may answer in
+# words (kept when honest, replaced when it claims again), and a tool
+# call it makes anyway is dropped, as the render round drops them. An
+# order's retry keeps its tools: that is where "add milk" gets done.
+REMEMBER_Q = "Don't you remember that I graduate December 10th?"
+
+
+def test_the_retry_on_a_question_is_offered_no_tools_and_cannot_write(setup, caplog):
+    b, fake, record = setup
+    assert is_question(REMEMBER_Q)
+    fake.replies = [text_reply(OF_COURSE),
+                    tool_reply(("notes", {"action": "add",
+                                          "text": "I graduate December 10th"}))]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(REMEMBER_Q)
+    assert record == []
+    assert tags == [("SPEAK", MEMORY_LINE)]
+    p1, p2 = fake.chat_payloads()
+    assert p1.get("tools")
+    assert "tools" not in p2
+    assert p2["messages"][-1]["content"] == brain_mod.UNBACKED_MEMORY_NUDGE
+
+
+def test_the_retry_on_a_question_may_still_answer_in_words(setup):
+    b, fake, record = setup
+    fake.replies = [text_reply(OF_COURSE), text_reply(HONEST)]
+    assert b._chat_sync(REMEMBER_Q) == [("SPEAK", HONEST)]
+    assert "tools" not in fake.chat_payloads()[1]
+    assert record == []
+
+
+def test_streamed_the_retry_on_a_question_that_tries_to_write_speaks_the_line(streamed):
+    b, fake, record, streams = streamed
+    streams.append(_chunks(OF_COURSE))                    # withheld, nothing spoken
+    fake.replies = [tool_reply(("notes", {"action": "add",
+                                          "text": "I graduate December 10th"}))]
+    spoken = []
+    tags = b._chat_sync(REMEMBER_Q, on_sentence=spoken.append)
+    assert spoken == [MEMORY_LINE]
+    assert tags == [("STREAMED", "1"), ("SPEAK", MEMORY_LINE)]
+    assert record == []
+
+
+def test_the_retry_on_an_order_keeps_its_tools(setup):
+    """A pin, not a change: the order's retry is where the work gets
+    done, so its tools stay."""
+    b, fake, record = setup
+    fake.replies = [text_reply("I've added milk to your list, sir."),
+                    tool_reply(("notes", {"action": "add", "text": "milk"}))]
+    assert b._chat_sync("Add milk to my list") == [("SPEAK", "Noted, sir.")]
+    assert record == [("notes", "add", "milk")]
+    assert fake.chat_payloads()[1].get("tools")
