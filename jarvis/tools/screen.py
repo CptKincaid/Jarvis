@@ -2,8 +2,21 @@
 
 One tool, ``screen_qa(question)``: grab the active display, shrink it to
 ``screen.max_width`` pixels wide, JPEG + base64, and ask Ollama's
-``screen.model`` (llama3.2-vision by default) for a short spoken answer;
-the brain's model turn then phrases the reply.  The active window title
+``screen.model`` for a short spoken answer, handed back as an authored
+``speak=`` line.  WHAT BECOMES OF THAT LINE DEPENDS ON WHAT ELSE THE TURN
+OWES, and the unqualified form of this sentence has now been wrong in this
+docstring twice, in both directions.  ALONE, the line ends the turn as it
+stands and no model round rephrases it -- which is the point, because the
+vision call can take 25 s against an 8 s tool-loop budget.  HELD BESIDE A
+READ HE IS STILL OWED, it is appended to the render round's reply, and that
+round may phrase the screen content in its own words or drop this line
+altogether.  That is brain.py's rule, stated there beside ``answer_owed``
+("an authored line ends the turn alone, and held beside an owed read it is
+appended to the render round's reply"), and driven by
+tests/test_reply_coverage.py::test_a_read_that_authors_its_own_line_still_lets_the_rest_run.
+The ``if result.speak: break`` loop that would have made the short form true
+was REMOVED (brain.py says so where it used to be), so any comment resting
+on it is describing a deleted code path.  The active window title
 (xdotool) rides along in the prompt as context, because a screenshot of a
 terminal says nothing about WHICH terminal.
 
@@ -23,7 +36,8 @@ Two live findings from 2026-08-31/09-01 shaped the rest of this module:
   tool said "My vision model isn't answering, sir." while the model had in
   fact described the screen perfectly inside ``message.thinking``.  So the
   payload sends ``think: false`` for any model whose capabilities include
-  thinking, exactly as brain.py does on the chat path.
+  thinking -- and for any model ollama will not describe -- much as brain.py
+  does on the chat path, which sends the field unconditionally.
 
 The payload also mirrors the brain's ``keep_alive: -1`` and ``num_ctx``
 when it is talking to the chat model: a request with a different num_ctx
@@ -39,9 +53,10 @@ only -- it never loads a model, so it cannot evict anything).
 
 Privacy: the screenshot lives only in memory; it is written to disk ONLY
 with JARVIS_DEBUG_SCREEN=1 (``~/.cache/jarvis/screen_last.jpg``, 0600),
-and the image bytes are never logged — sizes and timings only.  The
-gnome-screenshot fallback has no stdout mode, so it round-trips through a
-0700 temp dir that is removed before the function returns.
+and the image bytes are never logged — sizes and timings only.  Nothing
+else reaches disk: the ImageMagick fallback is asked for ``png:-`` and the
+PNG comes back on stdout, so there is no temp file to clean up and no
+window for one to leak from.
 """
 from __future__ import annotations
 
@@ -74,7 +89,7 @@ DEFAULT_DISPLAY = ":1"             # the Spark's desktop; DISPLAY env wins
 DEFAULT_QUESTION = "what's on my screen"
 VISION_TIMEOUT_S = 25.0            # a cold projector load is ~9 s
 SHOW_TIMEOUT_S = 5.0               # /api/show reads a manifest; it is instant
-GRAB_TIMEOUT_S = 8.0               # the CLI screenshot fallbacks
+GRAB_TIMEOUT_S = 8.0               # the ImageMagick CLI grab (the only one)
 WINDOW_TIMEOUT_S = 2.0             # xdotool
 JPEG_QUALITY = 80
 MAX_SENTENCES = 3
@@ -130,8 +145,10 @@ def _grab_pil(display: str):
 
 
 def _grab_cli(display: str):
-    """gnome-screenshot, then ImageMagick ``import``; None when neither is
-    installed or both failed."""
+    """ImageMagick ``import`` on the X root window (``png:-``, straight to
+    stdout -- nothing is written to disk); None when ``import`` is missing
+    or the grab failed.  There is deliberately no gnome-screenshot path;
+    the comment below says why."""
     from PIL import Image
     env = _display_env(display)
     # No gnome-screenshot: the project spec forbids it (it drives the Shell's
@@ -347,7 +364,9 @@ def candidate_models(cfg) -> list:
 
 
 def setup_line(model: str, reason: str) -> str:
-    """The spoken excuse, naming the model and what is wrong with it."""
+    """The spoken excuse.  A SETUP failure names the model and what is wrong
+    with it; everything else falls through to NO_VISION_LINE, which names
+    neither -- see the comment on that constant."""
     spoken = normalise_model(model).replace(":latest", "")
     low = (reason or "").lower()
     if "not found" in low or "404" in low:
@@ -410,9 +429,10 @@ def vision_payload(model: str, b64: str, question: str, title: str,
     and returned an EMPTY ``content`` (measured 2026-09-01: done_reason
     "length", eval_count 200, a perfect description of the desktop stuck in
     the reasoning block) -- which surfaced as "My vision model isn't
-    answering, sir."  It is sent only for models whose capabilities include
-    thinking, since a build that rejects the field on a plain model would
-    turn a working model into a 400.
+    answering, sir."  ``ask_screen`` sends it for a model whose capabilities
+    include thinking AND for one whose capabilities ollama would not report;
+    it is withheld only from a model known NOT to think, since a build that
+    rejects the field on a plain model would turn a working model into a 400.
 
     ``resident`` means "this IS the brain's model": keep_alive -1 and the
     brain's num_ctx keep the SAME runner, so the screen question costs no
@@ -438,7 +458,12 @@ def vision_payload(model: str, b64: str, question: str, title: str,
 
 def tidy_answer(text, cap: int = ANSWER_WORD_CAP) -> str:
     """Plain prose, whitespace collapsed, at most ``cap`` words, cut at the
-    last sentence end that fits (the brain rephrases what is left)."""
+    last sentence end that fits.  The only caller is ``ask_screen``, whose
+    answer becomes screen_qa's ``speak=`` line.  It is spoken AS IT STANDS
+    only when the turn owes nothing else; held beside an owed read it goes
+    into the render round with the rest, where the model may re-word it or
+    leave it out.  See the module docstring -- and do not shorten either
+    sentence back to an unqualified one."""
     text = _MARKDOWN.sub(lambda m: m.group(1) or " ", str(text or ""))
     text = " ".join(text.split()).strip()
     if not text:
@@ -548,7 +573,10 @@ def look(question: str, b64: str, title: str, cfg) -> tuple:
     reason when none could.  A model that ollama REFUSES (404, or the 500
     "unknown model architecture: \'mllama\'" that llama3.2-vision gives on
     this build) is remembered in _UNUSABLE, so the wasted attempt is paid
-    once per process and every later question goes straight to the fallback.
+    once per CACHE_TTL_S -- the verdict EXPIRES, deliberately (see the
+    comment on that constant), so a model fixed by an ``ollama pull`` is
+    tried again -- and every question until then goes straight to the
+    fallback.
     """
     reason = "no vision model configured"
     model = ""
@@ -614,8 +642,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text=f"vision failed: {str(exc)[:60]}", ok=False,
                               speak=NO_VISION_LINE)
         if not same_model(model, wanted):
-            # Loud, once per process per model: the answer arrived, but the
-            # config is still pointing at something this ollama cannot use.
+            # Loud on EVERY question, not once: the wasted ATTEMPT is paid
+            # once per verdict TTL (_UNUSABLE, above), but nothing dedupes
+            # this line.  The answer arrived and the config still points at
+            # something this ollama cannot use, which is worth saying again.
             log.warning("screen: %s is unusable here, answered with %s "
                         "instead; %s", wanted, model, SETUP_HINT)
         # Sizes and timing only -- never the image, never the answer text.
@@ -623,10 +653,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                  orig[0], orig[1], small[0], small[1], len(b64) * 3 // 4096,
                  model, time.monotonic() - t0)
         text = f"Active window: {title}. {answer}" if title else answer
-        # speak=answer: the vision call can take 25 s and the brain's tool
-        # loop budget is 8 s, so a second model turn to phrase this would be
-        # refused and "I have the result but..." spoken instead. The answer
-        # was asked for in spoken form; it goes straight to the speaker.
+        # speak=answer: WITHIN THE TOOL LOOP nothing rephrases this. The
+        # vision call can take 25 s against an 8 s loop budget, so asking
+        # for a second model turn to phrase it would be refused and "I have
+        # the result but..." spoken instead; the answer was asked for in
+        # spoken form, so it is authored here: it goes straight to the speaker.
+        # THAT IS AS FAR AS THIS MODULE'S SAY GOES. If the same
+        # turn also owes him a read, the render round takes this line with
+        # the rest and may re-word it or drop it -- brain.py's rule beside
+        # answer_owed, not this module's. Do not restate it as "no model
+        # turn ever rephrases it": that has been wrong here twice.
         return ToolResult(text=text, max_sentences=MAX_SENTENCES, speak=answer)
 
     return [ToolSpec(

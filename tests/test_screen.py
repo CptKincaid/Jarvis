@@ -18,6 +18,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -300,6 +301,38 @@ def test_grab_cli_skips_gnome_screenshot_and_uses_import(monkeypatch, tmp_path):
     assert all(c[2] == ":9" for c in calls), "the fallbacks are told which display"
 
 
+def test_the_docstrings_describe_the_grab_path_the_code_actually_takes():
+    """The prose outlived the code it described.
+
+    jarvis-v3 REMOVED the gnome-screenshot path -- screen.py's own comment
+    in ``_grab_cli`` says "the project spec forbids it (it drives the
+    Shell's screenshot UI)" and the test above pins that ``import`` is the
+    only binary run.  But the prose that described the removed path stayed:
+    the module docstring still promised a "gnome-screenshot fallback" that
+    "round-trips through a 0700 temp dir that is removed before the
+    function returns", and ``_grab_cli``'s own docstring still promised
+    "gnome-screenshot, then ImageMagick ``import``".
+
+    There is no temp dir in this module at ALL -- ``import`` is asked for
+    ``png:-`` and the PNG comes back on stdout -- so a reader chasing the
+    cleanup path was chasing code that does not exist, and a reader
+    auditing what touches disk was given one extra thing to worry about
+    that never happens.  Pin the docs to the code both ways: what the
+    source does, and what the docstrings are allowed to claim."""
+    src = Path(scr.__file__).read_text()
+    # What the code actually does: one CLI grabber, PNG on stdout, no disk.
+    assert "png:-" in src
+    assert "tempfile" not in src and "mkdtemp" not in src
+    assert "0700" not in src, "no 0700 directory exists in this module"
+    doc = f"{scr.__doc__ or ''}\n{scr._grab_cli.__doc__ or ''}"
+    # What the docstrings may not claim.
+    assert "0700" not in doc, "the docstring invents a temp dir the code never makes"
+    for gone in ("gnome-screenshot fallback", "gnome-screenshot, then"):
+        assert gone not in doc, f"docstring still promises {gone!r}"
+    # ...and what they must still say, so this is not just a deletion.
+    assert "ImageMagick" in (scr._grab_cli.__doc__ or "")
+
+
 
 
 def test_vision_error_object_and_empty_answer(wired):
@@ -495,6 +528,53 @@ def test_a_dead_ollama_is_still_just_the_class_name(wired):
     assert "URLError" in res.text
 
 
+
+# ask_screen names FOUR classes at the transport seam (screen.py, the clause
+# under the HTTPError one): URLError, OSError, ValueError, TimeoutError.
+# MEASURED on this interpreter (CPython 3.12.3): socket.timeout IS
+# TimeoutError, TimeoutError is an OSError subclass, and URLError is one too
+# -- so that tuple is really (OSError, ValueError), and the two tests above
+# already inject HTTPError and URLError.  These are the classes nothing
+# pinned: a timeout, a bare socket error, and a body that is not JSON.
+@pytest.mark.parametrize("failure, name", [
+    (TimeoutError("timed out"), "TimeoutError"),      # == socket.timeout here
+    (OSError("connection reset by peer"), "OSError"),
+    (ValueError("body is not JSON"), "ValueError"),
+])
+def test_a_transport_failure_speaks_out_of_the_named_vision_path(wired, caplog,
+                                                                 failure, name):
+    """Not "does he get an excuse" -- he gets one either way, because
+    ``screen_qa`` has an ``except Exception`` at the tool boundary that also
+    returns NO_VISION_LINE.  What is pinned here is WHICH path produced it.
+
+    The named path (VisionUnavailable) puts the model and the setup hint in
+    ``res.text`` and logs one WARNING.  The tool-boundary catch-all puts
+    ``vision failed:`` there instead -- and for a bare ``TimeoutError()``,
+    whose ``str()`` is empty, that text is the word "failed" and nothing
+    else -- then logs a full traceback.  That difference is the whole of the
+    LIVE 2026-08-31 lesson two tests up: the excuse was spoken correctly and
+    the RECORD of why was a class name, so the one-line config fix was
+    invisible.  A 25 s call to a local vision model fails by timing out more
+    often than by any other route, and it was the one class in that tuple
+    with nothing holding it on the diagnosable path."""
+    vision, _grabbed = wired
+    vision.fail = failure
+    wanted = scr.candidate_models(None)[0]
+    with caplog.at_level(logging.DEBUG, logger="jarvis"):
+        res = tool().call("screen_qa", {})
+    assert res.ok is False
+    assert res.speak == scr.NO_VISION_LINE
+    # The reason and the fix ride in the recorded text; the catch-all can
+    # produce neither -- it never sees which model was asked.
+    assert name in res.text
+    assert wanted in res.text
+    assert scr.SETUP_HINT in res.text
+    assert "vision failed:" not in res.text
+    # ...and a transport failure is a warning with a hint, not a traceback.
+    assert any(r.levelno == logging.WARNING and scr.SETUP_HINT in r.getMessage()
+               for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
 def test_http_error_detail_survives_a_body_that_is_not_json():
     """A proxy's HTML page, or a body already read: never a second failure
     inside the error path."""
@@ -680,3 +760,221 @@ def test_model_caps_reads_api_show_and_reports_a_missing_model(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", missing)
     caps, why = scr.model_caps("moondream")
     assert caps is None and "not found" in why
+
+
+# ------------------------------------------------------- the doc-truth sweep
+# This file has now shipped a FALSE SENTENCE TWICE.  jarvis-v3 removed the
+# gnome-screenshot path and left the prose that described it; the branch that
+# existed to delete that prose left "llama3.2-vision by default" standing five
+# lines above its own fix, in the same docstring it was editing.  So the whole
+# file was read claim by claim against the code, and every sentence that lost
+# its argument is pinned here.  A doc bug in THIS module is not cosmetic: the
+# 2026-08-31 incident in ``ask_screen`` is the record of a reader being sent
+# to the wrong place by a line that used to be true.
+
+
+def test_the_module_docstring_names_the_default_model_the_code_actually_has():
+    """``DEFAULT_MODEL = ""`` -- the docstring said llama3.2-vision.
+
+    Git settles which half is stale: d5a0e6e shipped
+    ``DEFAULT_MODEL = "llama3.2-vision:latest"`` together with the
+    parenthetical "(llama3.2-vision by default)"; 53f5da6 changed the
+    constant to ``""`` and left the prose behind.  The SAME docstring then
+    said, four lines lower, "The model is the CHAT model by default
+    (``screen.model: ""``)" -- so the file contradicted both itself and its
+    own constant, and the half that was wrong is the half this module spent
+    twenty lines explaining ollama cannot even load."""
+    assert scr.DEFAULT_MODEL == ""
+    doc = scr.__doc__ or ""
+    assert "llama3.2-vision by default" not in doc, \
+        "the docstring still names a default the constant does not have"
+    # ...and the true half must survive, so the fix is not a silent deletion.
+    assert 'screen.model: ""' in doc
+    # The one place llama3.2-vision may still appear is the FINDING about it.
+    for line in doc.splitlines():
+        if "llama3.2-vision" in line:
+            assert "cannot load" in doc, "keep the mllama finding, drop the default"
+
+
+def test_the_docstrings_do_not_promise_a_model_turn_the_tool_skips(wired):
+    """What this module authors is a ``speak=`` line, and what happens to
+    that line NEXT is brain.py's business, not this module's.
+
+    This docstring has now been wrong in BOTH directions, which is why the
+    test pins the qualification rather than either half of it.  The first
+    version promised "the brain's model turn then phrases the reply"; the
+    correction over-swung to "no model turn rephrases it", which reads as
+    never.  MEASURED (verdict, 2026-09-05, driving a real JarvisBrain over a
+    faked Ollama and counting /api/chat rounds): screen_qa ALONE is one
+    round and the authored line is spoken as it stands, but screen_qa beside
+    a read he is still owed is TWO rounds, the render round can phrase the
+    screen content in its own words, and it can drop the authored line
+    entirely.  The rule already sat one module away, beside
+    ``brain.answer_owed``: "an authored line ends the turn alone, and held
+    beside an owed read it is appended to the render round's reply."  The
+    ``if result.speak: break`` loop the short claim rested on was REMOVED --
+    brain.py says so where it used to be -- so a comment resting on it is
+    describing a deleted code path.  Driven end to end by
+    tests/test_reply_coverage.py::test_a_read_that_authors_its_own_line_still_lets_the_rest_run.
+    """
+    vision, _ = wired
+    res = tool().call("screen_qa", {"question": "what is showing"})
+    assert res.ok
+    # Verbatim OUT OF THE TOOL: what the vision model said is what is
+    # authored. Where it goes after that is the brain's decision.
+    assert res.speak == vision.content
+    doc = f"{scr.__doc__ or ''}\n{scr.tidy_answer.__doc__ or ''}"
+    src = Path(scr.__file__).read_text()
+    # Neither wrong version, in either direction.
+    for claim in ("model turn then phrases", "brain rephrases",
+                  "no model turn rephrases it",
+                  "ends the turn without a model round"):
+        assert claim not in doc, f"docstring is promising {claim!r} again"
+    # ...and the qualification itself must survive the next tidy-up: the
+    # word that carries it is "owed", and it has to appear in the same
+    # breath as the render round in BOTH docstrings and in the source.
+    for where, text in (("module", scr.__doc__ or ""),
+                        ("tidy_answer", scr.tidy_answer.__doc__ or ""),
+                        ("source", src)):
+        assert "owed" in text and "render round" in text, (
+            f"the {where} text dropped the qualification: a speak= line "
+            f"ends the turn ALONE, not beside a read he is owed")
+    # ...and the reason the tool authors it at all must stay in the source.
+    assert "goes straight to the speaker" in src
+
+
+def test_a_model_whose_capabilities_are_unknown_is_still_told_not_to_think(wired,
+                                                                           monkeypatch):
+    """``vision_payload`` said think:false "is sent ONLY for models whose
+    capabilities include thinking".  ``ask_screen`` passes
+    ``suppress_thinking=caps is None or "thinking" in caps`` -- and the
+    comment five lines above that call says so out loud: "caps unknown
+    (ollama would not say) -> still send think:false".  Unknown is the third
+    case and it was the one nothing pinned: a thinking model that eats its
+    whole budget reasoning is the failure actually seen, so silence from
+    /api/show must not buy it back."""
+    vision, _ = wired
+    # /api/show refuses to answer -> model_caps returns (None, reason).
+    monkeypatch.setattr(scr, "_ollama_show", show(OSError("ollama is down")))
+    caps, why = scr.model_caps(scr.chat_model())
+    assert caps is None and why, "the premise: capabilities are unknown here"
+    res = tool().call("screen_qa", {})
+    assert res.ok
+    assert vision.payloads[-1]["think"] is False, \
+        "unknown capabilities must still suppress thinking"
+    doc = " ".join((scr.vision_payload.__doc__ or "").split())   # wrapped in source
+    assert "sent only for models whose capabilities include thinking" not in doc, \
+        "the docstring forgets the unknown case"
+
+
+def test_the_unusable_model_warning_fires_on_every_question_not_once(wired, caplog,
+                                                                     monkeypatch):
+    """The comment claimed "Loud, once per process per model".  It is not.
+
+    ``_UNUSABLE`` makes the wasted ATTEMPT once per process -- that is the
+    line above it, and ``test_an_unloadable_model_falls_back_to_the_chat_model``
+    pins it.  The warning that the config is still wrong has no guard of any
+    kind: ``if not same_model(model, wanted)`` is true on every screen
+    question for as long as assistant.json points at a model this ollama
+    cannot load.  Measured here, not read: two questions, two warnings."""
+    broken = "llama3.2-vision:latest"
+
+    def refuse_the_broken_one(payload, timeout=None):
+        vision, _ = wired
+        vision.payloads.append(payload)
+        if payload["model"] == broken:
+            raise urllib.error.HTTPError(
+                "u", 500, "Internal Server Error", {},
+                io.BytesIO(b'{"error":"unknown model architecture: \'mllama\'"}'))
+        return {"message": {"role": "assistant", "content": "A terminal."}}
+    monkeypatch.setattr(scr, "_ask_vision", refuse_the_broken_one)
+
+    reg = tool({"screen": {"model": broken}})
+    with caplog.at_level(logging.WARNING, logger="jarvis"):
+        assert reg.call("screen_qa", {}).ok
+        assert reg.call("screen_qa", {}).ok
+    unusable = [r for r in caplog.records if "is unusable here" in r.getMessage()]
+    assert len(unusable) == 2, \
+        f"expected one warning per question, got {len(unusable)}"
+    assert "once per process per model" not in Path(scr.__file__).read_text(), \
+        "the comment claims a dedupe the code does not do"
+
+
+def test_the_constant_comments_outlived_nothing(wired):
+    """``GRAB_TIMEOUT_S``'s comment said "the CLI screenshot fallbackS".
+
+    Plural was true when gnome-screenshot was a second CLI grabber.  There
+    is one now: ``shutil.which`` is called once in the whole module, for
+    ``import``, and GRAB_TIMEOUT_S bounds exactly one ``subprocess.run``.
+    The same residue, one word wide, in the same file."""
+    src = Path(scr.__file__).read_text()
+    assert src.count('shutil.which("import")') == 1
+    assert src.count("shutil.which") == 1, "one CLI grabber, not several"
+    line = next(ln for ln in src.splitlines() if ln.startswith("GRAB_TIMEOUT_S"))
+    assert "fallbacks" not in line, f"still plural: {line!r}"
+    assert "8.0" in line
+
+
+def test_setup_line_does_not_claim_to_name_a_model_it_cannot_name():
+    """``setup_line``'s docstring: "The spoken excuse, naming the model and
+    what is wrong with it."  Three of its four branches do.  The fourth --
+    the fallthrough, which is every timeout and every dead socket -- returns
+    ``NO_VISION_LINE``, which names neither, and the constant's OWN comment
+    twelve lines earlier says exactly that: "The generic line is for a model
+    that is present and simply did not answer".  The docstring over-claimed
+    the one line whose namelessness sent Hunter looking at the wrong thing
+    twice on 2026-08-31."""
+    generic = scr.setup_line("gemma4:26b", "TimeoutError")
+    assert generic == scr.NO_VISION_LINE
+    assert "gemma4" not in generic and "Timeout" not in generic
+    # the three that DO name it, so the fix cannot degrade into a deletion
+    assert "moondream" in scr.setup_line("moondream", 'model "moondream" not found')
+    assert "gemma4" in scr.setup_line("gemma4:26b", "gemma4 is not a vision model")
+    assert "llama3.2-vision" in scr.setup_line("llama3.2-vision:latest",
+                                               "HTTP 500: unknown architecture")
+    doc = scr.setup_line.__doc__ or ""
+    assert "naming the model and what is wrong with it" not in doc, \
+        "the docstring promises a name the generic line does not carry"
+
+
+def test_the_wasted_attempt_is_paid_once_per_TTL_not_once_per_process(wired,
+                                                                     monkeypatch):
+    """``look``'s docstring said the refused model is "paid once per process".
+
+    It is not, and the module says so twelve lines above ``_UNUSABLE``:
+    "Both caches expire.  A verdict that outlived the process would be right
+    for the wrong reason: ``ollama pull``, an ollama upgrade, or a restarted
+    server all change the answer, and Jarvis can run for days."
+    ``unusable_reason`` reads through ``_cached``, which drops any entry
+    older than ``CACHE_TTL_S``, and ``test_the_verdict_cache_expires``
+    already pins that.  So the file held the claim and its own refutation at
+    the same time.  Measured here end to end: two questions ten minutes
+    apart cost TWO wasted attempts on the broken model, not one."""
+    broken = "llama3.2-vision:latest"
+    asked = []
+
+    def refuse_the_broken_one(payload, timeout=None):
+        asked.append(payload["model"])
+        if payload["model"] == broken:
+            raise urllib.error.HTTPError(
+                "u", 500, "Internal Server Error", {},
+                io.BytesIO(b'{"error":"unknown model architecture: \'mllama\'"}'))
+        return {"message": {"role": "assistant", "content": "A terminal."}}
+    monkeypatch.setattr(scr, "_ask_vision", refuse_the_broken_one)
+
+    reg = tool({"screen": {"model": broken}})
+    assert reg.call("screen_qa", {}).ok
+    assert reg.call("screen_qa", {}).ok
+    # within the TTL the verdict holds: one wasted attempt, two answers
+    assert asked == [broken, scr.chat_model(), scr.chat_model()]
+
+    later = time.monotonic() + scr.CACHE_TTL_S + 1
+    monkeypatch.setattr(scr.time, "monotonic", lambda: later)
+    assert reg.call("screen_qa", {}).ok
+    assert asked == [broken, scr.chat_model(), scr.chat_model(),
+                     broken, scr.chat_model()], \
+        "past the TTL the refused model is tried again -- not once per process"
+
+    src = Path(scr.__file__).read_text()
+    assert "once per process" not in src, \
+        "both verdict caches expire; no memory here lasts a whole process"
