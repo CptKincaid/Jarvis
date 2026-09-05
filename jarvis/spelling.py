@@ -35,10 +35,18 @@ WHY IT CANNOT HOLD AN ORDINARY SENTENCE OPEN
 --------------------------------------------
 Three separate reasons, each of which alone would do:
 
-* **A run needs two.** Only "a" and "I" are one-letter English words, so
-  no ordinary sentence ends on two single characters in a row. A tail of
-  one character is not a run, which is exactly why "what is plan B" —
-  his own counter-example — is never spelling.
+* **A run needs two LETTERS, not two characters.** This is the sentence
+  that was WRONG IN WRITING until 09-05. It used to read "only 'a' and
+  'I' are one-letter English words, so no ordinary sentence ends on two
+  single characters in a row" — and that argument is false, because
+  DIGITS were counted as run characters. "gate 4 b", "row 2 a",
+  "channel 5 c", "unit 2 d" and "he got a c" are all runs of two under
+  it, and the verdict MEASURED them being held: 11 of 20 false holds on
+  a 67-phrase corpus, each costing +1792 ms once on that turn. So a run
+  now needs at least TWO of its single characters to be letters other
+  than "a" and "i". A digit may still ride INSIDE a run — k-b-w-7 is a
+  spelled string, not a label — the floor is on the run, not on every
+  character in it.
 * **The dangling case needs a LETTER.** A digit never dangles, so "set a
   timer for 5" and "volume to 5" are ordinary turns; and "a" and "I" are
   excluded by name, so "that is a" is too.
@@ -51,6 +59,17 @@ Three separate reasons, each of which alone would do:
 The cost of being wrong in each direction is the same asymmetry the
 filler hold was built on: a wrong hold costs one ``spell_hold_s`` once,
 on one turn; a missed one chops his address into four pieces.
+
+WHAT THE NARROWING DELIBERATELY DOES NOT REMOVE (Hunter, 09-05)
+---------------------------------------------------------------
+After the digit repair, 9 of the 20 measured false holds remain, and
+every one of them is the DANGLING-LETTER case: a phrase that ends on one
+bare letter after a function word ("switch to b", "the answer is c").
+**He ruled to keep them.** He accepts about 1.8 s occasionally on such a
+phrase, because that same rule is what buys him the FIRST character when
+he starts spelling an address, and being chopped off mid-address is worse
+than a pause. That is a DECISION, not a defect: it is not to be removed
+or watered down without asking him again.
 
 THE REASSEMBLY
 --------------
@@ -80,6 +99,15 @@ import re
 # and his pin says so explicitly.
 MIN_RUN = 2
 
+# ...and two of the run's characters must be LETTERS that are not "a" or
+# "i". MEASURED (the 09-05 verdict, 67 realistic non-spelling phrases):
+# counting digits as run characters held "gate 4 b", "row 2 a",
+# "channel 5 c", "unit 2 d" and "he got a c" -- 11 of 20 false holds, at
+# +1792 ms each, once per turn. In every one of them the letter LABELS
+# the number; none of them is a man spelling. The floor is on the run as
+# a whole, so a digit inside a spelled string ("k-b-w-7") still rides.
+MIN_RUN_LETTERS = 2
+
 # Closed-class words that cannot be the last word of an English sentence.
 # A single bare letter behind one of these is a name being spelled, not a
 # label: "send an email to q" is his own first fragment. Deliberately
@@ -92,9 +120,11 @@ DANGLING_WORDS = frozenset({
     "spelling", "letter", "letters",
 })
 
-# The two one-letter English words. They may sit INSIDE a run (a spelled
-# name is full of them) but neither may be the dangling letter that starts
-# one: "that is a" and "the answer is I" are finished sentences.
+# The two one-letter English words. They may sit inside a run and be
+# folded with it (a spelled name is full of them), but neither COUNTS
+# toward MIN_RUN_LETTERS and neither may be the dangling letter that
+# starts a run: "that is a" and "the answer is I" are finished sentences,
+# and "he got a c" is a grade.
 _NOT_A_DANGLING_LETTER = frozenset({"a", "i"})
 
 # What separates two spoken characters in a transcript. Whisper writes the
@@ -130,10 +160,11 @@ def _tokens(text: str) -> list:
 def spelling_run(text) -> int:
     """How many characters the text's trailing SPELLING RUN is, or 0.
 
-    3 for "send it to q-z-v", 1 for "send an email to q" (the dangling
-    case), 0 for "what is plan B", "set a timer for 5", "q-z-v at example
-    dot com" (the run ended when he started saying the domain) and every
-    ordinary sentence.
+    3 for "send it to q-z-v", 4 for "k-b-w-7" (a digit rides inside a
+    run), 1 for "send an email to q" (the dangling case), 0 for "what is
+    plan B", "set a timer for 5", "gate 4 b" (one letter labelling a
+    number is not a run), "q-z-v at example dot com" (the run ended when
+    he started saying the domain) and every ordinary sentence.
 
     A count, never the characters: this is what the recorder is given, and
     a spelled local part is half an address. The recorder logs the number.
@@ -142,14 +173,20 @@ def spelling_run(text) -> int:
     if not raw.strip():
         return 0
     toks = _tokens(raw)
-    n = 0
+    run: list = []
     for tok in reversed(toks):
         if len(tok) == 1 and tok.isalnum():
-            n += 1
+            run.append(tok)
         else:
             break
+    n = len(run)
     if n >= MIN_RUN:
-        return n
+        # Two real letters, or it is a label on a number, not spelling.
+        letters = sum(1 for c in run
+                      if c.isalpha() and c.lower() not in _NOT_A_DANGLING_LETTER)
+        if letters >= MIN_RUN_LETTERS:
+            return n
+        return 0
     if n != 1:
         return 0
     tail = toks[-1]

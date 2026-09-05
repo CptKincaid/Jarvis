@@ -22,12 +22,14 @@ letter left dangling after a function word that cannot end an utterance
 open CONFIG.spell_hold_s longer through the SAME seam the filler hold
 uses (Recorder.note_partial -> _hold_extra -> _counted_hold).
 
-WHY IT CANNOT HOLD AN ORDINARY SENTENCE OPEN. Only "a" and "I" are
-one-letter English words, so no ordinary sentence ends on two of them in
-a row; a run of one is not a run, so "what is plan B" is never held; and
-the dangling-letter case needs BOTH a bare letter (never a digit, never
-"a"/"I") AND a preceding closed-class word that cannot be the last word
-of a sentence, which "plan" is not.
+WHY IT CANNOT HOLD AN ORDINARY SENTENCE OPEN. A run needs two LETTERS
+other than "a" and "i" -- the first version of this argument said "two
+single characters", which was FALSE IN WRITING because digits counted as
+run characters, and the verdict measured "gate 4 b" and four more like it
+being held (section 8 below); a run of one is not a run, so "what is plan
+B" is never held; and the dangling-letter case needs BOTH a bare letter
+(never a digit, never "a"/"I") AND a preceding closed-class word that
+cannot be the last word of a sentence, which "plan" is not.
 
 Everything here runs on synthetic arrays and scripted fakes: no device is
 opened, no audio is played, no real address appears -- every letter and
@@ -572,3 +574,86 @@ def test_a_spelled_local_part_no_longer_resolves_to_its_last_letter():
     from jarvis import outbox
     assert outbox.parse_address("q z v at example dot com") != "v@example.com"
     assert outbox.parse_address("q z v at example dot com") == "qzv@example.com"
+
+
+# ============================ (8) THE VERDICT'S TWO REPAIRS, and his two
+#                                  rulings, taken 2026-09-05 after the
+#                                  measured verdict on this branch.
+#
+# The verdict measured the branch a large net win and blocked on ONE
+# number: 20 of 67 realistic non-spelling phrases were also held, each
+# costing +1792 ms ONCE on that turn (2592 ms of quiet instead of 800).
+# Ordinary sentences are not delayed by a millisecond -- that was measured
+# and was never at issue.
+#
+# HIS RULING (A): KEEP the dangling-letter rule. He accepts ~1.8 s
+# occasionally on a phrase ending in one bare letter, because that rule is
+# what buys him the FIRST character when he starts spelling, and being cut
+# off mid-address is worse than a pause.
+#
+# HIS RULING (B): "example.com" said as ONE WORD is a domain. It is the
+# exact shape whisper wrote down for him on 09-05, and today it is refused
+# with no re-ask at all.
+#
+# THE BUG THAT IS NOT A TRADE: the module's stated safety argument was
+# "no ordinary sentence ends on two single characters in a row" -- false,
+# because DIGITS were counted as run characters. The five phrases below
+# are all runs of two under the old rule.
+
+# The five the verdict named. Each was a false hold and none of them is a
+# man spelling: the letter LABELS the number in front of it.
+DIGIT_FALSE_HOLDS = ["gate 4 b", "row 2 a", "channel 5 c", "unit 2 d",
+                     "he got a c"]
+
+
+@pytest.mark.parametrize("phrase", DIGIT_FALSE_HOLDS)
+def test_a_number_and_one_label_letter_is_not_a_spelling_run(phrase):
+    """The measured repair: a run's two-or-more single characters must
+    include at least TWO letters that are not "a" or "i". These five are
+    11 of the 20 false holds, removed at zero cost to the spelled cases."""
+    assert spelling.spelling_run(phrase) == 0
+
+
+@pytest.mark.parametrize("phrase", DIGIT_FALSE_HOLDS)
+def test_a_number_and_one_label_letter_is_not_held_either(monkeypatch, phrase):
+    """The same five at the seam that costs the milliseconds."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial(phrase, 0.96, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec._spell_holds == 0
+    assert rec.stops[0][2] < 1.0
+
+
+# The spelled cases, all eight, that the narrowing must not touch.
+SPELLED_CASES = [
+    ("q-z-v", 3),
+    ("q z v", 3),
+    ("Q. Z. V.", 3),
+    ("q. z. v", 3),
+    ("q, z, v", 3),
+    ("q-z-v, k-b-w-7", 7),           # his fourth fragment's own shape
+    ("send an email to q-z-v", 3),
+    ("send an email to q", 1),       # the dangling case: his FIRST fragment
+]
+
+
+@pytest.mark.parametrize("said,count", SPELLED_CASES)
+def test_the_narrowing_costs_none_of_the_eight_spelled_cases(said, count):
+    assert spelling.spelling_run(said) == count
+
+
+def test_a_digit_may_still_ride_inside_a_spelled_run():
+    """k-b-w-7 is a spelled string with a digit in it, not a label: the
+    two-letter floor is on the RUN, not on every character in it."""
+    assert spelling.spelling_run("k-b-w-7") == 4
+    assert spelling.spelling_run("send it to q 7 z") == 3
+    assert spelling.spelling_run("7-k-b") == 3
+
+
+@pytest.mark.parametrize("phrase", ["switch to b", "the answer is c"])
+def test_ruling_a_the_dangling_letter_rule_is_kept_on_purpose(phrase):
+    """HIS RULING (A), 09-05. These two phrases DO cost him ~1.8 s once,
+    and he ruled to keep them held anyway, because the same rule is what
+    catches the first character of an address he is starting to spell.
+    This is a decision, not a defect: do not "fix" it."""
+    assert spelling.spelling_run(phrase) == 1
