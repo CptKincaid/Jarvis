@@ -1372,11 +1372,27 @@ def _event(title, start, all_day=False):
     return types.SimpleNamespace(title=title, start=start, all_day=all_day, calendar="Canvas")
 
 
+# 2026-09-05: the exam tests below built their instant as
+#     (datetime.now().astimezone() + timedelta(days=3)).replace(hour=13)
+# which carries TODAY's UTC offset onto a date three days away. When a DST
+# change falls inside that horizon the instant is an hour out, and the
+# product -- which reads real local dates -- then disagrees about both "in
+# 3 days" and "at 1:00 pm". Measured red on 2026-10-30/31 and 2027-03-13/14,
+# and reproduced live under TZ=America/Santiago and TZ=Pacific/Easter, both
+# of which change over this weekend. The cure is to do the wall-clock
+# arithmetic NAIVE and attach the zone LAST, so Python resolves the offset
+# that actually applies to the day we land on.
+def _in_days(days, hour, minute=0):
+    """A local wall-clock instant `days` from now, at hour:minute."""
+    return (datetime.now() + timedelta(days=days)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0).astimezone()
+
+
 def test_next_exam_answers_from_the_calendar_without_a_token(rich, services, monkeypatch):
     import jarvis.tools.canvas as cv
     monkeypatch.setattr(cv, "fetch_due", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("Canvas must not be asked without a token")))
-    start = (datetime.now().astimezone() + timedelta(days=3)).replace(hour=13, minute=0)
+    start = _in_days(3, 13)
     services.calendar = _exam_cal(_event("Physics exam", start), _event("Dentist", start))
     res = rich.handle("when's my next exam", source="typed")
     assert res.handled and res.speak
@@ -1391,7 +1407,8 @@ def test_next_exam_without_a_token_and_no_calendar_hit_falls_through(rich, servi
     """Nothing on the calendar and no token: the router's model turn reaches
     canvas_due, whose setup line names what is missing. A flat "nothing on
     the books" here would vouch for a source that was never read."""
-    services.calendar = _exam_cal(_event("Dentist", datetime.now().astimezone() + timedelta(days=1)))
+    services.calendar = _exam_cal(
+        _event("Dentist", (datetime.now() + timedelta(days=1)).astimezone()))
     res = rich.handle("when's my next exam", source="typed")
     assert res.status != "No exam found"
     # the router's rule path routes a question locally: a model turn ran
@@ -1402,16 +1419,15 @@ def test_next_exam_without_a_token_and_no_calendar_hit_falls_through(rich, servi
 def test_next_exam_with_a_token_merges_canvas_and_speaks_the_course(rich, services, monkeypatch):
     import jarvis.tools.canvas as cv
     services.assistant = FakeAssistantCfg(**{"canvas.token": "7~abcDEF123secret"})
-    now = datetime.now().astimezone()
     seen = {}
 
     def fake_fetch_due(settings, days, fetch, when):
         seen["days"] = days
         assert settings["token"] == "7~abcDEF123secret"
         return [{"course": "BIOSENSORS", "title": "Midterm 1",
-                 "due": (now + timedelta(days=6)).replace(hour=9, minute=0)},
+                 "due": _in_days(6, 9)},
                 {"course": "CIRCUITS", "title": "Quiz 2",
-                 "due": (now + timedelta(days=1)).replace(hour=17, minute=0)}]
+                 "due": _in_days(1, 17)}]
     monkeypatch.setattr(cv, "fetch_due", fake_fetch_due)
     services.calendar = None
     res = rich.handle("how long until the biosensors midterm", source="typed")

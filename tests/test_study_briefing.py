@@ -28,6 +28,9 @@ from jarvis.tools.quiz import NOTHING_DUE_LINE, FlashcardStore
 # 07:04:59, and test_a_deck_that_emptied_since_breakfast_says_so went red at
 # breakfast that morning. Same rule as tests/test_notes_mail.py:872 -- the
 # fixture must write with whichever clock the code under test reads.
+# clock-hygiene: deliberate, for the reason above -- a frozen NOW writes cards
+# at a fixed epoch that the real clock later crosses, which is exactly what
+# went red at breakfast on 2026-09-02.
 NOW = datetime.now().astimezone()
 
 
