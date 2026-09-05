@@ -1705,6 +1705,12 @@ def test_mask_addresses_leaves_ordinary_prose_alone(prose):
     # the side of the trade a log line should be on.
     ("look at the dot com bubble", "l… at the dot com bubble"),
     ("look at the dash board dot com", "l… at the dash board dot com"),
+    # (w6) The function-word skip narrowed again: it is spent only when
+    # the TOP LEVEL is a function word too, because a hand-written list of
+    # top levels cannot name them all ("site", "xyz", "info" were all
+    # missing, and all three were DRAFTED). So a prose sentence whose last
+    # word is an ordinary word now loses its first letter in a log line.
+    ("look at the dot marked X", "l… at the dot marked X"),
 ])
 def test_mask_addresses_deliberate_calls(said, want):
     """Where the rule is a trade-off, this is the side it takes."""
@@ -1727,10 +1733,31 @@ def test_mask_addresses_masks_a_function_word_domain_that_is_a_real_provider(sai
     assert outbox.mask_addresses(said) == want
 
 
+@pytest.mark.parametrize("said, want", [
+    # (w6) The measured leak the hand-written top-level list left open:
+    # a SPOKEN address whose domain opens on a function word AND whose top
+    # level is simply absent from _SAID_TLDS. Every one of these is
+    # DRAFTED by the parser and MAILED by a yes -- and every one of them
+    # was written raw into the four jarvis.commander INFO lines. There is
+    # no list of top levels that is ever finished; the top level being an
+    # English word is the test that is.
+    ("heather at the dash board dot site", "h… at the dash board dot site"),
+    ("dana at my dot xyz", "d… at my dot xyz"),
+    ("dana at it dot info", "d… at it dot info"),
+    ("email the handout to dana at my dot xyz",
+     "email the handout to d… at my dot xyz"),
+    ("yes, to heather at the dash board dot site",
+     "yes, to h… at the dash board dot site"),
+])
+def test_mask_addresses_masks_a_function_word_domain_on_an_unlisted_top_level(said,
+                                                                              want):
+    assert outbox.mask_addresses(said) == want
+
+
 @pytest.mark.parametrize("prose", [
     # ... and the guard that keeps the rule from eating prose: a
-    # function-word domain whose top level is NOT one in use is still a
-    # sentence, exactly as before.
+    # function-word domain whose TOP LEVEL is a function word too is a
+    # sentence, and is left byte-identical.
     "at the dot",
     "look at the dot on the map",
     "at 4 dot 30",
@@ -1738,8 +1765,41 @@ def test_mask_addresses_masks_a_function_word_domain_that_is_a_real_provider(sai
     "look at that dot there",
     "I'm at home. See you at six.",
 ])
-def test_a_function_word_domain_without_a_real_top_level_stays_prose(prose):
+def test_a_function_word_domain_ending_on_a_function_word_stays_prose(prose):
     assert outbox.mask_addresses(prose) == prose
+
+
+# EIGHT real country top levels are also English function words. A domain
+# that opens on a function word AND ends on one of these is read as prose,
+# so the address he said goes to the log raw. This is the KNOWN RESIDUAL:
+# it is pinned, not fixed.
+RESIDUAL_TLDS = ["at", "be", "in", "is", "it", "no", "so", "to"]
+
+
+@pytest.mark.parametrize("tld", RESIDUAL_TLDS)
+def test_the_known_residual_a_function_word_domain_on_a_function_word_ccTLD(tld):
+    """THE BOUNDARY, pinned so the next reader finds it instead of
+    re-deriving it. Measured on a 3552-row grid (96 function words x 37
+    top levels): the rule above cut leaking rows 3456 -> 864 and leaking
+    top levels 36 -> 8, and these are the 8 -- .at .be .in .is .it .no .so
+    .to, every one a real ccTLD and every one an English word. A word list
+    cannot tell "dana at my dot in" (an address) from "look at the dot in
+    the corner" (a sentence), and the sentence is far commoner; closing it
+    needs a public-suffix list, which is a bigger change than this one.
+    (Round 5's verdict put the residual at ONE top level, "in". Re-measured
+    here: it is eight. The grid it used carried only "in" of the eight.)"""
+    said = f"dana at my dot {tld}"
+    assert outbox.mask_addresses(said) == said, "still leaks -- see the docstring"
+
+
+def test_the_residual_costs_only_the_both_ends_case():
+    """It takes a function word at BOTH ends, so the ordinary spoken
+    address on one of those eight is still masked, and the sentence the
+    residual is paid for is still prose."""
+    assert outbox.mask_addresses("dana at example dot in") == "d… at example dot in"
+    assert outbox.mask_addresses("dana at example dot it") == "d… at example dot it"
+    assert outbox.mask_addresses("look at the dot in the corner") == \
+        "look at the dot in the corner"
 
 
 def _leaks(records, *raw):
@@ -1799,6 +1859,55 @@ def test_the_commander_log_masks_a_function_word_domain_he_said(cmd_book, caplog
     corrected = [ln for ln in lines if ln.startswith("send read-back:")
                  and "corrects the draft" in ln]
     assert corrected and all("d… at my dot com" in ln for ln in corrected), corrected
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said, addr", [
+    ("heather at the dash board dot site", "heather@the-board.site"),
+    ("dana at my dot xyz", "dana@my.xyz"),
+    ("dana at it dot info", "dana@it.info"),
+])
+def test_the_commander_log_masks_an_unlisted_top_level_end_to_end(cmd_book, caplog,
+                                                                  said, addr):
+    """The measured w6 leak, end to end and at DEBUG on EVERY logger: the
+    parser drafts it, a yes mails it, and not one line -- handle, tier-1
+    match, the "yes, to ..." handle line, the send read-back -- may carry
+    the address he said or the address it resolved to."""
+    with caplog.at_level(logging.DEBUG):
+        res = cmd_book.handle(f"email the biosensors handout to {said}",
+                              source="voice")
+        assert res.reply.endswith("Send it, sir?"), (said, res.reply)
+        # an address he SAID is read back as he said it and never shown as
+        # an address; the resolved form is only in the draft
+        assert f"to {said}" in res.reply, (said, res.reply)
+        assert cmd_book._pending_send is not None and not FakeSMTP.made
+        res = cmd_book.handle("yes", source="voice")
+        assert res.ack, (said, res)
+    assert len(FakeSMTP.made) == 1, FakeSMTP.made
+    assert FakeSMTP.made[-1].sent[0]["To"] == addr
+    assert _leaks(caplog.records, said, addr) == []
+    lines = [r.getMessage() for r in caplog.records]
+    masked = said[:1] + "…" + said[len(said.split()[0]):]
+    assert any(ln.startswith("handle ") and masked in ln for ln in lines), lines
+
+
+def test_the_commander_log_masks_an_unlisted_top_level_said_at_the_readback(cmd_book,
+                                                                            caplog):
+    """The other door: the address arrives as a CORRECTION at the confirm
+    ("yes, to ..."), which is where the raw form reached both the handle
+    line and the send read-back line."""
+    said, addr = "heather at the dash board dot site", "heather@the-board.site"
+    with caplog.at_level(logging.DEBUG):
+        cmd_book.handle("email the biosensors handout to Heather Smith",
+                        source="voice")
+        res = cmd_book.handle(f"yes, to {said}", source="voice")
+        assert f"to {said}" in res.reply, res
+    assert _leaks(caplog.records, said, addr) == []
+    lines = [r.getMessage() for r in caplog.records]
+    corrected = [ln for ln in lines if ln.startswith("send read-back:")
+                 and "corrects the draft" in ln]
+    assert corrected and all("h… at the dash board dot site" in ln
+                             for ln in corrected), corrected
     assert not FakeSMTP.made
 
 

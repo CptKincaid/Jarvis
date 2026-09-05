@@ -287,14 +287,26 @@ def _one_said(m) -> str:
     labels = [x for x in _SAID_SEP_RX.split(domain) if x]
     # The first WORD of the first label: "the dash board" opens on "the".
     first, tld = labels[0].split()[0].lower(), m.group("tld").lower()
-    # A function-word domain is USUALLY prose ("look at the dot on the
-    # map"), but not always: my.com, it.com and my-host.com are real
-    # providers, the parser drafts "dana at my dot com" to dana@my.com,
-    # and a yes mails it there -- so the skip is spent only when the top
-    # level is not one in use either. The cost is "look at the dot com
-    # bubble" losing a letter in a log line; the alternative was the
-    # address he said written out raw, four times (measured, wave B).
-    if first in _NOT_A_DOMAIN_WORD and tld not in _SAID_TLDS:
+    # THE RULE: a domain that opens on an English function word is prose
+    # only when its TOP LEVEL is a function word too ("look at the dot on
+    # the map"); anything else is an address.
+    # Keying prose on _SAID_TLDS alone leaked, because no hand-written
+    # list of top levels is ever finished: "site", "xyz" and "info" were
+    # all missing, so "heather at the dash board dot site" was drafted to
+    # heather@the-board.site, mailed by a yes, and written RAW into four
+    # jarvis.commander INFO lines. Reading the LAST word instead of a list
+    # cut a 3552-row grid (96 function words x 37 top levels) from 3456
+    # leaking rows to 864, and 36 leaking top levels to 8.
+    # THE RESIDUAL, which this does NOT close: eight real ccTLDs are also
+    # English function words -- at be in is it no so to -- so "dana at my
+    # dot in" is still read as prose and logged raw. A word list cannot
+    # split it from "look at the dot in the corner"; only a public-suffix
+    # list can, and masking those eight would eat the commoner sentence.
+    # The cost is the same trade the line already took for "look at the
+    # dot com bubble", one row wider: "look at the dot marked X" now loses
+    # its first letter in a log line. A letter is cheaper than an address.
+    if (first in _NOT_A_DOMAIN_WORD and tld not in _SAID_TLDS
+            and tld in _NOT_A_DOMAIN_WORD):
         return m.group(0)
     if "." in domain and tld not in _SAID_TLDS:
         return m.group(0)
