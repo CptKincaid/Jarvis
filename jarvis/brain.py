@@ -1477,14 +1477,17 @@ def log_settings(registry=None):
 # an invitation to make the call again, and the model can say what it lost.
 TOOL_DROPPED_TEXT = ("[an earlier result was dropped to keep the question "
                      "itself inside the model's window]")
-# ...but dropping whole is the LAST resort. When the overflow is smaller
-# than the result, the guard cuts the result's TAIL (as fit_material does
-# for a document) and marks the cut, so a long calendar loses its evening
-# rather than its morning: a review probe (num_ctx 2048, one 3 900-char
-# calendar result) showed the drop-whole rule replacing the ONLY result
-# the model needed and the turn ending as "an earlier result was dropped,
-# sir" instead of a partial calendar. A cut that would leave fewer than
-# MIN_TOOL_KEEP_CHARS is a drop.
+# ...but dropping whole is the LAST resort. The guard cuts the TAIL of the
+# LARGEST result (as fit_material does for a document) and marks the cut,
+# so a long calendar loses its evening rather than its morning: a review
+# probe (num_ctx 2048, one 3 900-char calendar result) showed the
+# drop-whole rule replacing the ONLY result the model needed and the turn
+# ending as "an earlier result was dropped, sir" instead of a partial
+# calendar. A result already cut is cut AGAIN on a later round that
+# overflows (the round-3 review measured the once-only rule dropping the
+# NEWEST result -- the one the model had just asked for -- whole, while
+# hundreds of trimmable tokens sat in the cut one). Only when every result
+# is down to MIN_TOOL_KEEP_CHARS is one dropped whole, the oldest first.
 TOOL_CUT_TEXT = ("\n[cut here to keep the question in the model's window; "
                  "the result went on]")
 MIN_TOOL_KEEP_CHARS = 400
@@ -1504,6 +1507,15 @@ def _split_allowance(content):
     if not m:
         return content, ""
     return content[:m.start()], content[m.start():]
+
+
+def _split_cut(body):
+    """(text, was_cut) of a tool body: the cut marker an earlier round left
+    at its end is lifted off so the body can be cut again and re-marked
+    once, never marked twice."""
+    if body.endswith(TOOL_CUT_TEXT):
+        return body[:-len(TOOL_CUT_TEXT)], True
+    return body, False
 
 
 def seen_after_guard(edits, index, ran_results, tool_texts):
@@ -1553,8 +1565,37 @@ TOOL_CHARS_PER_TOKEN = 2.25                 # tool results and tool-call JSON
 MESSAGE_OVERHEAD_TOKENS = 4
 # An image in a message (the screen tool) is not text: gemma-family models
 # spend a fixed block of tokens per image. Not measured on this box; 1024
-# is above the 256-token figure the model card gives, erring high.
+# is above the 256-token figure the model card gives, erring high. It is
+# costed by _image_tokens() in BOTH estimators (the per-message walk and
+# fit_material's dense figure): the round-3 review measured fit_material
+# costing the screen question's image at ZERO, because it summed the
+# other messages and the last one's text and never looked at its images.
 IMAGE_TOKENS_ALLOWANCE = 1024
+
+
+def _image_tokens(msg) -> int:
+    """The fixed allowance for the images one message carries: never
+    their base64 (a screenshot is ~200 000 chars), never zero."""
+    images = msg.get("images") if isinstance(msg, dict) else None
+    if not images:
+        return 0
+    try:
+        return IMAGE_TOKENS_ALLOWANCE * len(images)
+    except TypeError:
+        return IMAGE_TOKENS_ALLOWANCE
+
+
+def image_count(messages) -> int:
+    """How many images a request carries, for _log_round_tokens: a round
+    with one is logged like any other but does NOT calibrate."""
+    n = 0
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("images"):
+            try:
+                n += len(m["images"])
+            except TypeError:
+                n += 1
+    return n
 
 # CALIBRATION: the estimate is checked against Ollama's own prompt_eval_count
 # on every round (_log_round_tokens), and the ratio measured/estimated is
@@ -1568,7 +1609,13 @@ IMAGE_TOKENS_ALLOWANCE = 1024
 # tail-trim. A count below half the estimate is not used: it cannot be a
 # whole-prompt count (a prefix-cache hit reporting only the tail is the
 # suspected cause, not verified), and a low count is never a truncation
-# risk anyway. Every change is logged with both numbers.
+# risk anyway. A round that carries an IMAGE is not used either: whether
+# Ollama's count includes the image's tokens, and how many, is unmeasured
+# (256 per the model card, 1024 allowed for), so its ratio says nothing
+# about the text rate the factor tracks -- the round-3 review measured ONE
+# screen question pinning the process-wide factor at the 2.0 clamp and
+# halving the tool loop's raw trim threshold (14566 -> 7720) for the next
+# seven rounds. Every change is logged with both numbers.
 CALIBRATION_INITIAL = 1.06
 CALIBRATION_MAX = 2.0
 CALIBRATION_ALPHA = 0.5
@@ -1585,13 +1632,22 @@ def calibrated(estimate) -> int:
     return int(estimate * _CALIBRATION["factor"] + 0.5)
 
 
-def _calibrate(used, estimated, label="chat"):
-    """Fold one measured (used) vs estimated pair into the factor."""
+def _calibrate(used, estimated, label="chat", images=0):
+    """Fold one measured (used) vs estimated pair into the factor. A round
+    that carried an image is logged and left out (see the block above)."""
     try:
         used, estimated = int(used), int(estimated)
     except (TypeError, ValueError):
         return
     if used <= 0 or estimated <= 0:
+        return
+    if images:
+        log.info("ctx-calibration: unchanged at %.3f -- %d image%s in the "
+                 "prompt, costed at the %d-token allowance (Ollama counted "
+                 "%d against an estimate of %d [%s]; an image round says "
+                 "nothing about the text rate)", _CALIBRATION["factor"],
+                 images, "" if images == 1 else "s", IMAGE_TOKENS_ALLOWANCE,
+                 used, estimated, label)
         return
     ratio = used / estimated
     if ratio < 0.5:
@@ -1654,12 +1710,7 @@ def _message_tokens(msg) -> int:
             tokens += len(json.dumps(calls, default=str)) / TOOL_CHARS_PER_TOKEN
         except (TypeError, ValueError):
             pass
-    images = msg.get("images")
-    if images:
-        try:
-            tokens += IMAGE_TOKENS_ALLOWANCE * len(images)
-        except TypeError:
-            tokens += IMAGE_TOKENS_ALLOWANCE
+    tokens += _image_tokens(msg)
     return int(tokens)
 
 
@@ -1683,7 +1734,7 @@ def fit_prompt(messages, tools=None, ceiling=None, num_predict=None,
                label="chat", changed=None):
     """THE GUARD for the tool loop (assistant.json ``brain.protect_question``).
 
-    When a round would overflow the window, shorten the OLDEST TOOL RESULT
+    When a round would overflow the window, shorten the LARGEST TOOL RESULT
     -- because if we do not, Ollama makes room its own way, and its way is
     to delete whole messages oldest-first after the system prompt. That is
     HIS QUESTION. Measured 2026-09-04 on the live server: a 9 000-char
@@ -1693,11 +1744,21 @@ def fit_prompt(messages, tools=None, ceiling=None, num_predict=None,
     tool schemas alone. No error, no log line, nothing; the model then
     answered something confident and unrelated.
 
-    Oldest result first: its tail is cut to absorb the overflow when at
-    least MIN_TOOL_KEEP_CHARS of it would remain (TOOL_CUT_TEXT marks the
-    cut); otherwise it is replaced whole by TOOL_DROPPED_TEXT and the next
-    result is considered. The estimate compared is calibrated() -- the raw
-    estimate times the factor measured on earlier rounds.
+    Largest result first (ties: the oldest): its tail is cut to absorb the
+    overflow (TOOL_CUT_TEXT marks the cut). A result cut on an earlier
+    round is cut AGAIN, its marker lifted and put back once: the once-only
+    rule this replaces skipped the cut result and dropped the NEWEST whole
+    (measured, round-3 review: a 600-char mail result gone and the prompt
+    still over, with 937 chars of cut calendar left untouched). When the
+    largest cannot absorb it all above MIN_TOOL_KEEP_CHARS, one of two
+    things: if every result cut to that floor would fit, the largest goes
+    to its floor and the next largest takes the rest (every tool keeps
+    its head); if even the floors would not fit, a drop is unavoidable and
+    the OLDEST result is replaced whole by TOOL_DROPPED_TEXT first -- the
+    newest is the one the model just asked for, and dropping first is
+    what lets it keep more than a floor. The estimate compared is
+    calibrated() -- the raw estimate times the factor measured on earlier
+    rounds.
 
     Mutates ``messages`` in place and returns (results dropped WHOLE,
     calibrated estimate). ``changed``, when a list, receives one
@@ -1713,55 +1774,97 @@ def fit_prompt(messages, tools=None, ceiling=None, num_predict=None,
         return 0, estimate
     dropped = 0
     factor = calibration_factor()
-    for msg in messages:
-        if estimate <= ceiling:
+    slack = int(MESSAGE_OVERHEAD_TOKENS * TOOL_CHARS_PER_TOKEN)
+
+    def floors_fit(live):
+        """Would the prompt fit with every standing result at its floor?"""
+        by_pos = {x[1]: x for x in live}
+        shadow = []
+        for pos, msg in enumerate(messages):
+            x = by_pos.get(pos)
+            if x is None:
+                shadow.append(msg)
+                continue
+            size, _p, _m, body, suffix, was_cut, _c = x
+            if size > MIN_TOOL_KEEP_CHARS:
+                floor = body[:MIN_TOOL_KEEP_CHARS].rstrip() + TOOL_CUT_TEXT
+            else:
+                floor = body + (TOOL_CUT_TEXT if was_cut else "")
+            shadow.append({"role": "tool", "content": floor + suffix})
+        return calibrated(estimate_prompt_tokens(shadow, tools)) <= ceiling
+
+    while estimate > ceiling:
+        # every result still standing, as (body chars, position, ...):
+        # the body is the data in front of the sentence allowance (kept
+        # whole, it is instruction) with an earlier round's cut marker
+        # lifted off, so "largest" means largest data, marked or not
+        live = []
+        for pos, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content") or ""
+            if content == TOOL_DROPPED_TEXT:
+                continue
+            body, suffix = _split_allowance(content)
+            body, was_cut = _split_cut(body)
+            live.append((len(body), pos, msg, body, suffix, was_cut, content))
+        if not live:
             break
-        if not isinstance(msg, dict) or msg.get("role") != "tool":
-            continue
-        content = msg.get("content") or ""
-        if content == TOOL_DROPPED_TEXT or TOOL_CUT_TEXT in content:
-            continue                      # already given up on, once is enough
         over = estimate - ceiling
-        # the sentence allowance (instruction, at the end) is kept whole;
-        # only the data in front of it is cut
-        body, suffix = _split_allowance(content)
-        # chars to remove at the dense rate, un-calibrated back to raw
-        # chars, plus the marker and a line of slack so one pass fits
-        cut = int(over * TOOL_CHARS_PER_TOKEN / factor) \
-            + len(TOOL_CUT_TEXT) + int(MESSAGE_OVERHEAD_TOKENS * TOOL_CHARS_PER_TOKEN)
-        keep = len(body) - cut
-        if keep >= MIN_TOOL_KEEP_CHARS:
+        # a cut must SAVE something: past the floor, and (the first time)
+        # more than the marker it adds
+        cuttable = [x for x in live
+                    if x[0] - MIN_TOOL_KEEP_CHARS > (0 if x[5] else len(TOOL_CUT_TEXT))]
+        target = max(cuttable, key=lambda x: (x[0], -x[1])) if cuttable else None
+        if target is not None:
+            size, pos, msg, body, suffix, was_cut, content = target
+            # chars to remove at the dense rate, un-calibrated back to raw
+            # chars, plus the marker (unless already paid for) and a line
+            # of slack so one pass fits
+            cut = int(over * TOOL_CHARS_PER_TOKEN / factor) + slack \
+                + (0 if was_cut else len(TOOL_CUT_TEXT))
+            keep = len(body) - cut
+            if keep < MIN_TOOL_KEEP_CHARS and not floors_fit(live):
+                target = None          # a drop is unavoidable: take it first
+        if target is not None:
+            keep = max(MIN_TOOL_KEEP_CHARS, keep)
             head = body[:keep]
             nl = head.rfind("\n")
-            if nl > keep // 2:
+            if nl > keep // 2 and nl >= MIN_TOOL_KEEP_CHARS:
                 head = head[:nl]           # cut at a line, as cap_tool_text does
             msg["content"] = head.rstrip() + TOOL_CUT_TEXT + suffix
             kind = "cut"
             log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
-                        "cut the last %d of %d chars of the oldest result "
-                        "(%s) so his question stays in the window",
+                        "cut the last %d of %d chars of the largest result "
+                        "(%s%s) so his question stays in the window",
                         label, estimate, ceiling, len(body) - len(head),
-                        len(body), msg.get("tool_name") or "tool")
+                        len(body), msg.get("tool_name") or "tool",
+                        ", again" if was_cut else "")
         else:
+            size, pos, msg, body, suffix, was_cut, content = \
+                min(live, key=lambda x: x[1])
             msg["content"] = TOOL_DROPPED_TEXT
             dropped += 1
             kind = "dropped"
-            log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
-                        "dropped the oldest result (%s, %d chars) so his "
-                        "question stays in the window",
-                        label, estimate, ceiling,
-                        msg.get("tool_name") or "tool", len(content))
+            log.warning("%s: prompt ~%d tokens over the %d-token ceiling, "
+                        "and it would still be over with every result cut "
+                        "to its %d-char floor; dropped the oldest result "
+                        "(%s, %d chars) whole so his question stays in the "
+                        "window", label, estimate, ceiling,
+                        MIN_TOOL_KEEP_CHARS, msg.get("tool_name") or "tool",
+                        len(content))
         if changed is not None:
             changed.append((msg, kind, content))
         estimate = calibrated(estimate_prompt_tokens(messages, tools))
     if estimate > ceiling:
-        # Nothing left that is safe to drop: what remains is the system
+        # Nothing left that is safe to take: what remains is the system
         # prompt, the tool schemas and his turn, and his turn is the one
         # thing this whole guard exists to keep.
         log.warning("%s: prompt is still ~%d tokens against a %d-token "
-                    "ceiling with every tool result dropped; Ollama may "
-                    "truncate this round. Raise brain.num_ctx.",
-                    label, estimate, ceiling)
+                    "ceiling with every tool result dropped (%d) or at its "
+                    "%d-char floor; Ollama may truncate this round. Raise "
+                    "brain.num_ctx.", label, estimate, ceiling, dropped,
+                    MIN_TOOL_KEEP_CHARS)
     return dropped, estimate
 
 
@@ -1812,6 +1915,10 @@ def fit_material(messages, tools=None, ceiling=None, num_predict=None,
         return 0, estimate
     base = estimate_prompt_tokens([m for m in messages if m is not last],
                                   tools)
+    # the screen question rides its screenshot on THIS message: the fixed
+    # allowance per image, or the guard costs it at zero (measured, round
+    # 3 review: 116 tokens for a prompt the walk put at 1122)
+    base += _image_tokens(last)
     factor = calibration_factor()
 
     def dense(text):
@@ -1833,7 +1940,7 @@ def fit_material(messages, tools=None, ceiling=None, num_predict=None,
                 len(content), estimate)
     return len(content) - keep, estimate
 
-def _log_round_tokens(data, estimated=0, label="chat"):
+def _log_round_tokens(data, estimated=0, label="chat", images=0):
     """What the request ACTUALLY cost, from Ollama's own reply.
 
     prompt_eval_count is in every /api/chat body -- the same body this
@@ -1842,7 +1949,8 @@ def _log_round_tokens(data, estimated=0, label="chat"):
     says whether his question survived into the window was being thrown
     away on every single turn. Logged on every path now, with the path's
     label and the estimate beside it, so the estimate can be checked: on a
-    warm-up the number IS the static prefix's real cost."""
+    warm-up the number IS the static prefix's real cost. ``images`` is how
+    many the prompt carried (image_count): logged, never calibrated on."""
     if not isinstance(data, dict):
         return
     try:
@@ -1865,7 +1973,10 @@ def _log_round_tokens(data, estimated=0, label="chat"):
         raw = int(estimated / calibration_factor() + 0.5)
         line += " (estimated %d, raw %d x%.3f)" % (estimated, raw,
                                                     calibration_factor())
-        _calibrate(used, raw, label)
+        if images:
+            line += " (%d image%s at %d)" % (
+                images, "" if images == 1 else "s", IMAGE_TOKENS_ALLOWANCE)
+        _calibrate(used, raw, label, images=images)
     line += " [%s]" % label
     if pct >= 90.0:
         log.warning("%s -- close to the window; Ollama drops the OLDEST "

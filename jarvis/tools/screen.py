@@ -374,10 +374,17 @@ def _guard_payload(payload: dict) -> int:
         return 0
 
 
-def _log_reply_tokens(reply: dict, estimate: int) -> None:
+def _log_reply_tokens(reply: dict, estimate: int, payload=None) -> None:
+    """The ctx: line for the vision request. The image count rides along
+    so the round is logged but NOT folded into the brain's calibration:
+    the round-3 review measured one screen question (image costed at zero
+    then, and Ollama's count including whatever it charges for the image)
+    pinning the process-wide factor at its 2.0 clamp."""
     try:
         from jarvis import brain
-        brain._log_round_tokens(reply, estimate, label="screen")
+        images = brain.image_count((payload or {}).get("messages"))
+        brain._log_round_tokens(reply, estimate, label="screen",
+                                images=images)
     except Exception:                            # noqa: BLE001 - log only
         log.debug("screen: ctx log unavailable", exc_info=True)
 
@@ -489,8 +496,12 @@ def ask_screen(question: str, model: str, b64: str, title: str,
     # The same window guard and the same ctx: log line as every request
     # brain.py makes: fit_material() trims the tail of the user text (the
     # question -- the image is costed as a fixed allowance, never as its
-    # base64) before the post, _log_round_tokens() records what Ollama
-    # counted after it, tagged [screen]. Tolerant of a missing brain the
+    # base64, and never at zero: measured 2026-09-04, the walk put this
+    # prompt at 1122 tokens and the guard at 116 until fit_material was
+    # taught to look at the last message's images) before the post,
+    # _log_round_tokens() records what Ollama counted after it, tagged
+    # [screen] and left OUT of the calibration factor (an image round
+    # says nothing about the text rate). Tolerant of a missing brain the
     # way chat_model() is; a tiny prompt is the norm here, and the point
     # is that "every request" in the docs is true, not that this one is
     # at risk.
@@ -513,7 +524,7 @@ def ask_screen(question: str, model: str, b64: str, title: str,
         raise VisionUnavailable(type(exc).__name__) from exc
     if not isinstance(reply, dict):
         raise VisionUnavailable("reply is not an object")
-    _log_reply_tokens(reply, estimate)
+    _log_reply_tokens(reply, estimate, payload)
     if reply.get("error"):
         raise VisionUnavailable(str(reply["error"])[:80])
     message = reply.get("message")

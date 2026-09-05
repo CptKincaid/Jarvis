@@ -293,17 +293,18 @@ def test_prompt_ceiling_leaves_room_for_the_answer(brain):
                                answer_reserve_tokens=128).prompt_ceiling == 1024
 
 
-def test_guard_cuts_the_oldest_tool_result_not_his_question(brain):
+def test_guard_cuts_the_largest_tool_result_not_his_question(brain):
     """The measured failure, in miniature.
 
     LIVE 2026-09-04: a 9 000-char calendar result took prompt_eval_count
     from 8253 DOWN to 7754 -- exactly the 499 tokens of his question,
     background and memory. Ollama deletes whole messages oldest-first
     after the system prompt, so what it takes out is HIM. The guard cuts
-    the TAIL of the oldest tool result instead (round 3: it used to drop
+    the TAIL of the largest tool result instead (round 3: it used to drop
     the whole result, which for the only result of a turn meant the
-    model saw nothing of the calendar it was asked about), keeps the
-    newest whole, and says so in the log.
+    model saw nothing of the calendar it was asked about; the round-3
+    fix: largest, not oldest, and cut again rather than drop), keeps the
+    other whole, and says so in the log.
     """
     question = "what's on my calendar and what did that email say?"
     messages = [
@@ -318,7 +319,7 @@ def test_guard_cuts_the_oldest_tool_result_not_his_question(brain):
     dropped, estimate = brain.fit_prompt(messages, ceiling=ceiling)
 
     assert dropped == 0                                        # cut, not dropped
-    assert messages[2]["content"].startswith("old calendar")   # the OLDEST, its head
+    assert messages[2]["content"].startswith("old calendar")   # the LARGEST, its head
     assert messages[2]["content"].endswith(brain.TOOL_CUT_TEXT)
     assert len(messages[2]["content"]) < len("old calendar " * 400)
     assert messages[3]["content"] == "newer mail " * 400       # the newest, whole
@@ -327,10 +328,13 @@ def test_guard_cuts_the_oldest_tool_result_not_his_question(brain):
     assert estimate <= ceiling
 
 
-def test_guard_drops_a_result_too_small_to_absorb_the_overflow(brain):
-    """A cut that would leave fewer than MIN_TOOL_KEEP_CHARS is a drop
-    (the old TOOL_DROPPED_TEXT), and the guard moves on to the next
-    result, which it cuts."""
+def test_a_small_result_survives_when_a_large_one_can_absorb_the_overflow(brain):
+    """Round 3 as shipped went oldest-first: a 300-char weather result
+    that could not absorb a 300-token overflow was DROPPED whole, and only
+    then was the 5 600-char calendar behind it cut. The round-3 review's
+    point, in miniature: a result is never dropped while a large one has
+    trimmable tokens. Largest first: the calendar absorbs it all, the
+    weather is untouched."""
     messages = [
         {"role": "system", "content": "PERSONA " * 100},
         {"role": "user", "content": "his question"},
@@ -341,8 +345,8 @@ def test_guard_drops_a_result_too_small_to_absorb_the_overflow(brain):
     ]
     ceiling = brain.calibrated(brain.estimate_prompt_tokens(messages)) - 300
     dropped, estimate = brain.fit_prompt(messages, ceiling=ceiling)
-    assert dropped == 1
-    assert messages[2]["content"] == brain.TOOL_DROPPED_TEXT
+    assert dropped == 0
+    assert messages[2]["content"] == "tiny " * 60             # whole
     assert messages[3]["content"].startswith("long calendar")
     assert messages[3]["content"].endswith(brain.TOOL_CUT_TEXT)
     assert messages[1]["content"] == "his question"
@@ -881,11 +885,13 @@ def test_the_guard_compares_the_calibrated_estimate(brain, monkeypatch):
     assert msgs[2]["content"].endswith(brain.TOOL_CUT_TEXT)
 
 
-def test_calibration_learns_from_ollama_s_count_and_only_upward(brain, caplog):
+def test_calibration_learns_from_ollama_s_count_and_only_upward(brain, caplog,
+                                                                 monkeypatch):
     """Each ctx: line feeds the measured/estimated ratio into the factor
     the NEXT round's guard uses (EMA, half weight), logged with both
     numbers. It never goes below the measured baseline, and a count under
     half the estimate (not a whole-prompt count) is ignored."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
     f0 = brain.calibration_factor()
     assert f0 == brain.CALIBRATION_INITIAL == 1.06
     raw = 1000
@@ -1003,8 +1009,11 @@ def test_the_screen_tool_goes_through_the_guard_and_logs_its_count(
     """The fourth /api/chat path in the package (jarvis/tools/screen.py)
     now takes the same guard and writes the same ctx: line, tagged
     [screen]; the image is costed as a fixed allowance, never as its
-    base64, so a screenshot cannot trim the question."""
+    base64, so a screenshot cannot trim the question. (The round-3 review
+    measured the allowance at ZERO on this path; the tests further down
+    hold the number and the factor.)"""
     from jarvis.tools import screen as scr
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
     seen = []
 
     def vision(payload, timeout=None):
@@ -1021,6 +1030,7 @@ def test_the_screen_tool_goes_through_the_guard_and_logs_its_count(
     lines = [r.message for r in caplog.records
              if r.message.startswith("ctx:") and "[screen]" in r.message]
     assert len(lines) == 1 and "prompt 1900/" in lines[0]
+    assert "(1 image at %d)" % brain.IMAGE_TOKENS_ALLOWANCE in lines[0]
     assert seen[-1]["messages"][-1]["images"] == [b64]     # image intact
     assert brain.MATERIAL_CUT_TEXT not in seen[-1]["messages"][-1]["content"]
     est = brain.estimate_prompt_tokens(seen[-1]["messages"])
@@ -1043,3 +1053,316 @@ def test_the_docs_no_longer_say_an_agent_may_write_his_config():
     assert "[screen]" in sec
     assert "calibration" in sec.lower()
     assert "15441" in sec
+
+
+def test_the_docs_describe_the_round_3_review_fixes():
+    """Section 84 says what the guard does now: the LARGEST result, cut
+    AGAIN on a later round, a drop only when the floors would not fit;
+    and an image round is costed at the allowance but never calibrated
+    on. The words the two holes were reported against are gone."""
+    doc = (REPO / "docs" / "assistant-setup.md").read_text(encoding="utf-8")
+    sec = doc.split("## 84.", 1)[1].split("\n## ", 1)[0]
+    assert "tail of the largest tool" in sec
+    assert "cut again" in sec
+    assert "400 characters" in sec
+    assert "never feeds the calibration" in sec
+    assert "tail of the oldest tool" not in sec
+
+
+# ---------------------------------------------------------------------
+# 2026-09-04, the round-3 review's two measured holes
+# ---------------------------------------------------------------------
+# (1) The screen tool's image was costed at ZERO on the guard path it
+# uses: fit_material summed the other messages and the last message's
+# TEXT and never looked at its images (measured: the walk put the real
+# vision payload at 1122 tokens, the guard at 116). And because that
+# [screen] count fed the shared calibration EMA, ONE screenshot question
+# pinned the process-wide factor at the 2.0 clamp and halved the tool
+# loop's raw trim threshold (14566 -> 7720) for the next seven rounds.
+# (2) The once-only cut rule: a result already carrying TOOL_CUT_TEXT was
+# skipped, so on the round after a cut the guard dropped the NEWEST result
+# whole and stayed over, with hundreds of trimmable tokens left in the cut
+# one -- and logged "every tool result dropped", which was false.
+
+def _vision_messages(brain, question="what's on my screen?", images=1):
+    from jarvis.tools import screen as scr
+    payload = scr.vision_payload(brain.OLLAMA_MODEL, "A" * 200_000,
+                                 question, "hunter@spark")
+    msgs = [dict(m) for m in payload["messages"]]
+    msgs[-1]["images"] = ["A" * 200_000] * images
+    return msgs
+
+
+def test_fit_material_costs_the_image_the_screen_question_carries(brain,
+                                                                   monkeypatch):
+    """Measured pre-fix on the real vision payload: estimate_prompt_tokens
+    1122, fit_material 116 (raw 109). The guard now costs the last
+    message's images at IMAGE_TOKENS_ALLOWANCE each, the same figure the
+    walk uses, so the two estimators agree to within the text-rate
+    difference on the 58-char question."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    msgs = _vision_messages(brain)
+    walk = brain.estimate_prompt_tokens(msgs)
+    assert walk > brain.IMAGE_TOKENS_ALLOWANCE                # the walk always did
+    _, est = brain.fit_material([dict(m) for m in msgs], label="screen")
+    raw = int(est / brain.calibration_factor() + 0.5)
+    assert raw >= brain.IMAGE_TOKENS_ALLOWANCE + 100, raw    # not 109
+    assert abs(raw - walk) <= 20, (raw, walk)
+    # two images, two allowances
+    _, est2 = brain.fit_material(_vision_messages(brain, images=2),
+                                 label="screen")
+    raw2 = int(est2 / brain.calibration_factor() + 0.5)
+    assert raw2 - raw == brain.IMAGE_TOKENS_ALLOWANCE
+    # and the image's allowance counts toward the cut of a pasted page
+    monkeypatch.setattr(brain, "SETTINGS", brain.ModelSettings(num_ctx=4096))
+    ceiling = brain.SETTINGS.prompt_ceiling
+    with_image = _vision_messages(brain, question="word " * 3000)
+    without = _vision_messages(brain, question="word " * 3000)
+    without[-1].pop("images")
+    cut_with, est_with = brain.fit_material(with_image, label="screen")
+    cut_without, est_without = brain.fit_material(without, label="screen")
+    assert est_with <= ceiling and est_without <= ceiling
+    assert cut_with - cut_without >= int(
+        brain.IMAGE_TOKENS_ALLOWANCE * brain.TOOL_CHARS_PER_TOKEN) - 20
+
+
+def test_an_image_round_is_logged_but_never_calibrated_on(brain, caplog,
+                                                          monkeypatch):
+    """_log_round_tokens(images=n) writes the ctx: line with the image
+    count and leaves the factor alone, whatever Ollama counted; the same
+    count with images=0 moves it. The exclusion is per round, not a
+    switch."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    raw = 1134
+    with caplog.at_level("INFO"):
+        brain._log_round_tokens(text_reply("A terminal.", prompt_eval_count=4000),
+                                estimated=brain.calibrated(raw),
+                                label="screen", images=1)
+    assert brain.calibration_factor() == brain.CALIBRATION_INITIAL
+    ctx = [r.message for r in caplog.records if r.message.startswith("ctx:")]
+    assert len(ctx) == 1 and "(1 image at 1024) [screen]" in ctx[0]
+    cal = [r.message for r in caplog.records
+           if r.message.startswith("ctx-calibration:")]
+    assert len(cal) == 1 and cal[0].startswith("ctx-calibration: unchanged at 1.060")
+    assert "1 image" in cal[0] and "[screen]" in cal[0]
+    # the same count without an image is a real measurement
+    brain._log_round_tokens(text_reply("hi", prompt_eval_count=4000),
+                            estimated=brain.calibrated(raw))
+    assert brain.calibration_factor() == brain.CALIBRATION_MAX
+
+
+@pytest.mark.parametrize("count", [371, 1900, 4000])
+def test_one_screen_question_leaves_the_calibration_factor_where_it_was(
+        brain, monkeypatch, caplog, count):
+    """Measured pre-fix through ask_screen with a fake vision reply: a
+    prompt_eval_count of 371 (the 115 text tokens plus the 256 the model
+    card gives an image), 1900 or 4000 each took the factor from 1.060 to
+    the 2.000 clamp in ONE question, and the tool loop's raw trim
+    threshold at the shipped settings from 14566 to 7720. Now the factor
+    and the threshold do not move, and a chat round afterwards still
+    calibrates."""
+    from jarvis.tools import screen as scr
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    monkeypatch.setattr(brain, "SETTINGS", brain.ModelSettings())
+    ceiling = brain.SETTINGS.prompt_ceiling
+    assert ceiling == 15441
+    threshold_before = int(ceiling / brain.calibration_factor())
+    assert threshold_before == 14566
+
+    def vision(payload, timeout=None):
+        return {"model": payload["model"], "done": True,
+                "prompt_eval_count": count, "eval_count": 30,
+                "message": {"role": "assistant", "content": "A terminal."}}
+    monkeypatch.setattr(scr, "_ask_vision", vision)
+    with caplog.at_level("INFO"):
+        assert scr.ask_screen("what's on my screen?", brain.OLLAMA_MODEL,
+                              "A" * 200_000, "hunter@spark",
+                              caps=frozenset()) == "A terminal."
+    assert brain.calibration_factor() == brain.CALIBRATION_INITIAL
+    assert int(ceiling / brain.calibration_factor()) == threshold_before
+    ctx = [r.message for r in caplog.records
+           if r.message.startswith("ctx:") and "[screen]" in r.message]
+    assert len(ctx) == 1 and f"prompt {count}/" in ctx[0]
+    assert "(1 image at 1024)" in ctx[0]
+    raw = int(ctx[0].split("raw ")[1].split(" ")[0])
+    assert raw >= brain.IMAGE_TOKENS_ALLOWANCE + 100, raw   # the image, costed
+    assert not [r for r in caplog.records
+                if r.message.startswith("ctx-calibration:")
+                and "->" in r.message]                       # nothing moved
+    # the tool loop's guard is untouched by the screenshot
+    msgs = [{"role": "user", "content": "q"},
+            {"role": "tool", "content": "r" * 2250, "tool_name": "t"}]
+    assert brain.fit_prompt(msgs, ceiling=10_000)[1] == \
+        brain.calibrated(brain.estimate_prompt_tokens(msgs))
+    assert brain.calibrated(1000) == 1060
+    # a chat round afterwards is still a measurement
+    brain._log_round_tokens(text_reply("hi", prompt_eval_count=1200),
+                            estimated=brain.calibrated(1000))
+    assert brain.calibration_factor() == 1.13
+
+
+def test_the_round_after_a_cut_cuts_the_largest_again_and_keeps_the_newest(
+        brain, monkeypatch):
+    """The review's isolated replay (ceiling 1700). Measured pre-fix:
+    round 1 cut a 4 400-char calendar to 1261 chars (1671/1700); round 2
+    added a 550-char mail result and the guard DROPPED it whole, skipped
+    the cut calendar ("once is enough"), and was still over at 1743.
+    Now the calendar is cut again (one marker, not two) and the mail is
+    sent whole."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    line = "09:00 BMEN 427 lecture, room 1.14; 10:30 office hours\n"
+    msgs = [{"role": "system", "content": "P" * 4100},
+            {"role": "user", "content": "calendar and mail?"},
+            {"role": "tool", "content": line * 80, "tool_name": "get_calendar"}]
+    dropped, est = brain.fit_prompt(msgs, ceiling=1700)
+    assert dropped == 0 and est <= 1700
+    after_round_1 = msgs[2]["content"]
+    assert after_round_1.endswith(brain.TOOL_CUT_TEXT)
+    mail = "mail line\n" * 55                                  # 550 chars
+    msgs.append({"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "get_mail", "arguments": {}}}]})
+    msgs.append({"role": "tool", "content": mail, "tool_name": "get_mail"})
+    assert brain.calibrated(brain.estimate_prompt_tokens(msgs)) > 1700
+    edits = []
+    dropped, est = brain.fit_prompt(msgs, ceiling=1700, changed=edits)
+    assert dropped == 0
+    assert est <= 1700                                         # not 1743
+    assert msgs[4]["content"] == mail                          # the newest, whole
+    cal = msgs[2]["content"]
+    assert cal.startswith(line)                                # the morning
+    assert len(cal) < len(after_round_1)                       # cut again
+    assert cal.count(brain.TOOL_CUT_TEXT) == 1                 # marked once
+    assert cal.endswith(brain.TOOL_CUT_TEXT)
+    assert [(k, b) for _m, k, b in edits] == [("cut", after_round_1)]
+    assert msgs[1]["content"] == "calendar and mail?"
+
+
+def test_the_largest_result_is_cut_even_when_it_is_the_newest(brain, monkeypatch):
+    """Oldest-first dropped a 720-char weather result whole (it could not
+    absorb 200 tokens above the floor) before touching the 5 200-char
+    calendar behind it. Largest first cuts the calendar and keeps the
+    weather whole, whichever came first."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    msgs = [{"role": "system", "content": "PERSONA " * 100},
+            {"role": "user", "content": "q"},
+            {"role": "tool", "content": "old weather " * 60,
+             "tool_name": "get_weather"},
+            {"role": "tool", "content": "new calendar " * 400,
+             "tool_name": "get_calendar"}]
+    ceiling = brain.calibrated(brain.estimate_prompt_tokens(msgs)) - 200
+    dropped, est = brain.fit_prompt(msgs, ceiling=ceiling)
+    assert dropped == 0 and est <= ceiling
+    assert msgs[2]["content"] == "old weather " * 60
+    assert msgs[3]["content"].startswith("new calendar")
+    assert msgs[3]["content"].endswith(brain.TOOL_CUT_TEXT)
+
+
+def test_when_the_largest_cannot_absorb_it_all_every_result_keeps_its_head(
+        brain, monkeypatch, caplog):
+    """A 3 000-char calendar (oldest) and a 600-char mail, 1 200 tokens
+    over: the calendar cannot absorb that above the 400-char floor, but
+    both results AT the floor would fit -- so the calendar goes to its
+    floor and the mail takes the rest, and nothing is dropped. Pre-fix:
+    the calendar dropped whole, the mail untouched."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    cal = ("09:00 lecture\n" * 300)[:3000]
+    mail = "mail line\n" * 60
+    msgs = [{"role": "system", "content": "P" * 4100},
+            {"role": "user", "content": "calendar and mail?"},
+            {"role": "tool", "content": cal, "tool_name": "get_calendar"},
+            {"role": "tool", "content": mail, "tool_name": "get_mail"}]
+    ceiling = brain.calibrated(brain.estimate_prompt_tokens(msgs)) - 1200
+    with caplog.at_level("WARNING"):
+        dropped, est = brain.fit_prompt(msgs, ceiling=ceiling)
+    assert dropped == 0 and est <= ceiling
+    c, m = msgs[2]["content"], msgs[3]["content"]
+    assert c.startswith("09:00 lecture\n") and c.endswith(brain.TOOL_CUT_TEXT)
+    assert len(c) - len(brain.TOOL_CUT_TEXT) >= brain.MIN_TOOL_KEEP_CHARS
+    assert m.startswith("mail line\n") and m.endswith(brain.TOOL_CUT_TEXT)
+    assert len(m) - len(brain.TOOL_CUT_TEXT) >= brain.MIN_TOOL_KEEP_CHARS
+    assert brain.TOOL_DROPPED_TEXT not in (c, m)
+    assert not any("Ollama may truncate" in r.message for r in caplog.records)
+
+
+def test_a_drop_is_taken_first_when_even_the_floors_would_not_fit(
+        brain, monkeypatch, caplog):
+    """Same two results, 1 260 tokens over: even both at the floor would
+    not fit, so a drop is unavoidable -- and it is taken FIRST, oldest,
+    so the mail (the newest, the one the model just asked for) is sent
+    WHOLE rather than cut to its floor and then orphaned. The log says
+    why."""
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    cal = ("09:00 lecture\n" * 300)[:3000]
+    mail = "mail line\n" * 60
+    msgs = [{"role": "system", "content": "P" * 4100},
+            {"role": "user", "content": "calendar and mail?"},
+            {"role": "tool", "content": cal, "tool_name": "get_calendar"},
+            {"role": "tool", "content": mail, "tool_name": "get_mail"}]
+    ceiling = brain.calibrated(brain.estimate_prompt_tokens(msgs)) - 1260
+    with caplog.at_level("WARNING"):
+        dropped, est = brain.fit_prompt(msgs, ceiling=ceiling)
+    assert dropped == 1 and est <= ceiling
+    assert msgs[2]["content"] == brain.TOOL_DROPPED_TEXT
+    assert msgs[3]["content"] == mail                          # whole
+    why = [r.message for r in caplog.records if "dropped the oldest" in r.message]
+    assert len(why) == 1
+    assert "would still be over with every result cut to its 400-char floor" in why[0]
+    assert "get_calendar, 3000 chars" in why[0]
+
+
+@pytest.mark.parametrize("num_ctx", [4096, 3072])
+def test_a_real_turn_keeps_the_newest_result_on_the_round_after_a_cut(
+        brain, setup, monkeypatch, caplog, num_ctx):
+    """The review's replay through JarvisBrain._chat_sync: two tools, the
+    calendar round cuts, the mail round follows. Measured pre-fix at a
+    3072 window: the 600-char mail result was dropped whole (85-char
+    marker), the 937-char cut calendar skipped, the estimate still 2709
+    against a 2662 ceiling, and the log said "every tool result dropped".
+
+    At 4096 the calendar is cut again and BOTH results reach the model,
+    the mail whole. At 3072 two floors cannot fit (measured: 2672 with
+    both at 400 chars), so the calendar is dropped first and the mail is
+    still sent whole, with the estimate under the ceiling (2574) and no
+    "may truncate" warning -- the guard never gives up while something
+    can still be cut, and never says it did."""
+    b, fake = setup
+    monkeypatch.setitem(brain._CALIBRATION, "factor", brain.CALIBRATION_INITIAL)
+    line = "09:00 BMEN 427 lecture, room 1.14; 10:30 office hours\n"
+    mail = "mail line\n" * 60                                  # 600 chars
+    reg = ToolRegistry()
+    reg.register(ToolSpec("get_calendar", "Today's events.",
+                          {"type": "object", "properties": {}},
+                          lambda **_: ToolResult(text=line * 80)))
+    reg.register(ToolSpec("get_mail", "Unread mail.",
+                          {"type": "object", "properties": {}},
+                          lambda **_: ToolResult(text=mail)))
+    monkeypatch.setattr(brain, "_REGISTRY", reg)
+    _tiny_window(brain, monkeypatch, num_ctx=num_ctx)
+    ceiling = brain.SETTINGS.prompt_ceiling
+    fake.replies = [tool_reply("get_calendar", {}),
+                    tool_reply("get_mail", {}),
+                    text_reply("Lecture at nine; one mail, sir.",
+                               prompt_eval_count=2600)]
+    with caplog.at_level("WARNING"):
+        b._chat_sync("what's on my calendar and in my mail?")
+    sent = fake.chat_payloads()[-1]
+    tools = {m["tool_name"]: m["content"]
+             for m in sent["messages"] if m["role"] == "tool"}
+    assert tools["get_mail"] == mail                           # the newest, WHOLE
+    assert brain.calibrated(brain.estimate_prompt_tokens(
+        sent["messages"], sent.get("tools"))) <= ceiling
+    warnings = [r.message for r in caplog.records
+                if r.message.startswith("chat:")]
+    assert not any("Ollama may truncate" in w for w in warnings)
+    assert not any("every tool result dropped" in w for w in warnings)
+    cal = tools["get_calendar"]
+    if num_ctx == 4096:
+        assert cal.startswith(line) and cal.endswith(brain.TOOL_CUT_TEXT)
+        assert cal.count(brain.TOOL_CUT_TEXT) == 1
+        assert brain.TOOL_DROPPED_TEXT not in tools.values()
+        assert [w for w in warnings if "cut the last" in w
+                and "get_calendar, again" in w]                # cut TWICE
+    else:
+        assert cal == brain.TOOL_DROPPED_TEXT                  # unavoidable
+        assert [w for w in warnings if "dropped the oldest result (get_calendar"
+                in w and "every result cut to its 400-char floor" in w]

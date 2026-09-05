@@ -4332,19 +4332,28 @@ and the oldest message is **your question**. Measured: a 9000-character
 calendar result took his prompt from 8253 tokens down to 7754, and the
 499 tokens that vanished were your question, the background and his
 memory. He then answers something confident and unrelated, and nothing
-anywhere says why. With this on he cuts the *tail of the oldest tool
+anywhere says why. With this on he cuts the *tail of the largest tool
 result* instead — a long calendar loses its evening, not its morning —
 marks the cut in the result so the model knows it is reading part of it
 (the "you may take up to N sentences" note a list-shaped result carries at
 its end is lifted off and put back, so a cut calendar is still read out in
 full sentences), keeps your question, and writes a line in the log saying
-he did it. Only
-a result too small to absorb the overflow (fewer than 400 characters
-would be left) is dropped whole. Round 2 dropped whole every time, which
-for the one result a turn hinged on meant he answered "an earlier result
-was dropped, sir" instead of reading you the morning. What the model then
-sees of a cut result is also what his own checks judge the reply against,
-not the full text it never had.
+he did it. If the next round overflows again — the mail arrives after the
+calendar — the same result is **cut again**, its marker lifted and put
+back once, rather than the newest result being thrown away (round 3 as
+first shipped had a once-only rule, and on the round after a cut it
+dropped the newest result whole while hundreds of trimmable tokens sat
+in the cut one; the review measured it). A result is never cut below
+**400 characters**: when the largest cannot absorb the whole overflow
+above that floor, every result goes down toward its floor in turn so each
+tool keeps its head — unless even the floors would not fit, in which case
+a drop is unavoidable and he takes it *first*, oldest result first, so the
+newest (the one the model just asked for) is sent whole rather than cut
+to its floor and then thrown away anyway. Round 2 dropped whole every
+time, which for the one result a turn hinged on meant he answered "an
+earlier result was dropped, sir" instead of reading you the morning. What
+the model then sees of a cut result is also what his own checks judge the
+reply against, not the full text it never had.
 
 It guards **every** request he makes to the model, not only the tool
 loop: the spoken summaries, the router's tie-breaker, "explain this
@@ -4354,8 +4363,16 @@ log), which used to post on its own. Those have no tool result to cut, so
 there he cuts the *tail of the material* — the end of the document or
 digest, or the question — and marks the cut, because the instruction in
 front of it is what Ollama would have eaten first. A screenshot is costed
-as a fixed allowance, never as its base64, so an image cannot trim the
-question.
+as a fixed allowance of 1,024 tokens, never as its base64, so an image
+cannot trim the question — and that allowance is charged on the path the
+screen tool actually takes (round 3 as first shipped charged it there at
+zero; measured: the walk put a screen question at 1,122 tokens, the guard
+at 116). A round that carries an image **never feeds the calibration**
+below: whether Ollama's count includes the image, and at what price, is
+not measured here, so its ratio says nothing about the text rate the
+factor tracks. Before that rule, one screenshot question pinned the factor
+at its 2.0 cap and halved the tool loop's trim threshold for the next
+seven rounds.
 
 ### How he knows a prompt is too big
 
@@ -4372,6 +4389,8 @@ path:
 ```
 ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310, raw 4066 x1.060) [chat]
 ctx-calibration: 1.060 -> 1.079 (Ollama counted 4265 against an estimate of 4066 [chat])
+ctx: prompt 1900/16384 tokens (12%), answer 30/160 (estimated 1202, raw 1134 x1.060) (1 image at 1024) [screen]
+ctx-calibration: unchanged at 1.060 -- 1 image in the prompt, costed at the 1024-token allowance (...)
 ```
 
 The tag at the end names the path — `chat` (the tool loop), `persona`
@@ -4383,9 +4402,9 @@ factor it was multiplied by. The second line is the **calibration**: the
 measured-over-raw ratio of that round moves the factor half-way toward
 itself, and the *next* round's guard uses the new factor. It can only make
 him more careful than the measured 1.06 baseline, never less (a count
-below half the estimate is ignored as not a whole-prompt count), and it
-is capped at 2.0. Above 90% of the window the `ctx:` line becomes a
-warning. The `warm` line is special: the warm-up sends the static prefix
+below half the estimate is ignored as not a whole-prompt count, and so is
+any round that carried an image), and it is capped at 2.0. Above 90% of
+the window the `ctx:` line becomes a warning. The `warm` line is special: the warm-up sends the static prefix
 and nothing else, so its prompt number **is** the true cost of the
 persona plus the tool schemas.
 
