@@ -821,3 +821,109 @@ def test_the_retry_on_an_order_keeps_its_tools(setup):
     assert b._chat_sync("Add milk to my list") == [("SPEAK", "Noted, sir.")]
     assert record == [("notes", "add", "milk")]
     assert fake.chat_payloads()[1].get("tools")
+
+
+# BLOCKER 2 (M05 / M05b). "Check the weather, set a reminder for five and
+# remember that I graduate December 10th": get_weather and set_reminder
+# ran, the render reported both AND claimed the store, twice. brain.py
+# stripped the first reply with strip_unbacked_claims(source, cap,
+# kinds=...) and no ``ran``, so "I've set your reminder for five" --
+# BACKED by the set_reminder that ran, judged so when the claim was
+# found -- was unbacked at strip time and became "I couldn't do that
+# part, sir." beside the memory line; with set_reminder's own speak=
+# line appended after, he heard the reminder denied and confirmed in one
+# reply (measured: "Seventy-two and cloudy, sir. I couldn't do that part,
+# sir. I can't store that from here, sir -- say 'remember that ...' and
+# I will. Reminder set for five o'clock, sir.", three model rounds).
+# ONE coherent reply: what ran is confirmed, the memory clause gets the
+# authored line exactly once.
+ORDER_THREE = ("Check the weather, set a reminder for five and remember that "
+               "I graduate December 10th")
+RENDER_THREE = ("Seventy-two and cloudy, sir. I've set your reminder for five, "
+                "sir. I'll remember that.")
+REMINDER_KEPT = "Seventy-two and cloudy, sir. I've set your reminder for five, sir."
+REMINDER_LINE = "Reminder set for five o'clock, sir."
+
+
+def _add_reminder(record, speak=None):
+    from jarvis.tools.registry import ToolResult, ToolSpec
+
+    def set_reminder(when="", **_):
+        record.append(("set_reminder", when))
+        return ToolResult(text=f"reminder set for {when}", speak=speak)
+    brain_mod._REGISTRY.register_many([
+        ToolSpec("set_reminder", "Set a reminder.",
+                 {"type": "object", "properties": {"when": {"type": "string"}}},
+                 set_reminder)])
+
+
+THREE_RAN = [("get_weather", "now", None), ("set_reminder", "five")]
+
+
+def _once(spoken):
+    """The memory line exactly once, the action denial never."""
+    assert spoken.count(MEMORY_LINE) == 1, spoken
+    assert brain_mod.UNBACKED_LINE not in spoken, spoken
+
+
+def test_a_reminder_that_ran_is_not_denied_beside_a_memory_claim(setup, caplog):
+    b, fake, record = setup
+    _add_reminder(record)
+    fake.replies = [tool_reply(("get_weather", {"when": "now"}),
+                               ("set_reminder", {"when": "five"})),
+                    text_reply(RENDER_THREE), text_reply(RENDER_THREE)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(ORDER_THREE)
+    assert tags == [("SPEAK", f"{REMINDER_KEPT} {MEMORY_LINE}")]
+    _once(dict(tags)["SPEAK"])
+    assert record == THREE_RAN
+    assert len(fake.chat_payloads()) == 3                 # tools, render, retry
+    assert _warnings(caplog) == [
+        "brain: unbacked memory claim \"I'll remember that\" (get_weather, "
+        "set_reminder ran; nothing that ran stores a fact)",
+        "brain: unbacked action claim stands after the retry (no tool ran); "
+        "replacing it"]
+
+
+def test_a_reminder_with_its_own_line_is_not_denied_beside_a_memory_claim(setup):
+    """The same turn with set_reminder's speak= line: the line is spoken
+    after the render as before; what must not be there is a denial."""
+    b, fake, record = setup
+    _add_reminder(record, speak=REMINDER_LINE)
+    fake.replies = [tool_reply(("get_weather", {"when": "now"}),
+                               ("set_reminder", {"when": "five"})),
+                    text_reply(RENDER_THREE), text_reply(RENDER_THREE)]
+    spoken = dict(b._chat_sync(ORDER_THREE))["SPEAK"]
+    _once(spoken)
+    assert spoken.startswith(f"{REMINDER_KEPT} {MEMORY_LINE}"), spoken
+    assert spoken.endswith(REMINDER_LINE), spoken
+    assert record == THREE_RAN
+    assert len(fake.chat_payloads()) == 3
+
+
+def _tool_chunks(*calls):
+    return [{"message": {"role": "assistant", "content": "",
+                         "tool_calls": [{"function": {"name": n, "arguments": a}}
+                                        for n, a in calls]},
+             "done": True, "load_duration": 0}]
+
+
+def test_streamed_a_backed_action_claim_is_not_unsaid_by_the_line(streamed):
+    """On the stream the reminder sentence went out as it landed (backed
+    by set_reminder, guard() let it through); the memory claim was
+    withheld. The round-end line must be the memory line ALONE -- an
+    "I couldn't do that part" after a confirmation already spoken would
+    unsay it."""
+    b, fake, record, streams = streamed
+    _add_reminder(record)
+    streams.append(_tool_chunks(("get_weather", {"when": "now"}),
+                                ("set_reminder", {"when": "five"})))
+    streams.append(_chunks(RENDER_THREE))
+    fake.replies = [text_reply(RENDER_THREE)]          # the plain retry
+    spoken = []
+    tags = b._chat_sync(ORDER_THREE, on_sentence=spoken.append)
+    assert spoken == ["Seventy-two and cloudy, sir.",
+                      "I've set your reminder for five, sir.", MEMORY_LINE]
+    assert tags == [("STREAMED", "3"), ("SPEAK", f"{REMINDER_KEPT} {MEMORY_LINE}")]
+    _once(dict(tags)["SPEAK"])
+    assert record == THREE_RAN

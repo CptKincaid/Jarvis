@@ -3278,7 +3278,17 @@ class JarvisBrain:
                                             "tool ran); replacing it")
                             source = (final if len(ran_results) > unbacked_ran_at
                                       else unbacked_first)
+                            # Judged against the same tools the claim was
+                            # judged against: without ``ran`` here, "I've
+                            # set your reminder for five" -- BACKED by the
+                            # set_reminder that ran -- was unbacked at
+                            # strip time and became "I couldn't do that
+                            # part, sir." beside the memory line, a
+                            # denial of a thing that was done, with the
+                            # reminder's own line confirming it after
+                            # (2026-09-04 verifier, M05/M05b).
                             final = strip_unbacked_claims(source, cap,
+                                                          ran=ran_names(),
                                                           kinds=claim_kinds)
                             if on_sentence is not None and \
                                     not self._stale(gen):
