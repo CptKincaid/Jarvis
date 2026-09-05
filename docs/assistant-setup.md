@@ -4865,6 +4865,14 @@ Only the **microphone** is gated. The keyboard, the command socket, the
 phone and the intercom are exempt by construction and appear nowhere in the
 ledger.
 
+**One honest limit, and it decides how you use this.** `/tmp` is wiped at
+boot on this machine, so `gate.jsonl` starts empty after every reboot —
+exactly as `turns.jsonl` does. Asking for `--days 7` a day after a restart
+gives you one day of evidence, not seven; the header prints the window you
+asked for and the trend shows you which days are actually populated. If you
+want a week that survives a reboot, copy the file somewhere else before you
+restart.
+
 ### 5. Read the scorecard
 
 ```bash
