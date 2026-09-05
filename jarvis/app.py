@@ -3559,14 +3559,22 @@ class JarvisApp:
         the sentence rather than left to work it out from being refused.
         """
         try:
-            from jarvis.facegallery import EMBED_DIM
+            # The LIVE model's width, not facegallery.EMBED_DIM -- that name
+            # is a fixed alias for SFace's 128 and says nothing about what
+            # this box runs. Comparing against it told Hunter on 2026-09-05
+            # to re-enrol a CORRECT 512-D ArcFace enrolment, and re-enrolling
+            # would have produced another 512-D one. Pinned by
+            # tests/test_face_leg_line.py.
+            from jarvis import facemodels
+            live_dim = facemodels.backend_for(
+                str(self.get_option("camera.face_backend", "") or "")).embed_dim
             enrolled = [p for p in self.gate.registry.people if p.face]
             stale = [p for p in enrolled if p.face_dim and
-                     p.face_dim != EMBED_DIM]
+                     p.face_dim != live_dim]
             if stale:
                 return ("the gallery is %d-D and %s was enrolled at %d-D; "
                         "re-enrol to bring the face leg back"
-                        % (EMBED_DIM, stale[0].label, stale[0].face_dim))
+                        % (live_dim, stale[0].label, stale[0].face_dim))
             if not enrolled:
                 return "no face is enrolled in the registry"
             if not self.get_option("camera.identity", False):
