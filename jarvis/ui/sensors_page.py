@@ -663,7 +663,15 @@ def empty_state_line(get_option: Optional[Callable]) -> str:
         except Exception:                 # noqa: BLE001 - config boundary
             log.debug("sensors page: the master switch is unreadable",
                       exc_info=True)
-    where = " — edit ~/.config/jarvis/assistant.json and restart Jarvis"
+    # WHERE THE FIX IS depends on the look, because the button only exists
+    # in one of them. Until 2026-09-05 the only answer was a hand edit and a
+    # restart; holo now has SETUP, which does both keys and the profile, so
+    # pointing him at the file would be pointing him at the harder half of
+    # a job the page can do. Classic is frozen (``restyled``) and keeps the
+    # old sentence word for word.
+    where = (" — press SETUP to add one"
+             if restyled() else
+             " — edit ~/.config/jarvis/assistant.json and restart Jarvis")
     if not enabled:
         return ("no room sensors: presence.room_sensor_enabled is off, so "
                 "nothing is polled whatever the address says" + where)
@@ -2250,9 +2258,20 @@ class SensorsPage(tk.Frame):
     """
 
     def __init__(self, host, services=None, camera_status=None,
-                 cover=(), on_close: Optional[Callable] = None):
+                 cover=(), on_close: Optional[Callable] = None,
+                 profile_dir: Optional[Any] = None):
         super().__init__(host, bg=theme.TV_BG)
         self.host = host
+        # WHERE THE DEVICE PROFILES LIVE, as a seam. None means "ask
+        # jarvis/sensorprofile.py", which derives it from
+        # PATHS.ASSISTANT_CONFIG; a test hands it a tmp_path so no suite can
+        # read the real ones, which hold his Wi-Fi PSK.
+        self.profile_dir = profile_dir
+        # The setup sheet is built on the FIRST press of SETUP, not here: it
+        # is a second screenful of widgets and most openings of this page are
+        # to watch the numbers, not to add a sensor.
+        self.setup = None
+        self.setup_btn = None
         self.cover = tuple(w for w in (cover or ()) if w is not None)
         self.services = services
         self._camera_status = camera_status
@@ -2375,6 +2394,18 @@ class SensorsPage(tk.Frame):
         # the first place.
         act = tk.Frame(foot, bg=bg)
         act.pack(fill="x")
+        # SETUP, then SAVE. It is NOT in each room block's header: that row
+        # already packs name(w=12) + presence + distance(w=8) + rtt(w=8) at
+        # fixed widths and the measured body budget is 690 px into a 719-px
+        # viewport at 920x1440 -- 29 px spare. A fifth control there is the
+        # exact class of change that overflowed his real window this morning.
+        # The foot row is SAVE-left / age-right and has slack.
+        # HOLO ONLY (``restyled``): this is inside _build, which _build_v3
+        # never reaches, so classic gains nothing and loses nothing.
+        self.setup_btn = RoundButton(act, text="SETUP", kind="ghost",
+                                     size=theme.SIZE_CAPTION, bg=bg,
+                                     pad_y=5, command=self.open_setup)
+        self.setup_btn.pack(side="left", padx=(0, px(6)))
         self._save_btn = RoundButton(act, text="SAVE", kind="default",
                                      size=theme.SIZE_CAPTION, bg=bg,
                                      pad_y=5, command=self.save)
@@ -2776,6 +2807,86 @@ class SensorsPage(tk.Frame):
         e.insert(0, "%.2f" % value)
         return e
 
+    # -------------------------------------------------------- sensor setup
+    def open_setup(self) -> None:
+        """Open the setup sheet over this page, building it on first press.
+
+        The sheet is a child of the HOST, not of this page: ``reload()``
+        destroys and rebuilds this page's children, and a sheet parented
+        here would go with them mid-save.
+        """
+        from jarvis.ui.sensor_setup import SetupSheet
+        if self.setup is None:
+            try:
+                self.setup = SetupSheet(self.host, services=self.services,
+                                        directory=self.profile_dir,
+                                        on_saved=self._setup_saved)
+            except Exception:             # noqa: BLE001 - a page must survive
+                log.exception("sensors page: the setup sheet would not build")
+                self._note.configure(text="the setup sheet could not be "
+                                          "opened", fg=theme.ERR)
+                return
+        self.setup.show()
+
+    def _setup_saved(self, room: str) -> None:
+        """A room was added or changed: re-read the config and rebuild.
+
+        THE SPLIT THIS KEEPS HONEST. What happens here is that THIS PAGE
+        starts polling the new sensor at once, so he can walk in front of it
+        and watch the numbers move. What does NOT happen is Jarvis's own
+        presence lane picking it up -- ``AssistantConfig.reload_if_changed``
+        still has no callers, so that waits for a restart. The sheet's own
+        result line says both halves; this is only the half the page owns.
+        """
+        self.reload()
+        try:
+            if self.setup is not None:
+                self.setup.lift()
+            self._note.configure(text="%s is on this page now — Jarvis reads "
+                                      "it at the next restart" % room,
+                                 fg=tone_color(TONE_FAINT))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("sensors page: could not repaint after a setup save",
+                      exc_info=True)
+
+    def reload(self) -> None:
+        """Re-read the config and rebuild the blocks and band rows in place.
+
+        Everything ``__init__`` does after the widgets, done again. A room
+        that has just been added has no block, no ladder row and no entry in
+        the poller's spec list, and none of those can be patched in: the
+        blocks are built from ``specs`` and the band rows from the ladders.
+        """
+        was_open = self._open
+        if was_open:
+            self.poller.stop()
+            self._untick()
+            self._drop_wheel()
+        for child in list(self.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:             # noqa: BLE001 - already gone
+                log.debug("sensors page: a child would not go", exc_info=True)
+        self._blocks, self._bands, self._rooms_bands = {}, [], []
+        self._canvas = self._body = self._thumb = self._foot = None
+        self._save_btn = self.setup_btn = None
+        self._last = ()
+        self.specs = self._room_specs()
+        self.ladders = read_ladders(self._get_option)
+        self.config_notes = tuple(self.ladders.notes)
+        self.overrules, overrule_note = read_overrules_noted(self._get_option)
+        if overrule_note:
+            self.config_notes = tuple(self.config_notes) + (overrule_note,)
+        self.camera_room = camera_room_name(self._get_option, self.specs)
+        self.poller = SensorPoller(self.specs,
+                                   policy=getattr(self.services, "sensing",
+                                                  None))
+        self._build()
+        if was_open:
+            self.waiting()
+            self.poller.start(self.apply, post=self._post)
+            self._tick()
+
     # --------------------------------------------------------- open / shut
     def toggle(self) -> None:
         self.hide() if self._open else self.show()
@@ -2827,6 +2938,11 @@ class SensorsPage(tk.Frame):
         if not self._open:
             return
         self._open = False
+        # The sheet is placed over this page but parented to the host, so it
+        # would otherwise be left floating over the transcript when the tab
+        # is flipped or standby shuts the page.
+        if self.setup is not None:
+            self.setup.hide()
         self.poller.stop()
         self._untick()
         # bind_all is GLOBAL: a wheel binding left behind would scroll a
