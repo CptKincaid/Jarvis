@@ -1160,6 +1160,45 @@ DEFAULTS: dict = {
                       "downloads": "~/Downloads"},
         "max_mb": 100,
     },
+    # jarvis/foldersync.py -- the two DESKTOP folders that are the same
+    # folders on HPCOMPUTER.  Drop a file in ~/Desktop/Jarvis/Outbox and it
+    # appears in his Windows Jarvis\Inbox; anything he puts in the Windows
+    # Jarvis\Outbox appears in ~/Desktop/Jarvis/Inbox.  It rides the SAME
+    # transport as the section above (host, user, key, inbox, pull_dirs and
+    # the reachability rules all come from `remote`), so there is nothing to
+    # configure twice -- these keys are only about the local folders and the
+    # cadence.
+    #
+    # SHIPS OFF, like every lane that moves a file off the machine: it runs
+    # as a systemd --user service, so switching it on is `systemctl --user
+    # enable --now jarvis-foldersync.service`, and this flag is the second
+    # hand on the same switch.
+    #
+    # `max_mb` of 0 inherits remote.max_mb (100).  It is separate because
+    # 100 MB is the right bound on "send that file" inside a spoken turn and
+    # not necessarily on a folder he drags a video into -- and because
+    # raising it here also raises the per-copy timeout, which a bare
+    # remote.max_mb change would not (jarvis/foldersync.py:transfer_budget).
+    #
+    # The quiescence numbers are the answer to the worst bug this can have,
+    # sending a file that is still being copied in: a file is eligible only
+    # once its mtime is `min_quiet_s` old AND (size, mtime) has survived
+    # `stable_samples` looks `stable_interval_s` apart.
+    "foldersync": {
+        "enabled": False,
+        "outbox": "~/Desktop/Jarvis/Outbox",     # -> the Windows Jarvis\Inbox
+        "inbox": "~/Desktop/Jarvis/Inbox",       # <- the Windows Jarvis\Outbox
+        "sent": "~/Desktop/Jarvis/Sent",         # where a sent original goes
+        "status": "~/Desktop/Jarvis/status.txt",
+        "pull_from": "outbox",                   # a remote.pull_dirs key
+        "scan_interval_s": 2,                    # local stat; costs nothing
+        "remote_interval_s": 30,                 # one sftp listing; a handshake
+        "max_backoff_s": 300,
+        "stable_samples": 3,
+        "stable_interval_s": 1,
+        "min_quiet_s": 4,
+        "max_mb": 0,                             # 0 -> remote.max_mb
+    },
     # jarvis/gate.py -- whether Jarvis answers whoever speaks, or only the
     # people he recognises.  THIS IS RECOGNITION, NOT A LOCK: a photograph
     # defeats the face check and a recording defeats the voice check, and

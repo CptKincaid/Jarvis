@@ -1,0 +1,46 @@
+[Unit]
+Description=Jarvis desktop folder sync (~/Desktop/Jarvis <-> HPCOMPUTER)
+Documentation=file:%h/Jarvis/jarvis/foldersync.py
+# WHY A SERVICE AND NOT A TIMER, since a timer is the obvious answer and
+# restarts a process it cannot wedge.  Two cadences, one job: the LOCAL half
+# wants ~2 s so that dropping a file in a folder feels like a folder, and the
+# REMOTE half wants ~30 s so a sleeping Windows box is not handed 120 ssh
+# handshakes an hour.  One timer cannot be both and two timers is more moving
+# parts than one loop.  The wedge risk is answered where it actually lives:
+# every transfer is a bounded Popen + communicate(timeout) + kill inside
+# jarvis/tools/remote.py, Restart=always covers a crash, and the process holds
+# nothing in memory that ~/.local/state/jarvis/foldersync.json does not.
+#
+# WHY NOT A THREAD INSIDE JARVIS: Jarvis is a Tk app that needs the desktop
+# session.  A folder that only syncs while the assistant happens to be up is a
+# folder he cannot trust -- so this is deliberately independent of it, needs no
+# DISPLAY, and with lingering already on for this account it runs from boot,
+# before he logs in.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Jarvis
+ExecStart=%h/vss_env/bin/python -m jarvis.foldersync
+Restart=always
+RestartSec=15
+# A PREFLIGHT REFUSAL IS TERMINAL.  main() returns 2 when the folders are
+# configured into a shape that would loop (outbox == inbox, Sent nested inside
+# the Outbox) or when the Outbox sits outside remote.local_roots.  A restart
+# cannot fix any of those, and without this line five restarts in ten minutes
+# would replace a legible message with "start request repeated too quickly".
+RestartPreventExitStatus=2
+# Copying a 500 MB file must never make his desktop stutter.
+Nice=10
+IOSchedulingClass=idle
+# A backstop, not a plan: this process is a poll loop over two directory
+# listings and holds no file content in memory at any point.
+MemoryMax=512M
+# It touches exactly three things: his two Desktop folders, ~/.local/state
+# and ~/.ssh (read-only, and only ssh itself ever opens the key).
+PrivateTmp=false
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
