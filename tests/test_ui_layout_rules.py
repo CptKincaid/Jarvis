@@ -502,14 +502,25 @@ def _build_page(root, look: str, height: int = STAGE_H_WITH_PANE,
     return page
 
 
-@pytest.mark.parametrize("look", ["holo", "classic"])
-def test_nothing_on_the_sensors_page_is_clipped_at_his_window(root, look):
+def test_nothing_on_the_sensors_page_is_clipped_at_his_window(root):
     """The 09-05 shot: 'camera overrules radar' cut off under the camera
     pane, SAVE and its caption gone entirely. At his window with the pane
     packed and BOTH rooms in their worst state the page must FIT -- and
     the foot (SAVE, the overrule toggle, the caption, the age) is pinned
-    outside the scroll, so it is on screen whatever the body does."""
-    page = _build_page(root, look)
+    outside the scroll, so it is on screen whatever the body does.
+
+    HOLO ONLY, and that is a DECISION, not an oversight (round 2). This
+    used to be parametrized over both looks and the classic half only ever
+    passed because the relayout had been applied to both -- which moved
+    the look he never asked to change by 175,076 px at 920x1440 and
+    202,322 px at his own window, MEASURED on the photo rig. Classic is
+    frozen at jarvis-v3 4b7d373 (sensors_page.restyled), so it still
+    carries the clipping this fixes; the look he runs is holo
+    (theme.DEFAULT_LOOK) and that is where the fix lives. The frozen
+    shape, including the clipping, is pinned in
+    tests/test_ui_classic_frozen.py.
+    """
+    page = _build_page(root, "holo")
     assert page.overflow_px() == 0, page.overflow_px()
     view_bottom = page._canvas.winfo_rooty() + page._canvas.winfo_height()
     for band in page._bands:
@@ -712,6 +723,45 @@ def test_the_foot_follows_the_content_at_the_size_he_runs(root):
         w = getattr(page, name)
         assert w.winfo_ismapped(), name
         assert w.winfo_rooty() + w.winfo_height() <= page_bottom, name
+
+
+def test_the_pages_only_slack_is_at_the_bottom_where_a_page_ends(root):
+    """THE 428 px BLANK, DECIDED (2026-09-05, round 2) rather than left open.
+
+    MEASURED off the rig at his own window (1040x1760, holo, frame
+    26-sensors, blank rows counted from the ink): the page carries one run
+    of 428 blank rows, y976..1403 -- 24% of the window -- and it is BELOW
+    the last line. The v3 tip carried a 198 px run at y622..819, which is
+    in the MIDDLE, between the last band row and a foot pinned to the
+    frame's bottom edge.
+
+    This is NOT closed, and here is why. Both shapes have the same slack;
+    the only question is where it falls. Slack under a finished page is
+    what every document looks like; slack in the middle is a broken
+    layout, and it is the one he photographed. Closing it for real would
+    mean either growing the rows to fill a window the content does not
+    need (padding for its own sake, and rows that jump every time a fault
+    line appears) or shrinking the page to its content -- which would
+    uncover the transcript this page exists to cover (SensorsPage.cover).
+
+    So what is pinned here is the shape, not the number: ONE run of slack,
+    and it is the last thing on the page. If a gap ever opens between two
+    packed children again, this fails.
+    """
+    page = _build_page(root, "holo", height=STAGE_H_HIS_WINDOW)
+    top = page.winfo_rooty()
+    kids = [w for w in page.winfo_children() if w.winfo_ismapped()]
+    kids.sort(key=lambda w: w.winfo_rooty())
+    edge = top
+    for w in kids:                        # no void BETWEEN anything
+        gap = w.winfo_rooty() - edge
+        assert gap <= wg.px(24), (w, gap)
+        edge = max(edge, w.winfo_rooty() + w.winfo_height())
+    trailing = (top + page.winfo_height()) - edge
+    # it is real, and it is all at the foot
+    assert trailing >= wg.px(100), trailing
+    assert page._save_btn.winfo_rooty() + page._save_btn.winfo_height() \
+        <= edge
 
 
 def test_the_foot_is_still_pinned_below_the_fold_when_the_page_scrolls(root):

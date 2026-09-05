@@ -652,7 +652,18 @@ class RoundButton(tk.Canvas):
         # every button drew its right and bottom edge outside its own
         # canvas and had them clipped (measured 09-05: the ink ended 1 px
         # PAST the widget while a toggle's ended 5 px inside it).
-        w, h = canvas_size(self, self._btn_w, self._btn_h)
+        #
+        # HOLO ONLY, and theme.LOOK is read HERE, at paint time. The fix
+        # moves every button and toggle in the tree by up to 2 px, and
+        # classic is frozen at jarvis-v3 4b7d373: MEASURED on the rig, the
+        # un-gated change cost classic 13,055 px in the settings-drawer
+        # crop and all 1,117 px of the chat header's drift. He asked for
+        # the sensors tab and the settings area, not for the other look.
+        if theme.LOOK == "holo":
+            w, h = canvas_size(self, self._btn_w, self._btn_h)
+        else:
+            w = max(self.winfo_width(), self._btn_w)
+            h = max(self.winfo_height(), self._btn_h)
         outline = self._spec.get("outline", "")
         if self._state == "disabled":
             fill, fg = ("" if outline else theme.RAISED), theme.FAINT
@@ -749,8 +760,14 @@ class Toggle(tk.Canvas):
         knob = theme.CYAN if on_f > 0.5 else theme.MUTED
         # The same inset the button's ring uses, so a toggle and a button
         # in one control column share an ink edge (they were 6 px apart).
-        inset = max(1, px(1))
-        round_rect(self, inset, px(3), self.W - inset - 1, self.H - px(4),
+        # HOLO ONLY (see RoundButton._draw): classic is frozen at v3, which
+        # ended the track at W - px(2).
+        if theme.LOOK == "holo":
+            inset = max(1, px(1))
+            x1 = self.W - inset - 1
+        else:
+            inset, x1 = px(1), self.W - px(2)
+        round_rect(self, inset, px(3), x1, self.H - px(4),
                    radius=(self.H - px(7)) / 2, fill=track, outline="")
         r = (self.H - px(10)) / 2
         cx = px(4) + r + on_f * (self.W - 2 * (px(4) + r))
