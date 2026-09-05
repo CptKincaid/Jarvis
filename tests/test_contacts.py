@@ -1591,7 +1591,6 @@ def test_mask_addresses_masks_the_spoken_shape(said, want):
     "meet me at 4 dot 30",
     "the meeting is at 4 dot 30 pm",
     "aim at the red dot",
-    "look at the dot com bubble",
     "I'm at home. See you at six.",
     "we stopped at noon. Then we left",
     "polka dot at the dance",
@@ -1603,7 +1602,6 @@ def test_mask_addresses_masks_the_spoken_shape(said, want):
     "dot at",
     "email the biosensors handout to Heather Smith",
     "dana at example",
-    "look at the dash board dot com",
     "stand at the hyphen. Then read on",
     "what time is it",
     "",
@@ -1629,10 +1627,49 @@ def test_mask_addresses_leaves_ordinary_prose_alone(prose):
     # too: a lost letter in a log line is cheaper than a leaked address
     ("the site is at example dot com", "the site i… at example dot com"),
     ("look at handout dot pdf", "l… at handout dot pdf"),
+    # (w5d) A domain opening on an English function word used to be prose
+    # OUTRIGHT, and that let a real address through: my.com and it.com are
+    # providers, the parser DRAFTS "dana at my dot com", and a yes mails
+    # there. The function-word skip now applies only when the top level is
+    # NOT one in use -- so these two sentences lose one letter, which is
+    # the side of the trade a log line should be on.
+    ("look at the dot com bubble", "l… at the dot com bubble"),
+    ("look at the dash board dot com", "l… at the dash board dot com"),
 ])
 def test_mask_addresses_deliberate_calls(said, want):
     """Where the rule is a trade-off, this is the side it takes."""
     assert outbox.mask_addresses(said) == want
+
+
+@pytest.mark.parametrize("said, want", [
+    # The wave-B hole (w5d): every one of these is DRAFTED by the parser
+    # -- a yes puts the file in that mailbox -- and every one of them was
+    # written to four jarvis.commander INFO lines raw.
+    ("dana at my dot com", "d… at my dot com"),
+    ("dana at it dot com", "d… at it dot com"),
+    ("heather at my dash host dot com", "h… at my dash host dot com"),
+    ("dana at my.com", "d… at my.com"),
+    ("email the handout to dana at my dot com",
+     "email the handout to d… at my dot com"),
+    ("yes, to dana at it dot com", "yes, to d… at it dot com"),
+])
+def test_mask_addresses_masks_a_function_word_domain_that_is_a_real_provider(said, want):
+    assert outbox.mask_addresses(said) == want
+
+
+@pytest.mark.parametrize("prose", [
+    # ... and the guard that keeps the rule from eating prose: a
+    # function-word domain whose top level is NOT one in use is still a
+    # sentence, exactly as before.
+    "at the dot",
+    "look at the dot on the map",
+    "at 4 dot 30",
+    "she stared at the dot for a minute",
+    "look at that dot there",
+    "I'm at home. See you at six.",
+])
+def test_a_function_word_domain_without_a_real_top_level_stays_prose(prose):
+    assert outbox.mask_addresses(prose) == prose
 
 
 def _leaks(records, *raw):
@@ -1668,6 +1705,30 @@ def test_the_commander_log_masks_an_address_he_said(cmd_book, caplog):
                  and "corrects the draft" in ln]
     assert corrected and all("d… at example dot com" in ln for ln in corrected), \
         corrected
+    assert not FakeSMTP.made
+
+
+def test_the_commander_log_masks_a_function_word_domain_he_said(cmd_book, caplog):
+    """The measured leak (w5d): "my.com" is a real provider, so the whole
+    send path -- the handle line, the read-back, the correction line --
+    has to mask it the way it masks example.com."""
+    with caplog.at_level(logging.INFO):
+        res = cmd_book.handle("email the handout to dana at my dot com",
+                              source="voice")
+        assert "to dana at my dot com" in res.reply, res
+        cmd_book.handle("no", source="voice")
+        cmd_book.handle("email the biosensors handout to Heather Smith",
+                        source="voice")
+        res = cmd_book.handle("yes, to dana at my dot com", source="voice")
+        assert "to dana at my dot com" in res.reply, res
+        cmd_book.handle("no", source="voice")
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+    assert _leaks(caplog.records, "dana at my dot com", "dana@my.com") == []
+    assert any(ln.startswith("handle ") and "d… at my dot com" in ln
+               for ln in lines), lines
+    corrected = [ln for ln in lines if ln.startswith("send read-back:")
+                 and "corrects the draft" in ln]
+    assert corrected and all("d… at my dot com" in ln for ln in corrected), corrected
     assert not FakeSMTP.made
 
 

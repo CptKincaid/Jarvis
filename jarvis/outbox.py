@@ -287,7 +287,14 @@ def _one_said(m) -> str:
     labels = [x for x in _SAID_SEP_RX.split(domain) if x]
     # The first WORD of the first label: "the dash board" opens on "the".
     first, tld = labels[0].split()[0].lower(), m.group("tld").lower()
-    if first in _NOT_A_DOMAIN_WORD:
+    # A function-word domain is USUALLY prose ("look at the dot on the
+    # map"), but not always: my.com, it.com and my-host.com are real
+    # providers, the parser drafts "dana at my dot com" to dana@my.com,
+    # and a yes mails it there -- so the skip is spent only when the top
+    # level is not one in use either. The cost is "look at the dot com
+    # bubble" losing a letter in a log line; the alternative was the
+    # address he said, written out raw, four times (measured, wave B).
+    if first in _NOT_A_DOMAIN_WORD and tld not in _SAID_TLDS:
         return m.group(0)
     if "." in domain and tld not in _SAID_TLDS:
         return m.group(0)
