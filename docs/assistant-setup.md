@@ -428,6 +428,27 @@ If the machine was off or Jarvis was closed when something was due: less
 than an hour late fires at once ("While I was down, sir: …"), later than
 that is announced as missed.
 
+### Restarting him from the settings drawer
+
+Every code merge and every `assistant.json` edit needs a restart to take
+effect. The **System** section of the settings drawer ends with a line that
+says whether one would change anything — `Running 7539478, on disk 7539478
+(up to date)`, or `Running ac934b0, on disk 7539478 (2 commits behind)`,
+with `, uncommitted changes` appended when the tree is dirty and `Running
+unknown` when there is no git — and a **Restart Jarvis** button under it.
+The button arms on the first press (it reads *Press again to restart* for
+5 s) and restarts on the second, so a stray tap in a scrolling drawer never
+costs you the assistant. He says "Back in a moment, sir.", a small
+detached helper (`python -m jarvis.relaunch`) waits for the old process to
+be gone — patiently for 20 s, then SIGTERM, then SIGKILL — and launches
+`python -m jarvis.app` once, from the checkout, with the same environment.
+The whole hand-over is written, one timestamped line per step, to
+`/tmp/vss_voice/relaunch.log`; if the new Jarvis did not come up, that file
+says why (a failed launch is logged and never retried). It is a plain
+`-m jarvis.app`, not the `scripts/jarvis-autostart` wrapper: that wrapper
+only exists to wait out the Breeze sidecar's first start at login, and by
+the time you press the button the sidecar is already up.
+
 ---
 
 ## 11. Spotify (music)
@@ -4009,8 +4030,86 @@ wrong one of your three is as irreversible as sending to the wrong person.
   account and Jarvis asks which identity to send as, which is usually what
   you want: personal, work and school are three different people to whoever
   receives the mail.
-* `contacts` — a plain name-to-address map, checked before the people book
-  ("my advisor is Dr Peyrovi"). Both are consulted; neither is guessed at.
+* `contacts` — the OLD plain name-to-address map, kept as a fallback. Put
+  people in the address book below instead; it can say "which Heather?"
+  and this map cannot.
+
+### The address book
+
+The place to put people is **`~/.config/jarvis/contacts.json`** — its own
+file beside this one, not inside it, so nothing that edits the book ever
+touches the file with your passwords in it. Plain JSON, yours to edit by
+hand; Jarvis re-reads it on the next send, no restart:
+
+```json
+{
+  "format": 1,
+  "contacts": [
+    {"name": "Heather Smith", "email": "heather@example.com",
+     "honorific": "Dr", "aliases": ["my advisor"], "note": "PhD advisor"},
+    {"name": "Heather Jones", "email": "hjones@example.com"}
+  ]
+}
+```
+
+Three ways in: the file itself, `scripts/jarvis_contacts.py` over ssh
+(`list`, `show NAME`, `add NAME EMAIL`, `remove NAME` — it works with Jarvis
+down), and the **Address book** link in the phone page's footer (needs
+`phone.enabled`). Jarvis only ever *reads* it: nothing you say can write a
+row, because a misheard address stored is the typo waiting to be mailed.
+
+The matching is exact, on purpose. What you said has to equal a row's full
+name, first name, surname, honorific + name or an alias — "Heathr" is
+nobody, and two Heathers get "Which Heather, sir — Heather Smith or
+Heather Jones?" (answer with the full name, the surname, "Dr Smith" or
+"the second one" — an ordinal only counts when the list was short enough
+to be read out, four at most; with five or more it asks for the full name
+and "the first one" is asked again). A book recipient is read back by name
+— "to Dr Heather Smith" — and the address is *shown* in the transcript,
+never spoken. `show NAME` prints exactly what the send lane would do with
+a name, so you can test one over ssh with no microphone.
+
+Three rules keep the file honest, and each is worth knowing:
+
+* **Addresses are checked for shape only.** One @; a local part with no
+  leading, trailing or doubled dot; domain labels of 1–63 letters, digits
+  or hyphens that do not start or end with a hyphen; a last label of two
+  or more letters; 254 characters at most. `x@-.-`, `a@b.c`, `h@1.2`,
+  `h@example.com-` and `heather..x@example.com` are refused. What the
+  check *cannot* do is know that **`heather@gmail.con` is wrong — it is
+  well-formed, and no rule can catch it. The read-back before a send is
+  the last check**, which is why it always names the person. A row that
+  fails on load is flagged "not used" rather than mailed to.
+* **A file that cannot be read is never written over.** A trailing comma
+  from a hand edit, the wrong `format`, a permission: Jarvis keeps the
+  last good rows *for resolving only*, and every `add`/`remove` — CLI and
+  page — refuses with `REFUSED: contacts.json is not valid JSON (<path>)
+  — fix it by hand first` and writes nothing; `show` and `remove` say
+  that same line rather than "nothing in the book", because in a fresh
+  process the last good book is empty, and writing that back would have
+  been the loss. An empty or whitespace-only file (`touch`) is an empty
+  book, not a broken one, and a UTF-8 BOM is ignored.
+* **A one-word name has to be unique.** "Heather" beside "Heather Jones",
+  or "Smith" beside "Sam Smith", is refused on `add`; if you hand-edit
+  both in, both rows are kept and flagged, and "Heather" becomes a
+  question ("Which Heather, sir — Heather or Heather Jones?") rather than
+  a pick. "Dr Heather" is that same question when the one-word row carries
+  the Dr — the honorific narrows nothing and never picks the row — and
+  with the Dr on neither row, or only on "Heather Jones", it names nobody.
+  Answer with the two-word name, or "the first one" / "1" / "number one"
+  for the one-word row: the ordinal picks the row of the list you were
+  read, never the name again. One miss gets the list once more; a second
+  miss lets it go. A one-word row that clashes with nobody ("Mum") reads
+  back fine.
+* **An alias never costs a person.** An alias that is someone else's name
+  (or an earlier row's alias) is refused on `add`; hand-edited in, the
+  *alias* is passed over and both rows are kept and used — the name wins
+  in either file order — and `list` and the page say which alias and why.
+  The file still has it.
+
+The file is written 0600. If `contacts.json` is a symlink (a dotfiles
+checkout), it stays one: writes land beside the real file, and a dangling
+link gets its target created.
 
 ### Things it deliberately will not do
 

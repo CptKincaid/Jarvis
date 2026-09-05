@@ -498,6 +498,14 @@ class Services:
     # stage rides the camera preview's own capture (jarvis/handstage.py).
     # Optional: a stand-in Services simply has no gesture.
     gesture: Optional[Any] = None
+    # The Restart button (jarvis/relaunch.py; Hunter 2026-09-04, "yes,
+    # button only"). restart() is app.JarvisApp.restart -- say the line,
+    # spawn the detached helper, then this window's _on_close; code_status()
+    # answers the drawer's "Running X, on disk Y" line. Both Optional so a
+    # stand-in Services shows the button unwired (a toast) rather than a
+    # crash, and build_ui_services drops them on an older UI.
+    restart: Optional[Callable] = None
+    code_status: Optional[Callable] = None
 
 
 # ------------------------------------------------------------------ tray

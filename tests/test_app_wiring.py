@@ -29,13 +29,14 @@ import pytest
 
 import jarvis.app as app_mod
 import jarvis.channels.notify as notify_mod
+import jarvis.desktop as desktop_mod
 import jarvis.tools.timekeeper as tk_mod
 import jarvis.tts as tts_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
                            UncertainResolved, UncertainUtterance,
                            BriefingReady, ClaudeProgress, ClaudeTaskState,
-                           JarvisReply, ReminderFired, bus)
+                           JarvisReply, ReminderFired, Status, bus)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -194,6 +195,9 @@ def seams(monkeypatch):
     # the brain fakes below take (text, callback, force_tool): no streaming
     monkeypatch.setattr(CONFIG, "stream_replies", False)
     monkeypatch.setattr(app_mod, "TTS", FakeTTS)
+    # the running-commit stamp shells out to git, which the desktop
+    # firewall refuses under pytest; stub it so the ledger stays clean
+    monkeypatch.setattr(app_mod, "running_commit", lambda **kw: "")
     monkeypatch.setattr(CONFIG, "talkback", True)
     monkeypatch.setattr(CONFIG, "hotword", False)
     runs: list[tuple[str, list]] = []
@@ -201,6 +205,12 @@ def seams(monkeypatch):
                         lambda argv, timeout=5.0: runs.append(("notify", argv)))
     monkeypatch.setattr(tk_mod, "_run",
                         lambda argv, **kw: runs.append(("ring", argv)))
+    # JarvisApp.__init__ -> desktop.restore_target() -> list_windows(), i.e.
+    # `xdotool search --onlyvisible --name ""` against HIS display: every
+    # test that built the app read his window titles until the desktop
+    # firewall (tests/conftest.py, 2026-09-04) refused it. An empty desktop
+    # is what a headless box has, so the app boots the same either way.
+    monkeypatch.setattr(desktop_mod, "list_windows", lambda *a, **k: [])
     return runs
 
 
@@ -2186,3 +2196,186 @@ def test_the_open_debrief_gets_the_long_answer_window(app):
     app._pending_debrief = {"key": "k", "cand": cand,
                             "at": time.monotonic() - app.DEBRIEF_TTL_S - 1}
     assert app._capture_window() is None
+
+
+# ------------------------------------------------ the Restart button
+def test_the_running_commit_is_stamped_once_at_construction(build, monkeypatch):
+    """Read at startup, never at import: the drawer compares it with what
+    is on disk NOW, so the stamp must be the tree the process actually
+    started from."""
+    monkeypatch.setattr(app_mod, "running_commit", lambda **kw: "abc1234")
+    a = build()
+    assert a.running_commit == "abc1234"
+    monkeypatch.setattr(app_mod, "running_commit", lambda **kw: "changed")
+    assert a.running_commit == "abc1234"
+
+
+def test_code_status_compares_the_stamp_with_the_repo_now(app, monkeypatch):
+    seen = []
+
+    def probe(running, repo, git=None):
+        seen.append((running, Path(repo)))
+        return {"running": running, "disk": "d15c000", "behind": 1,
+                "dirty": False}
+    monkeypatch.setattr(app_mod, "probe_code_status", probe)
+    app.running_commit = "ru77777"
+    assert app.code_status()["disk"] == "d15c000"
+    assert seen == [("ru77777", Path(app_mod.relaunch.REPO_ROOT))]
+
+
+def test_ui_service_kwargs_carry_restart_and_code_status(app):
+    kwargs = app.ui_service_kwargs()
+    assert kwargs["restart"] == app.restart
+    assert kwargs["code_status"] == app.code_status
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_restart_says_the_line_spawns_the_helper_with_this_pid_then_quits(
+        app, paths):
+    """Order is the whole feature: helper first (with OUR pid to wait on),
+    quit second. A quit that ran first would leave nobody to relaunch."""
+    order = []
+    spawned = []
+
+    def spawn(old_pid, cmd, cwd, env, log_path, grace_s=20.0):
+        spawned.append(dict(old_pid=old_pid, cmd=cmd, cwd=cwd, env=env,
+                            log_path=Path(log_path)))
+        order.append("spawn")
+        return 999
+    app.close_window = lambda: order.append("close")
+    clock = _Clock()
+    helper = app.restart(spawn=spawn, sleep=clock.sleep, clock=clock)
+    assert helper == 999
+    assert order == ["spawn", "close"]
+    assert app.tts.spoken[-1] == "Back in a moment, sir."
+    s = spawned[0]
+    assert s["old_pid"] == os.getpid()
+    assert s["cmd"] == [sys.executable, "-m", "jarvis.app"]
+    assert Path(s["cwd"]) == REPO_ROOT
+    assert s["log_path"] == PATHS.LOG_DIR / "relaunch.log"
+    assert s["env"].get("PATH") == os.environ.get("PATH")
+
+
+def test_restart_waits_for_the_spoken_line_but_never_past_the_ceiling(
+        app, paths):
+    clock = _Clock()
+    spawn_at = []
+
+    def spawn(*a, **kw):
+        spawn_at.append(clock.t)
+        return 1
+    app.close_window = lambda: None
+    # still talking for 2 s (the same TTS.is_speaking the thinking filler
+    # reads through _tts_busy): the helper starts once the line is out
+    app.tts.is_speaking = True
+
+    def sleep(s):
+        clock.sleep(s)
+        if clock.t >= 2.0:
+            app.tts.is_speaking = False
+    app.restart(spawn=spawn, sleep=sleep, clock=clock)
+    assert 2.0 <= spawn_at[0] < 2.5
+    # a line still QUEUED counts too, and a TTS that never reports idle is
+    # bounded at RESTART_SAY_WAIT_S
+    app._restarting = False
+    app.tts.pending = 1
+    clock.t = 0.0
+    app.restart(spawn=spawn, sleep=clock.sleep, clock=clock)
+    assert app_mod.RESTART_SAY_WAIT_S <= spawn_at[1] < \
+        app_mod.RESTART_SAY_WAIT_S + 0.5
+
+
+def test_restart_that_cannot_start_the_helper_does_not_quit(app, paths):
+    """No helper means nobody to bring him back: stay up, say so."""
+    closed = []
+    app.close_window = lambda: closed.append(1)
+    quits = []
+    app.quit = lambda: quits.append(1)
+    sink = Sink(Status)
+    try:
+        def spawn(*a, **kw):
+            raise OSError("no interpreter")
+        clock = _Clock()
+        assert app.restart(spawn=spawn, sleep=clock.sleep, clock=clock) is None
+        assert closed == [] and quits == []
+        st = sink.wait(Status, timeout=2.0)
+        assert st is not None and "estart" in st.text and st.kind == "error"
+        # ...and a later press is allowed to try again
+        assert app._restarting is False
+    finally:
+        sink.close()
+
+
+def test_restart_falls_back_to_quit_when_no_window_is_attached(app, paths):
+    quits = []
+    app.quit = lambda: quits.append(1)
+    clock = _Clock()
+    app.restart(spawn=lambda *a, **kw: 5, sleep=clock.sleep, clock=clock)
+    assert quits == [1]
+
+
+def test_restart_never_spawns_twice_while_one_is_in_flight(app, paths):
+    spawns = []
+    app.close_window = lambda: None
+    clock = _Clock()
+    app.restart(spawn=lambda *a, **kw: spawns.append(1) or 7,
+                sleep=clock.sleep, clock=clock)
+    app.restart(spawn=lambda *a, **kw: spawns.append(2) or 8,
+                sleep=clock.sleep, clock=clock)
+    assert spawns == [1]
+
+
+def test_attach_window_routes_the_close_through_tk_after(app):
+    """The drawer's press runs restart() on a worker thread; the window's
+    _on_close (geometry save, tray, services.quit, root.destroy) must run
+    on the Tk thread, so the hook is an after(0, ...) marshal."""
+    afters = []
+
+    class _Root:
+        def after(self, ms, fn):
+            afters.append((ms, fn))
+
+    class _Window:
+        root = _Root()
+
+        def _on_close(self):
+            pass
+    w = _Window()
+    app_mod.attach_window(app, w)
+    app.close_window()
+    assert afters == [(0, w._on_close)]
+
+
+def test_main_attaches_the_window_it_creates():
+    import inspect
+    src = inspect.getsource(app_mod.main)
+    assert "attach_window(app, window)" in src
+    assert src.index("window = create(") < src.index("attach_window(app, window)")
+
+
+def test_restart_still_restarts_when_the_spoken_line_raises(app, paths):
+    """Review 2026-09-04: a TTS error inside restart() left _restarting set
+    forever, so every later press said 'already in flight' and the button
+    was dead until a manual restart. The line is a courtesy; the restart
+    he pressed for still happens."""
+    order = []
+
+    def boom(*a, **k):
+        raise RuntimeError("tts down")
+    app._say = boom
+    app.close_window = lambda: order.append("close")
+    clock = _Clock()
+    helper = app.restart(spawn=lambda *a, **k: (order.append("spawn"), 7)[1],
+                         sleep=clock.sleep, clock=clock)
+    assert helper == 7
+    assert order == ["spawn", "close"]

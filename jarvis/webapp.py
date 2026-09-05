@@ -145,6 +145,7 @@ from urllib.parse import parse_qs, urlparse
 
 from jarvis import cmdsock, intercom
 from jarvis.events import Status, UserUtterance, bus
+from jarvis import contacts as contacts_mod
 from jarvis.logs import get_logger
 
 log = get_logger("webapp")
@@ -755,6 +756,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, icon_png(512), "image/png",
                        cache="public, max-age=86400")
             return
+        if path == "/contacts":
+            # The ADDRESS BOOK's shell (jarvis/contacts.py). Static, like
+            # "/": no name and no address is baked in; the rows arrive
+            # only through the gated /api/contacts below.
+            self._send(200, CONTACTS_PAGE.encode("utf-8"),
+                       "text/html; charset=utf-8")
+            return
+        if path == "/api/contacts":
+            if not self._gate():
+                return
+            self._contacts_get()
+            return
         if path == "/api/ping":
             if not self._gate():
                 return
@@ -778,6 +791,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._say()
         elif path == "/api/voice":
             self._voice()
+        elif path == "/api/contacts":
+            self._contacts_post()
         else:
             self._error(404, "no such endpoint")
 
@@ -849,6 +864,73 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_clip(body)
             return
         self._stream_clip(rend, started)
+
+    # ---------------------------------------------------- the address book
+    # A read/write of ONE FILE (jarvis/contacts.py), never a turn: like
+    # /api/status and /api/board these do not go through app.dispatch_text,
+    # so an edit is not remembered as an exchange, never wakes the speaker
+    # and never barges in. The validator and the uniqueness rules are the
+    # CLI's -- contacts.validate_row / check_unique through Book.add -- so
+    # the page cannot accept a row the CLI would refuse, and a refusal
+    # writes nothing.
+    def _contacts_get(self):
+        try:
+            self._json(200, contacts_mod.current().public())
+        except Exception:                 # noqa: BLE001 - a file read
+            log.exception("contacts page: the book could not be read")
+            self._error(500, "the address book could not be read")
+
+    def _contacts_post(self):
+        if not self._gate():
+            return
+        body = self._body(MAX_TEXT_BYTES)
+        if body is None:
+            return
+        try:
+            msg = json.loads(body.decode("utf-8", "replace"))
+            if not isinstance(msg, dict):
+                raise ValueError("not an object")
+        except ValueError as exc:
+            self._error(400, f"malformed request: {exc}")
+            return
+        op = str(msg.get("op") or "").strip().lower()
+        book = contacts_mod.current()
+        try:
+            if op == "add":
+                row = {k: msg.get(k) for k in
+                       ("name", "email", "honorific", "aliases", "note")}
+                contact, why = book.add(row)
+            elif op == "remove":
+                # BOTH the exact name and the exact address, so a stale
+                # tab cannot remove the wrong row after a hand edit.
+                name = str(msg.get("name") or "").strip()
+                email = str(msg.get("email") or "").strip()
+                if not name or not email:
+                    self._error(400, "remove needs the name and the address")
+                    return
+                contact, why = book.remove(name, email)
+            else:
+                self._error(400, "op must be add or remove")
+                return
+        except OSError:
+            log.exception("contacts page: the book could not be written")
+            self._error(500, "the address book could not be written")
+            return
+        if contact is None:
+            if book.broken and why == book.broken:
+                # The file on disk cannot be read: nothing is written,
+                # and the last good rows are never written back over it.
+                # Keyed on WHICH check refused: a bad row on a broken
+                # book is refused for the row (400, below), and the 409
+                # carries the fix-it-by-hand line only when that is why.
+                self._error(409, "REFUSED: " + why)
+                return
+            self._error(400, why)
+            return
+        log.info("contacts page: %s %s", op, contact.name)
+        out = {"ok": True}
+        out.update(book.public())
+        self._json(200, out)
 
     def _json_text(self) -> Optional[tuple[str, dict]]:
         """``(text, the whole message)`` from a JSON body, or None having
@@ -1391,6 +1473,8 @@ PAGE = """<!doctype html>
     color: var(--ink); letter-spacing: .04em;
   }
   #ptt.off { color: var(--dim); border-style: dashed; }
+  #book { color: var(--dim); font-size: 13px; text-decoration: none;
+          white-space: nowrap; letter-spacing: .02em; }
   #ptt.rec { background: var(--bad); color: #180605; border-color: var(--bad); }
   #switches { display: flex; gap: 8px; padding: 0 16px 14px; }
   .sw {
@@ -1447,6 +1531,7 @@ PAGE = """<!doctype html>
 
 <footer>
   <button id="ptt" type="button">Hold to talk</button>
+  <a id="book" href="/contacts" title="Who Jarvis can email a file to">Address book</a>
 </footer>
 
 <!-- Two different rooms, and the labels say which. "Voice" plays his answer
@@ -1499,6 +1584,13 @@ PAGE = """<!doctype html>
     try { return localStorage.getItem(KEY_STORE) || ""; } catch (e) { return ""; }
   }
   var key = readKey();
+  /* The address book page reads the same localStorage key; the query form
+     is for a launcher that dropped it. */
+  var book = document.getElementById("book");
+  function linkBook() {
+    if (book) { book.href = "/contacts" + (key ? "?t=" + encodeURIComponent(key) : ""); }
+  }
+  linkBook();
 
   function el(cls, txt) {
     var d = document.createElement("div");
@@ -2000,6 +2092,7 @@ PAGE = """<!doctype html>
     key = keyInput.value.trim();
     try { localStorage.setItem(KEY_STORE, key); } catch (e) {}
     keyInput.value = "";
+    linkBook();
     hello();
   });
 
@@ -2081,3 +2174,261 @@ PAGE = """<!doctype html>
 PAGE = (PAGE.replace("__TAPS__", json.dumps([list(t) for t in QUICK_TAPS]))
             .replace("__CHECK__", json.dumps(SOUND_CHECK))
             .replace("__MIC_NOTE__", MIC_NOTE))
+
+
+# ---------------------------------------------------------- the address book
+# The third way into ~/.config/jarvis/contacts.json (the file and the CLI
+# are the other two). Same conventions as PAGE: no <form> (CSP form-action
+# is 'none' and a submit would fail in silence), every call is a fetch()
+# with the Bearer key, and the shell carries no data -- the list arrives
+# through the gated API. No manifest, no Add-to-Home-Screen: it is a page
+# he opens from the phone page's footer, not an app.
+CONTACTS_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1,
+      viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#050d14">
+<meta name="referrer" content="no-referrer">
+<title>Jarvis address book</title>
+<link rel="icon" href="/icon-180.png">
+<style>
+  :root {
+    --bg: #050d14; --slab: #0b1a25; --line: #17364a;
+    --ink: #dbeaf2; --dim: #7b98aa; --cyan: #4de0f5; --warn: #f0b849;
+    --bad: #e8695f;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+               font: 15px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 14px 16px 40px; }
+  h1 { font-size: 17px; letter-spacing: .06em; text-transform: uppercase;
+       color: var(--cyan); margin: 8px 0 4px; }
+  h1 a { color: var(--dim); font-size: 13px; text-transform: none;
+         letter-spacing: .02em; text-decoration: none; margin-left: 10px; }
+  p.hint { color: var(--dim); font-size: 13px; margin: 0 0 12px; }
+  #status { color: var(--warn); font-size: 13px; min-height: 1.4em; margin: 6px 0; }
+  #status.bad { color: var(--bad); }
+  #status.ok { color: var(--cyan); }
+  ul { list-style: none; padding: 0; margin: 0 0 18px; }
+  li { background: var(--slab); border: 1px solid var(--line); border-radius: 12px;
+       padding: 10px 12px; margin: 0 0 8px; display: flex; gap: 10px;
+       align-items: flex-start; }
+  li .who { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  li .name { font-weight: 600; }
+  li .addr { color: var(--dim); font-size: 13px; }
+  li .meta { color: var(--dim); font-size: 12px; }
+  li.bad { border-color: var(--bad); }
+  .badge { display: inline-block; font-size: 11px; color: #180605; background: var(--bad);
+           border-radius: 6px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
+  button { font: inherit; font-size: 13px; border-radius: 10px; padding: 8px 12px;
+           border: 1px solid var(--line); background: var(--slab); color: var(--ink); }
+  button.rm.armed { background: var(--bad); color: #180605; border-color: var(--bad); }
+  button.go { background: var(--cyan); color: #041017; border: 0; font-weight: 600;
+              padding: 10px 16px; }
+  button:disabled { opacity: .45; }
+  .add { background: var(--slab); border: 1px solid var(--line); border-radius: 12px;
+         padding: 12px; display: grid; gap: 8px; }
+  .add label { display: grid; gap: 3px; font-size: 12px; color: var(--dim); }
+  input { font: inherit; font-size: 15px; padding: 9px 10px; border-radius: 10px;
+          border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  input:focus { outline: none; border-color: var(--cyan); }
+  input:invalid { border-color: var(--bad); }
+  #path { color: var(--dim); font-size: 12px; margin: 10px 0 0; overflow-wrap: anywhere; }
+  #keybox { margin: 12px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>Address book <a href="/">&larr; Jarvis</a></h1>
+<p class="hint">Who Jarvis can email a file to. Exact names only: two people who
+share a first name are a question, never a guess. The address is shown to you and
+never spoken.</p>
+<div id="status" aria-live="polite"></div>
+<div id="keybox" hidden>
+  <label>Key <input id="key" type="password" autocomplete="off"
+                    placeholder="the key from jarvis-phone.txt"></label>
+</div>
+<ul id="list"></ul>
+<div class="add">
+  <label>Name (first and last) <input id="name" type="text" maxlength="80"
+                     autocomplete="off" autocapitalize="words"></label>
+  <label>Email <input id="email" type="email" maxlength="254" autocomplete="off"
+                      autocapitalize="none" inputmode="email"></label>
+  <label>Honorific (optional: Dr, Prof) <input id="honorific" type="text"
+                                     maxlength="12" autocomplete="off"></label>
+  <label>Also answers to (optional, comma separated: my advisor, mum)
+    <input id="aliases" type="text" autocomplete="off"></label>
+  <label>Note (optional, never spoken) <input id="note" type="text" maxlength="200"
+                                              autocomplete="off"></label>
+  <button class="go" id="addbtn" type="button">Add to the book</button>
+</div>
+<p id="path"></p>
+</main>
+<script>
+(function () {
+  "use strict";
+  var KEY_STORE = "jarvis.phone.key";
+  var status = document.getElementById("status");
+  var list = document.getElementById("list");
+  var keybox = document.getElementById("keybox");
+  var keyInput = document.getElementById("key");
+  var addbtn = document.getElementById("addbtn");
+  var pathEl = document.getElementById("path");
+  var fields = ["name", "email", "honorific", "aliases", "note"];
+
+  function readKey() {
+    var q = new URLSearchParams(location.search).get("t");
+    if (q) { try { localStorage.setItem(KEY_STORE, q); } catch (e) {} return q; }
+    try { return localStorage.getItem(KEY_STORE) || ""; } catch (e) { return ""; }
+  }
+  var key = readKey();
+
+  function say(text, cls) {
+    status.textContent = text || "";
+    status.className = cls || "";
+  }
+
+  function api(method, body) {
+    var opts = { method: method, cache: "no-store",
+                 headers: { "Authorization": "Bearer " + key } };
+    if (body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch("/api/contacts", opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (out) {
+        if (r.status === 401) { keybox.hidden = false; throw new Error("that key was refused"); }
+        if (!r.ok) { throw new Error(out.error || ("HTTP " + r.status)); }
+        return out;
+      });
+    });
+  }
+
+  function text(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) { e.className = cls; }
+    e.textContent = txt;
+    return e;
+  }
+
+  function render(out) {
+    list.textContent = "";
+    var rows = out.contacts || [];
+    rows.forEach(function (c) {
+      var li = document.createElement("li");
+      var who = text("div", "who", "");
+      var name = text("div", "name", (c.honorific ? c.honorific + " " : "") + c.name);
+      who.appendChild(name);
+      who.appendChild(text("div", "addr", c.email));
+      var meta = [];
+      if (c.aliases && c.aliases.length) { meta.push("also: " + c.aliases.join(", ")); }
+      if (c.note) { meta.push(c.note); }
+      if (meta.length) { who.appendChild(text("div", "meta", meta.join(" \u00b7 "))); }
+      li.appendChild(who);
+      var rm = text("button", "rm", "Remove");
+      rm.type = "button";
+      rm.addEventListener("click", function () {
+        /* Two taps, no confirm(): the first arms the button and says who
+           it would remove; the second removes. Both the name and the
+           address go up, so a stale list cannot remove the wrong row. */
+        if (!rm.classList.contains("armed")) {
+          rm.classList.add("armed");
+          rm.textContent = "Really remove " + c.name + "?";
+          setTimeout(function () { rm.classList.remove("armed"); rm.textContent = "Remove"; }, 6000);
+          return;
+        }
+        rm.disabled = true;
+        api("POST", { op: "remove", name: c.name, email: c.email })
+          .then(function (o) { say("removed " + c.name, "ok"); render(o); })
+          .catch(function (e) { say(e.message, "bad"); rm.disabled = false; });
+      });
+      li.appendChild(rm);
+      list.appendChild(li);
+    });
+    (out.skipped || []).forEach(function (s) {
+      var li = document.createElement("li");
+      li.className = "bad";
+      var who = text("div", "who", "");
+      var name = text("div", "name", "row " + (s.index + 1) + (s.name ? ": " + s.name : ""));
+      name.appendChild(text("span", "badge", "not used"));
+      who.appendChild(name);
+      who.appendChild(text("div", "meta", s.why + " \u2014 fix it in the file"));
+      li.appendChild(who);
+      list.appendChild(li);
+    });
+    (out.flagged || []).forEach(function (f) {
+      /* A one-word name that is also someone's first name or surname:
+         both rows are kept and used, but the name is a QUESTION now. */
+      var li = document.createElement("li");
+      li.className = "bad";
+      var who = text("div", "who", "");
+      var name = text("div", "name", "row " + (f.index + 1) + ": " + f.name);
+      name.appendChild(text("span", "badge", "ambiguous, kept"));
+      who.appendChild(name);
+      who.appendChild(text("div", "meta", f.why));
+      li.appendChild(who);
+      list.appendChild(li);
+    });
+    (out.trimmed || []).forEach(function (t) {
+      /* An alias that is someone else's name: the row is kept and used,
+         the alias is not, and the file still has it. */
+      var li = document.createElement("li");
+      li.className = "bad";
+      var who = text("div", "who", "");
+      var name = text("div", "name", "row " + (t.index + 1) + ": " + t.name);
+      name.appendChild(text("span", "badge", "alias not used, row kept"));
+      who.appendChild(name);
+      who.appendChild(text("div", "meta", t.why));
+      li.appendChild(who);
+      list.appendChild(li);
+    });
+    if (!rows.length && !(out.skipped || []).length) {
+      list.appendChild(text("li", "", "Nobody yet. Add someone below, or edit the file."));
+    }
+    if (out.broken) {
+      say("REFUSED: " + out.broken + " \u2014 this list is the last good book; nothing can be added or removed until the file reads.", "bad");
+    }
+    pathEl.textContent = out.path ? "The book is " + out.path + " \u2014 plain JSON, edit it by hand if you like; Jarvis re-reads it on the next send. Addresses are checked for shape only: gmail.con is well-formed, and the read-back is the last check." : "";
+  }
+
+  function load() {
+    if (!key) { keybox.hidden = false; say("This page needs the phone key.", "bad"); return; }
+    api("GET").then(function (o) { say(""); render(o); })
+              .catch(function (e) { say(e.message, "bad"); });
+  }
+
+  keyInput.addEventListener("change", function () {
+    key = keyInput.value.trim();
+    try { localStorage.setItem(KEY_STORE, key); } catch (e) {}
+    keyInput.value = "";
+    keybox.hidden = true;
+    load();
+  });
+
+  addbtn.addEventListener("click", function () {
+    var email = document.getElementById("email");
+    if (!email.checkValidity() || !email.value.trim()) {
+      say("That is not an address: one at-sign, a dot in the domain, no spaces.", "bad");
+      return;
+    }
+    var row = { op: "add" };
+    fields.forEach(function (f) { row[f] = document.getElementById(f).value.trim(); });
+    row.aliases = row.aliases ? row.aliases.split(",").map(function (a) { return a.trim(); })
+                                         .filter(function (a) { return a; }) : [];
+    addbtn.disabled = true;
+    api("POST", row).then(function (o) {
+      say("added " + row.name, "ok");
+      fields.forEach(function (f) { document.getElementById(f).value = ""; });
+      render(o);
+    }).catch(function (e) { say(e.message, "bad"); })
+      .then(function () { addbtn.disabled = false; });
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
+"""
