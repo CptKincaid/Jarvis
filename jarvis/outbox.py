@@ -401,19 +401,60 @@ def spoken_who(who: str) -> str:
     return spoken_address(w).strip() if "@" in w else w
 
 
+def spoken_recipient(name: object = "", addr: object = "") -> str:
+    """THE ONE PLACE a recipient becomes something Jarvis SAYS OUT LOUD.
+
+    Name first when there is one, the address in words when there is not
+    -- and NOTHING that leaves here carries an "@", whichever slot it
+    arrived in. Jarvis must never say an at sign: neither engine is
+    reliable on a raw address (edge-tts spells some domains letter by
+    letter; F5 clones prosody from a reference clip that has never said
+    one), so an address he HEARS has to be an address in words.
+
+    Every spoken line that names a recipient goes through here -- the
+    read-back, the correction, the re-ask, the sent line, the day's audit
+    summary. It exists because ``to_name or spoken_address(to_addr)`` was
+    written out by hand in four places and each copy spoke ``to_name``
+    UNTOUCHED: a half address that reached the name slot ("hjones@example"
+    -- round 4's attack), or a masked audit row ("d…@example.com" -- the
+    sent-log summary, measured), was said with its "@" in it. Masking is
+    not speaking. A field being safe on disk says nothing about whether
+    it is safe in the ear, and only this function decides that.
+    """
+    said = spoken_who(str(name or ""))
+    return said or spoken_address(str(addr or "")).strip()
+
+
+def auth_failed_line(label: object = "") -> str:
+    """The refused-password sentence, with the account label SPOKEN.
+
+    account_label falls back to whatever ``label`` the config carries,
+    raw, and this string is read out: a label he set to an address would
+    put an "@" in a spoken line by the same route the recipient did.
+    """
+    return AUTH_FAILED_LINE.format(label=spoken_who(str(label or "")) or "mail")
+
+
 def pronoun_for(gender: Optional[str]) -> str:
     """"her" / "him" for a known gender, "them" for none."""
     return {"f": "her", "m": "him"}.get(str(gender or "").lower(), "them")
 
 
 def account_words(account: dict) -> str:
-    """"your school account"."""
-    label = mail_mod.account_label(account)
+    """"your school account".
+
+    Through spoken_who, because account_label returns the configured
+    label RAW and this sentence is said out loud.
+    """
+    label = spoken_who(mail_mod.account_label(account))
     return f"your {label} account" if label else "your account"
 
 
 def _to_words(draft: Draft) -> str:
-    who = draft.to_name or ""
+    # spoken_who, not the raw field: a half address that landed in the
+    # name slot ("hjones@example") is said here, and it must be said in
+    # words like every other address.
+    who = spoken_who(str(draft.to_name or ""))
     if getattr(draft, "from_book", False) and who:
         hon = str(getattr(draft, "honorific", "") or "").strip()
         return f"{hon} {who}".strip()
@@ -444,7 +485,7 @@ def read_back(draft: Draft) -> str:
 def gender_line(draft: Draft) -> str:
     """The re-ask for a pronoun that is not the pending person's (Hunter's
     19:00 ruling): names them, and the pronoun that is theirs."""
-    who = draft.to_name or spoken_address(draft.to_addr)
+    who = spoken_recipient(draft.to_name, draft.to_addr)
     return GENDER_LINE.format(who=who, pron=pronoun_for(getattr(draft, "to_gender", None)))
 
 
@@ -1105,7 +1146,7 @@ def send(draft: Draft, smtp=None, cap_mb: float = MAX_ATTACHMENT_MB) -> str:
     record_sent(draft, message_id=message_id, dry_run=rehearsal)
     if rehearsal:
         return REHEARSAL_LINE
-    who = draft.to_name or spoken_address(draft.to_addr)
+    who = spoken_recipient(draft.to_name, draft.to_addr)
     return SENT_LINE.format(who=who)
 
 
@@ -1193,8 +1234,13 @@ def sent_today_line(now: Optional[datetime] = None,
 
     Rehearsals are excluded: nothing left the machine, so listing one
     among the day's sends would be the audit telling the same lie the
-    spoken line is written to avoid. The address is already masked on
-    disk, so nothing here can say one in full.
+    spoken line is written to avoid.
+
+    The address is already masked on DISK, so nothing here can say one in
+    full -- but masked is not spoken, and this line read the masked value
+    straight for one commit: "One, sir: lab report.pdf to d…@example.com",
+    measured. The recipient goes through spoken_recipient like every other
+    spoken recipient, and the "@" is said as "at".
     """
     ref = now or datetime.now()
     day = ref.date().isoformat()
@@ -1204,7 +1250,7 @@ def sent_today_line(now: Optional[datetime] = None,
         return "Nothing today, sir."
     said = []
     for row in rows:
-        who = row.get("to_name") or str(row.get("to") or "")
+        who = spoken_recipient(row.get("to_name"), row.get("to"))
         said.append(f"{spoken_name(str(row.get('name') or 'a file'))} to {who}")
     if len(said) == 1:
         return f"One, sir: {said[0]}."

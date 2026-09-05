@@ -6676,7 +6676,10 @@ def _h_sent_today(c, t, m):
     """The day's sends, off the append-only audit. Reads nothing else.
 
     The addresses are already masked ON DISK by outbox.record_sent, so
-    there is nothing here that could say one in full.
+    there is nothing here that could say one in full -- and
+    outbox.sent_today_line puts what is left through spoken_recipient, so
+    there is nothing here that can say an "@" out loud either. The two
+    are different jobs and the audit needs both.
     """
     return CommandResult(handled=True, speak=True, status="Sent today",
                          reply=outbox.sent_today_line())
@@ -11735,7 +11738,8 @@ class Commander:
                 return CommandResult(
                     handled=True, speak=True, status="Confirm?",
                     reply=outbox.SELF_LINE.format(
-                        who=draft.to_name or outbox.spoken_address(draft.to_addr)))
+                        who=outbox.spoken_recipient(draft.to_name,
+                                                    draft.to_addr)))
             # A yes that carries a CORRECTION -- "yes, send it to Dana",
             # "yes, but from my work account", "yes, to her work address
             # instead" -- is neither a yes nor a change of subject (F23).
@@ -11864,8 +11868,7 @@ class Commander:
                 # server's reply is still never spoken -- it quotes the
                 # username back -- only the account LABEL, which he said.
                 log.warning("send failed for %s: auth refused (%s)", name, exc)
-                line = outbox.AUTH_FAILED_LINE.format(
-                    label=draft.account_label or "mail")
+                line = outbox.auth_failed_line(draft.account_label)
                 kind, status = "error", "Password refused"
             except mail_mod.MailSendFailed as exc:
                 # A transport failure's text is a class name, never a line.
