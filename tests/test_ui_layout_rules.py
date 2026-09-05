@@ -13,6 +13,7 @@ e.g. ``:94``). It refuses his desktop displays the way the rig does: a
 window opened on ``:1`` is a window on the screen he is using.
 """
 import os
+import re
 
 import pytest
 
@@ -48,12 +49,35 @@ def _open_fds() -> int:
         return 0
 
 
+# theme.resolve_fonts() is a ONE-WAY door: it returns early once _FAMILY is
+# set, so the first test here that builds a root leaves theme._HAS_DISPLAY
+# True for the rest of the process -- and tests/fixtures/theme_tokens_*.json
+# pins it False. MEASURED 2026-09-05: `pytest tests/test_ui_layout_rules.py
+# tests/test_theme_look.py` gave 2 failed with the diff exactly
+# {'_HAS_DISPLAY': (False, True)} and no colour token drifted; the reverse
+# order gave 68 passed. Alphabetical order hides it and the canonical suite
+# skips this file, but this file's own docstring tells you to run it with
+# the other UI files, which is the failing order.
+FONT_GLOBALS = ("_FAMILY", "_FAMILY_MONO", "_HAS_DISPLAY", "_DISPLAY")
+
+
+def font_globals() -> dict:
+    return {k: getattr(theme, k) for k in FONT_GLOBALS}
+
+
+def set_font_globals(saved: dict) -> None:
+    for k, v in saved.items():
+        setattr(theme, k, v)
+
+
 @pytest.fixture(autouse=True)
 def _restore_look():
+    fonts = font_globals()
     yield
     theme.apply_scale(1.0)
     wg.set_scale(1.0)
     theme.select_look(theme.DEFAULT_LOOK)
+    set_font_globals(fonts)
 
 
 # ============================================================ Tk-free rules
@@ -240,6 +264,115 @@ def test_the_standing_captions_are_short_and_plain():
     assert "saved" not in sp.RESTART_NOTE.lower()
     assert sp.RESTART_NOTE == sp.RESTART_NOTE.strip()
     assert not sp.RESTART_NOTE.endswith(".")
+
+
+# ------------------------------------------------- the band bars are SPANS
+def test_a_band_bar_is_its_share_of_the_rooms_whole_ladder():
+    """ROUND 1 FIX. The bars were a full-width track with two end stops and
+    a marker that is absent whenever the live range is outside the band --
+    so on the 09-05 frames one of four bars carried a mark and on the fault
+    frame none of four did, and four bare tracks read as four sliders with
+    the handle gone (his words: the sliders "show no handle").
+
+    They are readouts, so they now draw WHAT THEY KNOW: each band's own
+    extent, positioned on the room's whole ladder. Two bands of one room
+    start at different x by construction, which is the thing a slider can
+    never do."""
+    assert sp.room_scale([(0.75, 2.25), (2.25, 3.75)]) == (0.75, 3.75)
+    assert sp.band_span(0.75, 2.25, 0.75, 3.75) == (0.0, 0.5)
+    assert sp.band_span(2.25, 3.75, 0.75, 3.75) == (0.5, 1.0)
+    assert sp.band_span(3.0, 3.75, 0.75, 3.0 + 0.75) == (0.75, 1.0)
+
+
+def test_a_gap_in_the_ladder_is_drawn_as_a_gap():
+    """fuse() has a whole rule for "the range is in a gap between the
+    bands"; until now the page could not SHOW him one."""
+    spans = sp.spans_for_room([(0.75, 2.0), (2.5, 3.75)])
+    assert spans[0][1] < spans[1][0]
+    assert spans[0][0] == 0.0 and spans[1][1] == 1.0
+
+
+def test_a_span_never_divides_by_a_degenerate_ladder():
+    assert sp.band_span(1.0, 1.0, 1.0, 1.0) is None
+    assert sp.band_span(None, 2.0, 0.0, 3.0) is None
+    assert sp.band_span(1.0, 2.0, 3.0, 3.0) is None
+    assert sp.spans_for_room([]) == ()
+    assert sp.spans_for_room([(None, None)]) == (None,)
+    assert sp.spans_for_room([("x", 2.0), (1.0, 2.0)]) == (None, (0.0, 1.0))
+    # one band is the whole scale
+    assert sp.spans_for_room([(0.75, 3.75)]) == ((0.0, 1.0),)
+
+
+def test_a_typed_band_moves_its_own_bar_and_nothing_else():
+    """He edits the numbers in the boxes; the ladder under them follows
+    what he typed, so a band he is widening grows while he types."""
+    before = sp.spans_for_room([(0.75, 2.25), (2.25, 3.75)])
+    after = sp.spans_for_room([(0.75, 3.0), (3.0, 3.75)])
+    assert after[0][1] > before[0][1]
+    assert after[1][0] > before[1][0]
+
+
+# --------------------------------------------------------- amber is a fault
+def test_no_opinion_is_not_amber_anywhere_in_a_room_block():
+    """His brief: "reserve orange for a fault only ... make it the only
+    orange". The reason lines were fixed in round 0 and the COUNT did not
+    move: a dark room still painted the state word amber twice (the header
+    verdict and the radar leg), so the fault frame was two stacked blocks
+    of orange. A missing answer is now the FAINTEST thing on the row, not
+    the loudest; the fault line under it says why, and it is the only
+    amber thing on the page."""
+    assert sp.presence_words(None) == ("NO OPINION", sp.TONE_FAINT)
+    assert sp.presence_words(True)[1] == sp.TONE_OK
+    assert sp.presence_words(False)[1] == sp.TONE_MUTED
+    assert sp.verdict_tone(sp.NO_OPINION) == sp.TONE_FAINT
+    assert sp.verdict_tone(sp.NO_LADDER) == sp.TONE_FAINT
+    assert sp.verdict_tone("at the desk") == sp.TONE_OK
+    assert sp.TONE_WARN not in (sp.presence_words(None)[1],
+                                sp.verdict_tone(sp.NO_OPINION))
+
+
+# ------------------------------------------------------ the house voice
+def test_no_reason_line_prints_python_quotes_or_a_config_key():
+    """MEASURED under pytest on round 0's tip: the RULE_BAND reason -- the
+    ordinary line, shown whenever the radar places him and the camera does
+    not overrule -- rendered `a target inside 'at the desk'`, and the
+    no-camera-zone line rendered `'office' has no camera zone in
+    zones.rooms`. %r puts Python's quotes and a dotted config key in the
+    house-voice column on a normal day."""
+    quoted = re.compile(r"""(^|\s)['"]|['"](\s|$)""")
+    for v in _fuse_matrix():
+        assert not quoted.search(v.why), v.why      # an apostrophe is fine
+        assert "zones." not in v.why, v.why
+        assert "_" not in v.why, v.why
+
+
+def test_no_opinion_names_no_source_even_when_the_camera_was_looking():
+    """fuse() printed "NO OPINION · radar" when the radar had been silent:
+    a face in a room whose camera_zone is blank set saw_face, and the
+    source line only checked saw_face. Neither leg answered, so neither
+    leg is named."""
+    ladders = sp.read_ladders(_opts())
+    face = sp.camera_view({"live": True, "faces": 1,
+                           "face": {"name": "hunterp", "id_score": 0.71,
+                                    "id_ran": True}})
+    v = sp.fuse(present=None, distance_m=None, camera=face,
+                zmap=ladders.for_room("kitchen"), overrules=True)
+    assert v.zone == sp.NO_OPINION
+    assert v.source == ""
+    assert sp.source_text(v) == ""
+    # and the radar is still named when the radar really did answer
+    v = sp.fuse(present=True, distance_m=3.0, camera=face,
+                zmap=ladders.for_room("kitchen"), overrules=True)
+    assert v.source == "radar"
+
+def test_this_file_hands_the_font_globals_back_the_way_it_found_them():
+    """Otherwise it corrupts the classic oracle for every file after it."""
+    before = font_globals()
+    theme._FAMILY, theme._HAS_DISPLAY = "Somefont", True
+    assert font_globals() != before
+    set_font_globals(before)
+    assert font_globals() == before
+    assert set(FONT_GLOBALS) <= set(vars(theme))
 
 
 def test_the_holo_band_bar_marker_is_a_needle_not_a_handle():
@@ -552,6 +685,151 @@ def test_the_drawer_keeps_its_width_and_its_section_order(root):
     assert plain == ["AUDIO", "RECOGNITION", "VOICEID", "SPEECH",
                      "INTELLIGENCE", "ASSISTANT", "PRIVACY", "SYSTEM"]
 
+
+# MEASURED 2026-09-05 from the rig at the app's OWN default geometry
+# (main_window.DEFAULT_W/H = 520x880 design units, i.e. 1040x1760 at S=2 --
+# the size he actually runs). The stage under the tab strip is 320 px
+# taller there than in the 920x1440 window the brief named.
+STAGE_H_HIS_WINDOW = 1172
+
+
+def test_the_foot_follows_the_content_at_the_size_he_runs(root):
+    """ROUND 1 FIX. Pinning the foot to the bottom of the frame traded the
+    clipped row for a VOID: measured on his own default geometry, 408 px
+    of nothing between the last band row and SAVE -- 23% of the window --
+    because the page fits with room to spare there. The page is one column
+    now: the foot follows the content, and the slack falls off the bottom
+    where a finished page ends."""
+    page = _build_page(root, "holo", height=STAGE_H_HIS_WINDOW)
+    body_bottom = page._body.winfo_rooty() + page._body.winfo_height()
+    gap = page._save_btn.winfo_rooty() - body_bottom
+    assert 0 <= gap <= wg.px(24), gap
+    assert page.overflow_px() == 0
+    assert not page._thumb.winfo_ismapped()
+    # and nothing has fallen off the bottom
+    page_bottom = page.winfo_rooty() + page.winfo_height()
+    for name in ("_save_btn", "_overrule", "_note", "_age"):
+        w = getattr(page, name)
+        assert w.winfo_ismapped(), name
+        assert w.winfo_rooty() + w.winfo_height() <= page_bottom, name
+
+
+def test_the_foot_is_still_pinned_below_the_fold_when_the_page_scrolls(root):
+    """The other half of the same rule: when the body is taller than the
+    room it has, the view stops at the foot and the body scrolls under it.
+    SAVE never scrolls away."""
+    page = _build_page(root, "holo", height=420)
+    assert page.overflow_px() > 0
+    save_top = page._save_btn.winfo_rooty()
+    view_bottom = page._canvas.winfo_rooty() + page._canvas.winfo_height()
+    assert view_bottom <= save_top
+
+
+def test_every_band_row_draws_its_own_span(root):
+    """The state he photographed: no live range in either room, so no
+    marker anywhere. Every bar must still carry ink of its own, and the
+    two bands of one room must start at different x -- which is what a
+    span is and a slider track is not."""
+    page = _build_page(root, "holo")
+    root.update_idletasks()
+    lefts = {}
+    for band in page._bands:
+        bar = band["bar"]
+        assert bar.find_all(), band["name"]
+        x0, x1 = bar.span_px()
+        assert x1 > x0, band["name"]
+        lefts.setdefault(band["room"], []).append(x0)
+    for room, xs in lefts.items():
+        assert len(set(xs)) == len(xs), (room, xs)
+
+
+def test_typing_a_band_bound_redraws_that_rooms_ladder(root):
+    """The boxes are the editor; the bars are the picture of what is in
+    them. Widening a band under his hands widens its bar and pushes the
+    next band along, so he can see the ladder he is typing.
+
+    The redraw is bound to <KeyRelease> and <FocusOut> on both boxes; the
+    BINDING is asserted rather than driven, because an Xvfb with no window
+    manager gives the toplevel no input focus and delivers no key event at
+    all (measured on :94: event_generate("<KeyRelease-0>", when="now") on
+    a mapped, focused entry fires nothing). What the binding calls is
+    driven directly."""
+    page = _build_page(root, "holo")
+    root.update_idletasks()
+    first, second = page._bands[0], page._bands[1]
+    for row in (first, second):
+        for box in (row["lo"], row["hi"]):
+            assert set(box.bind()) >= {"<KeyRelease>", "<FocusOut>"}, box
+    before = (first["bar"].span_px()[1], second["bar"].span_px()[0])
+    first["hi"].delete(0, "end")
+    first["hi"].insert(0, "3.00")
+    page._resync_spans()
+    root.update_idletasks()
+    assert first["bar"].span_px()[1] > before[0]
+    # the neighbour has not moved, so the OVERLAP he has just typed (0.75
+    # to 3.00 over 2.25 to 3.75) is on the page -- band_edits would refuse
+    # that pair on SAVE and now he can see it before he presses it
+    assert second["bar"].span_px()[0] == before[1]
+    assert second["bar"].span_px()[0] < first["bar"].span_px()[1]
+    # the live mark is measured against the same bounds the bar was drawn
+    # from, so the needle cannot drift off the bar while he types
+    assert (first["near_m"], first["far_m"]) == (0.75, 3.0)
+    # a box holding junk drops its own bar and leaves the room's alone
+    first["hi"].delete(0, "end")
+    first["hi"].insert(0, "abc")
+    page._resync_spans()
+    root.update_idletasks()
+    assert first["span"] is None
+    assert second["span"] is not None
+
+
+def test_the_live_range_marks_the_band_it_is_in_and_no_other(root):
+    page = _build_page(root, "holo")
+    page._open = True            # apply() only paints an open page; show()
+    # would start the poller, and this measures the paint, not the poll.
+    page.apply([sp.Reading(name="office", label="the office", present=True,
+                           distance_m=3.10, rtt_ms=0.4)])
+    root.update_idletasks()
+    marked = [b["name"] for b in page._bands if b["bar"].marked()]
+    assert marked == ["at the desk"], marked
+
+
+def test_only_the_fault_line_is_amber_in_a_dark_room_block(root):
+    """Counting amber ink on the fault frame: 6 lines before, and the
+    round-0 pass moved it to 6. The state word is the faintest thing on a
+    dark row now, so the fault line is the only amber one -- one per room,
+    two on the page."""
+    page = _build_page(root, "holo")
+    for block in page._blocks.values():
+        amber = [w for w in (block.name, block.presence, block.camera,
+                             block.verdict, block.source, block.why,
+                             block.distance, block.rtt)
+                 if str(w.cget("fg")) == theme.WARN]
+        assert amber == [], [w.cget("text") for w in amber]
+        assert str(block.fault.cget("fg")) == theme.WARN
+        assert block.fault.winfo_ismapped()
+
+
+def test_the_drawer_controls_share_one_ink_edge(root):
+    """The author's stated rule was "every button's right edge is the
+    toggles' right edge"; MEASURED on the frames it was 6 px out --
+    buttons' ink at x=1005, toggles' at 999 -- because RoundButton drew
+    its ring from winfo_width(), which counts the 2 px highlight border on
+    each side, so the ring was 4 px too wide and its right edge was
+    CLIPPED by the canvas. Widget geometry agreed; the ink did not."""
+    drawer = _build_drawer(root, "holo")
+    edges = {}
+    for row in _rows_of(drawer):
+        for kid in row.winfo_children():
+            if isinstance(kid, (wg.Toggle, wg.RoundButton)):
+                box = kid.bbox("all")
+                assert box, kid
+                bd = int(kid.cget("highlightthickness") or 0)
+                edges.setdefault(type(kid).__name__, set()).add(
+                    kid.winfo_width() - (box[2] + bd))
+    assert set(edges) == {"Toggle", "RoundButton"}, edges
+    every = set().union(*edges.values())
+    assert max(every) - min(every) <= 1, edges
 
 def test_the_rows_keep_one_vertical_rhythm(root):
     """Every row in a section box is a row frame with the same pady, so a
