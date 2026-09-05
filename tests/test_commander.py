@@ -190,14 +190,18 @@ def test_remember_routes_to_persistent_memory(cmdr, services):
     res = cmdr.handle("jarvis remember that I parked on level 3")
     assert services.memory.remember.call_count == 1
     key, value = services.memory.remember.call_args[0]
-    assert value == "i parked on level 3"
-    assert res.handled and "i parked on level 3" in res.reply
+    # 2026-09-04: filed in the SECOND person (memory.store_fact_from_speech)
+    # -- under "Known facts" the model is Jarvis, and "I parked" said that
+    # Jarvis did. The key is the first six words of the value.
+    assert value == "You parked on level 3"
+    assert key == "You parked on level 3"
+    assert res.handled and "You parked on level 3" in res.reply
     services.brain.think.assert_not_called()
 
 
 @pytest.mark.parametrize("said,fact", [
     ("jarvis put it in your memory that i graduate december 10th 2026 with an electrical engineering degree",
-     "i graduate december 10th 2026 with an electrical engineering degree"),
+     "you graduate december 10th 2026 with an electrical engineering degree"),
     ("jarvis keep in mind that heather prefers email", "heather prefers email"),
     ("jarvis don't forget that the lab moved to room 049", "the lab moved to room 049"),
 ])

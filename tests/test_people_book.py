@@ -167,7 +167,9 @@ def test_a_non_person_my_x_is_falls_through(cmdr, mem):
 
 def test_remember_that_my_advisor_is_stores_fact_and_contact(cmdr, mem):
     res = cmdr.handle("remember that my advisor is Dr Peyrovi", source="typed")
-    assert res.handled and res.reply.startswith("Remembered:")
+    # 2026-09-04: the ack states the fact, in the second person, spoken
+    assert res.handled and res.reply == "Noted, sir: your advisor is Dr Peyrovi."
+    assert res.speak is True
     assert mem.recall("peyrovi")
     assert mem.resolve_person("advisor")["name"] == "Dr Peyrovi"
 
