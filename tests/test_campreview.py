@@ -1848,7 +1848,23 @@ def test_a_recognised_face_cannot_grant_anything_because_nothing_reads_it():
                and re.search(r"^\s*(from|import)\s+\S*sensors_page|"
                              r"^\s*from\s+\S+\s+import\s+[^\n]*\bsensors_page\b",
                              p.read_text(), re.M)}
-    assert readers <= {"jarvis/ui/main_window.py"}, readers
+    # 2026-09-05: jarvis/ui/sensor_setup.py joined this list, and the
+    # exemption is NARROW ON PURPOSE. The setup sheet imports exactly one
+    # name from the page -- write_options, the helper that writes a dotted
+    # config key and reports which writes were refused. It does not import
+    # fuse(), Verdict, CameraView or page_rows, and it computes no verdict of
+    # its own, so the sentence above is untouched: the fused "AT THE DESK"
+    # still has exactly one reader, the window that packs the page. The
+    # assertion below is what keeps that narrow -- the day the sheet imports
+    # anything else from the page, this fails and asks why.
+    assert readers <= {"jarvis/ui/main_window.py",
+                       "jarvis/ui/sensor_setup.py"}, readers
+    if "jarvis/ui/sensor_setup.py" in readers:
+        names = set(re.findall(
+            r"^\s*from\s+jarvis\.ui\.sensors_page\s+import\s+([^\n]+)",
+            (REPO / "jarvis" / "ui" / "sensor_setup.py").read_text(), re.M))
+        taken = {n.strip() for line in names for n in line.split(",")}
+        assert taken == {"write_options"}, taken
     # …and the class itself hands nothing out but a shot: no callback, no
     # sink, no publish. The pane POLLS; nothing here pushes.
     #
