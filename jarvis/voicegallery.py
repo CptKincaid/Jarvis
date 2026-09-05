@@ -1698,18 +1698,21 @@ class VoiceGallery:
             log.warning("voice gallery: re-anchor refused -- %s", out["why"])
             return out
 
+        # THE REPLACEMENT AND THE SAVE ARE ONE TRY, and it is ANY exception,
+        # not only ValueError. migrate_voiceprint learned that on 2026-09-05
+        # when an OSError escaped with fourteen takes still staged; here the
+        # stakes are higher, because the pool has already been EMPTIED by the
+        # time anything can raise -- an escape would leave his label holding
+        # part of one pool and part of another.
         before = dict(self._pool), dict(self._takes), dict(self._consent)
-        keep_consent = self.consent(label)
-        self._pool[label] = []
-        self._takes[label] = []
-        for arr in staged:
-            self.add(label, arr, src="legacy",
-                     note="re-anchored from voiceprint.npz format 2")
-        if keep_consent:
-            self._consent[label] = keep_consent
-        elif not self.consent(label):
-            self.set_consent(label, "owner")
         try:
+            self._pool[label] = []
+            self._takes[label] = []
+            for arr in staged:
+                self.add(label, arr, src="legacy",
+                         note="re-anchored from voiceprint.npz format 2")
+            if not self.consent(label):
+                self.set_consent(label, "owner")
             out["generation"] = self.save(
                 reason=reason or ("re-anchored %s to voiceprint.npz (was cos "
                                   "%.4f of it over %d take(s))"

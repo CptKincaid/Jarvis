@@ -513,3 +513,40 @@ def test_the_recovery_takes_no_label_but_his(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(vg.PATHS, "VOICE_GALLERY", tmp_path / "vg")
     assert ve.main(["--reanchor", "--label", "mara"]) == 2
     assert "mara" in capsys.readouterr().err
+
+
+def test_a_failed_recovery_leaves_his_pool_exactly_as_it_was(rig, tmp_path,
+                                                             monkeypatch):
+    """THE STAKES ARE HIGHER HERE THAN IN A MIGRATION. A re-anchor EMPTIES
+    his label before it refills it, so an exception escaping between the two
+    leaves him holding part of one pool and part of another -- the same class
+    of loss ``migrate_voiceprint`` learned to roll back from on 2026-09-05,
+    with the pool already gone rather than merely staged."""
+    v, enc, gate = rig
+    world = Voices(seed=23, apart=0.3)
+    pool = _drifted(v, enc, world)
+    src = _write_voiceprint(tmp_path / "vp.npz", pool)
+    before = [np.array(e, copy=True) for e in v.gallery.embeddings("hunter")]
+    # HALF WAY THROUGH THE REFILL is the case the try has to cover, and it is
+    # the one an except around save() alone would miss: the old pool is
+    # already gone and the new one is not there yet.
+    real_add = v.gallery.add
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 5:
+            raise ValueError("refusing a degenerate embedding: pretend")
+        return real_add(*a, **k)
+
+    monkeypatch.setattr(v.gallery, "add", boom)
+    out = v.gallery.reanchor_voiceprint("hunter", path=src)
+    assert out["ok"] is False and out["why"], out
+    after = v.gallery.embeddings("hunter")
+    assert len(after) == len(before) == 14, (
+        "his pool came back holding %d of the 14 it had" % len(after))
+    assert all(np.array_equal(a, b) for a, b in zip(after, before)), \
+        "his pool came back different from the one that was there"
+    monkeypatch.setattr(v.gallery, "add", real_add)
+    assert v.gallery.reanchor_voiceprint("hunter", path=src)["ok"] is True
+    assert v.gallery.count("hunter") == len(pool)
