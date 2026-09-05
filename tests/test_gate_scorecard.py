@@ -15,6 +15,7 @@ The two questions the tests exist to hold down:
     also checks the output says so out loud.
 """
 import json
+import os
 import time
 
 import pytest
@@ -532,3 +533,331 @@ def test_the_empty_printout_points_at_a_heading_that_exists():
              if ln.startswith("#")]
     for title in quoted:
         assert any(title in h for h in heads), "no heading %r" % title
+
+
+# ------------------------------------ what it does when the file is BAD
+# THE PRINCIPLE THIS BLOCK ENFORCES. A scorecard that silently reports 0
+# when it could not read something is worse than no scorecard at all,
+# because he acts on it. MEASURED before this block existed: a MISSING
+# file, a file where EVERY line is unparseable, a file it has no PERMISSION
+# to read, and a --path pointing at a DIRECTORY all printed output that was
+# BYTE-IDENTICAL to a healthy, quiet, empty ledger -- and the text he then
+# read said "the usual reason is that nobody is enrolled ... Enrol yourself
+# first", sending him back to redo enrolment he had already done.
+def _healthy_empty(tmp_path):
+    """The one input that really IS a quiet week: the ledger exists, it is
+    readable, and it holds nothing. Everything else must not look like it."""
+    p = tmp_path / "healthy.jsonl"
+    p.write_text("")
+    return p
+
+
+def _card(path, *, now=None, window_s=None):
+    """The whole printout for one path, built the way the script builds it,
+    so a test cannot pass on a code path he never sees."""
+    now = NOW if now is None else now
+    window_s = DAY if window_s is None else window_s
+    rep = gl.read_report(path)
+    s = gl.summarise(rep, now=now, window_s=window_s)
+    return gl.render(s, now=now, window_s=window_s, path=str(path))
+
+
+def _above_the_fold(text):
+    """What he actually reads: everything before the standing assumptions."""
+    return text.split("What this cannot know")[0].lower()
+
+
+def test_a_missing_ledger_does_not_read_as_a_quiet_week(tmp_path):
+    text = _card(tmp_path / "nope.jsonl")
+    assert "does not exist" in _above_the_fold(text)
+    assert text != _card(_healthy_empty(tmp_path))
+
+
+def test_a_missing_ledger_is_not_dressed_up_as_you_are_not_enrolled(tmp_path):
+    """The specific harm: a typo in --path or a rotated file sent him back
+    to redo enrolment. "I could not read that" must come FIRST."""
+    low = _above_the_fold(_card(tmp_path / "nope.jsonl"))
+    assert "does not exist" in low
+    if "enrol" in low:
+        assert low.index("does not exist") < low.index("enrol")
+
+
+def test_a_ledger_of_rubbish_is_not_reported_as_an_empty_week(tmp_path):
+    p = tmp_path / "gate.jsonl"
+    p.write_text("{not json\nalso not json\n[1, 2, 3]\n")
+    low = _above_the_fold(_card(p))
+    assert "could not" in low or "unreadable" in low
+    assert "3" in low                       # all three lines, counted
+    assert _card(p) != _card(_healthy_empty(tmp_path))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read anything")
+def test_a_ledger_he_may_not_read_says_permission(tmp_path):
+    p = tmp_path / "gate.jsonl"
+    gl.append(p, _row(NOW - 10))
+    p.chmod(0o000)
+    try:
+        text = _card(p)
+    finally:
+        p.chmod(0o600)
+    assert "permission" in _above_the_fold(text)
+    assert text != _card(_healthy_empty(tmp_path))
+
+
+def test_a_path_that_is_a_directory_says_so(tmp_path):
+    d = tmp_path / "not-a-ledger"
+    d.mkdir()
+    text = _card(d)
+    assert "director" in _above_the_fold(text)
+    assert text != _card(_healthy_empty(tmp_path))
+
+
+def test_no_bad_input_is_byte_identical_to_a_healthy_quiet_ledger(tmp_path):
+    """The measured defect, pinned as one assertion."""
+    rubbish = tmp_path / "rubbish.jsonl"
+    rubbish.write_text("{not json\n")
+    adir = tmp_path / "adir"
+    adir.mkdir()
+    base = _card(_healthy_empty(tmp_path))
+    for bad in (tmp_path / "missing.jsonl", rubbish, adir):
+        assert _card(bad) != base, "%s reads as a quiet week" % bad.name
+
+
+def test_lines_it_could_not_read_are_counted_where_he_will_see_them(tmp_path):
+    """Partial corruption was silent: a 5-line file with 2 unreadable lines
+    reported 3 turns and never mentioned the 2."""
+    p = tmp_path / "gate.jsonl"
+    gl.append(p, _row(NOW - 10))
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write("{torn\nalso torn\n")
+    gl.append(p, _row(NOW - 20))
+    gl.append(p, _row(NOW - 30))
+    rep = gl.read_report(p)
+    assert rep.lines_seen == 5 and rep.lines_dropped == 2
+    low = _above_the_fold(_card(p))
+    assert "2 of 5" in low
+
+
+def test_rows_outside_the_window_are_not_dressed_as_nobody_enrolled(tmp_path):
+    """A populated ledger and an empty window are not the same thing, and
+    the advice for one is wrong for the other."""
+    p = tmp_path / "gate.jsonl"
+    for i in range(5):
+        gl.append(p, _row(NOW - 30 * DAY - i))
+    low = _above_the_fold(_card(p))
+    assert "5" in low
+    assert "outside" in low or "older" in low
+
+
+def test_a_healthy_empty_ledger_still_gets_the_enrolment_advice(tmp_path):
+    """The fix must not throw away the help that IS right for a real empty
+    file -- it must stop giving it for the three cases where it is wrong."""
+    low = _above_the_fold(_card(_healthy_empty(tmp_path)))
+    assert "enrol" in low
+    for trouble in ("could not", "does not exist", "permission", "director"):
+        assert trouble not in low
+
+
+def test_the_json_form_carries_the_trouble_too(tmp_path, capsys):
+    """--json is for a plot, and a plot of zeroes he cannot read is the
+    same lie in a different shape."""
+    import scripts.gate_scorecard as sc
+
+    assert sc.main(["--path", str(tmp_path / "nope.jsonl"), "--json"]) == 0
+    got = json.loads(capsys.readouterr().out)
+    assert got["trouble"]
+    assert "does not exist" in got["trouble"].lower()
+
+
+def test_the_script_says_it_out_loud_on_a_missing_file(tmp_path, capsys):
+    import scripts.gate_scorecard as sc
+
+    assert sc.main(["--path", str(tmp_path / "nope.jsonl")]) == 0
+    assert "does not exist" in capsys.readouterr().out.lower()
+
+
+# ------------------------------- one utterance is one turn, not two rows
+# MEASURED on the real app path: a clip the speaker filter dropped and a
+# window rescued is judged TWICE -- once inside _gate_rescue_inner
+# (rejected=True) and again at _process_audio's `verdict = self._gate_judge`
+# once the rescue has cleared `rejected`. Two ledger rows, one thing he
+# said. In SHADOW -- his live mode -- the rescue fires for the phrase and
+# code windows, which is exactly the path he exercises the first time he
+# tests Knightfall. So the headline number AND the "somebody else got in"
+# figure both inflate on the first thing he tries.
+def test_one_rescued_utterance_is_one_turn_not_two(tmp_path):
+    rows = [_row(NOW - 10, how=gt.HOW_GRANT, rescued=True, turn="t1"),
+            _row(NOW - 9.5, how=gt.HOW_GRANT, rescued=False, turn="t1")]
+    s = gl.summarise(rows, now=NOW, window_s=DAY)
+    assert s.judged == 1
+    assert s.window_admits == 1
+    assert s.admitted_owner == 1
+
+
+def test_the_verdict_count_is_still_available_and_is_named_apart(tmp_path):
+    """Both numbers are true and they are different questions. The one
+    labelled "turns" must be turns."""
+    rows = [_row(NOW - 10, how=gt.HOW_GRANT, rescued=True, turn="t1"),
+            _row(NOW - 9.5, how=gt.HOW_GRANT, rescued=False, turn="t1")]
+    s = gl.summarise(rows, now=NOW, window_s=DAY)
+    assert s.verdicts == 2 and s.judged == 1
+    text = gl.render(s, now=NOW, window_s=DAY, path="<synthetic>")
+    assert "verdict" in text.lower()
+
+
+def test_rows_with_no_turn_id_are_each_their_own_turn(tmp_path):
+    """The safe degradation: a ledger written by a gate that did not stamp
+    turns must never be merged by guesswork. Two rows, two turns."""
+    rows = [_row(NOW - 10), _row(NOW - 9.5)]
+    for r in rows:
+        r.pop("turn", None)
+    assert gl.summarise(rows, now=NOW, window_s=DAY).judged == 2
+
+
+def test_two_real_turns_that_share_nothing_are_never_merged(tmp_path):
+    rows = [_row(NOW - 10, turn="t1"), _row(NOW - 9.5, turn="t2")]
+    assert gl.summarise(rows, now=NOW, window_s=DAY).judged == 2
+
+
+def test_the_gate_stamps_both_verdicts_of_one_utterance_with_one_turn(tmp_path):
+    """The seam, driven through the REAL gate: the app hands the same turn
+    id to the rescue's judge and to the judge that follows it."""
+    rows = []
+    g = _gate(tmp_path, record=rows.append)
+    g.judge("voice", "", stats=NO_MATCH, rejected=True, turn="t7")
+    g.judge("voice", SENTENCE, stats=NO_MATCH, turn="t7")
+    assert [r["turn"] for r in rows] == ["t7", "t7"]
+    at = time.time()
+    for i, r in enumerate(rows):
+        r["at"] = at - 10 + i
+    assert gl.summarise(rows, now=at, window_s=DAY).judged == 1
+
+
+def test_the_app_stamps_one_turn_id_on_both_gate_calls():
+    """A source pin. Without it the double count comes straight back and
+    every test above still passes, because they all pass their own id."""
+    import inspect
+
+    import jarvis.app as app_mod
+
+    proc = inspect.getsource(app_mod.JarvisApp._process_audio)
+    assert "turn=tid" in proc, "_process_audio hands no turn id down"
+    assert proc.count("turn=tid") >= 2, "only one of the two calls is stamped"
+    for name in ("_gate_rescue", "_gate_rescue_inner", "_gate_judge"):
+        src = inspect.getsource(getattr(app_mod.JarvisApp, name))
+        assert "turn" in src, "%s drops the turn id" % name
+
+
+# --------------------------- a verdict this reader does not understand
+def test_a_leg_this_reader_does_not_know_is_counted_and_named(tmp_path):
+    """MEASURED before the fix: 3 judged turns with two unknown legs printed
+    33.3% / 0% / 0% / 0% and the missing 2 appeared NOWHERE. A future gate
+    that adds a leg must not make this scorecard quietly lose turns."""
+    rows = [_row(NOW - 10),
+            _row(NOW - 11, how="sunglasses", role="unknown", who=""),
+            _row(NOW - 12, how="sunglasses", role="unknown", who="")]
+    s = gl.summarise(rows, now=NOW, window_s=DAY)
+    assert s.judged == 3
+    assert s.unclassified == 2
+    text = gl.render(s, now=NOW, window_s=DAY, path="<synthetic>")
+    assert "sunglasses" in text
+
+
+def test_every_judged_turn_lands_in_exactly_one_line(tmp_path):
+    """The invariant that makes the printed percentages honest."""
+    rows = [_row(NOW - 10),
+            _row(NOW - 11, role=ROLE_KNOWN, who="heather", how=gt.HOW_FACE),
+            _refusal(NOW - 12),
+            _row(NOW - 13, how=gt.HOW_BLIND, role="unknown", who="",
+                 voice_running=False, face_running=False, score=None),
+            _row(NOW - 14, how="a-leg-from-the-future", role="unknown",
+                 who="")]
+    s = gl.summarise(rows, now=NOW, window_s=DAY)
+    assert (s.admitted_owner + s.admitted_other + s.refused + s.no_opinion
+            + s.unclassified) == s.judged == 5
+
+
+# ------------------------------------------- it must not overstate itself
+def test_the_line_he_opened_the_floor_says_it_is_a_subset(tmp_path):
+    """It is indented level with four MUTUALLY EXCLUSIVE lines but is a
+    subset of "ANSWERED you", so it reads as a fifth sibling that does not
+    add up. It has to say on the line that it is counted above."""
+    text = _render([_row(NOW - 10, consumed=True, how=gt.HOW_PHRASE)])
+    line = [ln for ln in text.splitlines()
+            if "opened the floor" in ln.lower()]
+    assert line, "the floor line is gone"
+    assert "of the above" in line[0].lower() or "included" in line[0].lower()
+
+
+def test_the_script_does_not_claim_more_about_itself_than_is_true():
+    """MEASURED: a real run mkdir's a log directory, appends 215 bytes to
+    /tmp/jarvis-adhoc/jarvis.log and shells out to nvidia-smi and ldconfig
+    -- all side effects of importing jarvis.config. Nothing of his leaks and
+    /tmp/vss_voice is untouched, but "it opens exactly one file ... it
+    writes nothing" is FALSE, and a file whose whole value is honesty about
+    itself must not overstate itself."""
+    import scripts.gate_scorecard as sc
+
+    doc = " ".join(sc.__doc__.split())
+    assert "opens exactly one file" not in doc
+    assert "writes nothing" not in doc
+    assert "one file" in doc.lower()             # it still says what it reads
+
+
+# --------------------------------- the walkthrough's face-leg step, fixed
+def test_it_does_not_send_him_to_read_a_number_that_is_never_printed():
+    """MEASURED: the substring "dim" appears ZERO times in
+    scripts/face_enrol.py -- --status prints the gallery, the generations,
+    the labels and the cohesion, and never an embedding width. Telling him
+    to "note the embedding width" from it is a step he cannot complete."""
+    src = (ROOT / "scripts" / "face_enrol.py").read_text().lower()
+    assert "dim" not in src, "face_enrol.py prints a width after all"
+    # Pin the TRUTH rather than the absence of a phrase: the paragraph that
+    # sends him to --status has to say, in that paragraph, that --status
+    # does not print a width -- otherwise the next reader re-adds the step.
+    para = _section().split("face_enrol.py --status")[1].split("###")[0]
+    assert "does not print" in para.lower() or "never prints" in para.lower()
+    assert "note two things" not in para.lower()
+
+
+def test_the_width_the_walkthrough_hands_him_matches_this_tree():
+    """MEASURED: the doc said --face-dim 512 while jarvis/facegallery.py on
+    this tree has EMBED_DIM 128. Follow it verbatim and app.py reports "the
+    gallery is 128-D and hunter was enrolled at 512-D; re-enrol to bring the
+    face leg back" -- a silently dead face leg, from a document."""
+    from jarvis.facegallery import EMBED_DIM
+
+    widths = {int(w) for w in re.findall(r"--face-dim\s+(\d+)", _section())}
+    assert widths <= {EMBED_DIM}, \
+        "the walkthrough hands him %r, this tree is %d-D" % (widths, EMBED_DIM)
+
+
+def test_the_walkthrough_names_where_the_width_really_comes_from():
+    """If it asks him for a width at all, it has to say which file states
+    it, so the next model swap makes the document wrong out loud."""
+    s = _section()
+    if "--face-dim" in s:
+        assert "facegallery" in s
+
+
+def test_the_walkthrough_does_not_repeat_the_scripts_false_self_claim():
+    s = " ".join(_section().split())
+    assert "writes nothing" not in s
+    assert "opens exactly one file" not in s
+
+
+def test_the_walkthrough_tells_him_what_an_unreadable_ledger_looks_like():
+    """§8 of the walkthrough is the empty case, and the empty case is now
+    four different sentences. It must not promise only one."""
+    s = _section().lower()
+    assert "could not" in s or "unreadable" in s
+
+
+def test_every_help_text_points_at_a_heading_that_exists():
+    """The wider form of the pin already on EMPTY_HELP: any section title
+    quoted by ANY of the reader's help texts has to be findable."""
+    heads = [ln.lstrip("# ").strip() for ln in DOC.read_text().splitlines()
+             if ln.startswith("#")]
+    for text in gl.HELP_TEXTS:
+        for title in re.findall(r'"([^"]{20,})"', text):
+            assert any(title in h for h in heads), "no heading %r" % title

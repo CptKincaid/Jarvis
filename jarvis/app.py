@@ -5033,9 +5033,13 @@ class JarvisApp:
             fn = self.transcriber.transcribe
         return fn(audio)
 
-    def _gate_rescue(self, audio, stats, speculative):
+    def _gate_rescue(self, audio, stats, speculative, turn=""):
         """A clip the speaker filter dropped: `(audio, stats, result)` to let
         it through after all, or None to keep today's behaviour.
+
+        ``turn`` IS THE LEDGER'S, NOT THE GATE'S. It changes no decision
+        here; it stamps both verdicts of one utterance with one id so the
+        scorecard counts a rescued clip as ONE turn (jarvis/gateledger.py).
 
         THE SPOKEN PASSPHRASE COSTS ONE DECODE, and only here. It arrives as
         a Whisper transcript, and a rejected clip is never transcribed -- so
@@ -5054,13 +5058,15 @@ class JarvisApp:
             return None
         try:
             return self._gate_rescue_inner(gate, audio, stats,
-                                           speculative=speculative)
+                                           speculative=speculative,
+                                           turn=turn)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: the rescue failed; the clip is "
                           "dropped exactly as it was before")
             return None
 
-    def _gate_rescue_inner(self, gate, audio, stats, speculative=False):
+    def _gate_rescue_inner(self, gate, audio, stats, speculative=False,
+                           turn=""):
         face, running = self._eye_identity(), self._face_running()
         # THE PHRASE COSTS ONE DECODE, IN EVERY MODE, and only when an owner
         # has set one. It is the ONE thing that acts in shadow: a rejected
@@ -5072,7 +5078,7 @@ class JarvisApp:
             result = self._gate_quiet_decode(audio)
             text = (getattr(result, "text", "") or "").strip()
         d = gate.judge("voice", text, stats=stats, rejected=True,
-                       face=face, face_running=running)
+                       face=face, face_running=running, turn=turn)
         if d.consumed:
             self._gate_consumed(d, getattr(result, "confidence", 0.0),
                                 speculative)
@@ -5125,16 +5131,18 @@ class JarvisApp:
         self._refuse_politely(d.line)
         return None
 
-    def _gate_judge(self, text, stats):
+    def _gate_judge(self, text, stats, turn=""):
         """One verdict for the turn, or None when there is no gate or it
-        could not decide (both mean: the turn stands, exactly as today)."""
+        could not decide (both mean: the turn stands, exactly as today).
+
+        ``turn`` only reaches the ledger row -- see ``_gate_rescue``."""
         gate = getattr(self, "gate", None)
         if gate is None:
             return None
         try:
             return gate.judge("voice", text, stats=stats,
                               face=self._eye_identity(),
-                              face_running=self._face_running())
+                              face_running=self._face_running(), turn=turn)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: judging failed; the turn stands")
             return None
@@ -5183,6 +5191,17 @@ class JarvisApp:
 
     def _process_audio(self, audio):
         stats = {}
+        # ONE STAMP FOR ONE THING HE SAID. A clip the speaker filter dropped
+        # and a window rescued is judged TWICE below -- once inside
+        # _gate_rescue with rejected=True, and again at `verdict =
+        # self._gate_judge(...)` once the rescue has cleared `rejected`.
+        # Both verdicts are real and both belong in the ledger; without a
+        # shared id the scorecard reports one utterance as two turns and
+        # two window admits, and it does so on exactly the path his FIRST
+        # Knightfall test takes. A timestamp rather than a counter on
+        # purpose: gate.jsonl outlives a restart, and a counter that began
+        # again at 1 would fold two boots' turns together.
+        tid = "%.4f" % time.time()
         try:
             spec = self._take_speculation()
             if spec is not None:
@@ -5202,7 +5221,8 @@ class JarvisApp:
                 # his voice will not) and to hear the spoken passphrase,
                 # which is his way back in when he is ill, in the dark, or
                 # turned away. Anything else and today's behaviour stands.
-                rescued = self._gate_rescue(audio, stats, spec is not None)
+                rescued = self._gate_rescue(audio, stats, spec is not None,
+                                            turn=tid)
                 if rescued is PHRASE_CONSUMED:
                     return             # the gate answered it; nothing else
                 if rescued is None:
@@ -5227,7 +5247,7 @@ class JarvisApp:
             # phrase on the bus as a rejected transcript.
             verdict = None
             if text and (result.accepted or self._owner_has_phrase()):
-                verdict = self._gate_judge(text, stats)
+                verdict = self._gate_judge(text, stats, turn=tid)
                 if verdict is not None and verdict.consumed:
                     self._gate_consumed(verdict, result.confidence,
                                         spec is not None)

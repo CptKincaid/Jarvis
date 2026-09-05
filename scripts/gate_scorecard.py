@@ -9,16 +9,31 @@ then answers the turn anyway. This reads the verdicts back.
     ~/vss_env/bin/python scripts/gate_scorecard.py --hours 6
     ~/vss_env/bin/python scripts/gate_scorecard.py --json     # for a plot
 
-SAFE TO RUN WHILE JARVIS IS LIVE. It opens exactly one file, /tmp/vss_voice/
-gate.jsonl, for reading; it writes nothing, touches no configuration, starts
-no model, and never reads the log, the people book or the voiceprint. A row
-half-written by the running app is skipped rather than parsed.
+SAFE TO RUN WHILE JARVIS IS LIVE. The only file of yours it touches is the
+one file it reads -- /tmp/vss_voice/gate.jsonl -- and it never writes it,
+never speaks to the running process, and never opens the log, the people
+book, the voiceprint or the gallery. Measured: /tmp/vss_voice is byte-for-
+byte unchanged after a run, and a row half-written by the app is skipped.
+
+IT IS NOT SILENT, THOUGH, AND THE HONEST VERSION OF THAT SENTENCE IS THIS:
+importing jarvis.config appends a startup line to this repository's own
+ad-hoc log under /tmp/jarvis-adhoc and probes the GPU, exactly as every
+other script here does. Nothing of yours is in that and your live log
+directory is untouched -- but a file whose whole value is honesty about
+itself must not advertise itself as side-effect-free, because that claim was
+measured on a real run and it was false.
 
 WHAT IT CANNOT TELL YOU, said here and again in every printout: the ledger
 records what the GATE DECIDED, never who was really speaking. No line in the
 output is a measurement of accuracy, and there is no number in it that makes
-switching to enforce safe. See jarvis/gateledger.py for the shape of a row
-and for what may never be written into one.
+switching to enforce safe.
+
+WHAT IT SAYS WHEN IT CANNOT READ: a missing, unreadable, corrupt or
+permission-denied ledger prints a sentence at the TOP saying so, never a
+table of zeroes. A scorecard that silently reports 0 when it could not read
+something is worse than no scorecard at all, because it gets acted on. See
+jarvis/gateledger.py for the shape of a row and for what may never be
+written into one.
 """
 from __future__ import annotations
 
@@ -55,9 +70,10 @@ def main(argv=None) -> int:
         window_s = gl.DEFAULT_WINDOW_S
 
     now = time.time()
-    rows = gl.read(args.path)
-    card = gl.summarise(rows, now=now, window_s=window_s,
-                        buckets=args.buckets)
+    # read_report, NOT read: the report carries what could not be read, and
+    # that is the half the printout must not lose.
+    card = gl.summarise(gl.read_report(args.path), now=now,
+                        window_s=window_s, buckets=args.buckets)
     if args.as_json:
         out = card.as_dict()
         out["window_s"] = window_s
