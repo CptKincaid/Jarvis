@@ -5568,14 +5568,22 @@ _SEND_VERB = r"(?:e-?mail|send|share|forward on|shoot|fire)"
 # B is the loose one -- "send me the weather" fits it perfectly -- so its
 # handler refuses to act unless the recipient RESOLVES to a real address in
 # the people book or the contacts map. A is anchored by an explicit "to".
+# The SPOKEN SUBJECT. outbox.prepare() has accepted subject= all along,
+# but before this there were ZERO call sites passing it (measured with
+# git grep on jarvis-v3), so a subject he said aloud reached nothing and
+# every message went out with the default. Accepted on either side of the
+# account hint because he says it both ways.
+_SUBJECT_CUE = r"(?:with\s+(?:the\s+)?subject|subject(?:\s+line)?)"
 _SEND_FILE_RX = re.compile(
     _SEND_OPENER + _SEND_VERB + r"\s+"
     r"(?:(?P<file_a>\S.*?)\s+(?:to|over to|across to|with)\s+(?P<who_a>\S.*?)"
     r"|(?P<who_b>[a-z][\w'.\-]*(?:\s+[a-z][\w'.\-]*)?)\s+"
     r"(?P<file_b>(?:the|my|that|this|a|an)\s+\S.*?))"
+    r"(?:\s*,?\s+" + _SUBJECT_CUE + r"\s*:?\s+(?P<subj>\S.*?))?"
     r"(?:\s+(?:from|using|via|out of|off)\s+(?:my\s+|the\s+)?"
     r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+"
     r"(?:account|address|mailbox|e-?mail))?"
+    r"(?:\s*,?\s+" + _SUBJECT_CUE + r"\s*:?\s+(?P<subj2>\S.*?))?"
     r"[\s,.!?]*$", re.I)
 
 # The NEGATIVE table. He says "send", "email" and "file" in ordinary
@@ -6512,6 +6520,10 @@ def _send_file_pieces(c, t, m=None):
     said_file = (rm.group("file_a") or rm.group("file_b") or "").strip()
     who = (rm.group("who_a") or rm.group("who_b") or "").strip()
     hint = (rm.group("acct") or "").strip()
+    # From the ORIGINAL casing, like the file name: a subject is read back
+    # verbatim and "Week Nine" is not "week nine" to his eye.
+    subject = outbox.clean_subject(
+        rm.group("subj") or rm.group("subj2") or "")
     memory = c._svc("memory")
     res = outbox.resolve(cfg, memory, who)
     addr = res.addr
@@ -6527,7 +6539,7 @@ def _send_file_pieces(c, t, m=None):
             log.info("send-file: %r names neither a file nor a correspondent",
                      outbox.mask_addresses(t[:60]))
             return None
-    return said_file, who, hint, addr
+    return said_file, who, hint, addr, subject
 
 
 def _send_file_offer(c, prep, who: str, hint: str):
@@ -6630,7 +6642,7 @@ def _h_send_file(c, t, m):
         log.info("send-file: %r is not a send-a-file request",
                  outbox.mask_addresses(t))
         return None
-    said_file, who, hint, _addr = pieces
+    said_file, who, hint, _addr, subject = pieces
     # ONE read-back at a time. Every ordinary path spends _pending_send in
     # _try_send_confirm before a second send can arm, so this is reached
     # only inside a single turn -- the compound "email A to Heather and
@@ -6642,8 +6654,35 @@ def _h_send_file(c, t, m):
                              reply="There's one waiting on your yes already, "
                                    "sir; that one first.")
     prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
-                          who, account_hint=hint)
+                          who, account_hint=hint, subject=subject)
     return _send_file_finish(c, prep, said_file, who, hint)
+
+
+# The day's sends, read off the append-only audit (outbox.SENT_LOG).
+# Deliberately narrow, because "what did I email" must not claim "what did
+# I email you about the deposit" -- that is a question for the model.
+_SENT_TODAY_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:what(?:'?s| did| have)?\s+(?:i|you|we)?\s*"
+    r"(?:e-?mail(?:ed)?|sent?)\s*(?:out)?"
+    r"|what\s+files?\s+(?:did|have)\s+(?:i|you|we)\s+"
+    r"(?:e-?mail(?:ed)?|sent?)"
+    r"|(?:show|read)\s+me\s+(?:my\s+)?sent\s+files?)"
+    r"(?:\s+(?:today|so far|this morning|this afternoon))?"
+    r"[\s,.!?]*$", re.I)
+
+
+def _h_sent_today(c, t, m):
+    """The day's sends, off the append-only audit. Reads nothing else.
+
+    The addresses are already masked ON DISK by outbox.record_sent, so
+    there is nothing here that could say one in full -- and
+    outbox.sent_today_line puts what is left through spoken_recipient, so
+    there is nothing here that can say an "@" out loud either. The two
+    are different jobs and the audit needs both.
+    """
+    return CommandResult(handled=True, speak=True, status="Sent today",
+                         reply=outbox.sent_today_line())
 
 
 def _h_network(c, t, m):                                   # 3267-3279
@@ -9403,6 +9442,10 @@ REGISTRY: list[Command] = [
     # table catches, so an ordinary sentence with "send" in it falls
     # through to the router exactly as it did before.
     Command("send file", _SEND_FILE_RX.match, _h_send_file),
+    # A QUESTION about sending, never an order to send. Its regex is
+    # anchored and narrow, and _SEND_NOT_RX already refuses the same
+    # shape for the send lane, so the order here decides nothing.
+    Command("sent files", _SENT_TODAY_RX.match, _h_sent_today),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
@@ -9532,6 +9575,11 @@ ASSISTANT_TIER1: list[Command] = [
                     # the registry pass never runs on it and the intent
                     # gate calls it background chat.
                     "send file",
+                    # "what did I email today" arrives the same way. It is
+                    # the ONLY way to read the audit, and the audit is what
+                    # replaces an undo -- a record he cannot ask for out
+                    # loud is a record he will never look at.
+                    "sent files",
                     # "what's my next class" arrives with the wake word
                     # already eaten, like every other question at the desk
                     "next class",
@@ -11690,7 +11738,8 @@ class Commander:
                 return CommandResult(
                     handled=True, speak=True, status="Confirm?",
                     reply=outbox.SELF_LINE.format(
-                        who=draft.to_name or outbox.spoken_address(draft.to_addr)))
+                        who=outbox.spoken_recipient(draft.to_name,
+                                                    draft.to_addr)))
             # A yes that carries a CORRECTION -- "yes, send it to Dana",
             # "yes, but from my work account", "yes, to her work address
             # instead" -- is neither a yes nor a change of subject (F23).
@@ -11811,10 +11860,20 @@ class Commander:
                 # Its message IS the sentence: the file moved between the
                 # read-back and the yes, and he needs to hear which.
                 line, kind, status = str(exc), "error", "Not sent"
+            except mail_mod.MailAuthFailed as exc:
+                # THE ONE SEND FAILURE HE CAN FIX. Before this it was
+                # collapsed into the generic line with everything else, so
+                # a revoked or rotated app password sounded exactly like a
+                # dead network and sent him to look at his router. The
+                # server's reply is still never spoken -- it quotes the
+                # username back -- only the account LABEL, which he said.
+                log.warning("send failed for %s: auth refused (%s)", name, exc)
+                line = outbox.auth_failed_line(draft.account_label)
+                kind, status = "error", "Password refused"
             except mail_mod.MailSendFailed as exc:
                 # A transport failure's text is a class name, never a line.
                 log.warning("send failed for %s (%s)", name, exc)
-                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+                line, kind, status = outbox.WIRE_FAILED_LINE, "error", "Send failed"
             except Exception:                          # noqa: BLE001 - source
                 log.exception("send blew up for %s", name)
                 line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
