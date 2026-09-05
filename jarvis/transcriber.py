@@ -205,6 +205,13 @@ MIN_AVG_LOGPROB = -2.90
 #    the same median (3.5/s on the 0.85 s cuts, 3.6/s on the 0.55 s cuts).
 #    Only the runaway tail differs, and that is what the loop gate catches.
 DECODE_TEMPERATURES = (0.0,)
+# What the PREVIEW's initial_prompt gains when CONFIG.filler_prompt_hint is
+# on. Whisper is trained on clean transcripts and tends to drop
+# disfluencies, and the filler hold (jarvis/recorder.py) can only hold on
+# an "um" it was shown. The final transcribe() NEVER carries this: commands
+# must stay clean. Words from jarvis.endpoint.FILLER_WORDS. UNMEASURED --
+# the setting ships off until scripts/filler_probe.py says it helps.
+FILLER_PROMPT_HINT = "Um, uh, hmm, er."
 
 # Tokens a real utterance can contain. The fastest of those 113 clips
 # emitted 8.89 tokens/second ("That didn't work, sir" cut to 0.9 s); the
@@ -527,6 +534,15 @@ class Transcriber:
             except Exception:
                 log.exception("prompt provider failed; using vocab file")
         return load_vocab()
+
+    def _partial_prompt(self) -> str:
+        """_prompt() plus FILLER_PROMPT_HINT when CONFIG.filler_prompt_hint
+        is on -- the PREVIEW's prompt only. transcribe() calls _prompt()
+        itself, so the hint can never reach a command."""
+        base = self._prompt()
+        if not CONFIG.filler_prompt_hint:
+            return base
+        return f"{base} {FILLER_PROMPT_HINT}".strip()
 
     # -- model ----------------------------------------------------------
     @property
@@ -852,7 +868,7 @@ class Transcriber:
                     # model lock the final decode is waiting on.
                     result = self._model.transcribe(
                         audio,
-                        initial_prompt=self._prompt(),
+                        initial_prompt=self._partial_prompt(),
                         language=lang,
                         condition_on_previous_text=False,
                         # ...which on its own also drops the vocab prompt
@@ -874,7 +890,7 @@ class Transcriber:
                 # without this the preview -- which runs several times a
                 # second, holding the lock the final decode waits on -- is
                 # the one unbounded decode left in the module.
-                kwargs = dict(beam_size=1, initial_prompt=self._prompt(),
+                kwargs = dict(beam_size=1, initial_prompt=self._partial_prompt(),
                               max_new_tokens=budget,
                               temperature=DECODE_TEMPERATURES,
                               condition_on_previous_text=False)

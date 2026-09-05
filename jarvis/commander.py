@@ -95,6 +95,7 @@ from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
+from jarvis.endpoint import FILLER_WORDS  # noqa: F401 - one list; see endpoint.py
 from jarvis.tools.location import clock_words
 from jarvis.events import (ClearTranscript, JarvisReply, SensingChanged,
                            Status, bus)
@@ -466,10 +467,9 @@ class IntentClassifier:
 # Command tables — ported from voice_input_gui.py 125-128 + 377-480
 # ------------------------------------------------------------------
 
-# Filler sounds that indicate thinking — reset silence timer when detected
-# Only pure filler sounds, NOT common words like "like", "so", "well"
-FILLER_WORDS = {"uh", "um", "uhh", "umm", "hmm", "hm", "er", "ah", "ehh", "eh",
-                "erm", "uhhh", "ummm"}
+# Filler sounds that indicate thinking: FILLER_WORDS now lives in
+# jarvis/endpoint.py (imported above), where the recorder's filler hold
+# reads it. The copy that sat here since the monolith was read by nothing.
 
 # Voice commands — spoken phrase → replacement
 VOICE_COMMANDS = [
