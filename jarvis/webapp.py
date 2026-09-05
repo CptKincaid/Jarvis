@@ -143,6 +143,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+from jarvis import castview as castview_mod
 from jarvis import cmdsock, intercom
 from jarvis.events import Status, UserUtterance, bus
 from jarvis import contacts as contacts_mod
@@ -168,6 +169,14 @@ RATE_WINDOW_S = 60.0
 RATE_MAX = 60
 RATE_MAX_AUDIO = 12
 RATE_MAX_CLIENTS = 64             # the LAN is small; do not grow unbounded
+# The Windows cast poller (jarvis/castview.py). It LONG-POLLS because
+# RATE_MAX is 60 requests per 60 s: a one-second poll would sit exactly on
+# the limit and trip intermittently, while a 25 s hold is about 2.4 requests
+# a minute -- 4% of the budget -- and still lands a cast in well under a
+# second. _Server is a ThreadingHTTPServer, so one held request costs one
+# thread and there is exactly one client.
+CAST_POLL_S = 25.0
+MAX_CAST_BYTES = 2048             # {mon, layout, seq} and nothing else fits
 SHUTDOWN_POLL_S = 0.4
 # How far past the cap an over-long body is read-and-dropped so that the
 # 413 can actually reach the sender (see _Handler._refuse). Nothing is
@@ -320,6 +329,11 @@ class PhoneServer:
         self.served = 0
         self.spoken = 0                  # replies rendered for a phone's ear
         self.limiter = RateLimiter()
+        # The screen-cast relay (jarvis/castview.CastRelay), attached by
+        # jarvis/app.py when the gesture courier builds. None here means
+        # /api/cast answers "none" forever, which is the honest degradation
+        # for a Windows helper polling a Jarvis that cannot cast.
+        self.cast_relay = None
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -793,6 +807,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._voice()
         elif path == "/api/contacts":
             self._contacts_post()
+        elif path == "/api/cast":
+            self._cast()
         else:
             self._error(404, "no such endpoint")
 
@@ -873,6 +889,63 @@ class _Handler(BaseHTTPRequestHandler):
     # CLI's -- contacts.validate_row / check_unique through Book.add -- so
     # the page cannot accept a row the CLI would refuse, and a refusal
     # writes nothing.
+    def _cast(self):
+        """The cast poller HPCOMPUTER runs at logon. A VERB, never a command.
+
+        HIS RULING, and it is what keeps this from being remote execution
+        into his live session: the Windows side holds its own fixed command
+        lines and receives a verb from a CLOSED SET -- show-spark, stop,
+        none. The enumeration is applied HERE as well as where the verb was
+        set, because this is the last line before the wire: a bug anywhere
+        else in Jarvis that parks a command string on the relay still
+        cannot put one on it.
+
+        The request carries two things the Windows side computed itself --
+        ``mon``, the INDEX of the monitor holding the mouse pointer, and
+        ``layout``, the x-offset and width of each monitor. No cursor
+        coordinate, no window handle, no title, no process name and no path
+        crosses the wire. That is the only thing this poll tells Jarvis
+        about what he is doing, and it is one small integer.
+
+        With no relay wired (the gesture courier failed to build, or screen
+        casting was never turned on) it answers "none" rather than 404, so
+        a startup script he installed weeks ago keeps polling harmlessly
+        instead of erroring in a loop he cannot see.
+        """
+        if not self._gate():
+            return
+        body = self._body(MAX_CAST_BYTES)
+        if body is None:
+            return
+        try:
+            msg = json.loads(body.decode("utf-8", "replace"))
+            if not isinstance(msg, dict):
+                raise ValueError("not an object")
+        except ValueError as exc:
+            self._error(400, f"malformed request: {exc}")
+            return
+        try:
+            seq = int(msg.get("seq", -1))
+        except (TypeError, ValueError):
+            seq = -1
+        relay = getattr(self.phone, "cast_relay", None)
+        if relay is None:
+            self._json(200, {"seq": 0, "verb": castview_mod.VERB_NONE})
+            return
+        try:
+            relay.note(mon=msg.get("mon"), layout=msg.get("layout"))
+            out = relay.poll(seq, timeout_s=CAST_POLL_S)
+            verb = str(out.get("verb") or "")
+            answer = {"seq": int(out.get("seq", 0)),
+                      "verb": verb if verb in castview_mod.VERBS
+                      else castview_mod.VERB_NONE}
+        except Exception:                 # noqa: BLE001 - the relay boundary
+            log.exception("cast poll: the relay raised")
+            answer = {"seq": 0, "verb": castview_mod.VERB_NONE}
+        if answer["verb"] != castview_mod.VERB_NONE:
+            log.info("cast poll: %s (seq %d)", answer["verb"], answer["seq"])
+        self._json(200, answer)
+
     def _contacts_get(self):
         try:
             self._json(200, contacts_mod.current().public())

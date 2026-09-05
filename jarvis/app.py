@@ -599,6 +599,13 @@ class JarvisApp:
 
         # ---- routing ------------------------------------------------------
         self.services = self._build_services()
+        # The Windows cast poller's only way in (jarvis/castview.CastRelay
+        # through webapp's one gated /api/cast route). Attached here because
+        # this is the first line where both objects exist; with it absent
+        # the route answers "none" forever, which is the honest degradation
+        # for a startup script polling a Jarvis that cannot cast.
+        if self.webapp is not None and self.gesture is not None:
+            self.webapp.cast_relay = getattr(self.gesture, "relay", None)
         self._register_tools()
         # The mixer was built at 372, before any tool existed; the Connect
         # ducker it asks on every hold alongside the local one (#72) is the
@@ -1425,11 +1432,64 @@ class JarvisApp:
                 speak=lambda text: self._say(text),
                 board_show=self._board_show,
                 transfer=self._spotify_transfer,
+                view_launch=self._rustdesk_view,
+                view_stop=self._rustdesk_close,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
                           "stays off")
             return None
+
+    # -- the screen viewer, the one place a RustDesk window is opened -----
+    # NOTHING IN THE DESIGN OR TEST SESSION EVER RAN THESE. They are the
+    # injected seam jarvis/castview.py refuses to own: that module holds no
+    # process spawner at all, so the only way a viewer window can appear is
+    # through these two methods, in the running app, on his say-so.
+    #
+    # THE ONE THING I COULD NOT VERIFY FROM NUMBERS, and he should read it:
+    # I do not know whether the RustDesk viewer steals focus when it opens,
+    # whether it can be launched minimised, or whether --connect honours a
+    # window-state flag. I did not start a session and would not. It is the
+    # same class of harm as the 08-26 desktop freeze, so it is his to try
+    # once, deliberately, when he is not mid-sentence in something.
+    def _rustdesk_view(self, host: str) -> None:
+        """Open the Spark's own RustDesk viewer on ``host``. Outbound only.
+
+        A FIXED argument list built here, never a string from anywhere
+        else: the host comes from castview's own constant and the flag is a
+        literal. There is no shell, so nothing can be interpolated into
+        one.
+        """
+        import shutil                                       # noqa: PLC0415
+
+        binary = shutil.which("rustdesk") or os.path.expanduser(
+            "~/.local/bin/rustdesk")
+        if not os.path.exists(binary):
+            raise OSError("no rustdesk viewer on this box")
+        self._close_rustdesk()
+        self._rustdesk = subprocess.Popen(          # noqa: S603 - fixed argv
+            [binary, "--connect", str(host)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info("cast: opened a viewer on %s", host)
+
+    def _rustdesk_close(self) -> None:
+        self._close_rustdesk()
+
+    def _close_rustdesk(self) -> None:
+        """Stop ONLY the viewer this app started. A session he opened
+        himself is never touched -- which was the first thing the design
+        got wrong: killing every rustdesk process would have closed his
+        own window."""
+        proc = getattr(self, "_rustdesk", None)
+        self._rustdesk = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:                          # noqa: BLE001 - teardown
+            log.debug("cast: the viewer would not close", exc_info=True)
 
     def _eye_identity(self) -> str:
         """The camera's name for whoever is in frame, "" for no opinion.

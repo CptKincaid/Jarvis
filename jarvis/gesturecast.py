@@ -69,7 +69,9 @@ from collections import deque
 from typing import Any, Callable, Optional
 
 from jarvis import cast as cast_mod
+from jarvis import castview as view_mod
 from jarvis import identity as identity_mod
+from jarvis import screens as screens_mod
 from jarvis.cast import (
     NOTHING_LINE,
     ROUTABLE_DIRECTIONS,
@@ -102,11 +104,27 @@ PREPARE_MIN_GAP_S = 1.0          # reach flicker must not spawn xdotool repeated
 RECENT_TTL_S = 1800.0            # how long the board's CAST slab shows the last one
 EVENT_LOG = 32                   # events kept for status()
 
+# --- the screen cast (jarvis/screens.py, jarvis/castview.py) --------------
+# How stale the last hand row may be and still name the screen he grabbed
+# at. At 6-7.5 fps the grab lands on the very frame the row came from; this
+# is the backstop for a capture thread that stalled between the two, and it
+# is what makes "the preview shut" also mean "no screen cast".
+SOURCE_TTL_S = 1.5
+# Head yaw is read from the last clean face row in the window BEFORE the
+# fist closes, never at the grab instant: handstage.py's own docstring says
+# the reaching arm crosses the face at exactly the moment the gesture
+# matters, which is why attention is LATCHED for 3 s rather than sampled. A
+# design that read yaw at the grab would read it with the arm in the way.
+YAW_WINDOW_S = 1.0
+YAW_ROWS = 24                    # ~3-4 s of face rows at 6-7.5 fps
+
 DROPPED_LINE = "Put down, sir."
 SIDE_LINE = "{Target} is on your {side}, sir."
 SIDE_UNKNOWN_LINE = ("You haven't told me which side {target} is on, sir. "
                      "Say \"{target} is on my left\" or \"on my right\".")
 NO_VOICE_SINK_LINE = "I don't know a target called {name}, sir."
+NOTHING_THAT_WAY_LINE = "There's nothing that way, sir."
+NO_SCREEN_CAST_LINE = "Screen casting is off, sir."
 
 # Tones. The four statuses that speak instead of chiming come back "" from
 # cast.earcon_for; the grab is the one tone this module owns outright.
@@ -125,6 +143,17 @@ def _call(obj):
         except Exception:                        # noqa: BLE001 - a resolver
             return None
     return obj
+
+
+class _Source:
+    """A spoken cast names the destination, so the source is the OTHER
+    machine and there is no grab to score. This is that source, in the one
+    shape ``_cast_view`` reads -- rather than a second code path."""
+
+    __slots__ = ("machine",)
+
+    def __init__(self, machine: str) -> None:
+        self.machine = str(machine)
 
 
 class GestureCast:
@@ -154,6 +183,8 @@ class GestureCast:
                  handoff: Optional[dict] = None,
                  providers: Optional[dict] = None,
                  worker: Optional[Callable[[Callable[[], None]], None]] = None,
+                 view_launch: Optional[Callable[[str], object]] = None,
+                 view_stop: Optional[Callable[[], object]] = None,
                  now: Callable[[], float] = time.monotonic,
                  wall: Callable[[], float] = time.time,
                  thresholds=None, mirrored: Optional[bool] = None,
@@ -186,6 +217,23 @@ class GestureCast:
         self._post: Callable[[Callable[[], None]], None] = lambda fn: fn()
         self.casts = 0
 
+        # --- the screen cast -------------------------------------------
+        # OFF BY DEFAULT and UNLEARNED by default: both keys ship absent.
+        # Casting a screen puts a desktop on a monitor in his office; the
+        # board cast this sits beside costs three seconds of his
+        # attention. The two do not deserve the same default.
+        self.screens = screens_mod.load(self._get)
+        self.learner = screens_mod.ScreenLearner()
+        self.relay = view_mod.CastRelay(now=now)
+        self.view_state = view_mod.ViewState(now=now)
+        self._last_hand: Optional[dict] = None
+        self._yaws: deque = deque(maxlen=YAW_ROWS)
+        self._source = None
+        self._unarmed_said = False
+        self.yaw_misses = 0
+        self.source_reads = 0
+        self.refusals = 0
+
         self.registry = {
             "board": BoardSink(self._board_publish,
                                console_visible=self._console_is_visible),
@@ -193,7 +241,21 @@ class GestureCast:
                                          transport=transport, probe=probe),
             "handoff": HandoffSink(now=now, publish_url=self._board_url,
                                    **(handoff or {})),
+            # The two screen-view sinks. They live in jarvis/castview.py
+            # rather than jarvis/cast.py because
+            # test_the_module_cannot_open_a_window_or_a_lens greps that
+            # file for exactly the launcher this needs -- and a viewer
+            # window is what that test exists to keep out. Both launchers
+            # are INJECTED and default to None, so a courier built by a
+            # test opens nothing.
+            "spark-view": view_mod.SparkViewSink(
+                launch=view_launch, stop=view_stop,
+                state=self.view_state, now=now),
+            "hp-view": view_mod.HpViewSink(relay=self.relay,
+                                           state=self.view_state, now=now),
         }
+        self.views = view_mod.registry(self.registry["spark-view"],
+                                       self.registry["hp-view"])
         self.payload = CallablePayload(pick_up=self._pick_up,
                                        put_back=self._put_back,
                                        prepare=self._prepare)
@@ -224,7 +286,8 @@ class GestureCast:
         about trackers or thresholds."""
         from jarvis.handstage import HandStage             # noqa: PLC0415
         return HandStage(self.machine, get_option=get_option or self._get,
-                         hold_off=self.question_open, now=self._now, **kw)
+                         hold_off=self.question_open, watch=self.note_frame,
+                         now=self._now, **kw)
 
     def _option(self, key: str, default):
         if not callable(self._get):
@@ -374,11 +437,176 @@ class GestureCast:
     def carrying(self) -> bool:
         return self.machine.state is CastState.CARRYING
 
+    # ------------------------------------------------- which screen he grabbed
+    def note_frame(self, row: dict) -> None:
+        """One numbers-only frame row from the hand stage. Capture thread.
+
+        Two ring-buffers and nothing else. The hand row is kept only when a
+        hand was actually present, so a stretch of empty frames leaves the
+        last real one in place and ``SOURCE_TTL_S`` -- not a stale
+        coordinate -- decides whether it still counts. The face row is kept
+        separately because yaw must be read from BEFORE the fist closes,
+        and by then the reaching arm may well be across his face.
+
+        This must stay cheap: it runs inside ``PreviewPipeline.grab()``.
+        """
+        try:
+            at = float(row.get("at", 0.0))
+        except (TypeError, ValueError):
+            return
+        if row.get("present") and float(row.get("palm_diag", 0.0)) > 0.0:
+            self._last_hand = {"at": at, "cx": float(row.get("cx", 0.0)),
+                               "palm_diag": float(row.get("palm_diag", 0.0)),
+                               "frame_w": float(row.get("frame_w", 0.0))}
+        if row.get("face_ok"):
+            self._yaws.append(
+                (at, screens_mod.yaw_t_from_deg(row.get("yaw_deg", 0.0))))
+
+    def _yaw_before(self, at: float) -> Optional[float]:
+        """The newest clean yaw sample in the ``YAW_WINDOW_S`` before the
+        grab, or None for NO OPINION.
+
+        THE NUMBER I WOULD LOOK AT FIRST is how often this answers None:
+        if a clean pre-reach face row is missing on a quarter of grabs then
+        yaw is a veto that abstains often and nothing more, whatever the
+        clusters look like at rest. ``yaw_misses`` counts it.
+        """
+        for t, yaw in reversed(self._yaws):
+            if t <= at and (at - t) <= YAW_WINDOW_S:
+                return yaw
+            if t < at - YAW_WINDOW_S:
+                break
+        return None
+
+    def _read_source(self, at: float):
+        """Which machine he grabbed at, or None for no opinion.
+
+        None is what a shut preview produces, and that is the point: with
+        no fresh hand row there is no source, with no source there is no
+        screen cast, and the throw lands on the board exactly as it does
+        today.
+        """
+        row = self._last_hand
+        if row is None or (at - row["at"]) > SOURCE_TTL_S:
+            return None
+        if not float(row.get("frame_w", 0.0)) > 0.0:
+            return None
+        hand_u = screens_mod.hand_x_u(row["cx"], row["palm_diag"],
+                                      row["frame_w"],
+                                      mirrored=self.machine.mirrored)
+        yaw = self._yaw_before(at)
+        if yaw is None:
+            self.yaw_misses += 1
+        self.source_reads += 1
+        return screens_mod.score(self.screens, hand_u, yaw)
+
+    @property
+    def screen_cast_on(self) -> bool:
+        return screens_mod.enabled(self._get)
+
+    def _view_decision(self, sector: str, source, by: str):
+        """``None`` = not a screen cast, fall through to today's behaviour.
+
+        Every gate that returns None here is a gate that leaves the board
+        cast exactly as it is: the feature switched off, nothing learned, a
+        map that would not arm, a grab too near the boundary, a preview
+        that stopped feeding. The one thing that is NOT None-and-fall-
+        through is a valid source thrown at a direction with nothing in it,
+        which is a REFUSAL he hears.
+        """
+        if by != "gesture" or not self.screen_cast_on:
+            return None
+        if self.screens is None or not self.screens.armed:
+            if not self._unarmed_said:
+                self._unarmed_said = True
+                line = screens_mod.unarmed_line(self.screens)
+                if line:
+                    self._speak(line)
+            return None
+        if source is None or not source.ok:
+            return None
+        dest = screens_mod.route(source.machine, sector)
+        if not dest:
+            return ("refuse", source.machine, source)
+        return ("cast", dest, source)
+
+    def _cast_view(self, decision, by: str) -> tuple:
+        """``(line to say, status)``. Fires, or refuses. Never speaks
+        itself, so the spoken path can hand the line back to the commander
+        the way ``throw_by_voice`` already does."""
+        kind, target, source = decision
+        if kind == "refuse":
+            self.refusals += 1
+            self._earcon(DROP_TONE)
+            self._chip_do("dropped", "")
+            log.info("gesture: %s has nothing that way", target)
+            return NOTHING_THAT_WAY_LINE, "refused"
+        sink = self.views.get(target)
+        subject = view_mod.view_subject(source.machine, at=self._wall())
+        if sink is None or subject is None:
+            return NO_VOICE_SINK_LINE.format(name=str(target)), "refused"
+        lines: list = []
+        status = self._cast(sink, subject, lines.append)
+        self._record(status, sink, subject, by)
+        tone = earcon_for(status)
+        if tone:
+            self._earcon(tone)
+        self._chip_do("landed" if status in ("landed", "proposed") else
+                      "held", getattr(sink, "label", ""))
+        log.info("gesture: screen cast %s -> %s: %s (%s)", source.machine,
+                 target, status, by)
+        return " ".join(s for s in lines if s).strip(), status
+
+    # ------------------------------------------------------ stop the cast
+    @property
+    def cast_live(self) -> str:
+        """The name of the view sink that has a cast up, or ""."""
+        return self.view_state.live
+
+    def stop_cast(self) -> str:
+        """The stop, and it must be as easy as the start.
+
+        The harm here is a window appearing on a screen he is using, not
+        bytes leaving, and no tone undoes that. Reachable three ways: a
+        fling at the desk while a cast is up (DOWN is already the cancel
+        sector, so this costs no new gesture and no new vocabulary), "stop
+        the cast" by voice, and this method.
+        """
+        live = self.view_state.live
+        for sink in self.views.values():
+            if getattr(sink, "name", "") == live and sink.stop_cast():
+                self._chip_do("dropped", "")
+                log.info("gesture: cast stopped (%s)", live)
+                return view_mod.STOPPED_LINE
+        return view_mod.NOTHING_UP_LINE
+
+    def cast_screen(self, target: str) -> tuple:
+        """"cast the spark to HPCOMPUTER" -- the spoken way in.
+
+        His ruling gives two ways in, the gesture and a sentence, and
+        neither asks for confirmation. This one names the DESTINATION
+        outright, so it needs no map at all and works with the camera off.
+        """
+        if not self.screen_cast_on:
+            return NO_SCREEN_CAST_LINE, "refused"
+        name = str(target or "").strip().lower()
+        dest = name if name in screens_mod.MACHINES else \
+            (screens_mod.HPCOMPUTER
+             if cast_mod.sink_alias(name) == "hpcomputer" else "")
+        if dest not in self.views:
+            return NO_VOICE_SINK_LINE.format(name=str(target).strip()), "refused"
+        source = [m for m in screens_mod.MACHINES if m != dest][0]
+        return self._cast_view(("cast", dest, _Source(source)), "voice")
+
     # --------------------------------------------------------- the events
     def on_event(self, ev: CastEvent) -> None:
         """From the capture thread, inside the machine's lock. Cheap only."""
         self._events.append(ev.numbers_only())
         if ev.kind == "grab":
+            # WHICH SCREEN HE GRABBED AT, read from the frame the fist
+            # closed on and latched now, because by the time the throw
+            # lands his hand is somewhere else entirely.
+            self._source = self._read_source(float(ev.at))
             self._earcon(GRAB_TONE)
             subject = self.held
             name = subject.spoken if subject is not None else ev.payload
@@ -396,13 +624,24 @@ class GestureCast:
             subject = self._take_held()
             self._chip_do("thrown", ev.sector)
             sector = ev.sector
-            self._worker(lambda: self._throw(sector, subject, by="gesture"))
+            source, self._source = self._source, None
+            self._worker(lambda: self._throw(sector, subject, by="gesture",
+                                             source=source))
             return
         if ev.kind == "drop":
+            self._source = None
             with self._lock:
                 silent = self._silence_drops > 0
                 if silent:
                     self._silence_drops -= 1
+            if ev.toward == "down" and self.cast_live:
+                # A FLING AT THE DESK STOPS THE CAST. Down is already the
+                # cancel sector, so this costs no new gesture and no new
+                # vocabulary -- and a stop has to be as easy as a start,
+                # because what a start puts on his screen no tone takes off.
+                self._earcon(DROP_TONE)
+                self._worker(lambda: self._speak(self.stop_cast()))
+                return
             if ev.why == "nothing to carry":
                 self._earcon(DROP_TONE)
                 now = self._now()
@@ -458,9 +697,22 @@ class GestureCast:
         }
 
     def _throw(self, sector: str, subject: Optional[CastSubject],
-               by: str = "gesture") -> str:
+               by: str = "gesture", source=None) -> str:
         """Off the capture thread. Picks the sink for the side, casts,
-        speaks what cast() said, plays the tone for the outcome."""
+        speaks what cast() said, plays the tone for the outcome.
+
+        The SCREEN CAST is asked first and answers None for every reason
+        there could be not to do one -- switched off, nothing learned, a
+        map that would not arm, a grab too near the boundary, a preview
+        that stopped feeding -- and every one of those Nones leaves the
+        board cast below exactly as it was.
+        """
+        view = self._view_decision(sector, source, by)
+        if view is not None:
+            line, status = self._cast_view(view, by)
+            if line:
+                self._speak(line)
+            return status
         sink = pick_sink(sector, get_option=self._get, registry=self.registry)
         lines: list = []
         if subject is None or not subject.holdable:
@@ -612,11 +864,65 @@ class GestureCast:
                 "casts": self.casts, "taught": is_taught(self._get),
                 "sinks": dict(sink_map(self._get)),
                 "recent": self.recent() or {},
+                "screens": self.screens_status(),
                 "events": list(self._events)}
+
+    def screens_status(self) -> dict:
+        """The screen cast, in numbers only -- for the console readout and
+        for scripts/screen_selfcheck.py.
+
+        ``yaw_miss_pct`` is the number to look at first. If a clean
+        pre-reach face row is missing on a quarter of grabs then head yaw
+        is a veto that abstains often and nothing more, whatever the
+        clusters look like at rest, and that is the single likeliest way
+        this whole idea fails.
+        """
+        m = self.screens
+        reads = max(int(self.source_reads), 1)
+        out = {"on": bool(self.screen_cast_on),
+               "armed": bool(m is not None and m.armed),
+               "reason": m.reason if m is not None else "nothing learned",
+               "screens": len(m.screens) if m is not None else 0,
+               "machines": list(m.machines) if m is not None else [],
+               "boundary_u": round(float(m.boundary_u), 4) if m else 0.0,
+               "margin_sigma": round(float(m.margin_sigma), 3) if m else 0.0,
+               "source_reads": int(self.source_reads),
+               "yaw_misses": int(self.yaw_misses),
+               "yaw_miss_pct": round(100.0 * self.yaw_misses / reads, 1),
+               "refusals": int(self.refusals),
+               "live": self.cast_live}
+        out.update(self.relay.numbers_only())
+        out["deck"] = self.view_state.numbers_only()
+        out["learner"] = self.learner.numbers_only()
+        return out
+
+    def relearn(self, why: str = "") -> None:
+        """Forget the map and say so once. The three tripwires all land
+        here: the layout changed, the medians drifted, or grabs kept
+        disagreeing with his head. Disarmed is not broken -- with no map
+        every throw goes to the board, which is a real destination."""
+        self.screens = None
+        self._source = None
+        self._unarmed_said = False
+        self.learner = screens_mod.ScreenLearner()
+        log.info("gesture: the screen map is disarmed (%s)", why or "asked")
+
+    def note_layout(self, layout: str) -> bool:
+        """The Windows helper's layout string, checked against the stored
+        one. A change is an EXACT signal that he unplugged, added or moved
+        a monitor, and the map disarms at once rather than routing on a
+        room that no longer exists."""
+        if not screens_mod.layout_changed(self.screens, layout):
+            return False
+        self.relearn("the monitor layout changed")
+        self._speak(screens_mod.LAYOUT_CHANGED_LINE)
+        return True
 
 
 __all__ = [
     "DROPPED_LINE", "DROP_TONE", "GESTURE_TONE_COOLDOWN_S", "GRAB_TONE",
-    "GestureCast", "NOTHING_REPEAT_S", "NO_VOICE_SINK_LINE",
-    "OPTION_SPEAK_GRAB", "RECENT_TTL_S", "SIDE_LINE", "SIDE_UNKNOWN_LINE",
+    "GestureCast", "NOTHING_REPEAT_S", "NOTHING_THAT_WAY_LINE",
+    "NO_SCREEN_CAST_LINE", "NO_VOICE_SINK_LINE", "OPTION_SPEAK_GRAB",
+    "RECENT_TTL_S", "SIDE_LINE", "SIDE_UNKNOWN_LINE", "SOURCE_TTL_S",
+    "YAW_WINDOW_S",
 ]

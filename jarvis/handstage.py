@@ -256,6 +256,7 @@ class HandStage:
                  get_option: Optional[Callable] = None,
                  make_tracker: Optional[Callable[[], Any]] = None,
                  hold_off: Optional[Callable[[], bool]] = None,
+                 watch: Optional[Callable[[dict], None]] = None,
                  now: Callable[[], float] = time.monotonic,
                  attend_latch_s: Optional[float] = None,
                  face_window_s: Optional[float] = None,
@@ -264,6 +265,15 @@ class HandStage:
         self._get = get_option
         self._make = make_tracker or default_tracker_factory(get_option)
         self._hold_off = hold_off
+        # WHERE THE SCREEN-CAST SOURCE COMES FROM. ``watch(row)`` is handed
+        # the same scalars this stage already reports, on EVERY frame it
+        # looked at, BEFORE the machine's event fires -- so a courier that
+        # wants to know where his hand was when the fist closed has the
+        # number already, and ``gesture.CastEvent`` needs no new field. It
+        # is a dict of floats and bools; nothing of the frame is in it and
+        # nothing of the frame could be. Off by default (None), and the
+        # ``enabled`` gate above it means OFF really means never called.
+        self._watch = watch
         self._now = now
         self.attend_latch_s = float(
             attend_latch_s if attend_latch_s is not None
@@ -291,6 +301,7 @@ class HandStage:
         self.looked = 0
         self.events = 0
         self.last: Optional[HandShot] = None
+        self._face = (0.0, False)
 
     # ------------------------------------------------------------ reads
     @property
@@ -362,6 +373,21 @@ class HandStage:
             return 0.0
         return median
 
+    def _face_yaw(self, faces) -> tuple:
+        """``(yaw_deg, ok)`` for the ONE face rule this stage already
+        follows. Two faces is not this gesture, and a face whose landmarks
+        failed has no angle -- ``ok`` False is NO OPINION, never zero
+        degrees, which would read as looking straight at the lens."""
+        if len(faces) != 1:
+            return 0.0, False
+        f = faces[0]
+        if not bool(getattr(f, "landmarks_ok", True)):
+            return 0.0, False
+        try:
+            return float(getattr(f, "yaw_deg", 0.0) or 0.0), True
+        except (TypeError, ValueError):
+            return 0.0, False
+
     def _arm(self, faces, t: float) -> bool:
         if len(faces) == 1 and bool(getattr(faces[0], "attending", False)):
             self._attended_at = t
@@ -415,7 +441,30 @@ class HandStage:
         if ev is not None:
             self.events += 1
         self.last = shot
+        self._tell(shot, t0)
         return shot
+
+    def _tell(self, shot: HandShot, t: float) -> None:
+        """One numbers-only row to the watcher, on every frame we looked.
+
+        It carries the frame WIDTH because the lateral position that names
+        a screen is measured from the frame centre, and the stage is the
+        only thing that knows both. A watcher that raises must not kill the
+        capture thread: a dropped row costs one sample."""
+        watch = self._watch
+        if watch is None:
+            return
+        yaw_deg, face_ok = self._face
+        try:
+            watch({"at": float(t), "present": bool(shot.present),
+                   "cx": float(shot.cx), "cy": float(shot.cy),
+                   "palm_diag": float(shot.palm_diag),
+                   "frame_w": float(self.gesture.frame_w),
+                   "frame_h": float(self.gesture.frame_h),
+                   "yaw_deg": float(yaw_deg), "face_ok": bool(face_ok),
+                   "armed": bool(shot.armed), "state": shot.state})
+        except Exception:                            # noqa: BLE001 - a watcher
+            log.debug("gesture: the frame watcher raised", exc_info=True)
 
     # ---------------------------------------------------------- the call
     def observe(self, frame, faces, frame_w: int, frame_h: int,
@@ -436,6 +485,7 @@ class HandStage:
         self._fit(frame_w, frame_h)
         self._tick_fps(t0)
         eye_px = self._baseline(faces, t0)
+        self._face = self._face_yaw(faces)
         armed = self._arm(faces, t0)
         if self._hold_off is not None:
             try:
