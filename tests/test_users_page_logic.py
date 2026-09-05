@@ -486,3 +486,52 @@ def test_the_standing_note_never_claims_to_be_a_lock():
         assert word not in text
     assert "recognition, not a lock" in " ".join(up.CANNOT_DO).lower() or \
         "not a lock" in text
+
+
+# ============================== the page must not load a face detector
+def test_the_command_builder_needs_no_vision_module_at_all(monkeypatch):
+    """FOUND ON THE PHOTO RIG, 2026-09-05. The page asks for ONE STRING --
+    the command that deletes somebody's face measurements -- and that
+    import pulled in jarvis.faceenrol, which imports jarvis.facedetect and
+    jarvis.visionrig. The rig's lens blocker refused it outright and the
+    render died.
+
+    jarvis/enrolentry.py's own docstring claimed "there is no import in
+    this file that could" open a device, and at import time that was not
+    true. The heavy imports moved inside the four functions that need a
+    gallery; command_line and to_clipboard need neither.
+    """
+    import importlib
+    import sys
+
+    blocked = ("cv2", "jarvis.camera", "jarvis.eye", "jarvis.facedetect",
+               "jarvis.facemodels", "jarvis.facegallery", "jarvis.visionrig",
+               "jarvis.faceenrol")
+
+    class Blocker:
+        def find_spec(self, name, path=None, target=None):
+            if name in blocked:
+                raise ImportError("blocked for this test: %s" % name)
+            return None
+
+    for name in list(sys.modules):
+        if name in blocked or name in ("jarvis.enrolentry",):
+            sys.modules.pop(name, None)
+    monkeypatch.syspath_prepend(".")
+    sys.meta_path.insert(0, Blocker())
+    try:
+        ee = importlib.import_module("jarvis.enrolentry")
+        cmd = ee.command_line("pemberton", delete=True)
+    finally:
+        sys.meta_path.pop(0)
+    assert "--delete" in cmd and "--label pemberton" in cmd
+    assert not any(name in sys.modules for name in blocked), \
+        [n for n in blocked if n in sys.modules]
+
+
+def test_the_page_builds_the_same_command_the_voice_path_hands_over():
+    """ONE builder, not two: the tab's Copy button and "forget Heather's
+    face" must not drift into two different commands."""
+    from jarvis import enrolentry as ee
+    assert up.forget_face_command("pemberton") == \
+        ee.command_line("pemberton", delete=True)

@@ -102,6 +102,20 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       still open: the tab row goes with the footer, the page
                       is shut, and the note carries the number of radar
                       requests sent across the standby dwell (it is zero)
+  29  users           the USERS page (the third tab) in the state HE is in:
+                      an owner with an override code set, so the page is
+                      LOCKED and every write asks for it. The people come
+                      from RigPeople, an INVENTED book -- his own
+                      ~/.local/state/jarvis/people.json is never opened by
+                      this script, and there is no code path here that
+                      could open it
+  30  users-forget    the same page unlocked, with the destructive
+                      confirmation open on a guest: what is removed, what
+                      SURVIVES (the face gallery), the command that removes
+                      that, and the label typed to confirm
+  31  users-add       the add form, with the consent paragraph named for
+                      the person being added -- the words that say a row
+                      stores no measurement of anybody
 """
 from __future__ import annotations
 
@@ -156,6 +170,9 @@ STATES = (
     ("26", "sensors", None),
     ("27", "sensors-fault", None),
     ("28", "standby-over-sensors", None),
+    ("29", "users", None),
+    ("30", "users-forget", None),
+    ("31", "users-add", None),
 )
 
 
@@ -554,8 +571,74 @@ class DeskIdle:
         return float(self.idle)
 
 
+class RigPeople:
+    """An INVENTED people book for the USERS page (states 29-31).
+
+    HIS OWN REGISTRY IS NEVER OPENED. jarvis/identity.py reads
+    PATHS.OWNER_REGISTRY, and nothing in this file names that path or
+    constructs a Registry: the page reaches the app only through
+    Services.people_snapshot, and this answers it from the rows below. The
+    labels, names and dates are made up, and the two "hashes" are booleans
+    -- redacted() shape, so there is nothing here that a hash could be.
+
+    The state it renders is the one HE is in today: one owner with an
+    override code set, so the page opens LOCKED.
+    """
+
+    PATH = "/home/example/.local/state/jarvis/people.json"
+
+    def __init__(self):
+        self.people = [
+            {"label": "alderman", "name": "Alderman", "role": "owner",
+             "voice": True, "face": "alderman", "face_dim": 128,
+             "has_phrase": False, "has_code": True, "consent": "owner",
+             "enrolled_at": "2026-01-04T21:12:03"},
+            {"label": "pemberton", "name": "Pemberton", "role": "known",
+             "voice": False, "face": "pemberton", "face_dim": 128,
+             "has_phrase": False, "has_code": False, "consent": "typed",
+             "enrolled_at": "2026-02-17T10:40:55"},
+            {"label": "marchbanks", "name": "Marchbanks", "role": "known",
+             "voice": False, "face": "marchbanks-old", "face_dim": 128,
+             "has_phrase": False, "has_code": False, "consent": "console",
+             "enrolled_at": "2026-03-02T18:05:11"},
+        ]
+        self.calls: list = []
+
+    def snapshot(self) -> dict:
+        from jarvis import gate as gate_mod
+        return {"people": [dict(p) for p in self.people],
+                "gate_line": ("owner-gate: SHADOW -- 1 owner (alderman), "
+                              "voice leg live, face leg unavailable (the "
+                              "gallery is empty). Nothing is being refused."),
+                "fault_kind": "", "path": self.PATH,
+                # marchbanks points at a gallery label that is not there,
+                # which is what the amber face chip is for.
+                "gallery": ["alderman", "pemberton"],
+                "admin": gate_mod.ADMIN_CODE,
+                "admin_line": ("an owner has set an override code, so it is "
+                               "asked for before anything is changed")}
+
+    def unlock(self, code) -> tuple:
+        self.calls.append("unlock")
+        del code
+        return True, "Unlocked, sir."
+
+    def add(self, **kw) -> tuple:
+        self.calls.append(("add", kw.get("label")))
+        return True, "%s is enrolled" % kw.get("label")
+
+    def set_role(self, label, role, **kw) -> tuple:
+        self.calls.append(("set_role", label, role))
+        return True, "%s is now %s" % (label, role)
+
+    def forget(self, label) -> tuple:
+        self.calls.append(("forget", label))
+        return True, "%s is forgotten here" % label
+
+
 def build_services(sensing: Optional[RigSensing] = None,
-                   desk: Optional[DeskIdle] = None):
+                   desk: Optional[DeskIdle] = None,
+                   people: Optional["RigPeople"] = None):
     """The Services the rig hands to create(): camera_feed None, a sensing
     stand-in that cannot reach a device, and only harmless callables."""
     from jarvis.ui.main_window import Services
@@ -606,6 +689,13 @@ def build_services(sensing: Optional[RigSensing] = None,
         sensing=sensing or RigSensing(),
         board_closed=quiet("board_closed"),
     )
+    book = people or RigPeople()
+    svc.people_snapshot = book.snapshot
+    svc.people_unlock = book.unlock
+    svc.people_add = book.add
+    svc.people_set_role = book.set_role
+    svc.people_forget = book.forget
+    svc._rig_people = book               # type: ignore[attr-defined]
     svc._rig_calls = calls               # type: ignore[attr-defined]
     return svc
 
@@ -1161,6 +1251,55 @@ class Rig:
         S(lambda: (OPTIONS.__setitem__("camera.preview", False),
                    win._on_config_change(CAMERA_PREVIEW_OPTION, False)), 400)
 
+        # 29-31 the USERS page ---------------------------------------------
+        # The people are RigPeople's INVENTED rows (build_services). His own
+        # registry is never opened: the page reaches the app only through
+        # Services.people_snapshot, and nothing in this file names
+        # PATHS.OWNER_REGISTRY or builds a Registry.
+        def users_on():
+            strip = getattr(win, "tabs", None)
+            if strip is not None and "users" in strip.keys:
+                strip.select("users")
+            elif getattr(win, "users", None) is not None:
+                win.users.show()
+
+        S(lambda: (self.begin("29", "users"), users_on()), 900)
+        S(lambda: self.capture("29", "users", note=(
+            "the state HE is in: one owner with an override code set, so the "
+            "page is LOCKED and every write asks for it. The entry is masked "
+            "and empty. Marchbanks' face chip is amber because the pointer "
+            "names a gallery label that is not there -- which is exactly how "
+            "the face leg stops naming anybody")), 0)
+
+        def users_forget():
+            page = win.users
+            page._lock.unlock()
+            page._forget_pressed("pemberton")
+
+        S(lambda: (self.begin("30", "users-forget"), users_forget()), 700)
+        S(lambda: self.capture("30", "users-forget", note=(
+            "the destructive confirmation: what is removed, what SURVIVES "
+            "(the face gallery entry) with the command that removes it, that "
+            "it cannot be undone, and the label typed to confirm. Arming "
+            "forgets nobody")), 0)
+
+        def users_add():
+            page = win.users
+            page._forget.disarm()
+            page._add_pressed()
+            page._add_fields["label"].insert(0, "pemberton")
+            page._add_fields["name"].insert(0, "Pemberton")
+            page._retitle_consent()
+
+        S(lambda: (self.begin("31", "users-add"), users_add()), 700)
+        S(lambda: self.capture("31", "users-add", note=(
+            "the add form with the consent paragraph named for the person: a "
+            "row stores a name, a role and a face LABEL and no measurement "
+            "of anybody, so these are not the words the camera ceremony "
+            "shows. They type their own label to agree")), 0)
+        S(lambda: (win.users.hide() if getattr(win, "users", None) is not None
+                   else None), 200)
+
         S(self.teardown, 200)
 
     def teardown(self) -> None:
@@ -1175,6 +1314,8 @@ class Rig:
                 win.preview.stop()
             if getattr(win, "sensors", None) is not None:
                 win.sensors.hide()          # stops its poll thread
+            if getattr(win, "users", None) is not None:
+                win.users.hide()            # stops its one-second repaint
             if win.board is not None:
                 win.board.destroy()
                 win.board = None

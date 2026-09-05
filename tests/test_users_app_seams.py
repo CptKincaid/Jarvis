@@ -11,8 +11,6 @@ whole assistant.
 """
 import json
 
-import pytest
-
 from jarvis import app as app_mod
 from jarvis import gate as gt
 from jarvis import passphrase as pp

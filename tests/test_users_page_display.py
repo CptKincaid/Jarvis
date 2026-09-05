@@ -116,6 +116,9 @@ def _snapshot(n=2, *, fault="", admin=None, code=True):
                        "enrolled_at": "2026-02-02T09:00:00"})
     if fault:
         people = []
+        admin = admin or (gt.ADMIN_REFUSE if fault in ("malformed",
+                                                       "unreadable")
+                          else gt.ADMIN_FIRST)
     return {"people": people, "gate_line": "owner-gate: SHADOW -- 1 owner "
             "(alderman), voice leg live, face leg unavailable. Nothing is "
             "being refused.", "fault_kind": fault,
@@ -381,3 +384,227 @@ def test_the_module_captures_no_look_at_import_time():
         for token in ("theme.BG", "theme.INK", "theme.CYAN", "theme.MUTED",
                       "theme.WARN", "theme.RAISED", "theme.SURFACE"):
             assert token not in ast.unparse(node), ast.unparse(node)
+
+
+# ======================================================= the add form itself
+def _open_form(root, page, **fields):
+    page._lock.unlock()
+    page._add_pressed()
+    root.update_idletasks()
+    for key, value in fields.items():
+        page._add_fields[key].delete(0, "end")
+        page._add_fields[key].insert(0, value)
+    return page._add_fields
+
+
+def test_the_consent_paragraph_names_whoever_is_being_added(root):
+    page, _svc, _host = _page(root)
+    _open_form(root, page, label="pemberton")
+    page._retitle_consent()
+    text = page._consent_lbl.cget("text")
+    assert "pemberton" in text
+    assert "128" not in text, "adding a row stores no face measurement"
+    assert "cannot command Jarvis" in text
+
+
+def test_a_wrong_consent_adds_nobody(root):
+    page, svc, _host = _page(root)
+    _open_form(root, page, label="pemberton", name="Pemberton", consent="yes")
+    svc.calls.clear()
+    page._create_pressed()
+    assert not any(isinstance(c, tuple) and c[0] == "add" for c in svc.calls)
+    assert "nothing was written" in page._toasts[-1][0]
+
+
+def test_their_own_label_typed_adds_them_as_a_console_consent(root):
+    page, svc, _host = _page(root)
+    _open_form(root, page, label="pemberton", name="Pemberton",
+               consent="pemberton")
+    svc.calls.clear()
+    captured = {}
+    svc.people_add = lambda **kw: (captured.update(kw), (True, "enrolled"))[1]
+    page._create_pressed()
+    assert captured["label"] == "pemberton"
+    assert captured["role"] == "known"
+    assert captured["consent"] == "console", \
+        "a console consent must never be recorded as a terminal one"
+
+
+def test_a_label_the_gallery_could_not_store_never_reaches_the_app(root):
+    page, svc, _host = _page(root)
+    _open_form(root, page, label="Pemberton Smythe", consent="x")
+    svc.calls.clear()
+    page._create_pressed()
+    assert not any(isinstance(c, tuple) and c[0] == "add" for c in svc.calls)
+    assert "label" in page._toasts[-1][0]
+
+
+def test_a_face_label_the_gallery_could_not_store_is_refused_too(root):
+    """The pointer is the whole reason the face leg can name anyone. A
+    label one store would refuse must not reach the other."""
+    page, svc, _host = _page(root)
+    _open_form(root, page, label="pemberton", consent="pemberton",
+               face="NOT A LABEL")
+    svc.calls.clear()
+    page._create_pressed()
+    assert not any(isinstance(c, tuple) and c[0] == "add" for c in svc.calls)
+    assert "face" in page._toasts[-1][0].lower()
+
+
+def test_a_face_pointer_at_an_empty_gallery_is_allowed_but_said_out_loud(root):
+    """He may add somebody before their face is enrolled. That is fine and
+    it is not silent: an unresolved pointer is exactly how the face leg
+    stops naming anyone, so it is named at the moment it is created."""
+    page, svc, _host = _page(root)
+    _open_form(root, page, label="pemberton", consent="pemberton",
+               face="pemberton")
+    svc.calls.clear()
+    page._create_pressed()
+    assert any(isinstance(c, tuple) and c[0] == "add" for c in svc.calls)
+    joined = " ".join(line for line, _k in page._toasts)
+    assert "gallery" in joined.lower()
+
+
+def test_the_first_owner_form_asks_nobody_for_consent(root):
+    page, _svc, _host = _page(root, snapshot=_snapshot(fault="missing"))
+    page._add_pressed()
+    root.update_idletasks()
+    assert page._add_owner is True, "the first row must be an owner"
+    assert "consent" not in page._add_fields
+    assert "confirm_owner" not in page._add_fields
+
+
+# ============================ what the first render at 1040x1760 showed
+def test_the_unlock_row_is_actually_on_screen_when_a_code_is_set(root):
+    """FOUND BY LOOKING AT THE RENDER, 2026-09-05, at 1040x1760. The page
+    paints once at BUILD time, before the snapshot has been read, so the
+    admin state is still "refuse" and the lock row is packed away. Nothing
+    packed it back when the snapshot said a code IS required: the tab said
+    "locked" and offered no box to type the code into, which makes every
+    administrative action unreachable rather than guarded."""
+    page, _svc, _host = _page(root)
+    root.update_idletasks()
+    assert page._code_entry.winfo_ismapped(), \
+        "the tab demands a code and shows nowhere to type one"
+    assert page._unlock_btn.winfo_ismapped()
+    assert page._lock_btn.winfo_ismapped()
+
+
+def test_no_person_line_runs_off_the_right_edge(root):
+    """ALSO FOUND BY LOOKING. The chips line was one long unwrapped Label,
+    so "face: pemberton (128-D) · phrase: not set · code: not set" was cut
+    mid-word at the window edge -- the same class of defect he photographed
+    on the drawer this morning, and at his size, not a convenient one."""
+    for geom in ((HIS_W, HIS_H), (OLD_W, OLD_H)):
+        page, _svc, _host = _page(root, snapshot=_snapshot(3), geometry=geom)
+        root.update_idletasks()
+        width = page.winfo_width()
+        assert width > 1
+        for w in _walk(page._body):
+            if w.__class__.__name__ != "Label":
+                continue
+            assert w.winfo_reqwidth() <= width, \
+                (geom, w.cget("text")[:60], w.winfo_reqwidth(), width)
+        page.hide()
+        _host.destroy()
+
+
+def test_the_foot_note_and_the_gate_line_wrap_too(root):
+    page, _svc, _host = _page(root)
+    root.update_idletasks()
+    width = page.winfo_width()
+    for lbl in (page._gate_lbl, page._admin_lbl, page._note_lbl):
+        assert lbl.winfo_reqwidth() <= width, lbl.cget("text")[:60]
+
+
+def test_the_lock_status_is_not_cut_off_by_its_own_row(root):
+    """FOUND BY LOOKING at the second 1040x1760 render. The status sat
+    BESIDE the entry and two buttons, which left it ~340 px of a 1040-px
+    window, and "locked — the override code opens this tab and nothing
+    else" was cut at "ope". The sensors page learned the same lesson this
+    morning: a caption belongs BELOW the control, not next to it."""
+    for geom in ((HIS_W, HIS_H), (OLD_W, OLD_H)):
+        page, _svc, _host = _page(root, geometry=geom)
+        root.update_idletasks()
+        assert page._lock_lbl.winfo_reqwidth() <= page.winfo_width(), \
+            (geom, page._lock_lbl.cget("text"))
+        # and it is on its own line: below the entry, not beside it
+        assert page._lock_lbl.winfo_rooty() > page._code_entry.winfo_rooty()
+        page.hide()
+        _host.destroy()
+
+
+def test_arming_a_forget_brings_its_confirmation_into_view(root):
+    """FOUND BY LOOKING at the 30-users-forget render at 1040x1760. The
+    warning is ten lines long, so arming a forget on anybody but the first
+    person pushed the entry and the "Forget <label>" button below the
+    fold: he would press Forget, read a wall of amber, and find no way to
+    confirm without discovering that the body scrolls."""
+    page, _svc, _host = _page(root, snapshot=_snapshot(4))
+    page._lock.unlock()
+    page._forget_pressed("guest2")
+    root.update_idletasks()
+    entry = page._row_widgets["guest2"]["confirm"]
+    assert entry.winfo_ismapped()
+    top = page._canvas.winfo_rooty()
+    bottom = top + page._canvas.winfo_height()
+    assert entry.winfo_rooty() >= top, "the confirmation is above the fold"
+    assert entry.winfo_rooty() + entry.winfo_height() <= bottom, \
+        "the confirmation is below the fold"
+
+
+# ===================== what the 31-users-add render showed at 1040x1760
+@pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
+def test_create_is_pinned_where_add_is_and_never_scrolls_away(root, geom):
+    """The consent paragraph is twenty lines. With Create at the bottom of
+    the scrolling body it sat below the fold on a page that already has
+    people on it -- the same defect as a SAVE button that scrolls away,
+    which is the one he photographed this morning. The primary action
+    lives in the pinned foot, beside where "Add a person" was."""
+    page, _svc, _host = _page(root, snapshot=_snapshot(12), geometry=geom)
+    page._lock.unlock()
+    page._add_pressed()
+    root.update_idletasks()
+    btn = page._create_btn
+    assert btn.winfo_ismapped(), "Create is not on screen"
+    bottom = page.winfo_rooty() + page.winfo_height()
+    assert btn.winfo_rooty() + btn.winfo_height() <= bottom, geom
+    assert not page._add_btn.winfo_ismapped(), \
+        "Add and Create must not both be offered"
+
+
+def test_opening_the_form_shows_its_first_field(root):
+    """The body kept the scroll position it had from the LAST thing that
+    was open, so the form's name, label and face rows were above the fold
+    the moment it appeared -- visible in the 31-users-add render, which
+    opens on 'role'."""
+    page, _svc, _host = _page(root, snapshot=_snapshot(12))
+    page._lock.unlock()
+    page._forget_pressed("guest9")          # scrolls right down
+    root.update_idletasks()
+    assert page._canvas.canvasy(0) > 0
+    page._add_pressed()
+    root.update_idletasks()
+    assert page._canvas.canvasy(0) == 0, "the form opened part-way down"
+    first = page._add_fields["name"]
+    assert first.winfo_ismapped()
+    assert first.winfo_rooty() >= page._canvas.winfo_rooty()
+
+
+@pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
+def test_every_form_row_fits_the_window(root, geom):
+    """The caption column was 26 CHARACTERS wide, which at S=2 is ~410 px
+    of a 1040-px window, so "existing owner's label (owners only)" ran
+    into its own entry."""
+    page, _svc, _host = _page(root, geometry=geom)
+    page._lock.unlock()
+    page._add_pressed()
+    root.update_idletasks()
+    width = page.winfo_width()
+    for entry in page._add_fields.values():
+        right = (entry.winfo_rootx() - page.winfo_rootx()
+                 + entry.winfo_width())
+        assert right <= width, (geom, right, width)
+    for w in _walk(page._body):
+        if w.__class__.__name__ == "Label":
+            assert w.winfo_reqwidth() <= width, (geom, w.cget("text")[:50])
