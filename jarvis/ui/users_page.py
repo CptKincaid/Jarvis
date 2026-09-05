@@ -597,6 +597,14 @@ def label_fault(label) -> str:
 import tkinter as tk                                   # noqa: E402
 from tkinter import font as tkfont                     # noqa: E402
 
+
+# A Tk Label's requested width is its text plus its own border and
+# highlight ring even when padx and bd are 0 -- MEASURED at 14 px for this
+# label at 2.0 scale (font.measure said 510, winfo_reqwidth said 524). Fit
+# to the text budget, not to the allocation, or the label asks for slightly
+# more than it was given and Tk cuts the difference off the anchored end.
+_INK_SLACK = 16
+
 from jarvis.ui import theme                            # noqa: E402
 from jarvis.ui.widgets import RoundButton, px, ui_display, ui_font  # noqa: E402
 
@@ -780,6 +788,27 @@ class UsersPage(tk.Frame):
             fg=theme.FAINT, bg=bg, anchor="e", bd=0, padx=0, pady=0)
         self._path_full = ""
         self._act_row = act
+        # AND AGAIN WHENEVER THE ROW IS RESIZED. _fit_path is called from
+        # _paint_foot, but at that moment the geometry manager has not run
+        # yet and winfo_width() is still 1 or the PREVIOUS width -- so the
+        # first fit measures a row that does not exist yet and leaves the
+        # full path in a label that is then drawn right-anchored in a
+        # narrower slot, cutting its LEFT end with no ellipsis to say so
+        # ("ome/example/.local/state/jarvis/people.json", photographed
+        # 2026-09-05 on the first version of this fix). The Configure
+        # binding is the one that runs against real numbers.
+        # THE LABEL MEASURES ITSELF, and nothing else. An earlier version
+        # of this fix worked out the leftover from the row's width minus
+        # each sibling's requested width and padding, and it was wrong in
+        # both directions depending on WHEN it ran: during a repaint the
+        # row is still 1 px wide, and between repaints the foot holds a
+        # different set of buttons ("Add a person" is 272 px where Create
+        # and Cancel are 337), so a fit taken in one state was applied in
+        # the other and left the full path in a slot 21 px too small --
+        # drawn right-anchored, so its HEAD was cut, with no ellipsis to
+        # say so. The label's own allocated width needs no arithmetic and
+        # is never a guess.
+        self._path_lbl.bind("<Configure>", self._fit_path, add=True)
         self._note_lbl = tk.Label(
             self._foot, text="\n".join("· " + line for line in CANNOT_DO),
             font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
@@ -994,9 +1023,16 @@ class UsersPage(tk.Frame):
             # LAST, always: re-packing it here is what puts it behind the
             # buttons in the packer's allocation order, whichever buttons
             # this state has.
+            # EMPTY FIRST, THEN EXPAND INTO THE LEFTOVER. With no text the
+            # label asks for nothing, so the buttons take their natural
+            # width; expand=True then gives the label whatever is left, and
+            # its own <Configure> fills it in against that real number. It
+            # is repacked here rather than at build time so that it is
+            # behind the buttons in the packer's allocation order.
+            self._path_lbl.configure(text="")
             self._path_lbl.pack_forget()
-            self._path_lbl.pack(side="right", padx=(theme.PAD_S, 0))
-            self._fit_path()
+            self._path_lbl.pack(side="right", fill="x", expand=True,
+                                padx=(theme.PAD_S, 0))
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the foot could not be repacked",
                       exc_info=True)
@@ -1012,18 +1048,21 @@ class UsersPage(tk.Frame):
         """
         full = getattr(self, "_path_full", "") or ""
         try:
-            row = self._act_row
-            room = int(row.winfo_width()) or int(row.winfo_reqwidth())
-            for btn in row.winfo_children():
-                if btn is not self._path_lbl and btn.winfo_ismapped():
-                    room -= int(btn.winfo_reqwidth())
-            room -= 2 * theme.PAD_S
-            font = tkfont.Font(font=self._path_lbl.cget("font"))
+            lbl = self._path_lbl
+            room = int(lbl.winfo_width()) - _INK_SLACK
+            if int(lbl.winfo_width()) <= 1:
+                # Not laid out yet. Show NOTHING rather than guess: the
+                # Configure that gives it a width fits it a moment later
+                # against a real number, and an empty label for one frame
+                # is better than a path with its head cut off.
+                lbl.configure(text="")
+                return
+            font = tkfont.Font(font=lbl.cget("font"))
             if room <= 0 or not full:
-                self._path_lbl.configure(text="")
+                lbl.configure(text="")
                 return
             if font.measure(full) <= room:
-                self._path_lbl.configure(text=full)
+                lbl.configure(text=full)
                 return
             # Give up leading path segments first; then characters.
             parts = full.split("/")
@@ -1031,12 +1070,12 @@ class UsersPage(tk.Frame):
                 parts.pop(0)
                 shown = "\u2026/" + "/".join(parts)
                 if font.measure(shown) <= room:
-                    self._path_lbl.configure(text=shown)
+                    lbl.configure(text=shown)
                     return
             name = parts[-1] if parts else ""
             while name and font.measure("\u2026" + name) > room:
                 name = name[1:]
-            self._path_lbl.configure(text=("\u2026" + name) if name else "")
+            lbl.configure(text=("\u2026" + name) if name else "")
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the path could not be fitted",
                       exc_info=True)

@@ -988,6 +988,37 @@ def test_the_path_gives_up_its_width_and_keeps_the_tail(root):
     assert cancel.winfo_width() >= cancel.winfo_reqwidth()
 
 
+@pytest.mark.parametrize("geometry", [(SHOT_W, SHOT_H), (HIS_W, HIS_H)],
+                         ids=["photographed-920x1440", "his-stage-1040x1760"])
+def test_the_path_is_never_cut_without_an_ellipsis_to_say_so(root, geometry):
+    """A label with anchor="e" that is narrower than its text shows the
+    RIGHT end and silently drops the left. PHOTOGRAPHED on the first
+    version of this fix: "ome/example/.local/state/jarvis/people.json" --
+    the head was gone and nothing said so, because the fit ran before the
+    geometry manager had given the row a width.
+
+    THE RULE: whatever the label ends up showing, it must ASK FOR no more
+    room than it has. If it was shortened, the ellipsis is what says so."""
+    snap = dict(_snapshot())
+    snap["path"] = "/home/hunterp/.local/state/jarvis/people.json"
+    page, _, host = _page(root, snapshot=snap, geometry=geometry)
+    page._adding = True
+    page._paint()
+    root.update_idletasks()
+    root.update()
+    lbl = _foot_widget(page, "path")
+    if not lbl.winfo_ismapped():
+        return
+    assert lbl.winfo_reqwidth() <= lbl.winfo_width(), (
+        "the path asks for %d px of the %d it was given, so %r is being "
+        "drawn with its head cut off"
+        % (lbl.winfo_reqwidth(), lbl.winfo_width(), lbl.cget("text")))
+    shown = lbl.cget("text")
+    if shown and shown != snap["path"]:
+        assert shown.startswith("\u2026"), (
+            "%r was shortened but does not say so" % shown)
+
+
 def test_a_short_path_is_shown_in_full(root):
     """The fix must not trim what already fits."""
     snap = dict(_snapshot())
