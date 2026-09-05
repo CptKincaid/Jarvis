@@ -331,9 +331,17 @@ def config_writes(values: dict, get_option: Optional[Callable], *,
         notes.append("saved to the profile only — this room is not polled by "
                      "Jarvis. Tick “poll this room” to add it.")
         return edits, tuple(notes)
+    url = sp.presence_url(values.get("ip"))
+    if not url:
+        # He saved a profile before the router handed the device an address.
+        # The entry is written so the room exists, but roomfabric SKIPS a
+        # room with no url, so nothing here may claim it is being read.
+        notes.append("no address yet, so Jarvis cannot poll this room: put "
+                     "the address the router gave it into this sheet and "
+                     "save again")
     rooms = merged_presence_rooms(_opt(get_option, OPTION_ROOMS, None), room,
-                                  {"url": sp.presence_url(values.get("ip")),
-                                   "label": room, "primary": bool(primary),
+                                  {"url": url, "label": room,
+                                   "primary": bool(primary),
                                    "enabled": True})
     if rooms is None:
         notes.append("%s in assistant.json is not a list of rooms — fix that "
@@ -1056,7 +1064,11 @@ class SetupSheet(tk.Frame):
             return
         for key in ("password", "ota_password"):
             self._secret[key].delete(0, "end")
+        # POLLED means Jarvis will actually read it: the switch AND an
+        # address. roomfabric skips a room with no url, so the switch alone
+        # is not enough to say so.
         poll = bool(self._poll.get())
+        reads = poll and bool(sp.presence_url(values.get("ip")))
         edits, notes = config_writes(values, self._get_option, poll=poll,
                                      primary=bool(self._primary.get()),
                                      ladder=bool(self._ladder.get()))
@@ -1076,7 +1088,7 @@ class SetupSheet(tk.Frame):
                            public.get("has_ota_password"))
         self._field["room"].configure(state="disabled")
         self._rebuild_picker()
-        line = saved_line(room, polled=poll and not failed)
+        line = saved_line(room, polled=reads and not failed)
         if failed:
             line = ("NOT SAVED to assistant.json — %s would not write; the "
                     "profile itself was saved" % ", ".join(failed))

@@ -102,6 +102,14 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       still open: the tab row goes with the footer, the page
                       is shut, and the note carries the number of radar
                       requests sent across the standby dwell (it is zero)
+  29  sensor-setup    the SENSOR SETUP sheet over the page, opened on an
+                      INVENTED profile the rig writes into its own throwaway
+                      config directory: an invented SSID, a TEST-NET-1
+                      address and two invented secrets. The sheet renders
+                      "set" / "not set" for a secret and never a value, so
+                      nothing here can photograph one. SKIPPED IN CLASSIC at
+                      run time -- the SETUP button is holo's, because
+                      classic is frozen at the jarvis-v3 tip
 """
 from __future__ import annotations
 
@@ -156,6 +164,7 @@ STATES = (
     ("26", "sensors", None),
     ("27", "sensors-fault", None),
     ("28", "standby-over-sensors", None),
+    ("29", "sensor-setup", None),
 )
 
 
@@ -226,6 +235,19 @@ OPTIONS = {
         ],
     },
 }
+
+# THE INVENTED PROFILE state 29 photographs. Every value here is made up:
+# the SSID is not a network that exists, the address is RFC 5737 TEST-NET-1
+# like the two rooms above, and the two "secrets" are strings with the word
+# invented in them. jarvis.sensorprofile puts the file in
+# PATHS.ASSISTANT_CONFIG.parent/room-sensors, which _firewall_env has already
+# redirected into this run's throwaway directory, so his own profiles -- which
+# hold his real Wi-Fi PSK and OTA password -- are never opened, read or
+# rendered. Nothing in this rig ever reads them.
+RIG_SSID = "PRETEND-NET-5G"
+RIG_IP = "192.0.2.10"
+RIG_PSK = "invented-psk-not-his"
+RIG_OTA = "invented-ota-not-his"
 
 ROOM = {"playing": "", "next": "BIOSENSORS  ·  10:00", "due": "LAB REPORT  ·  NOON",
         "temp": "71°", "arc": "MORNING", "presence": "OFFICE", "quiet": "",
@@ -1158,6 +1180,51 @@ class Rig:
                    self.publish(DeskState(at_desk=True, idle_s=0.0,
                                           returned=True))), 0)
         S(lambda: self.wait_until(lambda: win.modes.mode == ACTIVE, 4000), None)
+
+        # 29 the SENSOR SETUP sheet ----------------------------------------
+        def setup_on():
+            from jarvis import sensorprofile
+            from jarvis.ui import sensors_page as sensors
+            # THE INVENTED PROFILE, written through the package's own writer
+            # so it lands in the firewalled config directory at 0600 -- his
+            # own profiles are never opened.
+            sensorprofile.write(
+                "office",
+                {"ssid": RIG_SSID, "ip": RIG_IP, "gateway": "192.0.2.1",
+                 "subnet": "255.255.255.0", "preset": "desk",
+                 "nearest_m": 2.0, "range_m": 3.5, "still": True,
+                 "timeout_s": 10, "flashed": True},
+                password=RIG_PSK, ota_password=RIG_OTA)
+            # the transport swap again, for the same reason as state 26: the
+            # page rebuilds its poller whenever its room list changes.
+            win.sensors.poller = sensors.SensorPoller(win.sensors.specs,
+                                                      get=self.radar)
+            if not win.sensors.is_open:
+                win.sensors_toggle()
+            win.sensors.open_setup()
+            win.sensors.setup.select("office")
+
+        def setup_state():
+            from jarvis.ui.sensors_page import restyled
+            if not restyled():
+                self.skip("29", "sensor-setup",
+                          "the SETUP button is holo's: classic is frozen at "
+                          "the jarvis-v3 tip and gains no new control")
+                return
+            self.begin("29", "sensor-setup")
+            setup_on()
+
+        S(setup_state, 1200)
+        S(lambda: (self.capture("29", "sensor-setup", note=(
+            "the setup sheet over the SENSORS page, on an INVENTED profile "
+            "the rig wrote into its own throwaway config directory. The two "
+            "secret boxes are empty and masked and the word beside each says "
+            "only whether one is set; no value is rendered anywhere"))
+            if win.sensors.setup is not None and win.sensors.setup.is_open
+            else None), 0)
+        S(lambda: (win.sensors.setup.hide()
+                   if win.sensors.setup is not None else None), 200)
+
         S(lambda: (OPTIONS.__setitem__("camera.preview", False),
                    win._on_config_change(CAMERA_PREVIEW_OPTION, False)), 400)
 
@@ -1174,6 +1241,8 @@ class Rig:
             if getattr(win, "preview", None) is not None:
                 win.preview.stop()
             if getattr(win, "sensors", None) is not None:
+                if getattr(win.sensors, "setup", None) is not None:
+                    win.sensors.setup.hide()
                 win.sensors.hide()          # stops its poll thread
             if win.board is not None:
                 win.board.destroy()

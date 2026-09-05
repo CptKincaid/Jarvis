@@ -1030,3 +1030,20 @@ def test_the_empty_page_points_at_setup_in_holo_and_at_the_file_in_classic():
                 assert unwanted not in line, (look, enabled)
     finally:
         theme.select_look(theme.DEFAULT_LOOK)
+
+
+def test_a_dhcp_room_with_no_address_yet_is_not_claimed_to_be_polled():
+    """He can save a profile before the router has handed the device an
+    address. presence.rooms takes the entry, but roomfabric SKIPS a room
+    with no url -- so "this page starts reading it now" would be a lie, and
+    the one thing this surface must not do is claim a sensor is being read
+    when it is not."""
+    get_option, _ = _cfg(rooms=[])
+    values = _values(dhcp=True, ip="")
+    assert values["ip"] == ""
+    edits, notes = ss.config_writes(values, get_option, poll=True,
+                                    primary=False, ladder=False)
+    assert edits["presence.rooms"][-1]["url"] == ""
+    assert any("no address" in n for n in notes)
+    assert any("cannot poll" in n for n in notes)
+    assert "restart" not in ss.saved_line("den", polled=False)
