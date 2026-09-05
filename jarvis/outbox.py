@@ -998,6 +998,32 @@ class DraftChanged(mail_mod.MailSendFailed):
     line to speak, unlike a transport failure whose text is a class name."""
 
 
+def send_notice(account, subject: str, body: str, *, smtp=None,
+                mail=None) -> str:
+    """A short note an account sends TO ITSELF; returns the Message-ID.
+
+    WHY THIS LIVES HERE. ``tests/test_send_file.py`` pins that the only
+    module in the package that calls ``mail.send_message`` is this one --
+    a guard, not a coding-style rule: one door to an irreversible action,
+    so that "can a tool loop reach the transport?" is a question with one
+    place to look. Knightfall's rotated code needs to be mailed, and the
+    first cut of it reached round the side and left that guard red
+    (verdict, 2026-09-05). It comes through here instead.
+
+    The door is NARROWER than :func:`send`'s: there is no recipient
+    parameter and no attachment. A notice goes to the account's own
+    address or nowhere, so nothing that gets hold of this seam can use it
+    to mail a stranger. ``mail`` is the module seam the tests substitute.
+    """
+    mail = mail or mail_mod
+    to_addr = str((account or {}).get("address") or "").strip()
+    if not to_addr:
+        raise mail_mod.MailSendFailed("that account has no address")
+    log.info("outbox: notice %r to the account itself (%s)", subject,
+             mail_mod.account_label(account))
+    return mail.send_message(account, to_addr, subject, body, smtp=smtp)
+
+
 def send(draft: Draft, smtp=None, cap_mb: float = MAX_ATTACHMENT_MB) -> str:
     """Send a confirmed draft; returns the line to speak.
 

@@ -176,6 +176,25 @@ class Config:
     # you off, lower it if the wait after a question feels long.
     endpoint_vad: bool = True
     endpoint_silence: float = 0.8
+    # The filler hold (jarvis/recorder.py, Hunter 08-31: "um/uh should buy
+    # him more time"). When the live preview's newest decode ends on a
+    # filler ("set a timer for, um…") and the VAD heard nothing after it,
+    # the stop waits filler_hold_s beyond endpoint_silence -- so a thinking
+    # pause after an um is 2.3 s, not 0.8 s. A hold is one such pause; at
+    # most filler_max_holds of them per capture, then the ordinary stop.
+    # Raise filler_hold_s if he still gets cut off after an um, lower it if
+    # the wait after "…um" feels long; 0 holds nothing. The 60 s cap and the
+    # 2.5 s energy timer are untouched (the energy timer can still end a
+    # held pause first: the turn line then says stop=energy).
+    filler_hold: bool = True
+    filler_hold_s: float = 1.5
+    filler_max_holds: int = 3
+    # Add "Um, uh, hmm, er." to the PREVIEW's initial_prompt so whisper
+    # writes fillers down instead of dropping them (it is trained on clean
+    # transcripts). The final transcribe() never carries it, so commands
+    # stay clean. UNMEASURED, so it ships OFF: scripts/filler_probe.py
+    # compares takes with it on and off; turn it on only if that says so.
+    filler_prompt_hint: bool = False
     # After Jarvis answers, keep listening this long for a follow-up with no
     # wake word ("...and Tuesday?"). Needs the VAD (it must know that nothing
     # was said); 0 turns it off. Every follow-up is still speaker-verified.

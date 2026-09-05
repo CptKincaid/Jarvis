@@ -133,9 +133,25 @@ GATED_SOURCES = ("voice",)
 # in jarvis/recognise.py.
 HOW_EXEMPT = "exempt"
 HOW_GRANT = "grant"
+# A turn inside the window the TYPED code opened (Knightfall, 2026-09-04).
+# Its own name rather than a second "grant" so the log says which path let
+# him in -- that is all a log line about this feature may ever carry: WHO
+# and WHICH PATH, never the code and never the phrase.
+HOW_CODE = "code"
 HOW_OFF = "off"
 HOW_BLIND = "blind"
 HOW_FAULT = "fault"
+# The legs a turn may be admitted on. HOW_CODE joins the two the window
+# already had; the app's rescue set reads the same tuple.
+ADMITTED_HOWS = (HOW_VOICE, HOW_FACE, HOW_PHRASE, HOW_GRANT, HOW_CODE)
+# THE TWO LEGS HE HIMSELF OPENED, as against the ones a sensor produced.
+# Every other leg in ADMITTED_HOWS is something the machine decided about
+# him; these two exist only because he said the phrase or typed the code,
+# and that difference is what lets them act in shadow (jarvis/app.py,
+# _gate_rescue_inner) while the face leg still only logs.
+WINDOW_HOWS = (HOW_GRANT, HOW_CODE)
+# The two ways the window can be opened, worded for the log.
+_OPENER_NAMES = {HOW_PHRASE: "the phrase", HOW_CODE: "the code"}
 
 # Three turns in a row where NOTHING was measuring is a broken gate, not a
 # besieged one, and it should stand down out loud rather than hold the door
@@ -183,8 +199,19 @@ PHRASE_OK_LINE = "Thank you, sir. I'm listening."
 # The refusal for a voice the gallery could not tell from another enrolled
 # one. Imported so there is one wording, in jarvis/signinlines.py.
 NEAR_MISS_LINE = signinlines.NEAR_MISS_LINE
+# ...AND WHAT MODE_OFF SAYS INSTEAD, because in off the phrase opens no
+# window (see _phrase_consumed) and the speaker filter -- which is not the
+# gate and does not care what mode the gate is in -- goes on dropping his
+# clips exactly as it did a second earlier. "I'm listening." was therefore
+# a promise the code did not keep in that mode: measured 2026-09-05, the
+# turn after the phrase dispatched nothing at all in off. This says thank
+# you and claims nothing. It is deliberately still opaque to a bystander --
+# it does not name the phrase, the mode, or the fact that anything was
+# recognised -- and deliberately DIFFERENT from PHRASE_OK_LINE, so that he,
+# who knows what the two mean, can hear which mode he is in.
+PHRASE_OFF_LINE = "Thank you, sir."
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE, NEAR_MISS_LINE)
+                 PHRASE_OK_LINE, PHRASE_OFF_LINE, NEAR_MISS_LINE)
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -219,6 +246,14 @@ class Decision:
     a Whisper transcript, and by the time a transcript reaches ``_dispatch``
     it has already been through the bus, the history, the transcript pane
     and commander's own log line.
+
+    ``consumed`` (Knightfall, 2026-09-04) says the gate ANSWERED THIS TURN
+    ITSELF: the words were the spoken phrase, the window is open, ``line``
+    is what to say, and the app must dispatch NOTHING -- no commander, no
+    model, no transcript but ``redact``. It is set in every mode, because
+    the phrase he chose is also the name of an Oracle service, and a phrase
+    that travelled on as a sentence would be answered as "is knightfall
+    up" or handed to the model.
     """
 
     admit: bool = True
@@ -229,6 +264,7 @@ class Decision:
     redact: str = ""
     why: str = ""
     would_refuse: bool = False
+    consumed: bool = False
 
 
 class OwnerGate:
@@ -244,6 +280,7 @@ class OwnerGate:
         self._blind_run = 0
         self._grant_who = ""
         self._grant_until = 0.0
+        self._grant_how = HOW_PHRASE      # which path opened the window
         # TWO limiters, never shared, different limits. Burning the
         # passphrase attempts must not lock out the break-glass, or the
         # fallback of last resort fails exactly when it is needed.
@@ -543,25 +580,87 @@ class OwnerGate:
             return ""
         return self._grant_who
 
-    def _try_phrase(self, text, now) -> str:
-        """The owner's way back in, or "". Runs the key derivation ONLY
-        when the words were phrase-shaped and recognition has already
-        failed, so an ordinary refused sentence pays nothing."""
+    def open_window(self, who: str, how: str, now=None) -> None:
+        """THE ONE WINDOW OPENER, for the spoken phrase and the typed code
+        alike. Opens the floor to ``who`` for GRANT_S; ``how`` is HOW_PHRASE
+        or HOW_CODE and is what a turn inside the window is attributed to.
+        The log line carries who, which path and the live mode -- nothing
+        else, ever."""
+        self._grant_who = str(who or "")
+        self._grant_how = HOW_CODE if how == HOW_CODE else HOW_PHRASE
+        self._grant_until = self._now(now) + GRANT_S
+        log.info("gate: %s opened the floor to %s for %.0fs (mode=%s)",
+                 _OPENER_NAMES[self._grant_how], self._grant_who, GRANT_S,
+                 self.effective_mode())
+
+    def _phrase_consumed(self, who: str, now, *,
+                         window: bool = True) -> "Decision":
+        """The one verdict the phrase produces, in EVERY mode: the turn
+        ends here. Nothing of the words travels -- the text is
+        REDACTED_TEXT and the app dispatches nothing.
+
+        ``window`` is False in MODE_OFF only. Off already admits every
+        turn, so the window would buy him nothing -- while the phrase
+        check in that mode is deliberately unlimited, and an unlimited
+        path that leaves a five-minute admission behind it would still be
+        open if the mode were moved to enforce a minute later."""
+        if not window:
+            log.info("gate: the phrase was consumed for %s; the gate is off, "
+                     "so no floor was opened", who)
+            return Decision(admit=True, who=who, role=ROLE_OWNER,
+                            how=HOW_PHRASE, line=PHRASE_OFF_LINE,
+                            redact=REDACTED_TEXT, consumed=True,
+                            why="the phrase; the gate is off and answered "
+                                "this turn")
+        self.open_window(who, HOW_PHRASE, now=now)
+        return Decision(admit=True, who=who, role=ROLE_OWNER,
+                        how=HOW_PHRASE, line=PHRASE_OK_LINE,
+                        redact=REDACTED_TEXT, consumed=True,
+                        why="the phrase; the gate answered this turn")
+
+    def _try_phrase(self, text, now, *, limited: bool = True) -> str:
+        """The owner's phrase, or "". The key derivation runs ONLY when the
+        words were phrase-shaped (the cheap pre-filter, unchanged), so
+        "yes", "no" and silence pay nothing.
+
+        ``limited`` is whether this counts against the five-per-window
+        limiter: it does for a voice nobody recognised (a stranger
+        guessing, exactly as before) and it does NOT for a turn a leg has
+        already named an owner on. He is not attempting anything by
+        talking; if his own sentences burned attempts, the sixth sentence
+        in five minutes would close the phrase for the rest of the window
+        and "Knightfall protocol" would reach the Oracle lane.
+
+        THE COST OF CHECKING EVERY TURN, stated rather than hidden: a
+        recognised owner's phrase-shaped sentence now pays one scrypt per
+        owner with a phrase set (~20 ms at n=2**14, measured in
+        jarvis/passphrase.py). A cheaper bound that excludes ordinary
+        sentences would have to know something about the phrase -- its
+        length, its word count -- and storing that beside the hash is a
+        leak of the phrase's shape. The 20 ms was taken instead; see
+        tests/test_knightfall_kdf_cost.py for the count per 100 turns.
+        """
         if not pp.phrase_shaped(text):
             return ""
         owners = [p for p in self.registry.owners() if p.phrase_hash]
         if not owners:
             return ""
-        ok, wait = self.phrase_attempts.allow(now=now)
-        if not ok:
-            log.info("gate: too many passphrase attempts; %.0fs to wait", wait)
+        if limited:
+            ok, wait = self.phrase_attempts.allow(now=now)
+            if not ok:
+                log.info("gate: too many passphrase attempts; %.0fs to wait",
+                         wait)
+                return ""
+        offered = pp.spoken_candidates(text)
+        if not offered:
             return ""
-        offered = pp.normalise_spoken(text)
-        self.phrase_attempts.record(now=now)
+        if limited:
+            self.phrase_attempts.record(now=now)
         for person in owners:
-            self.kdf_calls += 1
-            if pp.check_secret(offered, person.phrase_hash):
-                return person.label
+            for candidate in offered:
+                self.kdf_calls += 1
+                if pp.check_secret(candidate, person.phrase_hash):
+                    return person.label
         return ""
 
     # -------------------------------------------------------- the verdict
@@ -591,6 +690,23 @@ class OwnerGate:
 
         mode = self._mode_unsafe()
         if mode == MODE_OFF:
+            # OFF ADMITS EVERYTHING; IT DOES NOT REPEAT HIS PASSPHRASE.
+            # This return used to be the first thing in the function, so
+            # the one mode where the gate is switched off was the one mode
+            # that dispatched the phrase as an ordinary command -- onto the
+            # bus, into the history, the transcript pane and the model
+            # (verdict, 2026-09-05). Consuming it here costs nothing but
+            # the derivation and gives away nothing: the window it opens
+            # grants what off already grants.
+            #
+            # UNLIMITED, and that is the point of it: the limiter exists to
+            # stop a stranger guessing his way past a gate, and there is no
+            # gate here to guess past. If his own sentences burned attempts
+            # in this mode, the sixth phrase-shaped one in five minutes
+            # would put the phrase back on the bus -- the leak this closes.
+            spoke = self._try_phrase(text, now, limited=False)
+            if spoke:
+                return self._phrase_consumed(spoke, now, window=False)
             return Decision(admit=True, how=HOW_OFF,
                             why=getattr(self.registry, "fault", "")
                                 or "the gate is switched off")
@@ -599,6 +715,30 @@ class OwnerGate:
         roles = self.registry.roles()
         voice_says, voice_running = self._voice_leg(stats, rejected)
         face_says, face_on = self._face_leg(face, face_running)
+        named = recognise(Legs(voice_says=voice_says,
+                               voice_running=voice_running,
+                               face_says=face_says, face_running=face_on),
+                          roles, owner)
+
+        # THE PHRASE, BEFORE ANYTHING ELSE CAN ACT ON THE WORDS. Whether a
+        # leg named him or not, in shadow and in enforce, a matching phrase
+        # is CONSUMED here: the window opens, the line is what he hears,
+        # and the app dispatches nothing. The limiter counts only a voice
+        # nobody recognised (see _try_phrase).
+        # THE EXEMPTION IS THE OWNER'S, AND ONLY HIS. This used to read
+        # ``limited=not named.who`` -- "somebody was named" -- which is not
+        # the same sentence at all: a KNOWN non-owner in front of the lens
+        # (a guest, the cleaner, anybody the camera has a row for) turned
+        # the five-per-window limiter OFF and bought a guesser unlimited
+        # attempts at one scrypt each, with the owner nowhere in the room.
+        # Measured 2026-09-05: 40 phrase-shaped guesses cost 40 key
+        # derivations with a KNOWN face in view, against 5 with nobody
+        # named. The reason for the exemption was only ever HIS OWN
+        # sentences not burning his own way back in, so it is his alone.
+        owner_named = bool(named.who) and named.role == ROLE_OWNER
+        spoke = self._try_phrase(text, now, limited=not owner_named)
+        if spoke:
+            return self._phrase_consumed(spoke, now)
 
         if not voice_running and not face_on:
             # NOTHING IS MEASURING. That is not "nobody is here", and it
@@ -614,55 +754,41 @@ class OwnerGate:
                             line=STANDDOWN_LINE if tripped else "",
                             why="no leg was running")
 
-        verdict = recognise(Legs(voice_says=voice_says,
-                                 voice_running=voice_running,
-                                 face_says=face_says, face_running=face_on),
-                            roles, owner)
-        granted = False
+        verdict = named
         if verdict.how == HOW_NOBODY:
             who = self._granted(now)
             if who:
-                granted = True
-            else:
-                who = self._try_phrase(text, now)
-                if who:
-                    self._grant_who = who
-                    self._grant_until = self._now(now) + GRANT_S
-                    log.info("gate: the passphrase opened the floor to %s "
-                             "for %.0fs", who, GRANT_S)
-            if who:
+                # The window, not the phrase: the words are ordinary and
+                # must not be redacted, and the log must not claim the
+                # phrase was said again. Attributed to whichever path
+                # opened it, so the log says which.
                 verdict = recognise(Legs(phrase_says=who), roles, owner)
+                verdict = type(verdict)(who=verdict.who, role=verdict.role,
+                                        how=self._grant_how if
+                                        self._grant_how == HOW_CODE
+                                        else HOW_GRANT,
+                                        why="inside the %s window"
+                                            % _OPENER_NAMES[self._grant_how])
 
-        if verdict.how in (HOW_VOICE, HOW_FACE, HOW_PHRASE, HOW_GRANT):
+        if verdict.how in ADMITTED_HOWS:
             self._blind_run = 0
             ok, line = self.allowed_for(verdict.role, text)
             person = self.registry.person(verdict.who)
             name = person.display() if person is not None else verdict.who
-            if granted and verdict.how == HOW_PHRASE:
-                # It was the window the phrase opened, not the phrase: the
-                # words are ordinary and must not be redacted, and the log
-                # must not claim the phrase was said again.
-                verdict = type(verdict)(who=verdict.who, role=verdict.role,
-                                        how=HOW_GRANT,
-                                        why="inside the passphrase window")
-            redact = REDACTED_TEXT if verdict.how == HOW_PHRASE else ""
             if ok:
                 log.info("gate: %s (%s) on the %s leg", verdict.who,
                          verdict.role, verdict.how)
                 return Decision(admit=True, who=verdict.who, role=verdict.role,
-                                how=verdict.how, redact=redact,
-                                why=verdict.why)
+                                how=verdict.how, why=verdict.why)
             log.info("gate: %s is %s; that one is out of scope", verdict.who,
                      verdict.role)
             refuse = Decision(admit=False, who=verdict.who, role=verdict.role,
                               how=verdict.how, line=line.format(name=name),
-                              redact=redact, why="out of scope for %s"
-                                                 % verdict.role)
+                              why="out of scope for %s" % verdict.role)
             if mode != MODE_ENFORCE:
                 return Decision(admit=True, who=verdict.who,
                                 role=verdict.role, how=verdict.how,
-                                redact=redact, would_refuse=True,
-                                why=refuse.why)
+                                would_refuse=True, why=refuse.why)
             return refuse
 
         # Nobody. The refusal NAMES THE WAY BACK IN rather than being a dead

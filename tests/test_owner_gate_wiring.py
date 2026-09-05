@@ -65,9 +65,16 @@ def _stand_in(tmp_path, *, mode="enforce", phrase=False, said="hello there",
     a._eye_identity = app_mod.JarvisApp._eye_identity.__get__(a)
     a._face_running = app_mod.JarvisApp._face_running.__get__(a)
     a._refuse_politely = app_mod.JarvisApp._refuse_politely.__get__(a)
+    a._gate_quiet_decode = app_mod.JarvisApp._gate_quiet_decode.__get__(a)
+    a._clip_decode = app_mod.JarvisApp._clip_decode.__get__(a)
+    a._log_transcript = app_mod.JarvisApp._log_transcript.__get__(a)
     a._gate_rescue = app_mod.JarvisApp._gate_rescue.__get__(a)
     a._gate_rescue_inner = app_mod.JarvisApp._gate_rescue_inner.__get__(a)
     a._gate_admits = app_mod.JarvisApp._gate_admits.__get__(a)
+    a._gate_judge = app_mod.JarvisApp._gate_judge.__get__(a)
+    a._gate_consumed = app_mod.JarvisApp._gate_consumed.__get__(a)
+    a._drop_partial = app_mod.JarvisApp._drop_partial.__get__(a)
+    a._loggable = app_mod.JarvisApp._loggable.__get__(a)
     a._owner_has_phrase = app_mod.JarvisApp._owner_has_phrase.__get__(a)
     a.gate = gate_mod.OwnerGate(registry=reg, owner="hunter",
                                 get_option=a.get_option)
@@ -119,7 +126,9 @@ def test_the_passphrase_ends_the_turn_and_publishes_nothing(tmp_path):
     reaches nothing at all -- not the bus, not the history, not the pane,
     not the ledger, not commander's log line. The turn is over."""
     a = _stand_in(tmp_path, phrase=True, said="Xxx not a real phrase xxx.")
-    assert a._gate_rescue(object(), MATCHED, False) is None
+    # PHRASE_CONSUMED rather than None (Knightfall, 2026-09-04): the caller
+    # must publish neither a rejection nor a transcript for this clip.
+    assert a._gate_rescue(object(), MATCHED, False) is app_mod.PHRASE_CONSUMED
     assert a.spoken == [gate_mod.PHRASE_OK_LINE]
     assert a._followup_after_speech is True
     assert FAKE_PHRASE not in " ".join(a.spoken)
@@ -134,11 +143,19 @@ def test_the_phrase_costs_one_decode_and_only_when_it_could_matter(tmp_path):
     assert b.transcriber.calls == 0
 
 
-def test_shadow_changes_nothing_at_all_about_a_rejected_clip(tmp_path):
+def test_shadow_changes_nothing_about_a_rejected_clip_but_hears_the_phrase(
+        tmp_path):
+    """CHANGED 2026-09-04 (Knightfall, "so he can test it tonight"): with
+    an owner's phrase set, shadow now pays ONE decode on a dropped clip so
+    the phrase can be heard -- and that is the only thing that acts. The
+    clip is still dropped, nothing is rescued, nothing is said."""
     a = _stand_in(tmp_path, mode="shadow", phrase=True)
     assert a._gate_rescue(object(), MATCHED, False) is None
     assert a.spoken == []
-    assert a.transcriber.calls == 0
+    assert a.transcriber.calls == 1
+    b = _stand_in(tmp_path, mode="shadow", phrase=False)
+    assert b._gate_rescue(object(), MATCHED, False) is None
+    assert b.transcriber.calls == 0
 
 
 def test_a_broken_transcriber_leaves_the_clip_exactly_as_it_was(tmp_path):

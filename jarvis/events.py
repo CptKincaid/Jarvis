@@ -43,6 +43,10 @@ class RecordingStopped(Event):
     reason: str = "manual"            # manual | silence | cap | abort
     endpoint: str = ""                # which detector ended it: vad | energy | voice_id | manual | cap
     dead_air_s: float | None = None   # silence waited through before stopping (turn ledger)
+    # Filler holds this capture (jarvis/recorder.py): pauses after a trailing
+    # "um"/"uh" the stop waited CONFIG.filler_hold_s longer for. Reaches the
+    # turn ledger line as holds=N so a week of turns can say how often it fired.
+    filler_holds: int = 0
     # The session was opened without a wake word (the follow-up window).
     # The app's "did not catch that" policy stays silent on those: nothing
     # said into a follow-up window is the normal case, not a lost turn.

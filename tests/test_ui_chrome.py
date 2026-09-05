@@ -711,20 +711,25 @@ def test_empty_panels_state_their_emptiness():
         assert text and text == text.lower(), key      # a line, not a label
 
 
-# ------------------------------------------- U12 settings slider geometry
-def test_holo_scale_rows_leave_the_value_room_at_the_low_end():
-    """MEASURED 2026-09-03 on :92 at S=2: 'Silence timeout (s)' 314 px in
-    the row face, the drawer's inner width 576, the px(130) trough 260 --
-    2 px of slack, and the Scale's value ('2.5', 36 px) is drawn centred
-    on a knob that sits at the trough's left edge at the low end, so it
-    overhung into the label. The holo trough shortens and gains a gap
-    wider than the overhang."""
-    label_w, inner, value_w = 314, 576, 36
-    holo = 2 * SettingsDrawer.SCALE_LEN_HOLO + 2 * SettingsDrawer.SCALE_GAP_HOLO
-    assert label_w + holo <= inner, (label_w + holo, inner)
-    assert 2 * SettingsDrawer.SCALE_GAP_HOLO >= value_w // 2
-    # the old geometry really did fill the row to within a few px
-    assert inner - label_w - 260 == 2
+# ------------------------------------------- settings slider geometry
+def test_the_holo_slider_row_fits_with_its_value_inline():
+    """The value used to be drawn ABOVE a stock Tk scale, centred on the
+    knob, so at the low end it overhung into the label ('Silence timeout
+    (s)2.5', shot 14). It is a Label on the row's own baseline now, to the
+    RIGHT of the track, so the row is a straight width budget.
+
+    MEASURED on :94 at S=2, 2026-09-05: inner width 576, the widest label
+    ('Silence timeout (s)') 310, the value ('0.015' in the caption mono
+    face) 70. The arithmetic is here so a longer label or a longer track
+    cannot silently collide again."""
+    label_w, inner, value_w = 310, 576, 70
+    row = (2 * SettingsDrawer.SLIDER_GAP_HOLO
+           + 2 * SettingsDrawer.SLIDER_LEN_HOLO
+           + 2 * SettingsDrawer.SLIDER_VALUE_GAP_HOLO + value_w)
+    assert label_w + row <= inner, (label_w + row, inner)
+    assert SettingsDrawer.SLIDER_VALUE_CHARS >= len("0.015")
+    # the old stock-scale geometry really did fill the row to within 2 px
+    assert inner - label_w - 2 * SettingsDrawer.SCALE_LEN_CLASSIC == 6
 
 
 # The rule applied to the two row-key sites that still tracked (2026-09-04):

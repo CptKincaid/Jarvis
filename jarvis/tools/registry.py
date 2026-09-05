@@ -28,6 +28,27 @@ schemas are free (they are the same bytes every turn, which is the whole
 point of the static-prefix rule in jarvis/brain.py).  So the tool count is
 a real tax on any turn that starts cold, and close to nothing on one that
 does not — trim it, but do not expect it to buy back seconds.
+
+WHAT MAX_SCHEMA_TOKENS IS, AND IS NOT (relabelled 2026-09-04, because it
+had been read as the wrong thing all week).  It is a COLD-PREFILL LATENCY
+budget: the ~294 ms above, paid once per cold prefix.  It is NOT a budget
+on window SPACE.  The window is jarvis/brain.py's num_ctx, it is his to
+set in assistant.json, and at its default the same 28 schemas occupy about
+a seventh of it rather than a third.  Trimming schema TEXT was measured
+and rejected on 2026-09-04: it buys back space that is no longer scarce,
+and the risk it carries — whether a 25 B model still picks the right
+argument without the descriptions it reads them from — has already cost
+two live incidents.  Per-route scoping was measured and rejected harder:
+editing the head of the tool array re-prefills 3455 tokens, +1.2 s on that
+turn, and alternating a tools prefix with a tools-free one never goes warm
+in either direction (+1.3 s per turn, forever).  Do not "optimise" either
+without a tool-selection regression pass behind it.
+
+CHARS_PER_TOKEN below is NOT a stale guess — the range under it was
+measured at three points.  Leave it at 4.1.  It is the rate for schema
+JSON and prose ONLY: tool RESULTS (calendar, mail) tokenize at 2.25 chars
+per token, measured 2026-09-04, and jarvis/brain.py costs those at its own
+TOOL_CHARS_PER_TOKEN.  Do not "fix" one number to fit the other text.
 """
 from __future__ import annotations
 
@@ -155,7 +176,9 @@ class ToolRegistry:
             state = self.schema_budget()
             report = log.warning if not state["ok"] else log.info
             report("tools: %d registered (budget %d), schema ~%d prompt "
-                   "tokens (budget %d)%s", state["tools"], MAX_TOOLS,
+                   "tokens (cold-prefill budget %d, ~294 ms once per cold "
+                   "prefix -- NOT a window-space budget; the window is "
+                   "brain.num_ctx)%s", state["tools"], MAX_TOOLS,
                    state["schema_tokens"], MAX_SCHEMA_TOKENS,
                    "; over the word cap: " + ", ".join(state["over_word_cap"])
                    if state["over_word_cap"] else "")

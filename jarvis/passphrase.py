@@ -36,6 +36,7 @@ import binascii
 import hmac
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from hashlib import scrypt
@@ -89,12 +90,60 @@ def phrase_shaped(text) -> bool:
     return len(normalise_spoken(text)) >= MIN_PHRASE_LEN
 
 
+# The wake word Whisper leaves at the FRONT of the sentence. The recorder
+# keeps the audio from before the hotword fired, so "Jarvis, <phrase>" comes
+# back with the vocative in the transcript -- and until 2026-09-05 that was
+# not the phrase, so the commonest way of saying it was dispatched as an
+# ordinary command instead of being consumed. Same list as
+# commander.JARVIS_PREFIXES, in normalised form.
+VOCATIVES = ("hey jarvis", "ok jarvis", "okay jarvis", "jarvis")
+
+
+def spoken_candidates(text) -> Tuple[str, ...]:
+    """What may be compared against a stored phrase: the normalised
+    utterance, and -- only when it opens with the wake word -- the same
+    sentence with that word taken off.
+
+    AT MOST TWO, deliberately. Each candidate costs one scrypt PER OWNER
+    (~18 ms measured), and this runs on every phrase-shaped turn, so a
+    sweep over every span of the sentence (which would catch a phrase
+    buried mid-sentence) would put ~180 ms on ordinary turns. Anything
+    shorter than MIN_PHRASE_LEN is dropped for free: no stored phrase can
+    be shorter, and the length rule is a public constant, not a fact about
+    his phrase.
+    """
+    first = normalise_spoken(text)
+    out = [first] if len(first) >= MIN_PHRASE_LEN else []
+    for word in VOCATIVES:
+        if first.startswith(word + " "):
+            rest = first[len(word) + 1:].strip()
+            if len(rest) >= MIN_PHRASE_LEN and rest not in out:
+                out.append(rest)
+            break
+    return tuple(out)
+
+
 def phrase_ok(plain) -> Tuple[bool, str]:
     """Is this acceptable as a NEW spoken phrase? Length only."""
     if len(normalise_spoken(plain)) < MIN_PHRASE_LEN:
         return False, ("a spoken passphrase needs at least %d letters and "
                        "digits once punctuation is dropped" % MIN_PHRASE_LEN)
     return True, ""
+
+
+# A ROTATED code (Knightfall, 2026-09-04) is generated here rather than
+# chosen: eight characters from an alphabet he can read back off a phone
+# screen without guessing -- no 0/o, no 1/l -- and it is his only until he
+# next types it, when the next one is mailed. secrets, never random.
+CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+NEW_CODE_LEN = 8
+
+
+def new_code(length: int = NEW_CODE_LEN) -> str:
+    """A fresh typed code. The caller mails it, hashes it, and deletes it;
+    nothing here keeps it."""
+    return "".join(secrets.choice(CODE_ALPHABET)
+                   for _ in range(max(MIN_CODE_LEN, int(length))))
 
 
 def code_ok(plain) -> Tuple[bool, str]:
@@ -108,12 +157,32 @@ def code_ok(plain) -> Tuple[bool, str]:
     return True, ""
 
 
+def _plain(secret) -> str:
+    """What is actually hashed: the secret with the surrounding whitespace
+    dropped. ONE definition, used by hash_secret and check_secret alike --
+    the trap this closes was the two of them disagreeing."""
+    try:
+        return str(secret or "").strip()
+    except Exception:  # noqa: BLE001 - a value that cannot be read is not one
+        return ""
+
+
 def hash_secret(plain, *, salt: Optional[bytes] = None) -> str:
     """``scrypt$n$r$p$<salt_b64>$<hash_b64>`` -- a new random salt each
-    time, so two owners sharing a phrase do not share a stored value."""
+    time, so two owners sharing a phrase do not share a stored value.
+
+    THE SURROUNDING WHITESPACE IS DROPPED, at BOTH ends of the pair (see
+    :func:`check_secret`), and that is a fix rather than a nicety. Until
+    2026-09-05 this hashed the raw ``getpass`` string while
+    ``gate.check_override_code`` stripped before checking, so a code set
+    with one stray space could be typed neither WITH the space nor
+    without it -- and ``scripts/jarvis_people.py`` answered "set." either
+    way. One keystroke killed the break-glass silently. A secret whose
+    meaning depends on an invisible character is not a secret he can type.
+    """
     if salt is None:
         salt = os.urandom(SALT_BYTES)
-    raw = str(plain or "").encode("utf-8")
+    raw = _plain(plain).encode("utf-8")
     digest = scrypt(raw, salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
                     dklen=DKLEN, maxmem=MAXMEM)
     return "scrypt$%d$%d$%d$%s$%s" % (
@@ -127,7 +196,7 @@ def check_secret(plain, stored) -> bool:
     stored value is a plain False -- never an exception, because a
     corrupted hash must not be able to raise its way past the caller, and
     never a different code path, because a different path is a signal."""
-    text = str(plain or "").strip()
+    text = _plain(plain)
     if not text:
         return False
     parts = str(stored or "").split("$")
@@ -142,7 +211,7 @@ def check_secret(plain, stored) -> bool:
     if not salt or not want or n <= 1 or r < 1 or p < 1:
         return False
     try:
-        got = scrypt(str(plain).encode("utf-8"), salt=salt, n=n, r=r, p=p,
+        got = scrypt(text.encode("utf-8"), salt=salt, n=n, r=r, p=p,
                      dklen=len(want), maxmem=MAXMEM)
     except (ValueError, MemoryError):
         return False

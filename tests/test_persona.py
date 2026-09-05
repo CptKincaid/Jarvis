@@ -566,7 +566,7 @@ def test_chat_sends_the_static_prompt_and_the_dynamic_turn(brain,
     assert p["model"] == brain.OLLAMA_MODEL
     assert p["stream"] is False and p["think"] is False
     assert p["keep_alive"] == -1
-    assert p["options"]["num_ctx"] == 8192
+    assert p["options"]["num_ctx"] == brain.NUM_CTX
     assert p["options"]["stop"] == ["\nUser:", "\nHunter:"]
     system, user = p["messages"]
     assert system == {"role": "system", "content": brain.static_system()}

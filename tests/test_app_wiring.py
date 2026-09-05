@@ -2188,6 +2188,38 @@ def test_the_open_debrief_gets_the_long_answer_window(app):
     assert app._capture_window() is None
 
 
+# ------------------------------------------ the config's ONE write
+def test_startup_fills_new_default_keys_once_and_hands_the_config_to_the_brain(
+        build, paths, monkeypatch):
+    """AssistantConfig.load() is a READ since 2026-09-04 (an agent's import
+    of jarvis.brain had rewritten his live, secret-bearing file through
+    it -- tests/test_config_readonly.py). The app is the process that owns
+    the file, so JarvisApp() alone fills in keys DEFAULTS has gained and
+    tightens a loose mode, once, right after its load -- and hands that
+    same loaded config to brain.configure, so the brain reads no config
+    of its own."""
+    import stat
+    from jarvis.assistant_config import DEFAULTS
+    cfg = paths / "assistant.json"
+    cfg.write_text(json.dumps({"version": 1, "user": {"name": "T"}}) + "\n")
+    os.chmod(cfg, 0o644)
+    seen = []
+    real = app_mod.brain_mod.configure
+
+    def spy(model=None, config=None):
+        seen.append(config)
+        return real(model, config=config)
+    monkeypatch.setattr(app_mod.brain_mod, "configure", spy)
+    a = build()
+    on_disk = json.loads(cfg.read_text())
+    assert on_disk["user"]["name"] == "T"                   # his value kept
+    assert on_disk["brain"] == DEFAULTS["brain"]            # new keys written
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600        # and tightened
+    assert seen == [a.assistant]                            # the same object, once
+    assert a.assistant.disk_state == {"missing": False, "corrupt": False,
+                                      "loose_mode": False, "new_keys": False}
+
+
 # ------------------------------------------------ the Restart button
 def test_the_running_commit_is_stamped_once_at_construction(build, monkeypatch):
     """Read at startup, never at import: the drawer compares it with what
