@@ -277,11 +277,22 @@ def test_a_new_code_that_cannot_be_mailed_stores_nothing(tmp_path):
 
 
 def test_with_nobody_enrolled_the_bootstrap_says_so_and_mails_nothing(
-        tmp_path):
+        tmp_path, caplog):
+    """The STATE is unchanged and correct -- no owner, no code, nothing
+    mailed. Only the sentence moved (2026-09-05): the old one was 1541 px
+    of text in an 894 px toast strip at his window and reached him cut off
+    mid-word, so the line is now short enough to arrive whole and the
+    command that fixes it is logged instead of shown
+    (tests/test_ui_layout_rules.py measures the strip)."""
     a = _app(tmp_path, code=False)
     a.gate.registry = Registry(path=tmp_path / "empty.json")
-    line = a.knightfall_new_code(smtp=FakeSMTP, now=1000.0)
-    assert line.startswith("Knightfall: nobody is enrolled as an owner")
+    with caplog.at_level("WARNING"):
+        line = a.knightfall_new_code(smtp=FakeSMTP, now=1000.0)
+    assert line == app_mod.KNIGHTFALL_NO_OWNER_LINE
+    assert line == "Knightfall: enrol an owner first, sir."
+    # it still says WHAT is wrong and WHAT fixes it, in the log
+    assert "nobody is enrolled as an owner" in caplog.text
+    assert "jarvis_people.py add" in caplog.text and "--role owner" in caplog.text
     assert FakeSMTP.made == []
 
 

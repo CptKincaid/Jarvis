@@ -4431,9 +4431,10 @@ face in view, against 5 with nobody named. It is now bound to the owner.
 
 ### Typing it
 
-Settings → Privacy → **Knightfall code**: a masked box and **Open**. The box
-is cleared the moment you press it, before anything else happens. The line
-that comes back is the only answer, and it never contains a code.
+Settings → Privacy → **Knightfall**: a masked box and **Open** (in the
+classic look the row is labelled **Knightfall code**). The box is cleared the
+moment you press it, before anything else happens. The line that comes back
+is the only answer, and it never contains a code.
 
 Using the code **rotates** it. A fresh eight-character code (no `0`/`o`,
 no `1`/`l`) is mailed to your first configured mail account, from that same
@@ -4446,9 +4447,12 @@ Message-ID is the new one stored. So:
   valid** and the line says so. There is never a moment with no working
   code.
 
-**Email me a new Knightfall code** does the same thing without typing
-anything — that is how you get the first one — and it answers at most once a
-minute. A press that mailed nothing does not start that minute.
+**Email me a new code** does the same thing without typing anything — that
+is how you get the first one — and it answers at most once a minute. A press
+that mailed nothing does not start that minute. With nobody enrolled yet it
+answers "Knightfall: enrol an owner first, sir." and mails nothing; that is
+correct, not a fault — the gate has no owner to let back in — and the log
+line beside it carries the command that fixes it.
 
 The typed code is a way back in, not a wall: anybody already at this
 keyboard can edit or delete `people.json`, which turns the gate off
