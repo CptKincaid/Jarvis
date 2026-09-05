@@ -102,7 +102,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from jarvis import passphrase as pp
-from jarvis.identity import (ROLE_KNOWN, ROLE_OWNER, ROLE_UNKNOWN, Registry,
+from jarvis.identity import (FAULT_MALFORMED, FAULT_UNREADABLE, ROLE_KNOWN,
+                             ROLE_OWNER, ROLE_UNKNOWN, Registry,
                              startup_line)
 from jarvis.logs import get_logger
 from jarvis.recognise import (HOW_FACE, HOW_NOBODY, HOW_PHRASE, HOW_VOICE,
@@ -633,6 +634,70 @@ class OwnerGate:
         log.info("gate: refusing a turn nobody claimed")
         return Decision(admit=False, how=HOW_NOBODY, line=line,
                         why=verdict.why)
+
+
+# ------------------------------------------------- may this keyboard admin?
+# The four answers. ADMIN_REFUSE is the one that is NEW: the terminal tool
+# treated a corrupt registry exactly like a fresh install, and a fresh
+# install is where anybody may enrol the first owner.
+ADMIN_FIRST = "open_first"        # nothing to protect yet; make an owner
+ADMIN_NOCODE = "open_nocode"      # an owner, but no code -- allowed, out loud
+ADMIN_CODE = "code_required"      # an owner HAS set a code; ask for it
+ADMIN_REFUSE = "refuse"           # the file is broken; writing would destroy
+
+ADMIN_FIRST_LINE = (
+    "nobody is enrolled yet, so the gate is OFF and anyone at this keyboard "
+    "can enrol the first owner. That is deliberate -- otherwise a fresh "
+    "install could never be set up.")
+ADMIN_NOCODE_LINE = (
+    "no override code has been set, so this is allowed at the keyboard. "
+    "`set-code` changes that. It is a way back in for you, not a barrier to "
+    "anyone already sitting here.")
+ADMIN_CODE_LINE = (
+    "an owner has set an override code, so it is asked for before anything "
+    "is changed. It is never echoed and it is rate limited on its own "
+    "counter.")
+ADMIN_REFUSE_LINE = (
+    "%s exists but could not be read as a registry, so nobody may be "
+    "enrolled from here. Its rows did NOT load, and writing a new one over "
+    "the top of them would destroy whatever it holds -- there is no history "
+    "and no backup. Repair or move the file, then try again.")
+
+
+def admin_gate(registry) -> Tuple[str, str]:
+    """May whoever is at this keyboard administer the gate? ``(state, why)``.
+
+    ONE DECISION, TWO CALLERS -- ``scripts/jarvis_people.py::_authorise`` and
+    ``jarvis/ui/users_page.py``. It used to live privately inside the CLI,
+    which is how the tab would have grown a second, slightly different rule.
+    This function takes no code and asks for none: it says WHICH of the four
+    situations this is, and the caller does its own asking (the CLI through
+    ``getpass``, the tab through a masked entry). ``check_override_code``
+    stays the only thing that checks a code.
+
+    THE CASE THE CLI GOT WRONG. ``Registry.load`` answers ``usable=False``
+    for five different reasons and the CLI treated all five as "first" --
+    anybody may enrol. For a file that FAILED TO PARSE that is not
+    permissive, it is destructive: ``people`` comes back empty, so the next
+    ``add_person`` + ``save`` writes a one-row registry over a file that may
+    have held everyone. Those two faults answer ADMIN_REFUSE.
+    """
+    try:
+        usable = bool(getattr(registry, "usable", False))
+        kind = str(getattr(registry, "fault_kind", "") or "")
+        owners = list(registry.owners()) if usable else []
+    except Exception:  # noqa: BLE001 - a registry that cannot answer
+        log.exception("gate: the registry could not be asked who may admin")
+        return ADMIN_REFUSE, ADMIN_REFUSE_LINE % getattr(registry, "path",
+                                                         "the registry")
+    if kind in (FAULT_MALFORMED, FAULT_UNREADABLE):
+        return ADMIN_REFUSE, ADMIN_REFUSE_LINE % getattr(registry, "path",
+                                                         "the registry")
+    if not usable or not owners:
+        return ADMIN_FIRST, ADMIN_FIRST_LINE
+    if not any(p.code_hash for p in owners):
+        return ADMIN_NOCODE, ADMIN_NOCODE_LINE
+    return ADMIN_CODE, ADMIN_CODE_LINE
 
 
 def check_override_code(registry, code, *, attempts=None) -> Tuple[str, str]:

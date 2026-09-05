@@ -119,6 +119,7 @@ from jarvis import camera as cam                          # noqa: E402
 from jarvis import facedetect                             # noqa: E402
 from jarvis import faceenrol as fe                        # noqa: E402
 from jarvis import visionrig as vr                        # noqa: E402
+from jarvis import consent as shared_consent              # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
 from jarvis.eye import FaceIdentifier                     # noqa: E402
 from jarvis.facegallery import (SFACE_COSINE_SAME,        # noqa: E402
@@ -251,31 +252,14 @@ def target_label(cfg, args) -> tuple:
     return want, ""
 
 
-CONSENT_LINES = (
-    "CONSENT -- this is %(who)s's data, not yours.",
-    "",
-    "Enrolling %(who)s stores a measurement of %(who)s's FACE: 128 numbers",
-    "per take, in %(root)s, at 0600 in a 0700",
-    "directory. No photograph, no video and no crop is stored, nothing is",
-    "displayed, and nothing leaves this machine. It cannot be re-issued if",
-    "it leaks, which is why it is treated like the voiceprint and not like",
-    "a setting.",
-    "",
-    "What it is FOR: Jarvis can say %(who)s is here, and can keep something",
-    "private when somebody else is in the room. What it never does: a",
-    "recognised face cannot command Jarvis, cannot unlock anything and",
-    "cannot pass the voice gate. Recognising a face may only ever make",
-    "Jarvis do LESS, never more.",
-    "",
-    "Deleting it, at any time, and it takes about a second:",
-    "    %(python)s %(script)s --delete --label %(who)s",
-    "which destroys every generation that holds %(who)s -- including the",
-    "older ones -- and leaves everybody else's alone.",
-    "",
-    "%(who)s must type their own name below. Nobody may type it for them,",
-    "and --yes cannot do it either: it is his flag, and this is not his",
-    "consent to give.",
-)
+# The words and the "type your own label" rule live in jarvis/consent.py so
+# the console (jarvis/ui/users_page.py) shows the SAME sentences: a Tk
+# window has no tty, so it could never call the function below, and a
+# second paragraph written beside it is exactly how two rules drift. These
+# lines are unchanged by the move -- tests/test_faceenrol_notes.py pins
+# them -- and the tty requirement stays right where it is, in consent()
+# below, as this taker's own precondition.
+CONSENT_LINES = shared_consent.CONSENT_LINES
 
 
 def _isatty(stream) -> bool:
@@ -339,16 +323,12 @@ def consent(label: str, owner: str, root, say, args) -> tuple:
                        "and type their own name, at a terminal. Run this "
                        "without redirecting stdin or stdout." % label)
     say("")
-    for line in CONSENT_LINES:
-        say(line % fields)
-    try:
-        answer = input('Type "%s" to agree: ' % label).strip().lower()
-    except EOFError:
-        answer = ""
-    if answer != label:
-        return False, ("consent was not given for %r -- nothing was "
-                       "captured and nothing was written" % label)
-    return True, "typed"
+    # The words, the prompt and the "type your own name" rule, from the one
+    # file that holds them. The three refusals above are this taker's own
+    # preconditions and stay here.
+    return shared_consent.take_at_terminal(
+        label, what=shared_consent.WHAT_FACE, fields=fields, say=say,
+        isatty=lambda _s: True)
 
 
 # -------------------------------------------------------------- the modes
