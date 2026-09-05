@@ -92,6 +92,7 @@ compares SIZES, not contents, for the same reason.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -120,6 +121,24 @@ PART_PREFIX = ".jarvis-part-"
 SKIP_SUFFIXES = (".part", ".partial", ".crdownload", ".download", ".tmp",
                  ".swp", NOTE_SUFFIX)
 SKIP_PREFIXES = (".", "~$", PART_PREFIX)
+
+# A send or a fetch that came back with one of these has told us about the
+# FILE, and nothing it says bears on whether HPCOMPUTER is answering.  Every
+# OTHER reason -- including the "failed" that classify_error falls back to
+# when none of its seven regexes match the stderr -- is put to the machine
+# again as a question before anybody calls the link down.  See
+# :meth:`Syncer._probe_link`, and the two-in-one-pass defect it closes.
+FILE_REASONS = frozenset({"odd-name", "not-found", "too-big", "denied",
+                          "no-space", "exists", "not-there"})
+
+# errno values that mean "this filesystem has no hard links", as opposed to
+# "that name is taken" (EEXIST, which is the answer land_beside wants) or a
+# real failure.  FAT and exFAT are the cases that reach this on his desk.
+_NO_HARDLINK = frozenset(
+    e for e in (getattr(errno, n, None) for n in
+                ("EPERM", "EOPNOTSUPP", "ENOTSUP", "ENOSYS", "EXDEV",
+                 "EMLINK"))
+    if e is not None)
 
 MAX_COPIES = 50          # "name (2)" .. "name (50)", then refuse
 MAX_ATTEMPTS = 5         # tries at ONE file before it is parked
@@ -176,6 +195,7 @@ class Entry:
     name: str
     size: int
     stamp: str                       # the listing's date text, verbatim
+    is_dir: bool = False             # a FOLDER over there is a taken name
 
     @property
     def key(self) -> str:
@@ -227,6 +247,15 @@ WHY = {
     "outside": "it is not inside the folders I am allowed to send from",
     "too-many-copies": "there are already fifty files by that name over there",
     "verify-failed": "it arrived the wrong size, so I have not moved yours",
+    # The copy itself failed and the far side did not say anything either
+    # end recognises.  It is about THIS file -- everything else in the
+    # folder is still going, and HPCOMPUTER answered a listing either side
+    # of this attempt.  The known cause is named because it is the one that
+    # can never fix itself: scp will not write a file over a FOLDER.
+    "failed": "the copy failed and HPCOMPUTER did not say why. This is "
+              "about this one file -- it was still answering either side "
+              "of the attempt. The usual cause is a FOLDER over there "
+              "with the same name",
 }
 
 
@@ -281,6 +310,74 @@ def dedupe_name(name: str, taken) -> str:
         if candidate not in taken:
             return candidate
     return ""
+
+
+def land_beside(source: Path, folder: Path, name: str) -> str:
+    """MOVE ``source`` into ``folder`` as ``name`` -- or the first free
+    ``name (2).ext`` -- and never, at any instant, over a file already
+    there.  Returns the name it took, or "" past :data:`MAX_COPIES`.
+
+    THIS IS THE WHOLE FIX for the pull race, and the reason it is a
+    function rather than three careful lines at each call site.  Asking
+    "is that name free?" and then writing is a guess about the next
+    microsecond, however tightly the two are pushed together: the puller
+    asked at the top of the pass and wrote after a transfer that can run
+    for minutes, and a 513-byte notes.txt of his was measured being
+    destroyed in that window on 2026-09-05, reported as "received".
+
+    ``os.link`` is the one POSIX operation that CREATES a name and REFUSES
+    if it is taken, atomically, in the kernel -- there is no window at all
+    between the question and the answer.  The link is made, then the
+    source name is removed; the inode, and so his bytes, is never at risk
+    in between.  On a filesystem with no hard links (FAT, exFAT) the
+    fallback claims the name with ``O_CREAT|O_EXCL``, which is atomic for
+    the same reason; the only thing it costs is a 0-byte file OF OURS left
+    behind if the process dies between the claim and the move -- never a
+    byte of his.
+    """
+    source, folder = Path(source), Path(folder)
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    candidates = [name] + [f"{stem} ({n})" + (f".{ext}" if dot else "")
+                           for n in range(2, MAX_COPIES + 2)]
+    hardlinks = True
+    for candidate in candidates:
+        dest = folder / candidate
+        if hardlinks:
+            try:
+                os.link(source, dest)
+            except FileExistsError:
+                continue                      # taken, by the kernel's word
+            except OSError as exc:
+                if exc.errno not in _NO_HARDLINK:
+                    raise
+                hardlinks = False             # no links here: claim instead
+            else:
+                _unlink_after_landing(source, dest)
+                return candidate
+        try:
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        try:
+            os.replace(source, dest)          # over OUR OWN empty claim
+        except OSError:
+            shutil.move(str(source), str(dest))
+        return candidate
+    return ""
+
+
+def _unlink_after_landing(source: Path, dest: Path) -> None:
+    """The second half of the move.  If it fails the file exists in BOTH
+    places, which is the safe direction and is said out loud rather than
+    retried into a loop."""
+    try:
+        os.unlink(source)
+    except OSError:
+        log.warning("foldersync: %s is safely at %s but I could not remove "
+                    "the original; nothing has been lost", source, dest)
 
 
 # -------------------------------------------------------------- quiescence
@@ -466,7 +563,7 @@ def parse_sftp_entries(out: str) -> list:
     rows = []
     for raw in (out or "").splitlines()[:remote.LISTING_CAP + 1]:
         line = raw.rstrip()
-        if not line or line.startswith("sftp>") or line[0] == "d":
+        if not line or line.startswith("sftp>"):
             continue
         fields = line.split(None, _SFTP_FIELDS)
         if len(fields) <= _SFTP_FIELDS:
@@ -478,7 +575,14 @@ def parse_sftp_entries(out: str) -> list:
         name = fields[_SFTP_FIELDS].rsplit("/", 1)[-1]
         if not name:
             continue
-        rows.append(Entry(name, size, " ".join(fields[5:8])))
+        # A "d" line is KEPT, flagged.  It used to be dropped here, which
+        # made a FOLDER on the Windows side invisible to dedupe_name -- so
+        # a file whose name matched one was sent straight at it, scp failed
+        # in a way classify_error does not recognise, and that was read as
+        # the link being down.  A folder over there is a name that is taken;
+        # this lane needs to see it, and never fetches one.
+        rows.append(Entry(name, size, " ".join(fields[5:8]),
+                          line[0] == "d"))
     return rows
 
 
@@ -727,6 +831,7 @@ class Syncer:
         self._recent: list = []
         self._status_text = ""
         self._skipped_names = False
+        self._skipped_dirs = False
 
     # -- small helpers ---------------------------------------------------
     @staticmethod
@@ -757,8 +862,14 @@ class Syncer:
         """A plain-English note beside the file that could not go.  Visible
         in his file manager, which is where he will be looking; it is
         removed again the moment the file is fixed or taken away."""
+        why = WHY.get(reason)
+        if not why and reason in remote.FAIL_LINES:
+            # A transport word with no plain-English line of its own reads
+            # as "Why: auth." otherwise.  The lane already owns a sentence
+            # for every one of them.
+            why = remote.fail_line(self.rconf, reason).rstrip(".")
         text = (f"Jarvis could not send {target.name}.\n\n"
-                f"Why: {WHY.get(reason, reason)}.\n")
+                f"Why: {why or reason}.\n")
         if extra:
             text += f"\n{extra}\n"
         text += ("\nYour file has not been moved, changed or deleted. Fix the\n"
@@ -861,12 +972,23 @@ class Syncer:
             size = self._size(p)
             reason = self.transport.send(p, landed)
             if reason:
-                if reason in remote.FAIL_LINES and reason not in (
-                        "denied", "no-space", "odd-name", "exists"):
-                    events.append(self._link_event(now, reason, len(ready)))
+                # A FILE that will not go is not a LINK that is down.  The
+                # only thing that can speak for the machine is the machine,
+                # so it is asked again, NOW -- the listing at the top of
+                # this pass is evidence about the past.  If it answers,
+                # this is one file's problem: it counts against that file,
+                # it parks after MAX_ATTEMPTS, the queue behind it still
+                # goes, and the inbound half still runs.
+                fresh, why = ((None, "") if reason in FILE_REASONS
+                              else self._probe_link("inbox"))
+                if why:
+                    events.append(self._link_event(now, why, len(ready)))
                     break
-                self.ledger.bump(f"push:{p.name}|{stat_key(p)}", reason, now)
-                self.note(p, reason)
+                if fresh is not None:
+                    taken = {e.name for e in fresh} | {n for _, n, _ in sent}
+                n = self.ledger.bump(f"push:{p.name}|{stat_key(p)}",
+                                     reason, now)
+                self.note(p, reason, f"Attempt {n} of {MAX_ATTEMPTS}.")
                 events.append(Event(now, "push", p.name, size, reason))
                 continue
             taken.add(landed)
@@ -895,11 +1017,22 @@ class Syncer:
         events = []
         entries, why = self.transport.listing("inbox")
         if why:
+            # Found by the same sweep as the two defects above, and it is
+            # the OTHER half of the rule: a LISTING that fails is the one
+            # thing that IS evidence about the link, and this one was
+            # silently swallowed -- no back-off, and the inbound half then
+            # opened a second connection to a box that had just refused a
+            # first.  It is a link event now.  The files are NOT counted
+            # against: an outage must never park a file of his.
             for p, _landed, size in sent:
                 events.append(Event(now, "push", p.name, size, "unverified",
                                     why))
+            events.append(self._link_event(now, why, len(sent)))
             return events
-        sizes = {e.name: e.size for e in entries}
+        # A FOLDER at that name is not the file we sent, and its 4096 must
+        # never be read as a byte count -- excluded, so the check fails
+        # loudly instead of passing by coincidence.
+        sizes = {e.name: e.size for e in entries if not e.is_dir}
         for p, landed, size in sent:
             there = sizes.get(landed)
             if there != size:
@@ -924,19 +1057,27 @@ class Syncer:
     def _move_to_sent(self, p: Path) -> str:
         """His original, out of the Outbox and into Sent -- MOVED, never
         deleted, so the Outbox visibly empties and the file is still one
-        double-click away."""
+        double-click away.
+
+        This side already re-read Sent immediately before renaming, which
+        made the window microseconds rather than minutes -- but it was
+        still a check followed by an ``os.replace``, and a window that
+        small is still a window.  It lands through the same
+        :func:`land_beside` as the pull now, so there is none.
+        """
         self.paths.sent.mkdir(parents=True, exist_ok=True)
-        try:
-            taken = {q.name for q in self.paths.sent.iterdir()}
-        except OSError:
-            taken = set()
-        name = dedupe_name(p.name, taken) or f"{p.name}.{int(time.time())}"
-        dest = self.paths.sent / name
-        try:
-            os.replace(p, dest)               # same filesystem: atomic
-        except OSError:
-            shutil.move(str(p), str(dest))    # different one: still a move
-        return name
+        moved = (land_beside(p, self.paths.sent, p.name)
+                 or land_beside(p, self.paths.sent,
+                                f"{p.name}.{int(time.time())}-{os.getpid()}"))
+        if not moved:
+            # Fifty-one names taken, and the stamped one too.  Say so
+            # rather than report a move that did not happen: his file is
+            # still in the Outbox and will go again next pass as a copy.
+            log.warning("foldersync: %s was sent but I could not free a "
+                        "name for it in %s; it is still in the Outbox",
+                        p.name, self.paths.sent)
+            return p.name
+        return moved
 
     # ------------------------------------------------------------- pulling
     def pull_once(self, now: Optional[float] = None) -> list:
@@ -951,6 +1092,17 @@ class Syncer:
 
         usable = []
         for e in entries:
+            if e.is_dir:
+                # It is in the listing so dedupe_name can see the name is
+                # taken; it is never fetched.  This lane moves files, one
+                # at a time, and there is no note to leave over there --
+                # the jarvis account cannot write in that folder.
+                if not self._skipped_dirs:
+                    self._skipped_dirs = True
+                    log.info("foldersync: there is a folder in the "
+                             "HPCOMPUTER outbox; I move files, one at a "
+                             "time, never a folder")
+                continue
             if remote.SAFE_REMOTE_NAME_RX.match(e.name):
                 usable.append(e)
             elif not self._skipped_names:
@@ -971,8 +1123,11 @@ class Syncer:
                 continue
             if self.ledger.blocked(f"pull:{entry.key}", now):
                 continue
-            landed = dedupe_name(entry.name, taken)
-            if not landed:
+            # A cheap look BEFORE the transfer, so a name with fifty
+            # copies already costs no bytes.  It is not the decision: the
+            # name is chosen and claimed in one step, after the fetch, by
+            # land_beside.
+            if not dedupe_name(entry.name, taken):
                 events.append(Event(now, "pull", entry.name, entry.size,
                                     "too-many-copies"))
                 continue
@@ -981,9 +1136,13 @@ class Syncer:
                                           part)
             if reason:
                 self._drop(part)
-                if reason in ("unreachable", "timeout", "asleep",
-                              "off-tailnet", "no-ssh"):
-                    events.append(self._link_event(now, reason, 0))
+                # Same rule as the push side: one file that would not come
+                # is not the machine being gone.  A timeout on an oversized
+                # file used to back the whole lane off.
+                _fresh, why = ((None, "") if reason in FILE_REASONS
+                               else self._probe_link(self.conf.pull_from))
+                if why:
+                    events.append(self._link_event(now, why, 0))
                     break
                 self.ledger.bump(f"pull:{entry.key}", reason, now)
                 events.append(Event(now, "pull", entry.name, entry.size,
@@ -1000,12 +1159,19 @@ class Syncer:
                                     "verify-failed", str(got)))
                 continue
             try:
-                os.replace(part, self.paths.inbox / landed)
+                landed = land_beside(part, self.paths.inbox, entry.name)
             except OSError:
+                log.warning("foldersync: cannot put %s into %s",
+                            entry.name, self.paths.inbox, exc_info=True)
                 self._drop(part)
                 self.ledger.bump(f"pull:{entry.key}", "denied", now)
                 events.append(Event(now, "pull", entry.name, entry.size,
                                     "denied"))
+                continue
+            if not landed:
+                self._drop(part)
+                events.append(Event(now, "pull", entry.name, entry.size,
+                                    "too-many-copies"))
                 continue
             taken.add(landed)
             self.ledger.clear(f"pull:{entry.key}")
@@ -1019,6 +1185,26 @@ class Syncer:
         return events
 
     # ------------------------------------------------------------- the link
+    def _probe_link(self, key: str) -> tuple:
+        """``(entries, "")`` if the far side answers a listing RIGHT NOW,
+        ``(None, reason)`` if it cannot.
+
+        The one question that is allowed to condemn the link, asked at the
+        moment of doubt.  A transfer that failed is evidence about a file:
+        scp will not write over a folder, a name can be refused, a single
+        copy can time out -- and none of that means HPCOMPUTER has gone.
+        MEASURED 2026-09-05 with the far side healthy and listing fine in
+        the very same pass: one such file put the status at "link DOWN:
+        HPCOMPUTER wouldn't answer that, sir", stopped the inbound half for
+        12 passes, and never parked.
+
+        It costs one extra listing per failing file per pass, and only ever
+        on a failure.  On the push side the entries it brings back are not
+        wasted -- they are the freshest word on which names are taken.
+        """
+        entries, why = self.transport.listing(key)
+        return (None, why) if why else (entries, "")
+
     def _link_event(self, now: float, why: str, waiting: int) -> Event:
         """Down, once.  The WARNING and the record entry are written on the
         transition only: a box asleep overnight must not fill either."""
@@ -1090,7 +1276,13 @@ class Syncer:
                 when = time.strftime("%H:%M:%S", time.localtime(e.when))
                 word = {"sent": "sent    ", "received": "received"}.get(
                     e.outcome, e.outcome)
-                lines.append(f"  {when}  {word}  {e.name} "
+                # When it landed beside a file of his, say the name that is
+                # actually on the disk.  The old line said "received
+                # notes.txt" for a file that is not there under that name.
+                as_ = (f" as {e.detail}"
+                       if e.outcome in ("sent", "received")
+                       and e.detail and e.detail != e.name else "")
+                lines.append(f"  {when}  {word}  {e.name}{as_} "
                              f"({e.size} bytes)".rstrip())
         lines.append("")
         lines.append("Sent files are moved to " + str(self.paths.sent) +

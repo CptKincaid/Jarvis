@@ -18,6 +18,7 @@ The sftp listing text parsed below is verbatim from the format measured on
 this box in ``jarvis/tools/remote.py`` (``sftp -D`` to the local
 sftp-server; no socket).
 """
+import errno
 import json
 import os
 import threading
@@ -55,7 +56,10 @@ class FakeTransport:
 
     def __init__(self, inbox=None, outbox=None):
         self.dirs = {"inbox": dict(inbox or {}), "outbox": dict(outbox or {})}
+        self.folders = {"inbox": set(), "outbox": set()}   # FOLDERS over there
         self.fail = ""            # a reason to return from every call
+        self.send_fail = {}       # {name: reason} -- this FILE, not the link
+        self.fetch_fail = {}      # {name: reason} -- likewise, inbound
         self.calls = []
         self.short_write = 0      # land this many bytes instead of the file's
         self.stamp = "Sep  5 13:45"
@@ -69,6 +73,8 @@ class FakeTransport:
         if self.fail:
             return [], self.fail
         rows = [fs.Entry(n, s, t) for n, (s, t) in sorted(self.dirs[key].items())]
+        rows += [fs.Entry(n, 4096, self.stamp, True)
+                 for n in sorted(self.folders[key])]
         return rows, ""
 
     def send(self, local, name, key="inbox"):
@@ -77,6 +83,10 @@ class FakeTransport:
             return self.fail
         if key != "inbox":
             raise AssertionError("nothing may write outside the remote inbox")
+        if name in self.send_fail:
+            return self.send_fail[name]
+        if name in self.folders[key]:
+            return "failed"       # scp onto a folder: what the regexes miss
         size = self.short_write or local.stat().st_size
         self.dirs[key][name] = (size, self.stamp)
         return ""
@@ -85,6 +95,8 @@ class FakeTransport:
         self.calls.append(("fetch", name))
         if self.fail:
             return self.fail
+        if name in self.fetch_fail:
+            return self.fetch_fail[name]
         size, _stamp = self.dirs[key][name]
         dest.write_bytes(b"y" * (self.short_write or size))
         return ""
@@ -606,9 +618,12 @@ def test_the_sftp_listing_parse_is_the_measured_format():
            "-rw-rw-r--    ? hunterp  hunterp 20481 Sep  3  2025 "
            "jarvis-outbox/old report.pdf\n")
     rows = fs.parse_sftp_entries(out)
-    assert [(r.name, r.size, r.stamp) for r in rows] == [
-        ("a.txt", 1, "Sep 3 12:21"),
-        ("old report.pdf", 20481, "Sep 3 2025"),
+    assert [(r.name, r.size, r.stamp, r.is_dir) for r in rows] == [
+        ("a.txt", 1, "Sep 3 12:21", False),
+        # KEPT, not dropped.  A folder over there is a name that is taken,
+        # and dedupe_name has to see it -- see the poison case below.
+        ("sub dir", 4096, "Sep 3 12:21", True),
+        ("old report.pdf", 20481, "Sep 3 2025", False),
     ]
 
 
@@ -887,3 +902,457 @@ def test_a_down_status_says_since_when(home):
         s.run_pass()
     assert s._down_since == first          # the outage clock does not reset
     assert "not answering since" in (home / "status.txt").read_text()
+
+
+# ==========================================================================
+# The two defects an adversarial pass measured on 2026-09-05, pinned here.
+#
+# Neither is about a name or a size; both are about a WINDOW.  The pull
+# landed a file onto a name it had checked at the top of the pass, seconds
+# or minutes before the write, so a file HE put in the Inbox during the
+# transfer was overwritten and the record called it "received".  And one
+# unsendable local file was read as proof that HPCOMPUTER was gone, which
+# stopped the inbound half of a link that was demonstrably answering.
+# ==========================================================================
+
+# ------------------------------------------------ 1. the pull never clobbers
+def test_a_file_of_his_dropped_in_the_inbox_mid_fetch_is_never_destroyed(home):
+    """MEASURED against the code before this fix: a 513-byte notes.txt of
+    his, written into ~/Desktop/Jarvis/Inbox while a same-named file was in
+    flight from Windows, was GONE after the pass -- no note, no duplicate --
+    and the row read "received"."""
+    his = b"h" * 513
+    t = FakeTransport(outbox={"notes.txt": (300, "Sep  5 13:45")})
+    real_fetch = t.fetch
+
+    def he_drops_one_mid_transfer(key, name, dest):
+        r = real_fetch(key, name, dest)
+        (home / "Inbox" / "notes.txt").write_bytes(his)
+        return r
+
+    t.fetch = he_drops_one_mid_transfer
+    s = syncer(home, t)
+    events = s.pull_once()
+
+    assert (home / "Inbox" / "notes.txt").read_bytes() == his   # HIS, intact
+    assert (home / "Inbox" / "notes (2).txt").stat().st_size == 300
+    assert [(e.outcome, e.detail) for e in events] == \
+           [("received", "notes (2).txt")]
+
+
+def test_the_record_and_the_status_name_the_file_that_actually_landed(home):
+    """The old row said "received notes.txt" for a file that is not there
+    under that name.  What he reads must be the name on disk."""
+    t = FakeTransport(outbox={"notes.txt": (300, "Sep  5 13:45")})
+    (home / "Inbox" / "notes.txt").write_bytes(b"h" * 513)
+    s = syncer(home, t)
+    s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert "notes (2).txt" in text
+    rows = [json.loads(r) for r in s.history_path.read_text().splitlines()]
+    assert [(r["outcome"], r["detail"]) for r in rows] == \
+           [("received", "notes (2).txt")]
+
+
+def test_the_landing_refuses_a_name_taken_at_the_instant_it_is_claimed(home):
+    """The window pinned as tight as it goes: his file appears BETWEEN the
+    free name being chosen and the link being made.  A check-then-write
+    loses here however narrow the check is; os.link cannot."""
+    t = FakeTransport(outbox={"notes.txt": (300, "Sep  5 13:45")})
+    real_link = os.link
+    raced = []
+
+    def racing_link(src, dst, **kw):
+        if not raced:
+            raced.append(str(dst))
+            Path(dst).write_bytes(b"his, by a microsecond")
+        return real_link(src, dst, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", racing_link)
+        s = syncer(home, t)
+        events = s.pull_once()
+
+    assert raced == [str(home / "Inbox" / "notes.txt")]
+    assert (home / "Inbox" / "notes.txt").read_bytes() == b"his, by a microsecond"
+    assert (home / "Inbox" / "notes (2).txt").stat().st_size == 300
+    assert [e.outcome for e in events] == ["received"]
+
+
+def test_the_landing_still_never_overwrites_on_a_filesystem_without_links(home):
+    """A FAT or exFAT Inbox has no hard links.  The fallback claims the name
+    with O_EXCL, which is atomic too -- it must not degrade to a check."""
+    t = FakeTransport(outbox={"notes.txt": (300, "Sep  5 13:45")})
+    his = b"h" * 513
+    (home / "Inbox" / "notes.txt").write_bytes(his)
+
+    def no_hardlinks(src, dst, **kw):
+        raise OSError(errno.EPERM, "hard links not supported here")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", no_hardlinks)
+        s = syncer(home, t)
+        events = s.pull_once()
+
+    assert (home / "Inbox" / "notes.txt").read_bytes() == his
+    assert (home / "Inbox" / "notes (2).txt").stat().st_size == 300
+    assert [e.outcome for e in events] == ["received"]
+
+
+def test_the_landing_takes_the_atomic_link_and_never_a_check(home):
+    """Which path runs is the difference between a window of ZERO and one
+    of 0.06 ms.  ~/Desktop is ext4 (measured with stat -f), so os.link is
+    what runs on his machine -- and nothing may quietly degrade to the
+    O_EXCL fallback without this noticing."""
+    t = FakeTransport(outbox={"notes.txt": (3, "Sep  5 13:45")})
+    used = []
+    real_link, real_open = os.link, os.open
+
+    def watch_link(src, dst, **kw):
+        used.append("link")
+        return real_link(src, dst, **kw)
+
+    def watch_open(path, flags, *a, **k):
+        if flags & os.O_EXCL:
+            used.append("o_excl")
+        return real_open(path, flags, *a, **k)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", watch_link)
+        mp.setattr(os, "open", watch_open)
+        syncer(home, t).pull_once()
+    assert used == ["link"]
+    assert (home / "Inbox" / "notes.txt").exists()
+
+
+def test_the_landing_leaves_no_part_file_and_gives_up_past_fifty(home):
+    t = FakeTransport(outbox={"notes.txt": (3, "Sep  5 13:45")})
+    (home / "Inbox" / "notes.txt").write_bytes(b"x")
+    for n in range(2, fs.MAX_COPIES + 2):
+        (home / "Inbox" / f"notes ({n}).txt").write_bytes(b"x")
+    s = syncer(home, t)
+    events = s.pull_once()
+    assert [e.outcome for e in events] == ["too-many-copies"]
+    assert not [p for p in (home / "Inbox").iterdir()
+                if p.name.startswith(fs.PART_PREFIX)]
+
+
+def test_land_beside_is_the_one_landing_and_it_never_replaces(tmp_path):
+    """Directly, without a transport: the helper both directions land
+    through returns the name it actually took and leaves what was there."""
+    folder = tmp_path / "f"
+    folder.mkdir()
+    (folder / "a.txt").write_bytes(b"first")
+    src = tmp_path / "src"
+    src.write_bytes(b"second")
+    assert fs.land_beside(src, folder, "a.txt") == "a (2).txt"
+    assert (folder / "a.txt").read_bytes() == b"first"
+    assert (folder / "a (2).txt").read_bytes() == b"second"
+    assert not src.exists()                       # it was a MOVE
+
+
+def test_his_file_in_sent_survives_a_name_taken_at_the_instant_of_the_move(home):
+    """The push side had the same shape, narrower: it re-read Sent and then
+    called os.replace.  Same helper, same guarantee."""
+    t = FakeTransport()
+    drop(home, "report.pdf", b"the one being sent")
+    (home / "Sent").mkdir()
+    real_link = os.link
+    raced = []
+
+    def racing_link(src, dst, **kw):
+        if not raced and Path(dst).parent.name == "Sent":
+            raced.append(str(dst))
+            Path(dst).write_bytes(b"an older keepsake")
+        return real_link(src, dst, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "link", racing_link)
+        s = syncer(home, t)
+        events = s.push_once()
+
+    assert [e.outcome for e in events] == ["sent"]
+    assert (home / "Sent" / "report.pdf").read_bytes() == b"an older keepsake"
+    assert (home / "Sent" / "report (2).pdf").read_bytes() == b"the one being sent"
+    assert not (home / "Outbox" / "report.pdf").exists()
+
+
+# ------------------------------------- 2. a file problem is not a link problem
+def _poison(home, name="poison.txt"):
+    """A far side that is HEALTHY -- its listings answer -- but that refuses
+    one particular send with the reason classify_error falls back to when
+    none of its seven regexes match."""
+    t = FakeTransport()
+    t.send_fail = {name: "failed"}
+    drop(home, name, b"a" * 40)
+    return t
+
+
+def test_one_unsendable_file_does_not_stop_the_inbound_half(home):
+    """MEASURED before this fix: 0 fetches over 12 passes, so a file waiting
+    in the Windows Outbox never arrived at all."""
+    t = _poison(home)
+    t.put("outbox", "from_windows.txt", b"z" * 90)
+    s = syncer(home, t)
+    events = s.run_pass()
+    assert (home / "Inbox" / "from_windows.txt").stat().st_size == 90
+    assert "received" in [e.outcome for e in events]
+
+
+def test_a_send_failure_never_claims_a_link_that_just_answered_is_down(home):
+    """The same pass listed HPCOMPUTER twice, successfully.  Saying it
+    "wouldn't answer" is a confident wrong number about a machine that did."""
+    t = _poison(home)
+    s = syncer(home, t)
+    for _ in range(3):
+        s.run_pass()
+    text = (home / "status.txt").read_text()
+    assert "link      DOWN" not in text
+    assert "link      OK, last answered" in text
+    assert s.interval_s == s.conf.remote_interval_s      # never backed off
+
+
+def test_a_second_good_file_still_goes_when_the_first_cannot(home):
+    """MEASURED before this fix: a perfectly good file went unsent for 6
+    passes because the poison one broke out of the loop ahead of it."""
+    t = _poison(home, "a_poison.txt")
+    drop(home, "b_good.pdf", b"g" * 20)
+    s = syncer(home, t)
+    events = s.push_once()
+    assert ("b_good.pdf", "sent") in [(e.name, e.outcome) for e in events]
+    assert (home / "Sent" / "b_good.pdf").exists()
+
+
+def test_an_unsendable_file_parks_instead_of_retrying_for_ever(home):
+    """MEASURED before this fix: 30 send attempts over 30 passes with the
+    ledger's fails table EMPTY -- MAX_ATTEMPTS was never applied on that
+    path.  A file this box cannot send is a file, and files park."""
+    t = _poison(home)
+    s = syncer(home, t)
+    for _ in range(fs.MAX_ATTEMPTS + 8):
+        s.run_pass()
+    sends = [c for c in t.calls if c[0] == "send"]
+    assert len(sends) == fs.MAX_ATTEMPTS
+    assert any(k.startswith("push:poison.txt") for k in s.ledger.fails)
+    assert (home / "Outbox" / "poison.txt").exists()          # never deleted
+    assert (home / "Outbox" / ("poison.txt" + fs.NOTE_SUFFIX)).exists()
+
+
+def test_an_unsendable_file_does_not_flood_the_log_every_pass(home, caplog):
+    """MEASURED before this fix: a WARNING plus an INFO "HPCOMPUTER is
+    answering again" on EVERY pass, for ever, from a healthy link."""
+    t = _poison(home)
+    t.put("outbox", "from_windows.txt", b"z" * 5)
+    s = syncer(home, t)
+    with caplog.at_level("INFO", logger="jarvis.foldersync"):
+        for _ in range(12):
+            s.run_pass()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not [m for m in msgs
+                if "answering again" in m or "backing off" in m]
+
+
+def test_a_link_that_really_is_down_mid_pass_still_stops_the_queue(home):
+    """The separation must not go the other way: when the box goes away
+    between the listing and the send, that IS the link, the rest of the
+    queue waits, and the inbound half is not attempted."""
+    t = FakeTransport()
+    drop(home, "one.txt", b"a")
+    drop(home, "two.txt", b"b")
+    s = syncer(home, t)
+
+    def send_then_the_box_sleeps(local, name, key="inbox"):
+        t.calls.append(("send", name))
+        t.fail = "asleep"                  # every later call, listing included
+        return "failed"
+
+    t.send = send_then_the_box_sleeps
+    events = s.run_pass()
+    assert [e.outcome for e in events] == ["link-down"]
+    assert len([c for c in t.calls if c[0] == "send"]) == 1   # it stopped
+    assert not [c for c in t.calls if c[0] == "fetch"]
+    assert s.interval_s > s.conf.remote_interval_s
+
+
+def test_one_bad_fetch_does_not_declare_the_link_down_either(home):
+    """The pull half had the same shape in a narrower form: a timeout on one
+    oversized file spoke for the whole machine."""
+    t = FakeTransport(outbox={"huge.bin": (100, "Sep  5 13:45"),
+                              "small.txt": (4, "Sep  5 13:45")})
+    t.fetch_fail = {"huge.bin": "timeout"}
+    s = syncer(home, t)
+    events = s.pull_once()
+    outcomes = {(e.name, e.outcome) for e in events}
+    assert ("small.txt", "received") in outcomes
+    assert ("huge.bin", "timeout") in outcomes
+    assert "link-down" not in [e.outcome for e in events]
+    assert s.ledger.fails                                  # it counted
+    assert "link      DOWN" not in s.status_text()
+
+
+def test_a_verify_listing_that_fails_is_the_link_and_costs_the_file_nothing(home):
+    """The other half of the rule, found by the same sweep: the listing
+    that VERIFIES a push is a listing, and a listing that cannot answer is
+    the one thing that really is evidence about the link.  It used to be
+    swallowed -- no back-off, and the inbound half then dialled the same
+    dead box again in the same pass.  His file must not be charged an
+    attempt for an outage."""
+    t = FakeTransport()
+    drop(home, "report.pdf", b"a" * 50)
+    s = syncer(home, t)
+    real_listing = t.listing
+    seen = []
+
+    def listing_then_the_box_goes(key):
+        seen.append(key)
+        if len(seen) > 1:                  # the top-of-pass one answered
+            return [], "asleep"
+        return real_listing(key)
+
+    t.listing = listing_then_the_box_goes
+    events = s.run_pass()
+    assert [e.outcome for e in events] == ["unverified", "link-down"]
+    assert not [c for c in t.calls if c[0] == "fetch"]     # no second dial
+    assert s.interval_s > s.conf.remote_interval_s         # it backed off
+    assert not s.ledger.fails                              # never his fault
+    assert (home / "Outbox" / "report.pdf").exists()
+
+
+# ------------------------------------------- a folder on the far side is real
+def test_the_sftp_listing_keeps_folders_instead_of_dropping_them(home):
+    """parse_sftp_entries used to skip every line starting with "d", so a
+    FOLDER on the Windows side was invisible to dedupe_name -- which is
+    exactly how an unsendable name arises."""
+    out = ('sftp> ls -ln "Desktop/Jarvis/Inbox"\n'
+           "-rw-rw-r--    ? hunterp  hunterp   1 Sep  3 12:21 "
+           "jarvis-inbox/a.txt\n"
+           "drwxrwxr-x    ? hunterp  hunterp 4096 Sep  3 12:21 "
+           "jarvis-inbox/reports\n")
+    rows = fs.parse_sftp_entries(out)
+    assert [(r.name, r.is_dir) for r in rows] == [("a.txt", False),
+                                                  ("reports", True)]
+
+
+def test_a_file_whose_name_is_a_folder_over_there_lands_beside_it(home):
+    """The reachable poison case, closed at the source: the folder is in the
+    listing now, so dedupe_name never picks that name in the first place."""
+    t = FakeTransport()
+    t.folders["inbox"].add("reports")
+    drop(home, "reports", b"a file, not a folder")
+    s = syncer(home, t)
+    events = s.push_once()
+    assert [(e.outcome, e.detail) for e in events] == [("sent", "reports (2)")]
+    assert "reports" in t.folders["inbox"]           # his folder untouched
+
+
+def test_a_folder_in_the_windows_outbox_is_not_fetched(home):
+    t = FakeTransport(outbox={"ok.txt": (2, "Sep  5 13:45")})
+    t.folders["outbox"].add("a whole folder")
+    s = syncer(home, t)
+    events = s.pull_once()
+    assert [e.name for e in events] == ["ok.txt"]
+    assert not [c for c in t.calls if c == ("fetch", "a whole folder")]
+    assert sorted(p.name for p in (home / "Inbox").iterdir()) == ["ok.txt"]
+
+
+def test_a_folder_over_there_never_passes_verification_as_a_file(home):
+    """If a folder somehow appears at the name we just sent, the size check
+    must FAIL rather than read the folder's own size as the file's."""
+    t = FakeTransport()
+    drop(home, "reports", b"a" * 4096)
+    s = syncer(home, t)
+
+    real_listing = t.listing
+    calls = []
+
+    def listing_that_grows_a_folder(key):
+        calls.append(key)
+        if len(calls) > 1:
+            t.folders["inbox"].add("reports")
+            t.dirs["inbox"].pop("reports", None)
+        return real_listing(key)
+
+    t.listing = listing_that_grows_a_folder
+    events = s.push_once()
+    assert [e.outcome for e in events] == ["verify-failed"]
+    assert (home / "Outbox" / "reports").exists()          # his file stays
+
+
+# ----------------------------------------- the window, measured not claimed
+def test_measure_the_window_that_is_left_after_the_race_is_closed(tmp_path,
+                                                                  capsys):
+    """NUMBERS, because "we closed it" is a claim and this project has twice
+    been damaged by confident numbers with no source.
+
+    Two things are measured.  First a HAMMER: a thread looping on the same
+    name while the lane lands file after file on it -- if the landing were
+    a check followed by a write, this is where bytes go missing.  Then the
+    one gap the no-hard-links fallback leaves, which is the ONLY window
+    still open anywhere in either direction, and how many milliseconds
+    wide it is.
+
+    ~/Desktop is ext4 (measured 2026-09-05, `stat -f -c %T`), so the
+    fallback does not run on his machine at all; it is there for a FAT or
+    exFAT folder and is measured so the number is not a guess.
+    """
+    folder = tmp_path / "hammer"
+    folder.mkdir()
+    rounds = 2000
+    stop = threading.Event()
+    ours_wrong = 0
+
+    def competitor():
+        while not stop.is_set():
+            try:
+                (folder / "notes.txt").write_bytes(b"H" * 513)
+            except OSError:
+                pass
+
+    th = threading.Thread(target=competitor, daemon=True)
+    th.start()
+    t0 = time.perf_counter()
+    try:
+        for i in range(rounds):
+            src = tmp_path / f"src{i}"
+            src.write_bytes(b"A" * 300)
+            landed = folder / fs.land_beside(src, folder, "notes.txt")
+            if landed.read_bytes() != b"A" * 300:
+                ours_wrong += 1
+            landed.unlink()
+    finally:
+        stop.set()
+        th.join(timeout=5)
+    per_landing_ms = (time.perf_counter() - t0) * 1000 / rounds
+
+    assert ours_wrong == 0, \
+        f"{ours_wrong} of {rounds} landings took somebody else's bytes"
+    assert (folder / "notes.txt").exists(), \
+        "the competitor's file was destroyed by a landing"
+
+    # The fallback's only window: between the atomic O_EXCL claim and the
+    # replace onto our own 0-byte claim.
+    gaps = []
+    for i in range(2000):
+        src = tmp_path / f"g{i}"
+        src.write_bytes(b"B" * 300)
+        dest = tmp_path / f"d{i}.txt"
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        t1 = time.perf_counter_ns()             # window OPENS
+        os.close(fd)
+        os.replace(src, dest)                   # window CLOSES
+        gaps.append(time.perf_counter_ns() - t1)
+    gaps.sort()
+    with capsys.disabled():
+        print(f"\n  MEASURED, the window after the fix:"
+              f"\n    hard-link path (his ext4 Desktop): {rounds} landings "
+              f"against a\n      writer looping on the same name -- "
+              f"{ours_wrong} lost, {per_landing_ms:.3f} ms each."
+              f"\n      os.link is one syscall, so the window is ZERO, not "
+              f"narrowed."
+              f"\n    O_EXCL fallback (FAT/exFAT only): median "
+              f"{gaps[len(gaps)//2]/1e6:.4f} ms, "
+              f"p99 {gaps[int(len(gaps)*0.99)]/1e6:.4f} ms, "
+              f"max {gaps[-1]/1e6:.4f} ms"
+              f"\n      -- and a 0-byte file OF OURS holds the name for it, "
+              f"so what\n      that window can cost is his WRITE, never his "
+              f"file.")
