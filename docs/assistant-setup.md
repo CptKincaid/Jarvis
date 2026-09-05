@@ -4924,7 +4924,8 @@ sentence and nothing else.
     --name Hunter --role owner --voice
 ```
 
-With the face leg too, using the label and width you just read:
+With the face leg too — the label from `--status`, the width from the
+one-liner above:
 
 ```bash
 ~/vss_env/bin/python scripts/jarvis_people.py add hunter \
