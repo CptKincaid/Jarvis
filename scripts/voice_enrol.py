@@ -32,6 +32,12 @@ WHAT IT REFUSES, AND IT PRINTS THE NUMBER EVERY TIME:
 Usage:
     ~/vss_env/bin/python scripts/voice_enrol.py --migrate            # the owner, no mic
     ~/vss_env/bin/python scripts/voice_enrol.py --label mara         # a guest, 8 takes
+
+THE ORDER IS NOT OPTIONAL. ``--migrate`` takes ONLY the owner's label (it
+carries HIS voiceprint; ``--label`` anybody else is refused before the
+gallery is opened), and a guest cannot be enrolled until the owner has a
+pool somewhere -- a guest enrolled first on a fresh box measurably left
+Jarvis listening for her alone (see ``owner_ready``).
     ~/vss_env/bin/python scripts/voice_enrol.py --status
     ~/vss_env/bin/python scripts/voice_enrol.py --delete --label mara
 
@@ -159,8 +165,9 @@ def takes_ok(n):
 def owner_ready(gallery, owner, label, voiceprint_exists):
     """``(ok, why not)``: may ``label`` be enrolled as a SECOND person yet?
 
-    THE OWNER MUST BE IN THE GALLERY BEFORE ANYBODY ELSE IS, and the script
-    REFUSES rather than migrating him on the guest's behalf. Two reasons.
+    THE OWNER MUST HAVE A POOL BEFORE ANYBODY ELSE IS ENROLLED -- in the
+    gallery, or at least in ``voiceprint.npz`` -- and the script REFUSES
+    rather than migrating him on the guest's behalf. Three reasons.
 
     1. ``identify`` ranks GALLERY labels only. With a guest in the gallery
        and the owner still only in ``voiceprint.npz``, it cannot rank him
@@ -174,10 +181,17 @@ def owner_ready(gallery, owner, label, voiceprint_exists):
        ("owner"), and it can be refused (a format-1 voiceprint, degenerate
        vectors). That belongs to its own run with its own message, not to
        the middle of somebody else's consent flow.
+    3. A GUEST FIRST ON A FRESH BOX LOCKS HIM OUT. The first version of
+       this rule allowed it, claiming a box that never had voice ID could
+       not be locked out of it. Measured 2026-09-04 on synthetic vectors
+       (tests/test_voice_owner_lockout.py): with her ten takes in the
+       gallery and him nowhere, the wake gate woke him 0 of 50 (its
+       fail-open None became a number under the bar, against HER
+       centroid) and the transcript gate admitted him 0 of 50. The
+       runtime now reads that gallery as no instrument for him, but the
+       script must not build it in the first place.
 
-    Enrolling the OWNER himself is always allowed; so is a gallery holding
-    nobody yet when there is no voiceprint to migrate (a box that never had
-    voice ID cannot be locked out of it).
+    Enrolling the OWNER himself is always allowed.
     """
     if label == owner or owner in gallery.labels():
         return True, ""
@@ -187,12 +201,39 @@ def owner_ready(gallery, owner, label, voiceprint_exists):
             "cannot tell %s from %s until he is. Run this first, no "
             "microphone needed:\n    %s %s --migrate"
             % (owner, label, owner, sys.executable, __file__))
-    if gallery.labels():
-        return False, (
-            "the owner (%s) is not in the voice gallery and there is no "
-            "voiceprint to migrate; enrol him first (--label %s) so the "
-            "gallery can tell %s from %s." % (owner, owner, label, owner))
-    return True, ""
+    return False, (
+        "the owner (%s) has no voice enrolled anywhere -- no voiceprint.npz "
+        "and not in the voice gallery%s. Enrolling %s first would leave "
+        "Jarvis listening for %s and nobody else: the wake word would "
+        "suppress him and the transcript gate would refuse him. Enrol him "
+        "first:\n    %s scripts/enroll_voice.py\n    %s %s --migrate"
+        % (owner,
+           " (which holds %s)" % ", ".join(gallery.labels())
+           if gallery.labels() else "",
+           label, label, sys.executable, sys.executable, __file__))
+
+
+def migrate_label_ok(label, owner):
+    """``(ok, why not)``: ``--migrate`` carries the OWNER's voiceprint and
+    takes no other label. Pure, and asked BEFORE the gallery is opened.
+
+    Measured 2026-09-04 without this check: ``--migrate --label mara``
+    returned 0, filed his fourteen vectors under her label with consent
+    recorded "owner", and at runtime the cosine fold (a copy of his pool
+    sits at 1.000, over the 0.98 alias line) made "mara" HIS pool -- so
+    "read my mail" in his own voice was answered as Mara with KNOWN scope,
+    30 of 30. The voiceprint has no label in it; the only label it may
+    ever be filed under is his.
+    """
+    label = str(label or "")
+    if not label or label == owner:
+        return True, ""
+    return False, (
+        "--migrate carries the owner's (%s) voiceprint and takes no other "
+        "label: %r would file HIS takes under somebody else's name, and "
+        "Jarvis would then answer him as %s. Drop --label to migrate him, "
+        "or enrol %s at the microphone:\n    %s %s --label %s"
+        % (owner, label, label, label, sys.executable, __file__, label))
 
 
 def take_ok(rms, min_rms=MIN_RMS):
@@ -386,16 +427,24 @@ def main(argv=None) -> int:
                     help="machine-readable status; cannot enrol anybody")
     args = ap.parse_args(argv)
 
+    owner = owner_label(CONFIG)
+    if args.migrate:
+        # Refused BEFORE the gallery is opened: nothing read, nothing
+        # written, under a label that is not his.
+        ok, why = migrate_label_ok(args.label, owner)
+        if not ok:
+            print("REFUSED: %s" % why, file=sys.stderr)
+            return 2
+
     gallery = vg.default_gallery()
     gallery.load()
-    owner = owner_label(CONFIG)
 
     if args.status:
         show_status(gallery)
         return 0
 
     if args.migrate:
-        label = args.label or owner
+        label = owner
         out = gallery.migrate_voiceprint(label)
         if not out["ok"]:
             print("migration refused: %s" % out["why"], file=sys.stderr)

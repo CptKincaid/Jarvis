@@ -303,10 +303,18 @@ class _RaisesOnEverything:
         raise RuntimeError("wedged")
 
 
-def test_a_wedged_gallery_is_distinguishable_from_a_non_match(rig, tmp_path):
-    """Both used to arrive as who="". Now the wedged one says so, and the
-    gate treats it as NO INSTRUMENT: admitted blind and counted toward the
-    dead-man, never as a name -- where the stranger is refused."""
+def test_a_wedged_gallery_says_so_and_names_nobody(rig, tmp_path):
+    """Both used to arrive as who="". The wedged one SAYS SO (who_fault),
+    and the gate answers it as NOBODY -- fail shut, never the owner.
+
+    The first version of this policy treated a fault as NO INSTRUMENT:
+    admitted blind, counted toward the dead-man. The round-3 review
+    measured the hole in that: identify() raising while centroids() works
+    let her clip clear the bar on HER pool and arrive with owner scope,
+    50/50 with the camera off. The pool is a fact from the matching
+    instrument, which ran; a fault in the naming instrument is an
+    abstention, and an abstention on somebody else's pool is nobody
+    (tests/test_voice_owner_lockout.py measures both sides)."""
     v, enc, gate = rig
     world = Voices(seed=35, apart=0.3)
     wedged = _RaisesOnIdentify(root=tmp_path / "vg2")
@@ -321,7 +329,7 @@ def test_a_wedged_gallery_is_distinguishable_from_a_non_match(rig, tmp_path):
     assert stats["who"] == "" and stats["who_fault"]
     d = gate.judge("voice", "unlock the door", stats=stats)
     assert d.who != "hunter"
-    assert d.how == gt.HOW_BLIND
+    assert d.how == gt.HOW_NOBODY and d.admit is False
 
     v.gallery = vg.VoiceGallery(root=tmp_path / "vg3")
     _enrol(v.gallery, world, "hunter", 14)
@@ -334,10 +342,13 @@ def test_a_wedged_gallery_is_distinguishable_from_a_non_match(rig, tmp_path):
     d2 = gate.judge("voice", "unlock the door", stats=stats2,
                     rejected=out2 is None)
     assert d2.how == gt.HOW_NOBODY and d2.admit is False
-    assert d.how != d2.how
+    # distinguishable in the STATS and the log, not in the verdict
+    assert bool(stats["who_fault"]) != bool(stats2["who_fault"])
 
 
 def test_a_gallery_that_cannot_even_list_itself_is_a_fault(rig):
+    """And a fault is nobody, on his own voiceprint too: the stated cost of
+    failing shut. Typed input, the socket and the passphrase remain."""
     v, enc, gate = rig
     world = Voices(seed=36)
     v._embeddings = world.takes("hunter", 14)
@@ -348,14 +359,18 @@ def test_a_gallery_that_cannot_even_list_itself_is_a_fault(rig):
     out, stats = v.filter_segments(clip)
     assert stats["who_fault"]
     d = gate.judge("voice", "what's the time", stats=stats)
-    assert d.how == gt.HOW_BLIND and d.who == ""
+    assert d.how == gt.HOW_NOBODY and d.who == "" and d.admit is False
 
 
-def test_a_fault_trips_the_dead_man_rather_than_holding_the_door(tmp_path):
+def test_a_fault_holds_the_door_rather_than_tripping_the_dead_man(tmp_path):
+    """The dead-man counts turns where NOTHING was measuring. A fault is a
+    leg that ran and could not name, so three of them refuse three turns
+    and stand nothing down."""
     g = _gate(tmp_path)
     for _ in range(gt.DEADMAN_TURNS):
         d = g.judge("voice", "hello", stats=_stats(who_fault="wedged"))
-    assert g.stood_down is True and d.line == gt.STANDDOWN_LINE
+        assert d.admit is False
+    assert g.stood_down is False and d.line != gt.STANDDOWN_LINE
 
 
 # --------------------------------------------- 5. the keys are always there

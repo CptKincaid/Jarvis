@@ -204,8 +204,16 @@ def test_enrolling_a_guest_stops_at_the_consent_prompt(tmp_path, monkeypatch,
                                                        capsys):
     """AND THAT IS THE TEST. Under pytest stdout is not a terminal, so the run
     refuses before the recorder is even imported -- which is why this file can
-    exercise the enrolment path at all without a microphone."""
+    exercise the enrolment path at all without a microphone.
+
+    The owner is seeded into the gallery first: a guest on a box where he
+    is enrolled nowhere is refused EARLIER (rc 5, owner_ready -- the
+    fresh-box lockout, tests/test_voice_owner_lockout.py), and this test is
+    about the consent step behind that."""
     monkeypatch.setattr(vg.PATHS, "VOICE_GALLERY", tmp_path / "vg")
+    g = vg.VoiceGallery(root=tmp_path / "vg")
+    _fill(g, Voices(seed=8, apart=0.3), "hunter", 14)
+    g.save("the owner")
     assert voice_enrol.main(["--label", "mara"]) == 3
     assert "pipe" in capsys.readouterr().err
 

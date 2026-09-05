@@ -17,6 +17,15 @@ ANYBODY HE HAS ENROLLED
     a greeting's business: ``gate.allowed_for`` still holds a KNOWN person
     to the time, the weather and the music a second later.
 
+    SETTLED 2026-09-04 FOR BOTH BRANCHES (voice-multispeaker and
+    people-signin): THIS MODULE OWNS THE LINE AND THE RULE. The rule: his
+    exact words are spoken TO THE PERSON RECOGNISED, addressed by FIRST
+    NAME -- ``first_name(person)`` -- and never by an honorific; "sir" and
+    "ma'am" live elsewhere (jarvis/honorific.py). Both branches import
+    ``BOTH_LEGS_LINE`` and ``first_name`` from here and neither carries its
+    own copy; tests/test_signin_lines.py fails on a second copy anywhere
+    under jarvis/, on purpose, so the integration merge cannot disagree.
+
     It claims BOTH legs, so it may only be said when both legs actually
     confirmed. Four preconditions, all required, and ``both_legs_line``
     returns "" if any one of them is missing:
@@ -84,15 +93,21 @@ MODE_SHADOW = "shadow"
 
 
 def first_name(person, fallback: str = "") -> str:
-    """The first token of a Person's display name.
+    """What ``{first}`` renders as -- THE ONE RESOLVER OF THE FIRST NAME.
 
-    Falls back to the label capitalised, which is what ``Person.display``
-    already does -- a greeting with an empty name in it is worse than a
-    greeting with a plain one.
+    A TYPED first name wins (people-signin's Person row carries ``first``,
+    typed at enrolment; a row without the field, as on this branch, simply
+    has none), else the first token of the display name, else the label
+    capitalised, which is what ``Person.display`` already does -- a
+    greeting with an empty name in it is worse than a greeting with a
+    plain one -- else ``fallback``.
     """
     if person is None:
         return str(fallback or "")
     try:
+        typed = str(getattr(person, "first", "") or "").strip()
+        if typed:
+            return typed
         name = str(getattr(person, "name", "") or "")
         if name.strip():
             return name.split()[0]

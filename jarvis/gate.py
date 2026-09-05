@@ -92,7 +92,16 @@ FAILING OPEN ON ITS OWN FAILURE IS NOT FAILING OPEN ON A NEGATIVE
     A missing, corrupt or unreadable registry, nothing enrolled, no leg
     running at all, a raised exception anywhere inside ``judge`` -- all of
     those admit, loudly. Somebody the registry does not know is still
-    refused.
+    refused. ONE EXCEPTION, RULED 2026-09-04: a fault reported BY the voice
+    leg's naming instrument (``who_fault``) is not the gate failing, it is
+    the leg abstaining, and it names nobody -- fail shut, never the owner.
+    See ``_voice_leg``.
+
+THE GALLERY'S LABELS ARE NOT THE REGISTRY'S
+    The voice gallery files the owner under ``identity.owner_label`` (the
+    config slug); his registry row is typed. ``_registry_label`` is the one
+    place the two are reconciled, and every label the voice leg reads goes
+    through it.
 """
 from __future__ import annotations
 
@@ -267,6 +276,42 @@ class OwnerGate:
         owners = reg.owners()
         return owners[0].label if owners else ""
 
+    def _registry_label(self, label) -> str:
+        """THE ONE RESOLVER FROM A GALLERY LABEL TO A REGISTRY LABEL, for
+        everything the voice leg reads (``who``, ``top``, ``matched_label``)
+        -- what ``_face_leg`` already does for a face label through
+        ``Registry.face_labels``.
+
+        The two stores name him differently by construction. His GALLERY
+        label is ``identity.owner_label(cfg)`` -- ``slug(user.name)``, which
+        is what ``--migrate`` files his takes under and what ``self.owner``
+        holds, since app.py passes the same derivation to both -- while his
+        REGISTRY row is TYPED (scripts/jarvis_people.py add --label). A
+        guest's gallery label IS their registry label (scripts/voice_enrol
+        says so), so only the owner can straddle the two.
+
+        Measured 2026-09-04 (tests/test_voice_owner_lockout.py) with
+        user.name -> "hunterpeyrovi" beside a registry row "hunter": the leg
+        handed ``recognise`` the raw gallery label, ``recognise`` drops any
+        label the registry lacks, and 50 of 50 of HIS turns were refused as
+        nobody after --migrate -- with load_gallery's warning silent, since
+        his label was in the gallery. Latent on his box today (slug and
+        row are both "hunter"); it bites the day one of them changes.
+
+        A registry row is itself. The config slug is the registry OWNER. A
+        label neither knows stays what it is: still SOMEBODY for the "best
+        guess is somebody else" rule, and ``recognise`` still drops it as
+        an identity.
+        """
+        label = str(label or "")
+        if not label:
+            return ""
+        if self.registry.person(label) is not None:
+            return label
+        if self.owner and label == self.owner:
+            return self._owner_label() or label
+        return label
+
     def _mode_unsafe(self) -> str:
         """The live mode. Raises only if the registry does; ``judge`` owns
         that boundary so a broken registry becomes an admit, not a crash."""
@@ -339,16 +384,29 @@ class OwnerGate:
             return "", False
         fault = str(stats.get("who_fault") or "")
         if fault:
-            # THE NAMING INSTRUMENT IS BROKEN, and a broken instrument is NO
-            # INSTRUMENT -- not a name, not a negative. Before this key
+            # A FAULT IN THE IDENTITY PATH IS AN ABSTENTION: the leg RAN and
+            # names NOBODY. Fail shut, never the owner. Before this key
             # existed a gallery that raised arrived here as who="", which is
             # byte-identical to a voice it measured and declined to name, so
             # a wedged store either minted the owner (one label) or refused
-            # him (two). Not running is loud: it counts toward the dead-man
-            # and stands the gate down rather than guessing either way.
+            # him (two). The first fix read a fault as NO INSTRUMENT --
+            # "not running", counted toward the dead-man -- and the round-3
+            # review measured the hole in that: identify() raising while
+            # centroids() still worked let her clip clear the bar on HER
+            # pool and reach the gate with the camera off as a BLIND admit,
+            # owner scope, 50 of 50. The pool is a fact from the matching
+            # instrument, which did run; "not running" threw it away and
+            # admitted on the strength of nothing. RULING (2026-09-04):
+            # any fault here is nobody, in enforce a refusal, whichever
+            # pool it was measured on -- his included. The cost is stated:
+            # a persistently faulting gallery refuses him on the voice path
+            # rather than standing the gate down after three turns; typed
+            # input, the socket and the passphrase remain, and the face
+            # leg still rescues (recognise rule 1).
             log.warning("gate: the voice leg's naming instrument faulted "
-                        "(%s); treating the leg as not running", fault)
-            return "", False
+                        "(%s); this turn names nobody -- never the owner",
+                        fault)
+            return "", True
         try:
             hits = int(stats.get("matched") or 0)
         except (TypeError, ValueError):
@@ -357,7 +415,9 @@ class OwnerGate:
             # The clip was dropped, or nothing matched. That is not evidence
             # against anybody else's leg: "no name from me" is all it says.
             return "", True
-        who = str(stats.get("who") or "")
+        # EVERYTHING THE GALLERY SAYS IS IN ITS OWN LABEL SPACE, and the
+        # registry's is the one the verdict is made in: see _registry_label.
+        who = self._registry_label(stats.get("who"))
         if who:
             # A NAMED match means the person the gallery named. No threshold
             # is applied here and none ever may be. Both bars live in
@@ -385,8 +445,8 @@ class OwnerGate:
         # his refused 50 of 50, provisional labels counting though they can
         # match nobody. And a 6-take "probably mara" was minted as him
         # 150 of 150 at a separation where her voice clears his bar.
-        top = str(stats.get("top") or "")
-        pool = str(stats.get("matched_label") or "")
+        top = self._registry_label(stats.get("top"))
+        pool = self._registry_label(stats.get("matched_label"))
         if stats.get("near_miss"):
             # THE MARGIN FAILED: the gallery could not tell two enrolled
             # people apart on this voice, and that is nobody WHICHEVER of

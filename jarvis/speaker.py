@@ -235,17 +235,50 @@ class SpeakerVerifier:
     # ------------------------------------------------------------ state
     @property
     def is_enrolled(self):
-        """Whether anybody at all is enrolled -- the voiceprint OR the gallery.
+        """Whether THE OWNER has a pool to be verified against -- the
+        voiceprint, or his own label in the gallery. ``enrolment_gap`` is
+        the same question with the sentence attached.
 
         BOTH HALVES OF THE "OR" ARE LOAD-BEARING AND IN OPPOSITE DIRECTIONS.
         False here makes the wake gate and the transcript gate BOTH fail open,
         which is what keeps a fresh box from being mute; True makes the
         transcript gate fail shut, which is what stops a television reaching
-        the commander. So a box with only a gallery must read True (or the
-        person who just enrolled is not being filtered for), and a box with
+        the commander. So a box with only a gallery must read True WHEN HE
+        IS IN IT (enroll_voice --reset after --migrate), and a box with
         neither must read False (or it goes silent on its first day).
+
+        AND A GALLERY HOLDING ONLY OTHER PEOPLE IS NO INSTRUMENT FOR HIM.
+        The first version read any gallery label as an enrolment, arguing
+        the person who just enrolled must be filtered for. Measured
+        2026-09-04 (tests/test_voice_owner_lockout.py) on the layout that
+        produces -- a guest enrolled first on a box with no voiceprint --
+        that reading woke him 0 of 50 (the wake gate's fail-open None had
+        become a number under the bar, against HER centroid) and admitted
+        him 0 of 50 on the transcript gate. Filtering for her meant
+        refusing him, which is the one thing this feature is not allowed to
+        do; so a verifier that was TOLD who the owner is (``owner_label``,
+        which app.py sets) reads that gallery as nothing enrolled, loudly.
+        A verifier nobody told cannot tell whose the gallery is and keeps
+        the old reading -- the explicit label is the mechanism.
         """
-        return bool(self._embeddings) or bool(self._gallery_labels())
+        return not self.enrolment_gap()
+
+    def enrolment_gap(self) -> str:
+        """"" when there is a pool of HIS to verify against, else one
+        sentence saying what is missing and what to run. The reason every
+        fail-open in this file logs, so the log says WHY the box is open."""
+        if self._embeddings:
+            return ""
+        labels = self._gallery_labels()
+        if not labels:
+            return "no voiceprint enrolled"
+        if not self.owner_label or self.owner_label in labels:
+            return ""
+        return ("the owner (%s) has no voice pool: no voiceprint, and the "
+                "voice gallery holds only %s. Voice verification is OFF -- "
+                "everyone is answered -- until he is enrolled: "
+                "scripts/enroll_voice.py, then scripts/voice_enrol.py "
+                "--migrate" % (self.owner_label, ", ".join(labels)))
 
     def _gallery_labels(self):
         return self._gallery_state()[0]
@@ -438,11 +471,21 @@ class SpeakerVerifier:
             log.exception("voice gallery load error; multi-speaker voice ID "
                           "is off and the voiceprint is unaffected")
 
+    def _warn_if_owner_has_no_pool(self):
+        """Said at LOAD, not only on the first fail-open: a gallery that
+        holds somebody while the owner is enrolled nowhere is the layout
+        that used to lock him out (see is_enrolled), and the fix is a
+        command he has to run."""
+        gap = self.enrolment_gap()
+        if gap and self._gallery_labels():
+            log.warning("voice verification is OFF: %s", gap)
+
     def load(self):
         """Load saved voiceprint AND the multi-speaker gallery from disk."""
         self.load_gallery()
         if not VOICEPRINT_FILE.exists():
             self._loaded = True
+            self._warn_if_owner_has_no_pool()
             return
         self.format_fault = ""
         try:
@@ -484,6 +527,7 @@ class SpeakerVerifier:
         except Exception:
             log.exception("voiceprint load error")
         self._loaded = True
+        self._warn_if_owner_has_no_pool()
 
     def save(self):
         """Save voiceprint to disk atomically (.tmp + os.replace)."""
@@ -653,6 +697,14 @@ class SpeakerVerifier:
         somebody can only make that gate MORE permissive -- never less. An
         unwakeable assistant is the worse failure and this feature is not
         allowed to create one.
+
+        THE ONE TRANSITION A MAXIMUM DOES NOT COVER is nothing -> somebody
+        else: with no pool of his at all there is no maximum to raise, and
+        the first guest's centroid turned the wake gate's ``None`` (fail
+        open) into a number under the bar (suppress) -- measured 2026-09-04,
+        woken 0 of 50. ``is_enrolled`` closes it: a gallery holding only
+        other people is not an enrolment for a verifier that knows who the
+        owner is, so ``score`` keeps returning None there.
 
         OVER THE MATCHABLE CENTROIDS ONLY -- a provisional label is left out
         (see ``_all_centroids``), so enrolling somebody with too few takes to
@@ -854,9 +906,10 @@ class SpeakerVerifier:
         to whole-clip verification on a short capture and needs the name too;
         returning it through a shared attribute would race the recorder's
         1 Hz polling."""
-        if not self.is_enrolled:
-            # Nobody enrolled — accept all audio
-            self._fail_open("no voiceprint enrolled")
+        gap = self.enrolment_gap()
+        if gap:
+            # Nobody enrolled -- or nobody who is HIM -- accept all audio
+            self._fail_open(gap)
             return True, 1.0, self._ident()
 
         speech_s = len(trim_silence(audio_16k)) / SAMPLE_RATE
@@ -1033,9 +1086,10 @@ class SpeakerVerifier:
                         counts the windows KEPT: those that cleared the bar
                         on the clip's own speaker's pool.
         """
-        if not self.is_enrolled:
+        gap = self.enrolment_gap()
+        if gap:
             # Unconfigured: pass through, or voice never works on a fresh box.
-            self._fail_open("no voiceprint enrolled")
+            self._fail_open(gap)
             return audio_16k, {"total": 0, "matched": 0, "scores": [],
                                **self._ident()}
         if not self._ensure_model():

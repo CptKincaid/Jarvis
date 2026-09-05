@@ -43,6 +43,42 @@ def test_the_first_name_is_the_first_token():
     assert sl.first_name(None, "there") == "there"
 
 
+def test_a_typed_first_name_wins_over_the_display_name():
+    """people-signin's Person row carries a typed ``first``; the ONE
+    resolver of the first name honours it, so that branch's greeting
+    becomes an import of this module and nothing else at the merge."""
+    from types import SimpleNamespace
+    typed = SimpleNamespace(label="hunter", name="Hunter Peyrovi",
+                            first="Hunt")
+    assert sl.first_name(typed) == "Hunt"
+    blank = SimpleNamespace(label="hunter", name="Hunter Peyrovi", first="  ")
+    assert sl.first_name(blank) == "Hunter"
+    assert sl.BOTH_LEGS_LINE.format(first=sl.first_name(typed)) == (
+        "Voice and identity recognized, welcome back Hunt. "
+        "How may I be of assistance today?")
+
+
+def test_the_sentence_lives_in_one_file():
+    """SETTLED 09-04 for both branches: jarvis/signinlines.py OWNS the line
+    and the rule -- his words, spoken TO the person recognised, addressed
+    by first name, honorifics elsewhere. Neither branch carries its own
+    copy, so the integration merge cannot disagree; a second copy anywhere
+    under jarvis/ fails here, on purpose."""
+    from pathlib import Path
+    root = Path(sl.__file__).resolve().parent
+    holders = sorted(p.name for p in root.rglob("*.py")
+                     if "welcome back {first}" in p.read_text(encoding="utf-8"))
+    assert holders == ["signinlines.py"], holders
+    doc = sl.__doc__ or ""
+    assert "TO THE PERSON RECOGNISED" in doc.upper()
+    assert "FIRST NAME" in doc.upper()
+
+
+def test_the_gate_takes_its_near_miss_line_from_here():
+    from jarvis import gate
+    assert gate.NEAR_MISS_LINE is sl.NEAR_MISS_LINE
+
+
 @pytest.mark.parametrize("legs,why", [
     (Legs(voice_says="hunter", voice_running=True,
           face_says="", face_running=True), "the face leg named nobody"),

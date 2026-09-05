@@ -492,12 +492,15 @@ def test_a_second_person_is_refused_until_the_owner_is_in_the_gallery():
     assert ok is False and "--migrate" in why and "hunter" in why
     # the owner himself is always allowed
     assert ve.owner_ready(g, "hunter", "hunter", True) == (True, "")
-    # no voiceprint and nobody enrolled: a box that never had voice ID
-    assert ve.owner_ready(g, "hunter", "mara", False) == (True, "")
+    # no voiceprint and nobody enrolled: a guest FIRST would leave the box
+    # listening for her and nobody else -- the round-3 review measured him
+    # woken 0/50 and admitted 0/50 in that layout. Refused, with the fix.
+    ok, why = ve.owner_ready(g, "hunter", "mara", False)
+    assert ok is False and "hunter" in why and "enroll_voice" in why
     # a guest already there without him and no voiceprint: enrol him first
     _enrol(g, world, "heather", 10)
     ok, why = ve.owner_ready(g, "hunter", "mara", False)
-    assert ok is False and "--label hunter" in why
+    assert ok is False and "hunter" in why
     # migrated: fine
     _enrol(g, world, "hunter", 14)
     assert ve.owner_ready(g, "hunter", "mara", True) == (True, "")

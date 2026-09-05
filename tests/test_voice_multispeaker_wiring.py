@@ -139,12 +139,20 @@ def test_a_broken_model_still_fails_shut(rig):
 
 
 def test_a_gallery_only_box_still_fails_shut(rig):
-    """Somebody enrolled in the GALLERY with no voiceprint at all must still
-    be filtered for. If is_enrolled ignored the gallery, the person who just
-    enrolled would be the one person the gate stopped protecting."""
+    """THE OWNER enrolled in the GALLERY with no voiceprint at all (his
+    label, after enroll_voice --reset) must still be filtered for: the
+    transcript gate keeps failing shut on a stranger.
+
+    The first version of this test enrolled a GUEST alone and asserted
+    is_enrolled True, arguing the person who just enrolled must be
+    protected. The round-3 review measured what that layout does to HIM:
+    woken 0/50, admitted 0/50 -- a gallery holding only other people is
+    no instrument for the owner, and a verifier told who he is now reads
+    it as nothing enrolled (tests/test_voice_owner_lockout.py)."""
     v, enc = rig
+    v.owner_label = "hunter"
     world = Voices(seed=4, apart=0.02)
-    _enrol(v.gallery, world, "mara", 10)
+    _enrol(v.gallery, world, "hunter", 14)
     assert v._embeddings == []
     assert v.is_enrolled is True
     clip = _clip(4.0, 0.44)
@@ -153,6 +161,10 @@ def test_a_gallery_only_box_still_fails_shut(rig):
     if stats["scores"] and max(stats["scores"]) >= v.threshold:
         pytest.skip("this fixture's stranger is not far enough away")
     assert out is None and stats["matched"] == 0
+    # ...and a gallery holding only somebody ELSE is no pool of his.
+    v.gallery = vg.VoiceGallery()
+    _enrol(v.gallery, world, "mara", 10)
+    assert v.is_enrolled is False
 
 
 # ------------------------------------------ 3. nothing enrolled fails open
