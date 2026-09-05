@@ -705,3 +705,18 @@ class TestTheSelfCheck:
         code = mod.main(["--build", "--write", "--samples", path])
         assert code == 1
         assert "NOT written" in capsys.readouterr().out
+
+
+def test_the_layout_tripwire_fires_from_the_windows_poll_itself():
+    """END TO END: the Windows helper reports a new monitor layout on the
+    poll it was going to make anyway, and the map disarms without anything
+    else having to notice. Nothing polls, nothing schedules, nothing has to
+    be remembered -- which is why this is the tripwire I trust most."""
+    r = rig()
+    assert r.courier.screens is not None and r.courier.screens.armed
+    r.courier.relay.note(mon=0, layout="0,1920,1920,1920,3840,1080")
+    assert r.courier.screens is None
+    assert sc.LAYOUT_CHANGED_LINE in r.rec.spoken
+    throw(r, FROM_SPARK_LEFT)
+    assert r.launched == []
+    assert r.courier.recent()["sink"] == "board"

@@ -224,7 +224,8 @@ class GestureCast:
         # attention. The two do not deserve the same default.
         self.screens = screens_mod.load(self._get)
         self.learner = screens_mod.ScreenLearner()
-        self.relay = view_mod.CastRelay(now=now)
+        self.relay = view_mod.CastRelay(
+            now=now, on_layout=self.note_layout)
         self.view_state = view_mod.ViewState(now=now)
         self._last_hand: Optional[dict] = None
         self._yaws: deque = deque(maxlen=YAW_ROWS)

@@ -145,9 +145,16 @@ class CastRelay:
     """
 
     def __init__(self, *, now: Callable[[], float] = time.monotonic,
-                 alive_s: float = HELPER_ALIVE_S) -> None:
+                 alive_s: float = HELPER_ALIVE_S,
+                 on_layout: Optional[Callable[[str], object]] = None) -> None:
         self._now = now
         self._alive_s = float(alive_s)
+        # THE TRIPWIRE. A layout string that differs from the last one is an
+        # exact signal that he unplugged, added or moved a monitor, and it
+        # arrives from the machine that owns the layout -- which is the one
+        # thing I could not enumerate over SSH. The courier disarms its map
+        # on it rather than routing on a room that no longer exists.
+        self._on_layout = on_layout
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._verb = VERB_NONE
@@ -193,7 +200,13 @@ class CastRelay:
             index = -1
         self.mon = index if -1 <= index <= 15 else -1
         text = layout if isinstance(layout, str) else ""
-        self.layout = text.strip()[:MAX_LAYOUT_CHARS]
+        was, self.layout = self.layout, text.strip()[:MAX_LAYOUT_CHARS]
+        if self.layout and self.layout != was and callable(self._on_layout):
+            try:
+                self._on_layout(self.layout)
+            except Exception:                    # noqa: BLE001 - the courier
+                log.debug("cast relay: the layout watcher raised",
+                          exc_info=True)
 
     def alive(self, at: Optional[float] = None) -> bool:
         """Is the Windows helper actually polling? Never assumed."""
