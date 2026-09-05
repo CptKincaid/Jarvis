@@ -550,3 +550,38 @@ def test_a_failed_recovery_leaves_his_pool_exactly_as_it_was(rig, tmp_path,
     monkeypatch.setattr(v.gallery, "add", real_add)
     assert v.gallery.reanchor_voiceprint("hunter", path=src)["ok"] is True
     assert v.gallery.count("hunter") == len(pool)
+
+
+def test_status_says_whether_his_pool_still_measures_as_his_voiceprint(
+        tmp_path, monkeypatch, capsys):
+    """THE INSTRUMENT THE WARNING POINTS AT HAS TO ANSWER THE QUESTION.
+
+    ``speaker._disowned`` logs "it is NOT being read as the owner ... Check
+    with: scripts/voice_enrol.py --status", and ``--status`` printed take
+    counts, cohesion and floors -- every number except the ONE that decides
+    whether Jarvis answers him. So the log named an instrument that could not
+    see the fault it was reporting."""
+    ve = _voice_enrol()
+    world = Voices(seed=31, apart=0.3)
+    him = world.takes("hunter", 14)
+    root = tmp_path / "vg"
+    g = vg.VoiceGallery(root=root)
+    for e in him:
+        g.add("hunter", e, src="legacy")
+    g.set_consent("hunter", "owner")
+    g.save(reason="migrated")
+    monkeypatch.setattr(vg.PATHS, "VOICE_GALLERY", root)
+
+    healthy = _write_voiceprint(tmp_path / "ok.npz", him)
+    monkeypatch.setattr(vg.PATHS, "VOICEPRINT", healthy)
+    assert ve.main(["--status"]) == 0
+    out = capsys.readouterr().out
+    assert "1.000" in out and "--reanchor" not in out, out
+
+    drifted = _write_voiceprint(tmp_path / "drift.npz",
+                                him + world.takes("hunter", 24))
+    monkeypatch.setattr(vg.PATHS, "VOICEPRINT", drifted)
+    assert ve.main(["--status"]) == 0
+    out = capsys.readouterr().out
+    assert "--reanchor" in out, out
+    assert "NOT" in out, out

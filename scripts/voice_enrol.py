@@ -460,6 +460,42 @@ def separation_report(gallery):
     return out
 
 
+def _owner_anchor_line(gallery, label) -> None:
+    """Whether his pool still MEASURES as voiceprint.npz, printed beside it.
+
+    THE WARNING NAMED THIS INSTRUMENT AND THIS INSTRUMENT COULD NOT SEE IT.
+    ``speaker._disowned`` logs "it is NOT being read as the owner ... Check
+    with: scripts/voice_enrol.py --status", and --status printed take counts,
+    cohesion and floors -- every number except the one that decides whether
+    Jarvis answers him. Passive learning used to walk this cosine under the
+    line on its own (see speaker._would_leave_his_own_pool), which is exactly
+    the fault a person would come here to diagnose.
+
+    The number is the runtime's own: vg.OWNER_POOL_COSINE over the two
+    centroids, the same comparison speaker._owner_alias_cosine makes.
+    """
+    vectors = voiceprint_vectors(PATHS.VOICEPRINT)
+    if not vectors:
+        print("               anchor : no %s to measure against"
+              % PATHS.VOICEPRINT.name)
+        return
+    mine = vg.centroid(list(vectors))
+    theirs = vg.centroid(gallery.embeddings(label))
+    if mine is None or theirs is None:
+        return
+    sim = vg.cosine(theirs, mine)
+    if sim >= vg.OWNER_POOL_COSINE:
+        print("               anchor : %.4f of %s (needs %.2f) -- read as his"
+              % (sim, PATHS.VOICEPRINT.name, vg.OWNER_POOL_COSINE))
+        return
+    print("               anchor : %.4f of %s, under %.2f"
+          % (sim, PATHS.VOICEPRINT.name, vg.OWNER_POOL_COSINE))
+    print("  ** this pool is NOT being read as %s. Jarvis will refuse his own "
+          "turns.\n     Nothing was recorded wrong -- his voiceprint and his "
+          "pool have come\n     apart. Put them back, no microphone needed:"
+          "\n         %s %s --reanchor **" % (label, sys.executable, __file__))
+
+
 # ------------------------------------------------------------------ reporting
 def show_status(gallery) -> None:
     print("voice gallery   : %s" % gallery.root)
@@ -490,6 +526,8 @@ def show_status(gallery) -> None:
                  "-" if floor is None else "%.3f" % floor))
         if gallery.consent(label):
             print("               consent: %s" % gallery.consent(label))
+        if owner and label == owner:
+            _owner_anchor_line(gallery, label)
     print("\nseparation between enrolled people:")
     for line in separation_report(gallery):
         print(line)
