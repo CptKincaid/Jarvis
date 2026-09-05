@@ -2,8 +2,8 @@
 """Can Jarvis tell WHICH SCREEN he grabbed at? Numbers only.
 
     ~/vss_env/bin/python scripts/screen_selfcheck.py --synthetic
-    ~/vss_env/bin/python scripts/screen_selfcheck.py --minutes 10
-    ~/vss_env/bin/python scripts/screen_selfcheck.py --minutes 10 --json
+    ~/vss_env/bin/python scripts/screen_selfcheck.py --minutes 3 --label right
+    ~/vss_env/bin/python scripts/screen_selfcheck.py --build --write
 
 WHAT THIS IS FOR. Two numbers decide whether "grab a screen and throw it at
 another" can work, and NEITHER HAS EVER BEEN MEASURED, on him or on anyone,
@@ -20,16 +20,20 @@ in this project:
     head yaw IF he turns his head, and 1.4 sigma if he barely does. That is
     the difference between yaw being the stronger axis and being useless.
 
-WHAT HE DOES. Runs it, sits where he normally sits, and works across the
-three screens for ten minutes. When he reaches at a screen and closes his
-hand, say which one out loud -- no, do not: say nothing at all. Just press
-1 for the right-hand screen (the Spark), 2 for the middle and 3 for the
-left BEFORE each grab, or run it with --label right/middle/left for one
-screen at a time, which is easier and is what I would do:
+WHAT HE DOES. Three short runs, one per screen, working normally at each
+one and reaching out and grabbing at it now and then -- the same reach he
+would use to throw it:
 
-    ...screen_selfcheck.py --minutes 3 --label right      # sit at the Spark
+    ...screen_selfcheck.py --minutes 3 --label right     # his right screen
     ...screen_selfcheck.py --minutes 3 --label middle
     ...screen_selfcheck.py --minutes 3 --label left
+    ...screen_selfcheck.py --build                       # what it worked out
+    ...screen_selfcheck.py --build --write               # and save it
+
+Nothing is shown and no frame is kept; what is written between runs is a
+list of two numbers per grab (a lateral hand position and a head-yaw ratio)
+and ``--write`` saves one key, ``gesture.screens``, into assistant.json.
+Jarvis has to be restarted for that key to take effect.
 
 It prints, per label: n, yaw_t at p10/p50/p90, the pooled within-label
 spread, the separation between each pair on BOTH axes, the correlation
@@ -422,6 +426,59 @@ def report_rows(summary: dict, say) -> None:
         % (summary["yaw_miss_pct"], summary["grabs"]))
 
 
+SAMPLES_DEFAULT = "~/.aiws_trainer/screen_samples.json"
+
+
+def load_samples(path: str) -> dict:
+    """Rows kept between runs: ``{label: [[hand_x_u, yaw_t or null], ...]}``.
+
+    Numbers and nothing else -- there is no timestamp, no window, no
+    machine name and no trace of what was on any screen. It lives beside
+    the voiceprint rather than in the repo, and it is his to delete.
+    """
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for label, rows in raw.items():
+        if label in LABELS and isinstance(rows, list):
+            keep = []
+            for row in rows:
+                if isinstance(row, list) and len(row) == 2:
+                    try:
+                        keep.append((float(row[0]),
+                                     None if row[1] is None else float(row[1])))
+                    except (TypeError, ValueError):
+                        continue
+            out[label] = keep
+    return out
+
+
+def save_samples(path: str, rows: dict) -> str:
+    target = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump({k: [[h, y] for h, y in v] for k, v in rows.items()}, fh)
+    return target
+
+
+def build_map(rows: dict, *, at: float, layout: str = "") -> sc.ScreenMap:
+    """The three labels -> one ScreenMap, through the SAME arming rules the
+    courier applies. A map that would not arm comes back saying why."""
+    lrn = sc.ScreenLearner(stable_s=0.0)
+    t = 0.0
+    for label, samples in rows.items():
+        for hand, yaw in samples:
+            lrn.observe(at=t, label=label, hand_u=hand, yaw_t=yaw)
+            t += 1.0
+    return lrn.build({k: MACHINE_OF[k] for k in rows if k in MACHINE_OF},
+                     at=at, source="named", layout=layout)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--minutes", type=float, default=10.0,
@@ -431,6 +488,15 @@ def main(argv=None) -> int:
     ap.add_argument("--synthetic", action="store_true",
                     help="run the arithmetic over invented rows. Opens no "
                          "device and says nothing about him.")
+    ap.add_argument("--samples", default=SAMPLES_DEFAULT,
+                    help="where the rows between runs are kept")
+    ap.add_argument("--build", action="store_true",
+                    help="build the screen map from the rows already "
+                         "collected and print it. Opens no device.")
+    ap.add_argument("--write", action="store_true",
+                    help="with --build, SAVE the map to gesture.screens in "
+                         "assistant.json. It writes that one key and "
+                         "nothing else. Restart Jarvis afterwards.")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable, and just as pixel-free")
     args = ap.parse_args(argv)
@@ -439,6 +505,28 @@ def main(argv=None) -> int:
     say = (lambda *a: None) if args.json else print
     say(BANNER)
     say("")
+
+    if args.build:
+        kept = load_samples(args.samples)
+        say("1. building the map from %d label(s) already collected"
+            % len(kept))
+        for label in sorted(kept):
+            say("   %-8s %d rows" % (label, len(kept[label])))
+        m = build_map(kept, at=time.time())
+        report["map"] = sc.to_config(m)
+        say("")
+        say("   armed: %s%s" % (m.armed, "" if m.armed else "  -- " + m.reason))
+        if m.armed:
+            say("   boundary %+.3f u, machines %.2f sigma apart"
+                % (m.boundary_u, m.margin_sigma))
+        if args.write and m.armed:
+            AssistantConfig.load().set(sc.OPTION_MAP, sc.to_config(m))
+            say("   written to %s. RESTART JARVIS for it to take effect."
+                % sc.OPTION_MAP)
+        elif args.write:
+            say("   NOT written: an unarmed map must not route.")
+        report["summary"] = {}
+        return _finish(report, args, {}, say, code=0 if m.armed else 1)
 
     if args.synthetic:
         rows, misses, looks = synthetic_rows()
@@ -475,6 +563,12 @@ def main(argv=None) -> int:
         "nothing is saved.")
     rows, misses, looks = live_rows(cfg, policy, label=args.label,
                                     minutes=args.minutes, say=say)
+    kept = load_samples(args.samples)
+    kept.setdefault(args.label, [])
+    kept[args.label] = rows.get(args.label, [])          # this run replaces it
+    where = save_samples(args.samples, kept)
+    say("   %d rows for '%s' kept in %s" % (len(kept[args.label]),
+                                            args.label, where))
     summary = summarise(rows, misses, looks)
     report["summary"] = summary
     report_rows(summary, say)

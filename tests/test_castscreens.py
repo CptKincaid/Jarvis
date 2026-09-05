@@ -655,3 +655,53 @@ class TestTheSelfCheck:
         assert z["zones_3_half_u"] == pytest.approx(0.7617, abs=1e-3)
         assert z["zones_2_pct"] > z["zones_3_pct"]
         assert z["zones_2_pct"] > 99.9
+
+    def test_the_map_it_builds_is_the_one_the_courier_would_arm(self, tmp_path):
+        """--build runs the SAME arming rules the courier applies, so a map
+        this prints as armed is a map that will actually route -- and one it
+        refuses is refused for a reason he can read."""
+        mod = self.script()
+        rows = {"right": [(anchor_u(SPARK_X) + 0.01 * (i % 5 - 2), YAW["right"])
+                          for i in range(40)],
+                "middle": [(anchor_u(MIDDLE_X) + 0.01 * (i % 5 - 2),
+                            YAW["middle"]) for i in range(40)],
+                "left": [(anchor_u(LEFT_X) + 0.01 * (i % 5 - 2), YAW["left"])
+                         for i in range(40)]}
+        m = mod.build_map(rows, at=1000.0, layout="0,1920,1920,1920")
+        assert m.armed, m.reason
+        assert sc.score(m, hand_u=anchor_u(SPARK_X)).machine == sc.SPARK
+        assert sc.score(m, hand_u=anchor_u(MIDDLE_X)).machine == sc.HPCOMPUTER
+
+    def test_the_rows_it_keeps_between_runs_are_numbers_only(self, tmp_path):
+        mod = self.script()
+        path = str(tmp_path / "rows.json")
+        mod.save_samples(path, {"right": [(1.3, -0.30), (1.28, None)]})
+        back = mod.load_samples(path)
+        assert back["right"][0] == (1.3, -0.30)
+        assert back["right"][1][1] is None
+        import json as _json
+        with open(path, encoding="utf-8") as fh:
+            assert_numbers_only(_json.load(fh))
+
+    def test_a_hand_edited_rows_file_cannot_smuggle_anything_in(self, tmp_path):
+        mod = self.script()
+        path = tmp_path / "rows.json"
+        path.write_text('{"right": [["oops", 1]], "telly": [[1, 2]], '
+                        '"middle": "nope"}')
+        back = mod.load_samples(str(path))
+        # "oops" is not a number, "telly" is not one of his screens, and
+        # "nope" is not a list of rows: all three are dropped rather than
+        # coerced into something the arming rules would then believe.
+        assert back == {"right": []}
+
+    def test_an_unarmed_map_is_never_written(self, tmp_path, capsys):
+        """A map that would not arm must not reach his config: the courier
+        re-derives armed on load, but a file that claims it is armed is a
+        trap worth not laying."""
+        mod = self.script()
+        path = str(tmp_path / "rows.json")
+        mod.save_samples(path, {"right": [(1.0, 0.0)] * 40,
+                                "middle": [(1.02, 0.01)] * 40})
+        code = mod.main(["--build", "--write", "--samples", path])
+        assert code == 1
+        assert "NOT written" in capsys.readouterr().out
