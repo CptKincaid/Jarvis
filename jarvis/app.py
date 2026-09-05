@@ -361,6 +361,9 @@ class JarvisApp:
     _pending_debrief = None
     aside = None
     debrief = None
+    # The reading _gate_admits installs for an admitted VOICE turn, read
+    # back by _process_audio one statement later on that same thread.
+    _gate_addressee = scope_mod.OWNER
 
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
@@ -930,8 +933,9 @@ class JarvisApp:
             log.exception("address thinning failed; speaking as written")
             return list(fragments)
 
-    def _tell_the_model_who_is_here(self, who: str) -> None:
-        """Name the addressee to the prompt builder, or clear it.
+    def _tell_the_model_who_is_here(self, who: str):
+        """Name the addressee to the prompt builder, or clear it, and hand
+        back THE READING it installed -- ``(name, honorific)``.
 
         BELT TO THE SWAP'S BRACES. The swap at ``_say`` is the authority
         and would correct a "sir" gemma4 generated anyway; this stops it
@@ -946,20 +950,19 @@ class JarvisApp:
                       if gate is not None else None)
             if person is None or who == owner or person.role == \
                     identity_mod.ROLE_OWNER:
-                brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
-                return
-            brain_mod.set_addressee(person.display(), person.honorific)
+                return brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+            return brain_mod.set_addressee(person.display(), person.honorific)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("honorific: the addressee could not be named to "
                           "the model; using the owner prompt")
             try:
-                brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+                return brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
             except Exception:                      # noqa: BLE001
-                pass
+                return scope_mod.OWNER
 
-    def _the_turn_is_his(self) -> None:
-        """This turn is the OWNER'S: attribute it to nobody and name the
-        owner to the prompt builder.
+    def _the_turn_is_his(self):
+        """This turn is the OWNER'S: attribute it to nobody, name the owner
+        to the prompt builder, and HAND BACK that reading.
 
         Called for every source the gate does not judge -- the keyboard,
         the command socket, the phone's intercom clip, Discord -- and
@@ -969,10 +972,17 @@ class JarvisApp:
         typed turn of his, and his own briefing, ran scoped as the guest.
         The scope is per turn now (jarvis/scope.py); this is the owner's
         half of "per turn", and ``_gate_admits`` is the voice half.
+
+        RETURNS THE READING (round-3, 09-05). Clearing the module state and
+        then having the commander look it up again put an unbounded wait
+        between the two -- measured 198/200 as HIM being refused his own
+        notes when a guest was admitted in that window. The caller carries
+        this value into every door of the turn instead.
         """
         self._gate_who, self._gate_how = "", ""
         self._gate_who_ts = -1e9
         self._tell_the_model_who_is_here("")
+        return scope_mod.OWNER
 
     def _honorific(self) -> str:
         """"sir", "ma'am" or "" for WHOEVER THE NEXT LINE IS AIMED AT.
@@ -3492,8 +3502,16 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - a line only
             return "the camera could not be asked"
 
-    def _after_dispatch(self, text, source, result):
+    def _after_dispatch(self, text, source, result, addressee=None):
         """Bookkeeping once a command has been handled synchronously."""
+        # ROUND-3, named lower and closed here: this filed a GUEST'S
+        # sentence and Jarvis's refusal of it into HIS conversation memory
+        # -- measured add_exchange("what's on my to-do list", "That one's
+        # Hunter's, Mara Voss. ..."). Nothing of his is disclosed by that,
+        # but his record is his: a turn that was not his leaves no trace
+        # in it. The mic and follow-up bookkeeping below is I/O, not his
+        # data, and still runs for her.
+        his_turn = not scope_mod.reading(addressee)[0]
         # "no, I said X" / "that was for you" answered X, not the words
         # said: the exchange is remembered under X.
         text = getattr(result, "corrected", None) or text
@@ -3509,10 +3527,11 @@ class JarvisApp:
                 self._reopen_mic = True
             return
         if reply and done and not getattr(result, "ack", False):
-            self.context.add_exchange(text, reply)
+            if his_turn:
+                self.context.add_exchange(text, reply)
             if source == "voice" and result.speak and CONFIG.talkback:
                 self._followup_after_speech = True
-        if done and getattr(result, "speak", False):
+        if his_turn and done and getattr(result, "speak", False):
             # After the answer, never inside it. _emit_result has already
             # queued the reply, and TTS.speak is FIFO, so this lands as its
             # own beat behind it (jarvis/aside.py).
@@ -3572,7 +3591,7 @@ class JarvisApp:
         self._followup_after_speech = True   # answer it without the wake word
         self._say(cand.question)
 
-    def _debrief_reply(self, text, source):
+    def _debrief_reply(self, text, source, addressee=None):
         """The open debrief owns this transcript -- or gives it up.
 
         Gives it up for anything that is plainly a command (a Tier-1 match,
@@ -3582,6 +3601,25 @@ class JarvisApp:
         meant to be able to trust months from now."""
         pending = self._pending_debrief
         if pending is None or source not in ("voice", "typed"):
+            return None
+        # ROUND-3 BLOCKER 3, MEASURED. This method is hoisted ABOVE
+        # commander.handle on purpose (see _ask_debrief), so it is the one
+        # door of the turn that sits above the commander's scope read --
+        # and it took no reading of its own. With the gate naming a guest,
+        # "honestly it was a disaster, he ran out of time" was written to
+        # BOTH his private sinks (memory.remember + context.journal_debrief)
+        # and commander.handle was never called. Worse than an ordinary
+        # leak: mark_asked is written when the question is PUT, so she did
+        # not merely answer his once-ever question, she SPENT it.
+        #
+        # It cannot simply move below the commander (jarvis/debrief.py:381
+        # explains why), so it asks the same question the commander asks,
+        # of the same carried value. Like the floor-holder branch below,
+        # this returns None WITHOUT clearing _pending_debrief: the question
+        # is his, it was not answered, and it stays open for him.
+        who = scope_mod.reading(addressee)[0]
+        if who:
+            log.info("debrief stands down: this turn is %s's, not his", who)
             return None
         if time.monotonic() - pending["at"] > self.DEBRIEF_TTL_S:
             self._pending_debrief = None
@@ -5007,20 +5045,29 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: judging failed; the turn stands")
             return True
+        if not d.admit:
+            # NOT ATTRIBUTED. Round 3 measured this the other way round:
+            # the three lines below used to run BEFORE this check, so a
+            # voice turn the gate REFUSED still left that person owning
+            # the process-wide scope for the full 120 s TTL -- after
+            # _gate_admits("read me my mail") returned False,
+            # scope.addressee() was ("Heather", "ma'am"). A refused turn
+            # is nobody's; whatever held the scope before still holds it.
+            self.turns.abandon("gate:%s" % (d.role or "unknown"))
+            self._refuse_politely(d.line)
+            return False
         self._gate_who, self._gate_how = d.who, d.how
         self._gate_who_ts = time.monotonic()
-        self._tell_the_model_who_is_here(d.who)
-        if d.admit:
-            if d.line:
-                # The sign-in welcome. Only ever set on an admitted turn
-                # where a name was CONFIRMED by a leg, and rate-limited
-                # inside the gate, so this cannot become a preamble on
-                # every sentence.
-                self._say(d.line)
-            return True
-        self.turns.abandon("gate:%s" % (d.role or "unknown"))
-        self._refuse_politely(d.line)
-        return False
+        # THE READING FOR THIS TURN, taken at the instant the turn is
+        # attributed and read back by _process_audio one statement later
+        # on this same thread -- never looked up again after a wait.
+        self._gate_addressee = self._tell_the_model_who_is_here(d.who)
+        if d.line:
+            # The sign-in welcome. Only ever set on an admitted turn where
+            # a name was CONFIRMED by a leg, and rate-limited inside the
+            # gate, so this cannot become a preamble on every sentence.
+            self._say(d.line)
+        return True
 
     def _process_audio(self, audio):
         stats = {}
@@ -5091,10 +5138,17 @@ class JarvisApp:
                 # taking one of its own.
                 if not self._gate_admits(text, stats):
                     return
+                # The reading _gate_admits just installed, carried by
+                # value. Only this thread writes it and only this thread
+                # reads it, one statement apart, with no lock between --
+                # so unlike the module state it cannot be flipped by
+                # another turn while this one queues.
+                turn_addr = getattr(self, "_gate_addressee", scope_mod.OWNER)
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
-                self._dispatch(text, "voice", confidence=result.confidence)
+                self._dispatch(text, "voice", confidence=result.confidence,
+                               addressee=turn_addr)
             elif text:
                 # Garbled, not silent: say so and re-open the mic rather
                 # than routing "by Agenda 4.2.6" or going quiet -- once.
@@ -5299,7 +5353,7 @@ class JarvisApp:
     _turn_seq = 0
     _turn_answered = False
 
-    def _dispatch(self, text, source, confidence=None):
+    def _dispatch(self, text, source, confidence=None, addressee=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
@@ -5311,14 +5365,24 @@ class JarvisApp:
         self._dispatch_gen = getattr(self, "_dispatch_gen", 0) + 1
         if source not in SOCKET_SOURCES:
             self._active_turn_id = ""
+        # THE ONE READING OF WHOSE TURN THIS IS, taken HERE -- where the
+        # turn is attributed -- and carried by value into the debrief, the
+        # commander and the bookkeeping below. Round 3 (09-05) measured
+        # what looking it up downstream costs: the commander re-read this
+        # module state inside its own turn lock, i.e. after an unbounded
+        # wait, and with the lock contended 200/200 trials answered a
+        # guest from his notes and 198/200 refused him his own. Nothing
+        # below this line looks the scope up again.
+        turn_addr = scope_mod.OWNER
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
+            turn_addr = scope_mod.reading(addressee)
         elif source not in gate_mod.GATED_SOURCES:
             # Not judged by the gate, so nobody but him: the keyboard, the
             # socket, his phone, Discord. The attribution a guest's voice
             # turn left behind must not scope HIS typed turn.
-            self._the_turn_is_his()
+            turn_addr = self._the_turn_is_his()
         # The Whisper avg_logprob travels only when there is one: typed
         # text has none, and a stand-in commander need not take the keyword.
         kw = {} if confidence is None else {"confidence": confidence}
@@ -5326,16 +5390,17 @@ class JarvisApp:
             # An open debrief question owns this transcript unless it is
             # plainly a command -- the answer is FILED, never routed to the
             # model as chat (jarvis/debrief.py).
-            filed = self._debrief_reply(text, source)
+            filed = self._debrief_reply(text, source, turn_addr)
             result = self._emit_result(
                 filed if filed is not None
-                else self.commander.handle(text, source, **kw))
+                else self.commander.handle(text, source,
+                                           addressee=turn_addr, **kw))
             corrected = getattr(result, "corrected", None)
             if corrected:
                 self._last_user_text = corrected
             if source == "voice":
                 self._turn_after_result(result)
-            self._after_dispatch(text, source, result)
+            self._after_dispatch(text, source, result, turn_addr)
         except Exception:
             if source == "voice":
                 self._turn_finished()
@@ -5627,7 +5692,12 @@ class JarvisApp:
         # or a synchronous command is closed right here.
         self._turn_start()
         try:
-            result = self._emit_result(self.commander.resolve_uncertain(text, yes))
+            # The card is on HIS screen, so this turn is his -- said with
+            # the argument rather than left to the ambient scope, which a
+            # guest's voice turn may hold when he clicks (round-3: this was
+            # a third path around the one scope read).
+            result = self._emit_result(self.commander.resolve_uncertain(
+                text, yes, addressee=self._the_turn_is_his()))
         except Exception:
             self._turn_finished()
             raise

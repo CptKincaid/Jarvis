@@ -231,10 +231,26 @@ def test_good_night_from_a_guest_starts_nothing_of_his():
 
 
 def test_quiet_and_say_again_work_and_quiet_does_not_cancel_his_claude():
+    """CORRECTED BY ROUND 3 (09-05). This test used to ASSERT the defect:
+    "say again" from a guest handed back ``tts.last_text`` -- "It's five
+    past four." -- which is whatever was last SAID, to anybody, at any
+    distance in the past. The reviewer measured the same rung returning
+    "Your bank balance is 412 dollars and the code is 88213, sir."
+
+    What she may work is unchanged: the voice I/O words. What she gets
+    back from "say again" is now the last line the commander wrote FOR
+    HER, and nothing at all when there is none.
+    """
     scope_mod.set_addressee("Mara", "ma'am")
     c, svc = _commander()
     res = c.handle("say again", source="voice")
-    assert res.status == "Repeating" and res.reply == "It's five past four."
+    assert res.status.startswith("Nothing to repeat for Mara")
+    assert "It's five past four." not in res.reply
+    # Give her a line of her own, then she may hear that one back.
+    first = c.handle("what's on my to-do list", source="voice")
+    assert first.reply == MARA_LINE
+    res = c.handle("say again", source="voice")
+    assert res.status == "Repeating for Mara" and res.reply == MARA_LINE
     res = c.handle("stop talking", source="voice")
     assert res.status == "Quiet"
     assert not svc.claude.cancel.called
@@ -410,8 +426,16 @@ def test_handle_reads_the_scope_once_and_the_known_path_never_reaches_his():
         start = src.index(f"    def {name}(")
         return src[start:src.index("\n    def ", start + 1)]
     handle = method("handle")
-    assert len(re.findall(r"scope_mod\.addressee\(\)", handle)) == 1
+    # ONE reading, and it is taken from the value the ATTRIBUTOR passed
+    # down (jarvis/scope.reading), not looked up in module state after the
+    # lock wait -- round-3 blockers 1 and 2. The pin is the reading count
+    # AND its position: above `with self._turn_lock`, never below it.
+    assert len(re.findall(r"scope_mod\.reading\(addressee\)", handle)) == 1
+    assert "scope_mod.addressee()" not in handle
+    assert handle.index("scope_mod.reading(") < handle.index("with self._turn_lock")
     assert "self._handle_known(text, source, who, hon)" in handle
+    # The gesture cast is BELOW the reading and runs only on his turn.
+    assert handle.index("scope_mod.reading(") < handle.index("_cast_spoken_over(")
     known = method("_handle_known")
     for banned in ("_handle_inner(", "_route_text(", "_try_assistant(",
                    "_try_registry(", "_dispatch_router(", "_try_multi(",

@@ -1013,7 +1013,7 @@ def test_a_failure_mid_transcription_does_not_leave_jarvis_deaf(app, monkeypatch
 def test_a_fast_reply_says_nothing_extra(app, monkeypatch):
     monkeypatch.setattr(app, "_thinking_delay_s", 5.0)   # far longer than the reply
     monkeypatch.setattr(app.commander, "handle",
-                        lambda text, source: SimpleNamespace(
+                        lambda text, source, **kw: SimpleNamespace(
                             reply="Right away, sir.", speak=True, status=""))
 
     app._dispatch("what time is it", "voice")
@@ -1025,7 +1025,7 @@ def test_a_fast_reply_says_nothing_extra(app, monkeypatch):
 def test_a_slow_lookup_gets_an_acknowledgement_first(app, monkeypatch):
     monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
 
-    def slow(text, source):
+    def slow(text, source, **kw):
         time.sleep(0.6)
         return SimpleNamespace(reply="Nothing on today, sir.", speak=True, status="")
 
@@ -1043,7 +1043,7 @@ def test_typed_input_never_gets_the_spoken_filler(app, monkeypatch):
     """You can see a typed answer arriving; being told to wait is noise."""
     monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
 
-    def slow(text, source):
+    def slow(text, source, **kw):
         time.sleep(0.5)
         return SimpleNamespace(reply="Done, sir.", speak=False, status="")
 
@@ -1074,7 +1074,8 @@ def _async_result():
 
 
 def test_an_async_turn_stays_busy_until_the_reply_arrives(app, monkeypatch):
-    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+    monkeypatch.setattr(app.commander, "handle",
+                        lambda t, s, **k: _async_result())
 
     app._dispatch("what's on my agenda for monday", "voice")
     assert app._turn_busy.is_set(), "handle() returning is not the end of the turn"
@@ -1084,7 +1085,8 @@ def test_an_async_turn_stays_busy_until_the_reply_arrives(app, monkeypatch):
 
 
 def test_a_wake_word_during_reply_generation_is_refused(app, monkeypatch):
-    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+    monkeypatch.setattr(app.commander, "handle",
+                        lambda t, s, **k: _async_result())
     app.recorder.recording = False
     started = []
     monkeypatch.setattr(app.recorder, "start", lambda: started.append(1))
@@ -1100,7 +1102,8 @@ def test_a_wake_word_during_reply_generation_is_refused(app, monkeypatch):
 def test_the_filler_speaks_for_a_slow_async_reply(app, monkeypatch):
     """The case it was built for, and the case it silently missed."""
     monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
-    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+    monkeypatch.setattr(app.commander, "handle",
+                        lambda t, s, **k: _async_result())
 
     app._dispatch("what's on my agenda for monday", "voice")
     time.sleep(0.45)
@@ -1112,7 +1115,8 @@ def test_the_filler_speaks_for_a_slow_async_reply(app, monkeypatch):
 def test_a_reply_that_never_comes_cannot_leave_him_deaf(app, monkeypatch):
     """A stuck turn flag would make every future wake word a no-op."""
     monkeypatch.setattr(app, "_turn_timeout_s", 0.2)
-    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+    monkeypatch.setattr(app.commander, "handle",
+                        lambda t, s, **k: _async_result())
 
     app._dispatch("something that never answers", "voice")
     assert app._turn_busy.is_set()
@@ -1121,7 +1125,7 @@ def test_a_reply_that_never_comes_cannot_leave_him_deaf(app, monkeypatch):
 
 
 def test_a_synchronous_answer_closes_the_turn_immediately(app, monkeypatch):
-    monkeypatch.setattr(app.commander, "handle", lambda t, s: SimpleNamespace(
+    monkeypatch.setattr(app.commander, "handle", lambda t, s, **k: SimpleNamespace(
         reply="Half past nine, sir.", speak=True, status="", done=True))
 
     app._dispatch("what time is it", "voice")

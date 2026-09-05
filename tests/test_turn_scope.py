@@ -206,7 +206,13 @@ def _dispatching(tmp_path):
         handle=lambda text, source, **kw: (
             a.seen.append((source, scope_mod.addressee(), a._gate_who)),
             SimpleNamespace(reply="", speak=False, status="", done=True))[1])
-    a._debrief_reply = lambda text, source: None
+    # NOTE (round-3, 09-05): stubbing this out is what hid BLOCKER 3 from
+    # the lane's own evidence -- _debrief_reply is the one door hoisted
+    # ABOVE commander.handle, and a guest's sentence went straight into
+    # his memory and his journal through it. The door itself is measured
+    # in tests/test_turn_carried.py with the REAL method; here it is only
+    # kept out of the way, and it takes the carried reading like the rest.
+    a._debrief_reply = lambda text, source, addressee=None: None
     a._emit_result = lambda r: r
     a._after_dispatch = lambda *x, **k: None
     a._the_turn_is_his = app_mod.JarvisApp._the_turn_is_his.__get__(a)

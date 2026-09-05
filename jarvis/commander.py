@@ -77,7 +77,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from jarvis import address
 from jarvis import arc as arc_mod
@@ -96,6 +96,7 @@ from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis import scope as scope_mod
+from jarvis.honorific import ADDRESSEE_TTL
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
@@ -1562,6 +1563,15 @@ def _h_quiet(c, t, m):
                          status="Quiet")
 
 
+# How old the owner's last answer may be and still be replayable. Round 3
+# named the absence of ANY bound here: "say that again" would hand back a
+# line from hours ago. His own line to himself is not a disclosure, so this
+# is a quality bound, not the security one -- the security bound is
+# Commander._repeat_for_known, which is default-deny.
+REPEAT_MAX_AGE_S = 600.0
+REPEAT_STALE_LINE = "That was a while ago, sir -- ask me again."
+
+
 def _h_repeat(c, t, m):
     tts = c._svc("tts")
     last = getattr(tts, "last_text", "") if tts is not None else ""
@@ -1569,6 +1579,10 @@ def _h_repeat(c, t, m):
         return CommandResult(handled=True,
                              reply="I haven't said anything yet, sir.",
                              speak=True, status="Nothing to repeat")
+    said_at = getattr(c, "_owner_said_at", None)
+    if said_at is not None and (time.monotonic() - said_at) > REPEAT_MAX_AGE_S:
+        return CommandResult(handled=True, reply=REPEAT_STALE_LINE,
+                             speak=True, status="Nothing to repeat (stale)")
     if _talkback():
         try:
             tts.repeat_last()
@@ -10430,25 +10444,44 @@ class Commander:
 
     # -- public entry --------------------------------------------------
     def handle(self, text: str, source: str = "voice",
-               confidence: Optional[float] = None) -> CommandResult:
+               confidence: Optional[float] = None,
+               addressee: Optional[Tuple[str, str]] = None) -> CommandResult:
         """Route one utterance. ``confidence`` is the transcript's Whisper
         avg_logprob when the app has one (voice); every other caller
-        leaves it unset."""
+        leaves it unset.
+
+        ``addressee`` is WHOSE TURN THIS IS, taken by the caller at the
+        instant it attributed the turn (``app._dispatch``) and carried
+        here as a value. Round 3 (09-05) measured why that argument has to
+        exist: the reading used to be looked up from module state INSIDE
+        ``self._turn_lock``, i.e. after an unbounded wait, while the
+        writers ran outside it. With a third turn holding the lock 5 ms,
+        200/200 trials answered a guest from his notes and 198/200 refused
+        him his own; the control with no scope flip leaked 0/200. A caller
+        that passes nothing still gets the ambient reading -- but taken
+        ABOVE the lock, so even that caller no longer reads after a wait.
+        """
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
-        self._cast_spoken_over(text)
+        # ONE reading of whose turn this is (jarvis/scope.py), taken HERE
+        # -- above the lock, from the value the attributor passed down --
+        # and carried for the whole turn. A known person who is not the
+        # owner gets the narrow path and nothing below it: not the pending
+        # yes/no rungs (his read-backs are his to answer), not the sticky
+        # modes, not the Tier-1 table that reads his calendar, notes,
+        # memory and held lines with no model and, until 09-04, no scope.
+        who, hon = scope_mod.reading(addressee)
+        if not who:
+            # A sentence outranks a gesture -- HIS sentence. This sat
+            # ABOVE the scope read until round 3 measured a guest's
+            # refused question putting his live carry down
+            # (svc.gesture.spoken_over.called == True): a write to his
+            # state on a turn that was refused for reading anything.
+            self._cast_spoken_over(text)
         with self._turn_lock:
             self._confidence = confidence
             self._turn_source = source
-            # ONE reading of whose turn this is (jarvis/scope.py), taken
-            # here and carried for the whole turn. A known person who is
-            # not the owner gets the narrow path and nothing below it: not
-            # the pending yes/no rungs (his read-backs are his to answer),
-            # not the sticky modes, not the Tier-1 table that reads his
-            # calendar, notes, memory and held lines with no model and,
-            # until 09-04, no scope.
-            who, hon = scope_mod.addressee()
             if who:
                 return self._handle_known(text, source, who, hon)
             armed = (getattr(self, "_pending_send", None),
@@ -10476,14 +10509,67 @@ class Commander:
             undo = getattr(result, "undo", None)
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
+            # WHEN he was last answered aloud, so "say that again" can be
+            # bounded (round-3: the rung had no age limit at all, for
+            # anybody). A repeat must not refresh its own age or the line
+            # never expires.
+            if getattr(result, "reply", "") and \
+                    getattr(result, "speak", False) and not repeat_kind(text):
+                self._owner_said_at = time.monotonic()
         return result
 
     # -- a known person's turn ------------------------------------------
     def _refused(self, what: str, who: str) -> CommandResult:
         """The authored refusal, through the one scope function."""
         line = scope_mod.owner_only(what, who=who)
-        return CommandResult(handled=True, reply=line, speak=True,
-                             status="Not %s's" % who)
+        return self._said_to(who, CommandResult(
+            handled=True, reply=line, speak=True, status="Not %s's" % who))
+
+    # The only line a known person may hear back is one THIS COMMANDER
+    # wrote FOR HER, and only while her attribution would still be live.
+    KNOWN_NOTHING_LINE = "I haven't said anything to you, {name}."
+
+    def _said_to(self, who: str, res: CommandResult) -> CommandResult:
+        """Remember the last line spoken TO ``who``, with its age.
+
+        This is the whole provenance the repeat rung has: a line recorded
+        here was authored by the commander on that person's own turn, so
+        replaying it can disclose nothing of his. ``tts.last_text`` -- what
+        the rung used to hand back -- carries no such claim.
+        """
+        reply = getattr(res, "reply", "") or ""
+        if reply and getattr(res, "speak", False):
+            self._known_last = (who, reply, time.monotonic())
+        return res
+
+    def _repeat_for_known(self, who: str) -> CommandResult:
+        """"Say that again", asked by a known person who is not the owner.
+
+        ROUND-3 BLOCKER 4, MEASURED. This rung called ``_h_repeat``, which
+        returns ``tts.last_text`` verbatim -- a line that may have been
+        said to HIM, at any distance in the past. Five phrasings ("say
+        that again", "what was that", "repeat that", "come again",
+        "pardon") each handed a guest "Your bank balance is 412 dollars
+        and the code is 88213, sir." Nothing tied ``last_text`` to the
+        asker having been in the room when it was first said, and there
+        was no age limit for anybody.
+
+        So the guest path does not read ``tts.last_text`` at all. It
+        replays the last line the commander wrote FOR THIS PERSON, and it
+        expires with her attribution -- ``honorific.ADDRESSEE_TTL``, the
+        same one number the scope and the spoken honorific use, so there
+        is not a second bound to keep in step. DEFAULT-DENY: missing,
+        mismatched or stale is an authored line, never a fall-through.
+        """
+        last = getattr(self, "_known_last", None)
+        if last and last[0] == who and \
+                (time.monotonic() - last[2]) <= float(ADDRESSEE_TTL):
+            return CommandResult(handled=True, reply=last[1], speak=True,
+                                 status="Repeating for %s" % who)
+        log.info("scope: nothing said to %s to repeat", who)
+        return CommandResult(
+            handled=True, speak=True, status="Nothing to repeat for %s" % who,
+            reply=self.KNOWN_NOTHING_LINE.format(name=who or "there"))
 
     def _handle_known(self, text: str, source: str, who: str,
                       hon: str) -> CommandResult:
@@ -10522,13 +10608,13 @@ class Commander:
             return CommandResult(handled=True, reply="Very good.",
                                  speak=False, status="Quiet")
         if repeat_kind(t):
-            return _h_repeat(self, t, True)
+            return self._repeat_for_known(who)
         # 2. Courtesies and greetings: the line, and only the line.
         kind = courtesy_kind(t) or greeting_kind(t)
         if kind:
-            return CommandResult(
+            return self._said_to(who, CommandResult(
                 handled=True, speak=True, status="Courtesy",
-                reply=courtesy_reply(kind, register=_register_name(self)))
+                reply=courtesy_reply(kind, register=_register_name(self))))
         # 3. The table, by name -- the WHOLE of REGISTRY, prefixed or not,
         #    which is stricter than his unprefixed pass (ASSISTANT_TIER1)
         #    on purpose: a matcher of his that accepts her words is a
@@ -10562,7 +10648,7 @@ class Commander:
                                      reply=f"Command failed: {entry.name}",
                                      status="error")
             if res is not None:
-                return res
+                return self._said_to(who, res)
         # 4. The background-chat gate, voice only, as for him -- but an
         #    UNCERTAIN verdict is dropped rather than put on his screen as
         #    a card: a YES there re-runs the words down HIS path.
@@ -11465,8 +11551,21 @@ class Commander:
 
         return self._route_text(text)
 
-    def resolve_uncertain(self, text: str, yes: bool) -> CommandResult:
-        """UI feedback for the 'Was this for me?' prompt."""
+    def resolve_uncertain(self, text: str, yes: bool,
+                          addressee: Optional[Tuple[str, str]] = None
+                          ) -> CommandResult:
+        """UI feedback for the 'Was this for me?' prompt.
+
+        ROUND-3, named lower and closed here: this was a THIRD path around
+        the one scope read. It takes ``self._turn_lock`` and then ran
+        ``_route_text`` -- his whole router -- whatever the scope said.
+        Measured with a guest attributed: "what's on my to-do list" came
+        back "1. buy milk. 2. call the bank about the mortgage." The
+        reading is taken HERE, above the lock, exactly as ``handle`` does.
+        """
+        who, _hon = scope_mod.reading(addressee)
+        if who:
+            return self._refused("the was-that-for-me answer", who)
         with self._turn_lock:
             return self._resolve_uncertain_locked(text, yes)
 

@@ -952,7 +952,7 @@ ADDRESS_BY_NAME_ONLY = ("Call them \"{name}\" now and then, and use no "
 
 
 def set_addressee(name: str = "", honorific: str = "sir",
-                  now=None) -> None:
+                  now=None) -> tuple:
     """WHO the next prompt is written for. Empty name = Hunter.
 
     Called from ``JarvisApp._gate_admits`` with what the owner gate
@@ -970,8 +970,12 @@ def set_addressee(name: str = "", honorific: str = "sir",
     guest is answered. So the cache is KEYED on the addressee
     (``static_system``): his render is built once and handed back byte
     for byte the moment the room is his again.
+
+    RETURNS THE READING IT INSTALLED (round-3, 09-05), so the attributor
+    carries it into the turn instead of every consumer looking the module
+    state up again after a wait -- see jarvis/scope.py.
     """
-    scope_mod.set_addressee(name, honorific, now=now)
+    return scope_mod.set_addressee(name, honorific, now=now)
 
 
 def addressee(now=None) -> tuple:
