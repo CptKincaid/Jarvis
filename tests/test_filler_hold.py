@@ -630,3 +630,43 @@ def test_the_hinted_prompt_does_not_blank_a_real_command(firewall, monkeypatch):
     assert caught == {}
     # ...while a pure stutter still is, and only in the preview.
     assert tr_mod.prompt_echo("um um um", hinted)[1] >= 2
+
+
+# ------------------------------------------------ (7) the one invariant
+@pytest.mark.parametrize("end_s", [0.0, 0.5, 0.96, 1.2, 5.0, 999.0])
+@pytest.mark.parametrize("text", ["set a timer for, um", "set a timer for uh",
+                                  "set a timer for ten minutes", "", "...",
+                                  "Um, uh, hmm, er. Um, uh, hmm, er."])
+def test_no_partial_of_any_shape_ends_a_capture_before_the_ordinary_endpoint(
+        monkeypatch, text, end_s):
+    """The whole feature rests on one invariant: whatever the preview
+    reports -- a stale span, a span from another capture, a decoder
+    runaway, nothing at all -- the capture never ends SOONER than the
+    0.8 s it would have ended at with the hold switched off. A wrong hold
+    costs him one filler_hold_s once; a wrong stop cuts him off
+    mid-sentence. Both 09-05 guards only ever REMOVE an unearned hold, so
+    this is the test that says they cannot have gone the other way.
+
+    WHAT THIS TEST ACTUALLY GUARDS, measured by mutation on 09-05 rather
+    than assumed. Making _filler_hold_extra return -0.5 does NOT turn it
+    red: _check_endpoint returns early on `gap < CONFIG.endpoint_silence`
+    before the filler code is reached, so that early return -- not the
+    hold arithmetic -- is the floor. It goes red (`assert 0.32 >= 0.8`)
+    only when BOTH floors are moved, which is exactly the refactor this
+    test exists to catch: someone hoisting the filler check above the
+    ordinary endpoint.
+
+    Bounded by an iteration count, never a condition: an unbounded push
+    loop against this harness is what OOM-killed the box on 09-05 (only
+    _check_endpoint feeds the endpointer, so audio_seconds cannot move
+    inside a loop that merely appends frames)."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial(text, end_s)
+    for _ in range(200):
+        _push(rec, 5)
+        if rec._check_endpoint():
+            break
+    assert rec.stops, "the capture never ended in 200 poll ticks"
+    (reason, endpoint, dead_air), = rec.stops
+    assert (reason, endpoint) == ("silence", "vad")
+    assert dead_air >= recorder_mod.CONFIG.endpoint_silence
