@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from jarvis import gateledger
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import (
     AlarmFired,
@@ -3510,7 +3511,13 @@ class JarvisApp:
             self.gate = gate_mod.OwnerGate(
                 registry=identity_mod.Registry.load(),
                 get_option=self.get_option,
-                owner=identity_mod.owner_label(self.assistant))
+                owner=identity_mod.owner_label(self.assistant),
+                # THE LEDGER, and shadow mode is worth nothing without it.
+                # Every gated verdict lands in gate.jsonl as decisions and
+                # scores -- never a word of what was said -- so that
+                # scripts/gate_scorecard.py can tell him what enforce would
+                # have done to him before he switches it on.
+                record=gateledger.writer(PATHS.LOG_DIR / "gate.jsonl"))
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: could not be built; it is OFF and "
                           "everyone is being answered")
