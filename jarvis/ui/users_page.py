@@ -79,6 +79,14 @@ VOICE_OWNER_NONE = "voice: no voiceprint enrolled"
 VOICE_GUEST = ("voice: cannot name a guest — there is one voiceprint and "
                "it is the owner's")
 
+# The one amber sentence on a person block. It NAMES the pointer, because
+# the whole failure is that a face label was renamed or deleted in the
+# gallery and the registry row kept pointing at the old one -- which is
+# how the face leg stops naming somebody without ever saying so.
+FACE_DANGLING = ('face: "%s" is not in the face gallery, so the face leg '
+                 "cannot name them; re-enrol them or point the row at the "
+                 "label the gallery actually holds")
+
 # The standing note in the pinned foot. Plain sentences, and the first one
 # is the one this whole feature rests on.
 CANNOT_DO = (
@@ -327,6 +335,10 @@ class Row:
     forget_why: str
     can_change_role: bool
     role_why: str
+    # WHY the face chip is amber, in a line of its own. A tint cannot say
+    # what is wrong, and tinting the whole chips list said it about five
+    # things that were fine. "" whenever there is nothing to explain.
+    face_why: str = ""
 
 
 SOLE_OWNER_FORGET = ("%s is the only owner; forgetting them would leave "
@@ -375,14 +387,18 @@ def _row(person: dict, gallery, sole) -> Row:
     except (TypeError, ValueError):
         dim = 0
     known = bool(face) and face in gallery
+    face_why = ""
     if not face:
+        # no pointer at all is a CHOICE, not a dangling one
         tone = "muted"
     elif known:
         tone = "ok"
     else:
         # A pointer at a gallery label that is not there is exactly how the
-        # face leg silently stops naming anyone.
+        # face leg silently stops naming anyone -- so say so, rather than
+        # tinting a list of chips that are all perfectly correct.
         tone = "warn"
+        face_why = (FACE_DANGLING % face)
     voice = bool(_get(person, "voice", False))
     if role == ROLE_OWNER:
         voice_text = VOICE_OWNER if voice else VOICE_OWNER_NONE
@@ -409,6 +425,7 @@ def _row(person: dict, gallery, sole) -> Row:
                phrase_text=phrase_text, code_text=code_text,
                consent=consent, enrolled_at=enrolled,
                detail="  ·  ".join(bits),
+               face_why=face_why,
                can_forget=not is_sole,
                forget_why=SOLE_OWNER_FORGET % label if is_sole else "",
                can_change_role=not is_sole,
@@ -752,6 +769,22 @@ class UsersPage(tk.Frame):
             width = 0
         return max(px(160), width - 2 * theme.PAD)
 
+    @staticmethod
+    def _wrap_to_own_slot(event=None) -> None:
+        """Wrap ONE label to the width it was actually given.
+
+        For a label that shares a row with a button, the page width is not
+        the room it has. Re-entry guarded: setting wraplength changes the
+        requested height, which can bring another <Configure> straight
+        back round.
+        """
+        try:
+            want = max(px(160), int(event.width))
+            if int(event.widget.cget("wraplength")) != want:
+                event.widget.configure(wraplength=want)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: slot wrap failed", exc_info=True)
+
     def _wrap(self, event=None) -> None:
         """Re-wrap EVERY label the page draws, not only the three fixed
         ones. The chips line under a person is the longest text on the
@@ -1030,11 +1063,22 @@ class UsersPage(tk.Frame):
                                         "block": block}
         detail = tk.Label(block, text=row.detail,
                           font=ui_display(theme.SIZE_CAPTION),
-                          fg=theme.WARN if row.face_tone == "warn"
-                          else theme.MUTED, bg=bg, anchor="w",
+                          fg=theme.MUTED, bg=bg, anchor="w",
                           justify="left", bd=0, padx=0, pady=0)
         detail.pack(fill="x", pady=(px(2), 0))
         self._wrapped.append(detail)
+        if row.face_why:
+            # AMBER MEANS A FAULT AND NOTHING ELSE -- the rule this tree
+            # already keeps (tests/test_ui_classic_frozen.py). Colouring
+            # the chips line put five correct chips in the fault colour;
+            # this puts the colour on the one thing that IS at fault, and
+            # lets it say what to do about it.
+            face_note = tk.Label(block, text=row.face_why,
+                                 font=ui_display(theme.SIZE_CAPTION),
+                                 fg=theme.WARN, bg=bg, anchor="w",
+                                 justify="left", bd=0, padx=0, pady=0)
+            face_note.pack(fill="x")
+            self._wrapped.append(face_note)
         why = row.forget_why or row.role_why
         if why:
             note = tk.Label(block, text=why,
@@ -1058,28 +1102,54 @@ class UsersPage(tk.Frame):
         cmd = tk.Frame(parent, bg=bg)
         cmd.pack(fill="x", pady=(px(2), 0))
         command = forget_face_command(label)
+        RoundButton(cmd, text="Copy", kind="ghost", bg=bg, pad_x=8, pad_y=4,
+                    command=lambda c=command: self._copy(c)).pack(side="right")
         cmd_lbl = tk.Label(cmd, text=command, font=ui_font(theme.SIZE_CAPTION),
                            fg=theme.FAINT, bg=bg, anchor="w", justify="left",
                            bd=0, padx=0, pady=0)
+        # PACKED AFTER Copy, deliberately: pack() hands out parcels in
+        # call order, so a label asking for the whole command on one line
+        # (MEASURED 1395 px) would take the cavity and leave the button
+        # squeezed. The button goes first and keeps its natural width.
         cmd_lbl.pack(side="left", fill="x", expand=True)
-        self._wrapped.append(cmd_lbl)
-        RoundButton(cmd, text="Copy", kind="ghost", bg=bg, pad_x=8, pad_y=4,
-                    command=lambda c=command: self._copy(c)).pack(side="right")
+        # DELIBERATELY NOT in self._wrapped. That list wraps to the PAGE
+        # width, and this label shares its row with Copy -- so the page
+        # width overstates its room by the whole button, and every line
+        # that lands in the difference is drawn past the label's own
+        # window and clipped mid-word (MEASURED 2026-09-05: wraplength 856
+        # inside a 790 px slot at 920x1440). It follows its OWN allocation
+        # instead, which stays right at any window size and whatever the
+        # button beside it happens to measure.
+        cmd_lbl.bind("<Configure>", self._wrap_to_own_slot, add=True)
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", pady=(px(4), 0))
-        entry = tk.Entry(row, width=18, bd=0, relief="flat",
+        # ASKS FOR LITTLE AND GROWS. pack() never shrinks a widget below
+        # its requested width -- fill and expand only ever ADD space -- so
+        # a fixed 18-character entry is a hard floor that pushed the
+        # buttons off the edge at 920x1440. Asking for 8 and expanding
+        # into whatever is left fits every window and still gives him a
+        # wide field at his own.
+        entry = tk.Entry(row, width=8, bd=0, relief="flat",
                          bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
                          fg=theme.INK, insertbackground=theme.CYAN,
                          font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        entry.pack(side="left", ipady=px(3))
+        # THE BUTTONS TAKE THEIR WIDTH FIRST, anchored right, and the entry
+        # gives up whatever is left. MEASURED 2026-09-05 at 920x1440: with
+        # a fixed 18-character entry and both buttons packed left this row
+        # asked for 977 px of a 920 px body, and because the body scrolls
+        # only VERTICALLY the missing 57 px were not scrolled to -- they
+        # were cut, and what was cut was the right-hand end of "Cancel".
+        # A confirm entry 57 px narrower still takes a typed label; half a
+        # Cancel button on the destructive panel is not acceptable.
+        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
+                    pad_y=4, command=self._cancel).pack(side="right",
+                                                        padx=(px(4), 0))
         RoundButton(row, text="Forget %s" % label, kind="ghost", bg=bg,
                     pad_x=10, pad_y=4,
                     command=lambda who=label, e=entry:
                     self._forget_confirm(who, e.get())).pack(
-            side="left", padx=(theme.PAD_S, 0))
-        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="left",
-                                                        padx=(px(4), 0))
+            side="right", padx=(theme.PAD_S, 0))
+        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
         self._row_widgets.setdefault(label, {})["confirm"] = entry
 
     def _build_role_panel(self, parent, bg, label) -> None:
@@ -1145,7 +1215,9 @@ class UsersPage(tk.Frame):
                            fg=theme.FAINT, bg=bg, anchor="w", bd=0,
                            padx=0, pady=0)
             cap.pack(side="left", padx=(0, theme.PAD_S))
-            self._wrapped.append(cap)
+            # NOT wrapped: it is packed to its natural width beside the
+            # buttons, so the page width is not its room either (856 px
+            # claimed inside a 43 px slot). One word needs no wrapping.
             self._role_btn = RoundButton(
                 row, text="known", kind="ghost", bg=bg, pad_x=10, pad_y=4,
                 command=self._toggle_new_role)

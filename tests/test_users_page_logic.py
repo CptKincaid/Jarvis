@@ -357,6 +357,45 @@ def test_a_face_pointer_at_nothing_is_flagged_amber():
     assert rows[0].face_tone == "ok"
 
 
+def test_a_stale_face_pointer_explains_itself_and_tints_nothing_else():
+    """FOUND BY RENDERING AT 1040x1760 AND LOOKING, 2026-09-05.
+
+    ``detail`` is ONE label, and it was drawn in WARN whenever the face
+    pointer was stale -- so "phrase: not set", "code: not set" and the
+    enrolment date all went amber for that person and stayed muted for
+    everybody else, though nothing about them differed. This tree has an
+    explicit rule that amber means a fault and nothing else
+    (tests/test_ui_classic_frozen.py::
+    test_amber_on_the_holo_page_means_a_fault_and_nothing_else), and five
+    non-faults wearing the fault colour breaks it.
+
+    So the fault gets its OWN line, which can also say what is wrong --
+    a tint never could.
+    """
+    rows = up.rows_from(_snapshot())
+    good, stale = rows[0], rows[1]
+    assert good.face_why == ""
+    assert stale.face_tone == "warn"
+    # it NAMES the pointer that is dangling, and says what it costs
+    assert "missing-from-gallery" in stale.face_why
+    assert "gallery" in stale.face_why
+    # and the detail line itself stays a plain list of chips
+    assert "missing-from-gallery" in stale.detail
+
+
+def test_a_person_with_no_face_at_all_is_not_a_fault():
+    """"face: none" is a choice, not a dangling pointer; it must not
+    acquire an amber explanation."""
+    rows = up.rows_from(_snapshot(people=[
+        Person(label="alderman", name="Alderman", role=ROLE_OWNER,
+               voice=True, face="alderman", face_dim=128,
+               code_hash="zzz-a-hash").redacted(),
+        Person(label="pemberton", name="Pemberton",
+               role=ROLE_KNOWN).redacted()]))
+    assert rows[1].face_tone == "muted"
+    assert rows[1].face_why == ""
+
+
 def test_the_sole_owner_cannot_be_forgotten_or_demoted_and_is_told_why():
     rows = up.rows_from(_snapshot())
     owner = rows[0]
@@ -514,19 +553,66 @@ def test_the_command_builder_needs_no_vision_module_at_all(monkeypatch):
                 raise ImportError("blocked for this test: %s" % name)
             return None
 
-    for name in list(sys.modules):
-        if name in blocked or name in ("jarvis.enrolentry",):
-            sys.modules.pop(name, None)
+    def hidden(name):
+        return (name in blocked or name == "jarvis.enrolentry"
+                or any(name.startswith(b + ".") for b in blocked))
+
+    # HAND THEM ALL BACK. cv2 is a PACKAGE: popping the top-level name and
+    # leaving cv2.typing behind meant the next ``import cv2`` re-ran
+    # cv2/__init__.py against its own stale children and raised
+    # "partially initialized module". The whole subtree goes, and every
+    # object comes back -- pinned by the test below.
+    saved = {n: m for n, m in list(sys.modules.items()) if hidden(n)}
+    for name in saved:
+        sys.modules.pop(name, None)
     monkeypatch.syspath_prepend(".")
     sys.meta_path.insert(0, Blocker())
     try:
         ee = importlib.import_module("jarvis.enrolentry")
         cmd = ee.command_line("pemberton", delete=True)
+        # read while the blocker is still up: this is the assertion
+        leaked = [n for n in blocked if n in sys.modules]
     finally:
         sys.meta_path.pop(0)
+        for name in [n for n in list(sys.modules) if hidden(n)]:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
     assert "--delete" in cmd and "--label pemberton" in cmd
-    assert not any(name in sys.modules for name in blocked), \
-        [n for n in blocked if n in sys.modules]
+    assert leaked == [], leaked
+
+
+def test_the_blocker_dance_puts_every_vision_module_back(monkeypatch):
+    """THE TEST ABOVE MUST NOT COST THE SUITE A MODULE.
+
+    FOUND IN THE FULL SUITE, 2026-09-05: it popped ``cv2`` out of
+    ``sys.modules`` and never put it back. ``cv2`` is a PACKAGE, so
+    dropping the top-level name while ``cv2.typing`` and the rest stayed
+    behind left the next ``import cv2`` re-executing ``cv2/__init__.py``
+    against its own stale children -- "partially initialized module 'cv2'
+    has no attribute 'mat_wrapper'". tests/test_webapp.py's QR decode ran
+    later in the same process and was the one that died, which is why the
+    failure looked like somebody else's.
+
+    So this pins the hygiene rather than the symptom: after that test has
+    run, the vision modules are exactly the objects they were before it.
+    """
+    import sys
+
+    cv2 = pytest.importorskip("cv2")
+    def names():
+        return {n: sys.modules[n] for n in list(sys.modules)
+                if n == "cv2" or n.startswith("cv2.")}
+
+    before = names()
+    assert before, "cv2 was not loaded, so this pins nothing"
+
+    test_the_command_builder_needs_no_vision_module_at_all(monkeypatch)
+
+    after = names()
+    assert set(after) == set(before), (
+        "left behind: %s / lost: %s"
+        % (sorted(set(after) - set(before)), sorted(set(before) - set(after))))
+    assert after["cv2"] is cv2, "cv2 was replaced by a rebuilt module"
 
 
 def test_the_page_builds_the_same_command_the_voice_path_hands_over():

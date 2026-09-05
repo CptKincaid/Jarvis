@@ -261,6 +261,28 @@ def test_every_person_and_the_gate_s_own_line_are_on_the_page(root):
     assert "owner-gate:" in blob, "the tab and the log must agree on the mode"
 
 
+def test_only_the_face_fault_is_amber_and_not_the_whole_detail_line(root):
+    """The same defect, on the widget tree at HIS window. The chips label
+    must be MUTED even for the person whose pointer is stale; the amber
+    belongs to a line of its own that says what is wrong."""
+    snap = _snapshot(n=2)
+    snap["people"][1]["face"] = "gone-from-the-gallery"
+    page, _svc, _host = _page(root, snapshot=snap)
+    labels = [w for w in _walk(page)
+              if w.__class__.__name__ == "Label"]
+    detail = [w for w in labels
+              if "phrase: not set" in str(w.cget("text"))]
+    assert detail, "no chips line was drawn"
+    for w in detail:
+        assert str(w.cget("fg")) == str(theme.MUTED), (
+            "the chips line is wearing the fault colour: %r"
+            % str(w.cget("text")))
+    amber = [w for w in labels
+             if str(w.cget("fg")) == str(theme.WARN)
+             and "gone-from-the-gallery" in str(w.cget("text"))]
+    assert amber, "the dangling face pointer is never explained in amber"
+
+
 def test_the_sole_owner_s_destructive_controls_are_disabled(root):
     page, _svc, _host = _page(root, snapshot=_snapshot(1))
     row = page._row_widgets["alderman"]
@@ -554,6 +576,106 @@ def test_arming_a_forget_brings_its_confirmation_into_view(root):
 
 
 # ===================== what the 31-users-add render showed at 1040x1760
+@pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
+def test_the_delete_command_wraps_inside_its_own_slot_not_the_page(root, geom):
+    """FOUND BY LOOKING AT 1040x1760, 2026-09-05.
+
+    The delete command SHARES ITS ROW with the Copy button, but it was
+    wrapped to the whole page width like every other label -- so it was
+    told it had ~90 px more room than pack() had actually given it, and a
+    line landing in that gap is drawn past the label's own window and
+    clipped mid-word. It is the identical defect the chips line already
+    carries a comment about; this row was simply missed because the
+    button beside it is what makes the slot narrower.
+
+    The invariant, checked at BOTH his sizes: a label never wraps to more
+    room than it was given.
+    """
+    page, _svc, _host = _page(root, snapshot=_snapshot(n=2), geometry=geom)
+    page._lock.unlock()
+    page._forget_pressed("guest0")
+    root.update_idletasks()
+    root.update()
+    cmd = [w for w in _walk(page)
+           if w.__class__.__name__ == "Label"
+           and "--delete" in str(w.cget("text"))]
+    assert cmd, "the delete command is not on the panel"
+    for w in cmd:
+        allotted = int(w.winfo_width())
+        assert allotted > 1, "the row never got laid out"
+        assert int(w.cget("wraplength")) <= allotted, (
+            "wrapped to %d px inside a %d px slot, so ~%d px of every full "
+            "line is clipped" % (int(w.cget("wraplength")), allotted,
+                                 int(w.cget("wraplength")) - allotted))
+
+
+@pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
+def test_nothing_you_have_to_press_runs_off_the_right_edge(root, geom):
+    """FOUND ON THE 920x1440 RENDER, 2026-09-05.
+
+    The forget panel's row is an entry, "Forget <label>" and "Cancel", and
+    the delete command shares its row with "Copy". At his 1040 window they
+    fit. At 920 they did not: the body scrolls VERTICALLY only, so the
+    overflow is not scrolled to, it is simply cut -- the render showed
+    "Co" and "Car" against the window edge.
+
+    A control you cannot fully see is a control you cannot trust you have
+    pressed, and this is the destructive panel. Measured on the widget
+    tree at both his sizes.
+    """
+    page, _svc, _host = _page(root, snapshot=_snapshot(n=2), geometry=geom)
+    page._lock.unlock()
+    page._forget_pressed("guest0")
+    root.update_idletasks()
+    root.update()
+    # The body is a canvas that scrolls VERTICALLY. Its content frame is
+    # forced to the canvas width, so anything the frame REQUESTS beyond
+    # that is not scrolled to -- it is squeezed off the right edge. So the
+    # measurement is the content frame's requested width against the
+    # canvas it has to live in.
+    cv = page._canvas
+    inner = [root.nametowidget(cv.itemcget(i, "window"))
+             for i in cv.find_all() if cv.type(i) == "window"]
+    assert inner, "the scrolling body has no content frame"
+    for w in inner:
+        want, room = int(w.winfo_reqwidth()), int(cv.winfo_width())
+        assert want <= room, (
+            "the forget panel asks for %d px of a %d px body, so %d px of "
+            "it is cut off the right edge" % (want, room, want - room))
+
+
+@pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
+def test_no_label_on_this_page_wraps_wider_than_its_own_slot(root, geom):
+    """THE GENERAL FORM of the defect above, so the next row that puts a
+    button beside a paragraph cannot reintroduce it quietly.
+
+    Swept across the three states the page actually reaches -- the list,
+    an armed forget, and the add form -- at both his window sizes.
+    """
+    page, _svc, _host = _page(root, snapshot=_snapshot(n=3), geometry=geom)
+    page._lock.unlock()
+    bad = []
+    for state in ("list", "forget", "add"):
+        if state == "forget":
+            page._forget_pressed("guest0")
+        elif state == "add":
+            page._forget.disarm()
+            page._add_pressed()
+        root.update_idletasks()
+        root.update()
+        for w in _walk(page):
+            if w.__class__.__name__ != "Label":
+                continue
+            try:
+                wrap = int(w.cget("wraplength"))
+                got = int(w.winfo_width())
+            except Exception:                      # noqa: BLE001
+                continue
+            if wrap and got > 1 and wrap > got:
+                bad.append((state, str(w.cget("text"))[:44], wrap, got))
+    assert bad == [], bad
+
+
 @pytest.mark.parametrize("geom", [(HIS_W, HIS_H), (OLD_W, OLD_H)])
 def test_create_is_pinned_where_add_is_and_never_scrolls_away(root, geom):
     """The consent paragraph is twenty lines. With Create at the bottom of
