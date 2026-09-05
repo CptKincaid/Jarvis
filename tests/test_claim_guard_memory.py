@@ -501,3 +501,147 @@ def test_a_streamed_retry_that_runs_a_tool_and_reclaims_speaks_the_time_then_the
     assert record == [("get_time", None)]
     assert tags == [("STREAMED", "2"), ("SPEAK", f"It's five past four, sir. {MEMORY_LINE}")]
 
+
+# ------------------------------------ (6) an observation wearing the verb
+# "I have noted that the lab has no listed duration" is an OBSERVATION in
+# the store's clothes. _memory_claim_src takes one switch: strict flags
+# every "noted/remember that ..." whatever follows; observation_exempt
+# lets "that <clause>" through and keeps "that, sir" / "that." / "that
+# for you". Both rules are measured here over 60 sentences in three
+# groups -- STORE (a claim to have stored a fact: must flag), OBSERVATION
+# (the judgement calls), PLAIN (ordinary English: must never flag) -- and
+# the decision is pinned with its cost.
+#
+# The refuter's own 40-sentence list did not survive (the workflow's logs
+# were empty by the time the finisher read them); the 40 below are every
+# sentence its report names verbatim plus that sentence's family, and the
+# 20 marked MINE are the finisher's. The four OBSERVATIONs it named are
+# all here.
+STORE_, OBS_, PLAIN_ = "store", "observation", "plain"
+REFUTER_FAMILY = [
+    # the lie, in every coat the report lists
+    ("I have noted that, sir.", STORE_),
+    ("I have noted that you graduate December 10th.", STORE_),   # the incident, fact spelled out
+    ("I'll remember that, sir.", STORE_),
+    ("I've saved that to memory.", STORE_),
+    ("I'll keep that in mind, sir.", STORE_),
+    ("I've made a note of that, sir.", STORE_),
+    ("I won't forget that, sir.", STORE_),
+    ("I'll make a note of that for you.", STORE_),
+    ("I noted that already, sir.", STORE_),
+    ("I have noted that for you, sir.", STORE_),
+    # the four observations the report measured as FLAG
+    ("I have noted that the lab has no listed duration.", OBS_),
+    ("I've noted that it rains tomorrow.", OBS_),
+    ("I will remember that meeting fondly, sir.", OBS_),
+    ("I'll remember that face.", OBS_),
+    # the legitimate lines it named, and their families
+    ("I've saved you twenty minutes, sir.", PLAIN_),
+    ("I've saved you some time, sir.", PLAIN_),
+    ("I've saved you the trouble of a second trip.", PLAIN_),
+    ("I've saved you a trip to the lab, sir.", PLAIN_),
+    ("As I noted earlier, the lab has no listed duration.", PLAIN_),
+    ("As I noted this morning, your flight is at nine.", PLAIN_),
+    ("You noted that yourself last week, sir.", PLAIN_),
+    ("It is noted in your calendar as a tentative hold.", PLAIN_),
+    ("I remember that day well, sir.", PLAIN_),
+    ("I can't remember that, sir; it was before my time.", PLAIN_),
+    ("I haven't noted anything about your graduation, sir.", PLAIN_),
+    ("Shall I remember that for you, sir?", PLAIN_),
+    ("Would you like me to keep that in mind?", PLAIN_),
+    ("I'll keep it short, sir.", PLAIN_),
+    ("I'll remember this evening for a long time, sir.", PLAIN_),
+    ("I'm afraid I have no way to store that, sir; say remember that and I shall.", PLAIN_),
+    ("Nothing is stored in my memory about that, sir.", PLAIN_),
+    ("I don't remember that, sir.", PLAIN_),
+    ("Just as I noted yesterday, the dentist is at ten.", PLAIN_),
+    ("Your calendar notes that the lab is booked until four.", PLAIN_),
+    ("I remember it well: you said December 10th.", PLAIN_),
+    ("That is noted in your journal, sir, not in my memory.", PLAIN_),
+    ("I'll keep that short and to the point, sir.", PLAIN_),
+    ("I remember that you prefer tea, sir.", PLAIN_),
+    ("You'll remember that the lab closes early on Fridays.", PLAIN_),
+    ("I noted nothing unusual in the logs, sir.", PLAIN_),
+]
+MINE = [
+    # stores about a THIRD PARTY or a THING: what "Do remember that Heather
+    # prefers email" earns as a reply. Only "that you ..." would be caught
+    # by a rule that exempts "that <clause>", and these are not about him.
+    ("I've noted that Heather prefers email, sir.", STORE_),
+    ("I have noted that your locker code is 4412.", STORE_),
+    ("I'll remember that the lab moved to room 049.", STORE_),
+    ("I'll remember that you prefer the window seat.", STORE_),
+    ("I've committed that to memory: December 10th.", STORE_),
+    # observations of the same family as the report's four
+    ("I've noted that the file is empty, sir.", OBS_),
+    ("I have noted that nothing is on your calendar today.", OBS_),
+    ("I've noted that the meeting overlaps your dentist appointment.", OBS_),
+    ("I'll remember that one, sir; it was a good joke.", OBS_),
+    ("I have noted that the printer is offline again.", OBS_),
+    ("I'm noting that the forecast has changed since this morning.", OBS_),
+    ("I've remembered that the shop shuts at six on Sundays.", OBS_),
+    ("I have noted that the two of them share a birthday.", OBS_),
+    # plain
+    ("I keep that in mind whenever I plan your mornings, sir.", PLAIN_),
+    ("Do you want me to make a note of that?", PLAIN_),
+    ("I could make a note of that if you like, sir.", PLAIN_),
+    ("I have no memory of that, sir.", PLAIN_),
+    ("It was noted at the time, sir, by your supervisor.", PLAIN_),
+    ("I'd remember that if I could, sir.", PLAIN_),
+    ("Noted in passing: the kettle is on.", PLAIN_),
+]
+CORPUS = REFUTER_FAMILY + MINE
+
+
+def _flagged_by(observation_exempt):
+    """The corpus sentences the table flags under one rule, by group."""
+    import re
+    src = brain_mod._memory_claim_src(observation_exempt=observation_exempt)
+    # the memory branch alone, in the table's own position and with the
+    # same three vetoes _sentence_claim applies
+    rx = re.compile(r"\b(?:" + src + r")", re.I)
+    out = {STORE_: [], OBS_: [], PLAIN_: []}
+    for sent, group in CORPUS:
+        if brain_mod._CLAIM_HEDGE_RX.search(sent):
+            continue
+        for m in rx.finditer(sent):
+            if brain_mod._CLAIM_NEGATED_RX.search(sent[:m.start()]):
+                continue
+            if brain_mod._CLAIM_REPORTED_RX.search(sent[:m.start()]):
+                continue
+            if brain_mod._CLAIM_IDIOM_RX.match(sent[m.end():]):
+                continue
+            out[group].append(sent)
+            break
+    return out
+
+
+def test_the_corpus_is_the_sixty_it_says_it_is():
+    assert len(REFUTER_FAMILY) == 40 and len(MINE) == 20
+    assert len({s for s, _ in CORPUS}) == 60
+    assert [g for _, g in CORPUS].count(STORE_) == 15
+    assert [g for _, g in CORPUS].count(OBS_) == 12
+    assert [g for _, g in CORPUS].count(PLAIN_) == 33
+
+
+def test_strict_is_the_rule_compiled_and_this_is_what_it_costs():
+    """MEASURED over the 60: strict flags 15/15 stores and 0/33 plain,
+    at the price of 12/12 observations (a retry each, kept when honest).
+    observation_exempt flags 0/33 plain too, and 0/12 observations --
+    but only 10/15 stores: it lets "I have noted that you graduate
+    December 10th" (the incident with its fact spelled out) and every
+    store about a third party or a thing walk through, five in all. A
+    store's object is any fact he gives, so no rule on the WORDS after
+    "that" can tell a store from an observation; the retry can. Strict
+    stands. (The finisher guessed 9/15 before measuring; it is 10.)"""
+    strict, exempt = _flagged_by(False), _flagged_by(True)
+    assert brain_mod._MEMORY_CLAIM_SRC == brain_mod._memory_claim_src(observation_exempt=False)
+    # the compiled table agrees with the strict branch measured alone
+    assert sorted(s for s, g in CORPUS if brain_mod.unbacked_claim(s)) == \
+        sorted(strict[STORE_] + strict[OBS_] + strict[PLAIN_])
+    assert (len(strict[STORE_]), len(strict[OBS_]), len(strict[PLAIN_])) == (15, 12, 0)
+    assert (len(exempt[STORE_]), len(exempt[OBS_]), len(exempt[PLAIN_])) == (10, 0, 0)
+    missed = [s for s, g in CORPUS if g == STORE_ and s not in exempt[STORE_]]
+    assert "I have noted that you graduate December 10th." in missed
+    assert "I've noted that Heather prefers email, sir." in missed
+    assert len(missed) == 5
