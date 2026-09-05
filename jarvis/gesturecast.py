@@ -185,6 +185,9 @@ class GestureCast:
                  worker: Optional[Callable[[Callable[[], None]], None]] = None,
                  view_launch: Optional[Callable[[str], object]] = None,
                  view_stop: Optional[Callable[[], object]] = None,
+                 view_alive: Optional[Callable[[], bool]] = None,
+                 view_ack_wait: Optional[Callable[[float], object]] = None,
+                 view_settle: Optional[Callable[[float], object]] = None,
                  now: Callable[[], float] = time.monotonic,
                  wall: Callable[[], float] = time.time,
                  thresholds=None, mirrored: Optional[bool] = None,
@@ -249,11 +252,21 @@ class GestureCast:
             # window is what that test exists to keep out. Both launchers
             # are INJECTED and default to None, so a courier built by a
             # test opens nothing.
+            # ``view_alive`` is not optional decoration: without it the
+            # sink cannot tell whether the viewer it spawned is still
+            # there, so it reports itself unavailable rather than claiming
+            # a landing off a Popen that merely forked.
             "spark-view": view_mod.SparkViewSink(
-                launch=view_launch, stop=view_stop,
-                state=self.view_state, now=now),
+                launch=view_launch, stop=view_stop, alive=view_alive,
+                settle=view_settle, state=self.view_state, now=now),
+            # ``view_ack_wait`` is how the sink waits for HPCOMPUTER to
+            # acknowledge the verb; None is the real one -- the relay's own
+            # event, set when the poll route answers the Windows script. A
+            # test injects the helper's half of the round trip here rather
+            # than reaching inside the sink.
             "hp-view": view_mod.HpViewSink(relay=self.relay,
-                                           state=self.view_state, now=now),
+                                           state=self.view_state,
+                                           wait=view_ack_wait, now=now),
         }
         self.views = view_mod.registry(self.registry["spark-view"],
                                        self.registry["hp-view"])

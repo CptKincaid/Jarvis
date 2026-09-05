@@ -59,6 +59,24 @@ plausible: correct magnitudes, believable angles, wrong side of the room. A
 test that checks ``|B - A|`` passes with the sign inverted, so the tests here
 assert a NAMED DIRECTION on a trajectory whose direction is in its own name.
 
+A THROW MUST BE A THROW, AND LEAVING THE PICTURE IS NOT INTENT. The first
+draft said it was: ``throw_exit_u`` dropped to a quarter hand-width on the
+reasoning that at reach distance there is often no room for more. MEASURED
+09-05 over 1232 desk sequences: 448 false fires, P(fire | not a cast
+gesture) = 0.36, and every one of them the same shape -- reach at the
+screen, close the hand on something, carry it out of the picture, no fling
+and no release. A man carrying a mug leaves the picture. Distance cannot
+tell the two apart, because a carried hand and a flung hand cover the SAME
+~2 units before the frame edge takes them; SPEED can, by a factor of three.
+So every distance bar is kept and one requirement is put in front of all
+three of them: the hand must have been travelling at ``throw_speed_us``
+within ``fling_window_s`` of the last frame that saw it. That took the same
+grid to 0. What it does NOT do is separate his own slow deliberate throw
+(measured floor 3.02 hand-units/s) from a mug hurried out in 1.6 s (peak
+3.34): those are the same motion here, the bar sits between the mug's
+ordinary speeds and his gesture, and the residual is stated in
+``tests/test_gesture.py`` rather than hidden.
+
 THE CANCELS, and where each lives. Opening the hand where it is (a
 release under one hand-unit of travel), pulling it back STILL CLOSED
 (``reach_exit``, re-tested on every carry frame), a fling at the desk (the
@@ -366,6 +384,39 @@ class CastThresholds:
     throw_lost_u: float = 0.50
     exit_step_u: float = 0.35
     edge_frac: float = 0.30
+    # MEASURED (the carry-out attack, 09-05), AND THE BAR THAT NOW DECIDES.
+    # The three distance bars above cannot separate a throw from a mug: a
+    # hand carried out of the picture and a hand flung out of it cover the
+    # SAME ~2 units before the frame edge takes them, so raising
+    # throw_exit_u buys nothing. Speed can, and by a factor of three. Peak
+    # image speed of the carry, in HAND-UNITS PER SECOND (one unit is one
+    # palm_diag, 127 mm on the guessed anthropometry, so 3.0 u/s is about
+    # 380 mm/s at his reach):
+    #
+    #   the design's own throw (250-400 ms swing)   min 3.06  p05 4.90
+    #   a slow deliberate throw (0.8 s swing)       min 3.02  p05 3.18
+    #   a mug carried out over 2.0 s (235 mm/s)     max 2.73  p50 2.35
+    #   a mug carried out over 2.4 s                max 2.35  p50 1.98
+    #   a mug carried out over 3.2 s (147 mm/s)     max 1.83  p50 1.52
+    #
+    # over 5.5-8.0 fps with 0/3/5/8 px of landmark noise. 3.0 is the
+    # highest bar that leaves BOTH throw families intact. IT IS NOT A
+    # SEPARATION: his own slow throw floors at 3.02 and a mug hurried out
+    # in 1.6 s peaks at 3.34, and those two motions are the same motion by
+    # every signal this rig has. The bar is placed to keep the gesture and
+    # to take the whole band below it; what remains above it is stated in
+    # the tests rather than hidden.
+    #
+    # PER SECOND, NOT PER FRAME, and so ``for_fps`` must not touch it: a
+    # throw is fast in the world, not fast per sample, and the same fling
+    # sampled at 15 fps moves half as far between frames.
+    throw_speed_us: float = 3.0
+    # How stale the fling may be when the carry ends. The hand must have
+    # been travelling at throw speed within this much of the LAST FRAME
+    # THAT SAW IT -- so a jerk at the start of a four-second carry cannot
+    # be spent at the end of it. 0.55 s is four frames at 7.5 fps and one
+    # at the camera's 2 fps idle rate.
+    fling_window_s: float = 0.55
     # 2 frames is 267 ms at 7.5 fps: long enough to ride out one missed
     # detection, short enough that an unexplained gap ends the carry rather
     # than persisting it. Failing safe here means dropping, not holding.
@@ -578,6 +629,13 @@ class CastGesture:
         self._last: Optional[tuple[float, float]] = None
         self._last_fist: Optional[tuple[float, float]] = None
         self._last_step_u = 0.0
+        # The fling test. ``_last_seen_at`` is the clock at the last frame
+        # that actually held the carried hand -- the exit branch fires
+        # LATER than that, and the speed of the hand belongs to the frame
+        # that saw it, not to the frame that noticed it was gone.
+        self._last_seen_at: Optional[float] = None
+        self._speed_us = 0.0
+        self._fling_at = -1e9
         self._dist_u = 0.0
         self._reach = 0.0
         self._closed = 0.0
@@ -649,6 +707,8 @@ class CastGesture:
                 "lost": int(self._lost), "carry": int(self._carry),
                 "carry_s": round(now - started, 3) if started else 0.0,
                 "dist_u": round(float(self._dist_u), 4),
+                "speed_us": round(float(self._speed_us), 3),
+                "flung": bool(self._was_flung()),
                 "reach": round(float(self._reach), 4),
                 "closed": round(float(self._closed), 4),
                 "held": self.held, "ambiguous": bool(self._ambiguous),
@@ -826,6 +886,7 @@ class CastGesture:
         if self._last is not None:
             self._last_step_u = math.hypot(o.cx - self._last[0],
                                            o.cy - self._last[1]) / unit
+        self._note_speed(now)
         self._last = (o.cx, o.cy)
         self._dist_u = math.hypot(o.cx - self._anchor[0],
                                   o.cy - self._anchor[1]) / unit
@@ -842,6 +903,43 @@ class CastGesture:
         return None
 
     # ----------------------------------------------------------- helpers
+    def _note_speed(self, now: float) -> None:
+        """How fast the hand was travelling on the step just measured, and
+        WHEN it was last travelling like a fling.
+
+        In hand-units per SECOND, off the injected clock rather than off
+        the frame counter, so a dropped frame or a jittered interval
+        reports the speed the hand actually had rather than half of it. A
+        cycle with no measurable interval -- a hand-wound clock that has
+        not moved -- falls back to one frame period at the tuned rate; it
+        must never read as infinite speed, which is how a bar like this
+        becomes a hole.
+        """
+        seen = self._last_seen_at
+        dt = (now - seen) if seen is not None else 0.0
+        if dt <= 0.0:
+            dt = 1.0 / self.preview_fps
+        self._speed_us = self._last_step_u / dt
+        if self._speed_us >= self.t.throw_speed_us:
+            self._fling_at = now
+        self._last_seen_at = now
+
+    def _was_flung(self) -> bool:
+        """Was the hand still FLINGING when the picture last held it?
+
+        THE WHOLE OF THE FIX, and the sentence it stands on: leaving the
+        picture is not intent -- a man carrying a mug leaves the picture --
+        so a carry becomes a throw only if the hand was travelling at
+        ``throw_speed_us`` within ``fling_window_s`` of the last frame that
+        saw it. A mug cannot satisfy that: carried out at the measured
+        147 mm/s it moves at a fifth of the bar, and no amount of distance
+        substitutes for speed.
+        """
+        seen = self._last_seen_at
+        if seen is None:
+            return False
+        return (seen - self._fling_at) <= float(self.t.fling_window_s)
+
     def _carry_expired(self, now: float) -> bool:
         if self._carry > self.t.carry_max_frames:
             return True
@@ -868,6 +966,9 @@ class CastGesture:
         self._last_fist = None
         self._dist_u = 0.0
         self._last_step_u = 0.0
+        self._last_seen_at = None
+        self._speed_us = 0.0
+        self._fling_at = -1e9
 
     def _tick_cooldown(self) -> None:
         self._cool -= 1
@@ -921,6 +1022,11 @@ class CastGesture:
         self._lost = 0
         self._dist_u = 0.0
         self._last_step_u = 0.0
+        # The carry starts here and so does the fling clock. A fist that
+        # was moving before it was ever picked up brings no credit with it.
+        self._last_seen_at = now
+        self._speed_us = 0.0
+        self._fling_at = -1e9
         return self._emit(CastEvent(
             kind="grab", at=now, frame=self._frame, dist_u=0.0,
             reach=o.reach, closed=o.closed, why="held",
@@ -936,6 +1042,9 @@ class CastGesture:
         self._anchor = None
         self._last = None
         self._last_fist = None
+        self._last_seen_at = None
+        self._speed_us = 0.0
+        self._fling_at = -1e9
 
     def _end_carry(self, reason: str, now: float) -> CastEvent:
         """The whole throw decision, in one place.
@@ -960,10 +1069,15 @@ class CastGesture:
         dist_u = math.hypot(dx, dy) / unit
         vec_bearing = bearing_deg(*to_his_frame(dx, dy, self.mirrored))
         why, thrown, bearing = reason, False, vec_bearing
+        # A THROW MUST BE A THROW. Every distance bar below is kept exactly
+        # as it was and every one of them now has this in front of it: the
+        # hand has to have been FLINGING when the picture last held it.
+        flung = self._was_flung()
 
         if reason == "released":
-            thrown = dist_u >= self.t.throw_release_u
-            why = "released"
+            far = dist_u >= self.t.throw_release_u
+            thrown = far and flung
+            why = "released" if (flung or not far) else "set down, not flung"
         elif reason == "exit":
             edge, frac, edge_bear = edge_bearing(
                 end[0], end[1], self.frame_w, self.frame_h, self.mirrored)
@@ -976,12 +1090,15 @@ class CastGesture:
             agrees = _turn_between(vec_bearing, edge_bear) <= 90.0
             if frac <= self.t.edge_frac and agrees:
                 bearing = edge_bear
-                thrown = dist_u >= self.t.throw_exit_u
-                why = "left frame (his %s)" % edge
+                far = dist_u >= self.t.throw_exit_u
+                thrown = far and flung
+                why = ("left frame (his %s)" % edge if (flung or not far)
+                       else "carried out of frame, not flung")
             else:
-                thrown = (dist_u >= self.t.throw_lost_u
-                          and self._last_step_u >= self.t.exit_step_u)
-                why = "lost"
+                far = (dist_u >= self.t.throw_lost_u
+                       and self._last_step_u >= self.t.exit_step_u)
+                thrown = far and flung
+                why = "lost" if (flung or not far) else "lost, not flung"
         # 'timeout', 'stalled', 'withdrawn' and 'cancelled (...)' are never
         # throws: a carry that ran out, was pulled back closed, or that he
         # ended with a word, is him having put it down, not flung it.
@@ -1025,11 +1142,13 @@ def describe(t: CastThresholds = CastThresholds(),
     ms = 1000.0 / max(float(fps), 0.1)
     return ("cast: C<=%.2f closed / >=%.2f open, R>=%.2f grab (arm %.2f), "
             "dwell %d fr (%.0f ms), grace %d fr, cooldown %d fr, cap %d fr "
-            "(%.1f s) or %.1f s, targets %s at %.1f fps"
+            "(%.1f s) or %.1f s, fling >=%.1f u/s within %.2f s, "
+            "targets %s at %.1f fps"
             % (t.closed_max, t.open_min, t.reach_min, t.reach_arm,
                t.dwell_frames, t.dwell_frames * ms, t.lost_grace_frames,
                t.cooldown_frames, t.carry_max_frames,
                t.carry_max_frames * ms / 1000.0, t.carry_max_s,
+               t.throw_speed_us, t.fling_window_s,
                "/".join(t.target_sectors), fps))
 
 

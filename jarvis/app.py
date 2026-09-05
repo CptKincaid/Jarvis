@@ -1434,6 +1434,7 @@ class JarvisApp:
                 transfer=self._spotify_transfer,
                 view_launch=self._rustdesk_view,
                 view_stop=self._rustdesk_close,
+                view_alive=self._rustdesk_alive,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
@@ -1472,6 +1473,18 @@ class JarvisApp:
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
         log.info("cast: opened a viewer on %s", host)
+
+    def _rustdesk_alive(self) -> bool:
+        """Is the viewer THIS app started still running?
+
+        ``Popen`` returning is only evidence that the fork worked, and
+        jarvis/castview.py may not call a cast landed on that: a viewer
+        that cannot reach the host, cannot open a window or dies on a
+        missing display is gone within a moment, and this is what notices.
+        ``poll()`` is None while the child lives.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        return proc is not None and proc.poll() is None
 
     def _rustdesk_close(self) -> None:
         self._close_rustdesk()

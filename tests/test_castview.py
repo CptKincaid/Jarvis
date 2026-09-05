@@ -48,19 +48,42 @@ def subject(kind: str = "screen", spoken: str = "the Spark's screen"):
     return CastSubject(kind, spoken, at=1000.0)
 
 
-def deck(clock=None, *, launch=True, helper_at=None):
+def deck(clock=None, *, launch=True, helper_at=None, answers=True,
+         viewer_up=True):
     """Both sinks and the shared live-cast state, with recorders behind
-    every outward edge."""
+    every outward edge.
+
+    NEITHER SINK MAY CLAIM A LANDING IT CANNOT SEE (09-05), so this deck
+    now supplies both confirmations. ``answers`` plays the Windows script's
+    half of the round trip -- wake on the parked long poll, take the verb,
+    act, poll again quoting the sequence it acted on, which is the receipt.
+    ``viewer_up`` is the Spark viewer's aliveness a moment after launch.
+    Set either False for a cast that goes out and is never confirmed.
+    """
     clock = clock or Clock()
-    rec = {"launched": [], "stopped": [], "verbs": []}
+    rec = {"launched": [], "stopped": [], "verbs": [], "naps": []}
     state = cv.ViewState(now=clock)
     relay = cv.CastRelay(now=clock)
     if helper_at is not None:
         relay.note(mon=1, layout="0,1920,1920,1920", at=helper_at)
+    helper_seq = [-1]
+
+    def helper(_timeout_s):
+        if not answers:
+            return False
+        got = relay.poll(helper_seq[0], timeout_s=0.0)
+        if got["seq"] != helper_seq[0]:
+            helper_seq[0] = got["seq"]
+            rec["verbs"].append(got["verb"])
+            relay.poll(helper_seq[0], timeout_s=0.0)   # ...and it says so
+        return True
+
     spark = cv.SparkViewSink(
         launch=(lambda host: rec["launched"].append(host)) if launch else None,
-        stop=lambda: rec["stopped"].append(1), state=state, now=clock)
-    hp = cv.HpViewSink(relay=relay, state=state, now=clock)
+        stop=lambda: rec["stopped"].append(1),
+        alive=lambda: viewer_up, settle=rec["naps"].append,
+        state=state, now=clock)
+    hp = cv.HpViewSink(relay=relay, state=state, now=clock, wait=helper)
     return spark, hp, relay, state, rec, clock
 
 
@@ -412,3 +435,138 @@ class TestTheStartupFile:
         for leak in ("MainWindowTitle", "GetForegroundWindow", "Get-Clipboard",
                      "Cursor]::Position.X", "$env:USERNAME"):
             assert leak not in src, leak
+
+
+# ==================================== never say it landed until it has
+class TestReceiptNotHope:
+    """cast.py's oldest promise, made true in both directions.
+
+    ``CastResult.landed`` and ``.held`` are separate booleans and neither
+    is ever inferred from the other. Both view sinks broke the spirit of
+    that: HpViewSink said "The Spark's screen is on HPCOMPUTER, sir" the
+    instant the verb was PARKED for a helper that may last have polled
+    59 seconds ago, and SparkViewSink said the mirror of it whenever
+    ``launch()`` merely failed to raise -- and the real launcher is a
+    Popen, so a viewer that starts and dies a moment later reported
+    success. Neither had any confirmation behind it at all.
+    """
+
+    # -- Spark -> HPCOMPUTER: the helper must acknowledge RECEIPT --------
+    def test_a_parked_verb_is_not_a_landing(self):
+        """The helper is inside its alive window but never comes back for
+        the verb. Parked is not received, so this HOLDS."""
+        spark, hp, relay, state, rec, clock = deck(helper_at=1000.0,
+                                                   answers=False)
+        res = hp.deliver(subject())
+        assert not res.landed
+        assert res.held and res.spoken
+        assert state.live == ""            # and the deck is given back
+
+    def test_it_lands_when_the_helper_polls_back_for_the_verb(self):
+        """The receipt IS the helper's next poll: it long-polls carrying
+        the sequence it last acted on, so a poll quoting our sequence is
+        it saying 'I have this one'."""
+        spark, hp, relay, state, rec, clock = deck(helper_at=1000.0)
+        seen = []
+
+        def helper(timeout_s):
+            # the Windows script wakes, takes the verb, acts, polls again
+            got = relay.poll(relay.seq - 1, timeout_s=0.0)
+            seen.append(got["verb"])
+            relay.poll(got["seq"], timeout_s=0.0)
+            return True
+
+        res = hp.deliver(subject(), wait=helper)
+        assert seen == [cv.VERB_SHOW]
+        assert res.landed and not res.held
+        assert "HPCOMPUTER" in res.spoken
+        assert state.live == "hp-view"
+
+    def test_an_unreceipted_verb_is_taken_back_off_the_relay(self):
+        """Nothing is left queued for a machine that did not answer: a
+        helper that wakes up a minute later must not open a window for an
+        intention Jarvis has already said it did not carry out."""
+        spark, hp, relay, state, rec, clock = deck(helper_at=1000.0,
+                                                   answers=False)
+        hp.deliver(subject())
+        assert relay.verb == cv.VERB_STOP
+
+    def test_the_receipt_must_be_for_THIS_verb_not_an_older_one(self):
+        """An ack for an earlier sequence is not an ack for this one."""
+        spark, hp, relay, state, rec, clock = deck(helper_at=1000.0)
+        relay.poll(-1, timeout_s=0.0)              # the helper is up to date
+        stale = relay.seq
+        res = hp.deliver(subject(), wait=lambda _s: relay.poll(stale,
+                                                               timeout_s=0.0))
+        assert res.held and not res.landed
+
+    def test_the_relay_records_what_the_helper_has_acknowledged(self):
+        relay = cv.CastRelay(now=Clock())
+        assert relay.acked == -1
+        seq = relay.set_verb(cv.VERB_SHOW)
+        assert not relay.acked_through(seq)
+        relay.poll(seq, timeout_s=0.0)
+        assert relay.acked_through(seq) and relay.acked == seq
+        assert_numbers_only(relay.numbers_only())
+
+    # -- HPCOMPUTER -> Spark: the viewer must still be alive -------------
+    def test_a_viewer_that_dies_a_moment_later_is_not_a_landing(self):
+        clock = Clock()
+        state = cv.ViewState(now=clock)
+        naps = []
+        sink = cv.SparkViewSink(launch=lambda host: None, stop=lambda: None,
+                                alive=lambda: False, settle=naps.append,
+                                state=state, now=clock)
+        res = sink.deliver(subject())
+        assert not res.landed
+        assert res.held and res.spoken
+        assert state.live == ""
+        assert naps and naps[0] > 0.0          # it waited before it looked
+
+    def test_a_viewer_still_up_a_moment_later_is_a_landing(self):
+        clock = Clock()
+        state = cv.ViewState(now=clock)
+        sink = cv.SparkViewSink(launch=lambda host: None, alive=lambda: True,
+                                settle=lambda s: None, state=state, now=clock)
+        res = sink.deliver(subject())
+        assert res.landed and not res.held
+        assert state.live == "spark-view"
+
+    def test_a_viewer_with_no_way_to_confirm_it_is_never_claimed(self):
+        """No aliveness probe wired is the same class as no launcher
+        wired: a viewer that cannot be confirmed is a guess dressed as a
+        feature, so the sink says it is unavailable rather than claiming
+        a landing it cannot see."""
+        clock = Clock()
+        sink = cv.SparkViewSink(launch=lambda host: None, state=cv.ViewState(
+            now=clock), now=clock)
+        ok, why = sink.available()
+        assert not ok and why
+        res = sink.deliver(subject())
+        assert res.held and not res.landed
+
+    def test_a_dead_viewer_is_cleaned_up_not_left_behind(self):
+        clock = Clock()
+        state = cv.ViewState(now=clock)
+        stopped = []
+        sink = cv.SparkViewSink(launch=lambda host: None,
+                                stop=lambda: stopped.append(1),
+                                alive=lambda: False, settle=lambda s: None,
+                                state=state, now=clock)
+        sink.deliver(subject())
+        assert stopped == [1]
+
+    def test_neither_sink_ever_returns_landed_and_held_together(self):
+        """The constructor refuses it; this pins that every path here goes
+        through the constructor rather than around it."""
+        clock = Clock()
+        state = cv.ViewState(now=clock)
+        relay = cv.CastRelay(now=clock)
+        relay.note(mon=1, layout="0,1920", at=clock.t)
+        outs = [cv.SparkViewSink(launch=lambda h: None, alive=lambda: False,
+                                 settle=lambda s: None, state=state,
+                                 now=clock).deliver(subject()),
+                cv.HpViewSink(relay=relay, state=state,
+                              now=clock).deliver(subject())]
+        for res in outs:
+            assert res.landed is not res.held

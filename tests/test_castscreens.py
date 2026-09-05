@@ -114,12 +114,20 @@ FROM_SPARK_RIGHT = screen_gesture(SPARK_X, -340.0)      # nothing that way
 FROM_HP_LEFT = screen_gesture(MIDDLE_X, 300.0)          # nothing that way
 
 
-def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None, **kw):
+def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None,
+        answers=True, viewer_up=True, **kw):
     """The courier with the screen cast wired to recorders.
 
     ``on`` is the config switch, ``learned`` whether a map is stored,
     ``armed`` whether that map clears the bar, ``helper`` whether the
     Windows startup script is polling.
+
+    NEITHER DIRECTION MAY CLAIM A LANDING IT CANNOT SEE (09-05), so both
+    confirmations are wired here the way the app wires them: ``answers``
+    plays the Windows script coming back for the verb and quoting the
+    sequence it acted on, and ``viewer_up`` is the Spark viewer still
+    being there a moment after launch. Set either False and the cast HOLDS
+    -- which is the honest state, not a failure of the fixture.
     """
     from tests.test_gesturecast import Options
     opts = Options()
@@ -134,8 +142,27 @@ def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None, **kw):
         opts.data[sc.OPTION_MAP] = sc.to_config(m)
     launched: list = []
     stopped: list = []
+    box: list = []
+    seen = [-1]
+
+    def windows_helper(_timeout_s):
+        """The startup script's half: wake on the parked long poll, take
+        the verb, act on it, then poll again quoting what it acted on."""
+        if not answers or not box:
+            return False
+        relay = box[0].relay
+        got = relay.poll(seen[0], timeout_s=0.0)
+        if got["seq"] != seen[0]:
+            seen[0] = got["seq"]
+            relay.poll(seen[0], timeout_s=0.0)
+        return True
+
     out = build(opts=opts, view_launch=launched.append,
-                view_stop=lambda: stopped.append(1), **kw)
+                view_stop=lambda: stopped.append(1),
+                view_alive=lambda: viewer_up,
+                view_ack_wait=windows_helper,
+                view_settle=lambda _s: None, **kw)
+    box.append(out.courier)
     out.launched, out.stopped = launched, stopped
     if helper:
         out.courier.relay.note(mon=1, layout="0,1920,1920,1920",
@@ -720,3 +747,49 @@ def test_the_layout_tripwire_fires_from_the_windows_poll_itself():
     throw(r, FROM_SPARK_LEFT)
     assert r.launched == []
     assert r.courier.recent()["sink"] == "board"
+
+
+# ============================== never say it landed until it has (courier)
+class TestTheCourierNeverClaimsAnUnconfirmedCast:
+    """The same promise as tests/test_castview.py, driven through the whole
+    courier rather than the sink alone -- because that is where the spoken
+    line and the tone are chosen, and the bug he reported was what Jarvis
+    SAID. ``cast.py``'s oldest promise is that landed and held are separate
+    booleans and neither is inferred from the other; these two rows are it
+    working end to end."""
+
+    def test_a_helper_that_never_comes_back_for_the_verb_holds(self):
+        r = rig(learned=False, answers=False)
+        line, status = r.courier.cast_screen("hpcomputer")
+        assert status == "held"
+        assert "cast" in line.lower()
+        # and nothing is left queued for a machine that did not answer
+        assert r.courier.relay.verb == cv.VERB_STOP
+        assert r.courier.view_state.live == ""
+
+    def test_a_viewer_that_dies_a_moment_after_launch_holds(self):
+        r = rig(learned=False, viewer_up=False)
+        line, status = r.courier.cast_screen("spark")
+        assert status == "held"
+        assert r.launched == [cv.HPCOMPUTER_HOST]     # it did try
+        assert r.stopped == [1]                       # and cleaned up after
+        assert r.courier.view_state.live == ""
+
+    def test_an_unconfirmed_cast_leaves_the_deck_free_for_the_next_try(self):
+        """A held cast must not WEDGE the one-at-a-time rule: he should be
+        able to say it again once the helper is actually there. It still
+        serves the ordinary suppression first -- an unconfirmed cast gives
+        the deck back the same way a stop does, so the next attempt waits
+        the same 3 s a second fling would."""
+        r = rig(learned=False, answers=False)
+        assert r.courier.cast_screen("hpcomputer")[1] == "held"
+        assert r.courier.view_state.live == ""
+        r.clock.t += cv.CAST_SUPPRESS_S + 1.0
+        assert r.courier.view_state.take("probe")[0] is True
+
+    def test_both_directions_still_land_when_they_are_confirmed(self):
+        r = rig(learned=False)
+        assert r.courier.cast_screen("hpcomputer")[1] == "landed"
+        r.courier.stop_cast()
+        r.clock.t += cv.CAST_SUPPRESS_S + 1.0
+        assert r.courier.cast_screen("spark")[1] == "landed"
