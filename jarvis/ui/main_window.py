@@ -513,6 +513,21 @@ class Services:
     # crash, and build_ui_services drops them on an older UI.
     restart: Optional[Callable] = None
     code_status: Optional[Callable] = None
+    # The USERS tab (jarvis/ui/users_page.py; Hunter 2026-09-05, "a better
+    # process for processing users, prefereably through a users tab").
+    # FIVE NARROW SEAMS, and the narrowness is the point: the page never
+    # touches people.json and never holds a Person, so a scrypt hash has no
+    # path into a widget. people_snapshot() answers redacted rows plus the
+    # gate's line, its fault_kind and admin_gate's verdict; people_unlock()
+    # checks the typed override code against the gate's OWN counter and
+    # opens NO voice window; the three writes each answer (ok, one line).
+    # All Optional, so a stand-in Services simply has a page that toasts
+    # "not wired", and build_ui_services drops them on an older app half.
+    people_snapshot: Optional[Callable] = None
+    people_unlock: Optional[Callable] = None
+    people_add: Optional[Callable] = None
+    people_set_role: Optional[Callable] = None
+    people_forget: Optional[Callable] = None
 
 
 # ------------------------------------------------------------------ tray
