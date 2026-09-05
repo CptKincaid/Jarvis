@@ -261,6 +261,21 @@ def test_a_wrong_code_is_counted_on_the_codes_own_limiter(tmp_path):
     assert len(app.gate.phrase_attempts._hits) == before_phrase
 
 
+def test_a_spent_passphrase_budget_never_closes_the_break_glass(tmp_path):
+    """THE OTHER DIRECTION, and it is the reason the two counters exist.
+    The spoken passphrase is the leg somebody in the room can burn through
+    by talking; if that spent the code's budget too, the way back in would
+    be closed by exactly the person it protects against."""
+    app, _path = _app(tmp_path, code=True, known=True)
+    for _ in range(pp.PHRASE_LIMIT + 2):
+        app.gate.phrase_attempts.record()
+    assert app.gate.phrase_attempts.allow()[0] is False, \
+        "the phrase budget is not spent, so this proves nothing"
+    ok, line = app.people_unlock(FAKE_CODE, now=100.0)
+    assert ok is True, line
+    assert app.people_forget("pemberton", now=100.0)[0] is True
+
+
 def test_the_unlock_re_reads_so_a_code_set_at_a_terminal_can_be_typed(
         tmp_path):
     """THE OTHER HALF OF THE STALENESS. ``check_override_code`` was handed
