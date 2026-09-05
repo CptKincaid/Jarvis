@@ -17,8 +17,12 @@ were each checked and ruled out. What was left is the path:
 ``Transcriber.partial()`` returns text with NO log call on the success path,
 and ``_partial_loop`` publishes it with none either. It is also the only
 decode in the system that skips the speaker gate, the confidence gate, the
-repetition-loop gate and collapse_repeats. So the preview can put text on
-screen that nothing in the system has ever seen, scored, or written down.
+compression-ratio loop gate and collapse_repeats. (Since 2026-09-04 it
+does apply the prompt-echo half of the loop gate -- transcriber.prompt_echo
+-- and returns "" for an echo, so a name from the prompt is never shown;
+that blank is counted here as a decode with no emission, the same as
+"whisper returned the same text".) So the preview can put text on screen
+that nothing else in the system has ever seen, scored, or written down.
 
 This module does not fix that. The cause is UNPROVEN, and a guard aimed at
 an unproven cause is how this project got burned before: a silent Whisper

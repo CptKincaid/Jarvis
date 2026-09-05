@@ -1481,6 +1481,16 @@ def test_mask_addresses_masks_every_address_in_a_sentence():
     ("to Dana, at dana at example dot com", "to Dana, at d… at example dot com"),
     ("dana at example dot com.", "d… at example dot com."),
     ("Dana at Gmail dot com", "D… at Gmail dot com"),
+    # every joiner confirm-shapes' address_span reads (b61fb12) is a
+    # shape the file can be SENT to, so it is a shape this must mask
+    ("heather hyphen smith at example dot com", "h… at example dot com"),
+    ("heather under score smith at example dot com", "h… at example dot com"),
+    ("heather full stop smith at example dot com", "h… at example dot com"),
+    ("h underscore peyrovi at tamu dot edu", "h… at tamu dot edu"),
+    ("heather at spark dash lab dot com", "h… at spark dash lab dot com"),
+    ("heather at spark hyphen lab full stop com", "h… at spark hyphen lab full stop com"),
+    ("yes, send it to heather underscore smith at example dot com",
+     "yes, send it to h… at example dot com"),
 ])
 def test_mask_addresses_masks_the_spoken_shape(said, want):
     assert outbox.mask_addresses(said) == want
@@ -1506,6 +1516,8 @@ def test_mask_addresses_masks_the_spoken_shape(said, want):
     "dot at",
     "email the biosensors handout to Heather Smith",
     "dana at example",
+    "look at the dash board dot com",
+    "stand at the hyphen. Then read on",
     "what time is it",
     "",
 ])
