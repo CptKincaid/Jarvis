@@ -332,12 +332,29 @@ def test_passive_learning_is_unchanged_when_he_has_no_gallery_pool(rig):
 def test_the_bound_and_the_door_are_the_same_number(rig):
     """ONE NUMBER, TWO ENFORCERS. ``add_sample`` must not carry a bar of its
     own that could drift away from the one ``_disowned`` applies."""
-    src = inspect.getsource(sp.SpeakerVerifier.add_sample)
-    assert "OWNER_POOL_COSINE" not in src, (
-        "add_sample re-derives the bar instead of asking the predicate that "
-        "does the disowning")
-    v, _enc, _gate = rig
+    for name in ("_would_leave_his_own_pool", "_disowned"):
+        src = inspect.getsource(getattr(sp.SpeakerVerifier, name))
+        assert "_owner_alias_cosine" in src, (
+            "%s does not ask the shared predicate" % name)
+        assert "_cosine_similarity" not in src, (
+            "%s measures the anchor itself instead of asking for it" % name)
     assert sp.MIGRATED_ALIAS_COSINE == vg.OWNER_POOL_COSINE
+
+    # ...and the two agree on a WORKED case, not only on a constant: the
+    # centroid a refused sample would have produced is one the runtime would
+    # have disowned, measured rather than argued.
+    v, enc, gate = rig
+    world = Voices(seed=3, apart=0.3)
+    _layout(v, enc, world)
+    _restarts(v, enc, world, 30, base=0.3)
+    pool = sp.SpeakerVerifier._trimmed(v._embeddings + [world.take("hunter")])
+    refused = np.mean(pool, axis=0)
+    assert v._would_leave_his_own_pool(refused)
+    cents = dict(v._all_centroids())
+    cents[""] = refused
+    assert v._disowned(cents) == frozenset({"hunter"})
+    assert v._disowned(v._all_centroids()) == frozenset(), (
+        "the committed centroid is on the wrong side of the same line")
 
 
 # ======================================================== 3. the recovery
