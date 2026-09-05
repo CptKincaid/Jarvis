@@ -1518,6 +1518,8 @@ def test_mask_addresses_leaves_ordinary_prose_alone(prose):
     # it is SAID with "dot" ...
     ("dana at example dot in", "d… at example dot in"),
     ("dana at example dot me", "d… at example dot me"),
+    ("dana at me dot com", "d… at me dot com"),
+    ("look at me. In the morning", "look at me. In the morning"),
     # ... but after a full stop it is the next sentence, so a punctuated
     # domain has to end on a top level in use -- and "example.xyz" is
     # left alone (a typed address has an "@" and is masked by that)

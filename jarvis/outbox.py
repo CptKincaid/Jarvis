@@ -241,8 +241,10 @@ _NOT_A_DOMAIN_WORD = frozenset("""
     not no yes now just also very too all any some each every both few
     more most other such only own same do does did done can could will
     would shall should may might must have has had am we you they he she
-    me him them us i
+    him them i
 """.split())
+# ("me" and "us" are not in that list: "dana at me dot com" is an address
+# -- me.com is a mail domain -- and no sentence says "at me dot".)
 # Top levels a PUNCTUATED domain may end on ("gmail. com", "example.edu").
 # English words that are also top levels (in, me, us, it, is, be, no, to,
 # at, so, info) are left out on purpose: after a full stop they are the
