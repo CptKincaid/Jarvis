@@ -101,6 +101,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
+from jarvis import gateledger
 from jarvis import passphrase as pp
 from jarvis.identity import (FAULT_MALFORMED, FAULT_UNREADABLE, ROLE_KNOWN,
                              ROLE_OWNER, ROLE_UNKNOWN, Registry,
@@ -259,10 +260,17 @@ class OwnerGate:
     """One instance, held by the app. Constructing it cannot raise."""
 
     def __init__(self, *, registry=None, get_option: Optional[Callable] = None,
-                 owner: str = ""):
+                 owner: str = "", record: Optional[Callable] = None):
         self.registry = registry
         self.get_option = get_option
         self.owner = str(owner or "")
+        # THE LEDGER SEAM. ``record`` takes one dict per GATED verdict and
+        # is the only reason shadow mode is worth running: prose in
+        # jarvis.log cannot be counted, split by day, or asked whether
+        # anything was measuring at the time. It is optional and its
+        # failures are swallowed -- see _write_row. jarvis/gateledger.py
+        # owns the shape of the row and says what may never be in it.
+        self.record = record
         self.stood_down = False
         self.kdf_calls = 0
         self._blind_run = 0
@@ -498,23 +506,60 @@ class OwnerGate:
     # -------------------------------------------------------- the verdict
     def judge(self, source, text, *, stats=None, rejected: bool = False,
               face: str = "", face_running: bool = False,
-              now: Optional[float] = None) -> Decision:
+              now: Optional[float] = None, turn: str = "") -> Decision:
         """Admit this turn, or refuse it with a way back in.
 
         EVERY exception in here resolves to an admit. The gate failing must
         never be the reason he cannot speak to his own assistant.
+
+        ``turn`` STAMPS THE LEDGER ROW SO THAT ONE UTTERANCE IS ONE TURN.
+        The app calls this TWICE for a clip the speaker filter dropped and
+        a window rescued -- once inside the rescue with ``rejected=True``,
+        and again once the rescue has cleared it (jarvis/app.py). Both
+        verdicts are real and both belong in the file; without a shared
+        stamp the scorecard counts the thing he said twice, and it does so
+        on exactly the path his first Knightfall test takes. It changes no
+        decision here; it is written down and nothing else.
         """
+        src = str(source or "")
+        # Filled in by _judge once it knows: which instruments were running
+        # when the verdict was taken. "Nobody is here" and "nothing was
+        # measuring" are different sentences and the scorecard must never
+        # add them together.
+        legs = {"rescued": bool(rejected)}
+        tid = str(turn or "")
         try:
-            return self._judge(source, text, stats=stats, rejected=rejected,
-                               face=face, face_running=face_running, now=now)
+            d = self._judge(source, text, stats=stats, rejected=rejected,
+                            face=face, face_running=face_running, now=now,
+                            legs=legs)
         except Exception as exc:  # noqa: BLE001 - the gate's own boundary
             log.exception("gate: judging failed; admitting the turn")
-            return Decision(admit=True, how=HOW_FAULT,
-                            why="the gate failed: %s: %s"
-                                % (type(exc).__name__, exc))
+            d = Decision(admit=True, how=HOW_FAULT,
+                         why="the gate failed: %s: %s"
+                             % (type(exc).__name__, exc))
+            # THE EXCEPTION TYPE, NEVER ITS MESSAGE. Everywhere else `why`
+            # is a string written in this repository; this is the one path
+            # where a stray exception could carry something that was said.
+            self._write_row(src, d, stats, legs, turn=tid,
+                            why="the gate failed: %s" % type(exc).__name__)
+            return d
+        self._write_row(src, d, stats, legs, turn=tid)
+        return d
+
+    def _write_row(self, src, d, stats, legs, why=None, turn="") -> None:
+        """One ledger row per gated verdict. NEVER raises: a ledger that
+        cannot be written must not be the reason he cannot speak."""
+        if self.record is None or src not in GATED_SOURCES:
+            return
+        try:
+            self.record(gateledger.row(d, mode=self.effective_mode(),
+                                       source=src, stats=stats, why=why,
+                                       legs=legs, turn=turn))
+        except Exception:  # noqa: BLE001 - an instrument, not the feature
+            log.debug("gate: the verdict ledger refused a row", exc_info=True)
 
     def _judge(self, source, text, *, stats, rejected, face, face_running,
-               now) -> Decision:
+               now, legs=None) -> Decision:
         src = str(source or "")
         if src not in GATED_SOURCES:
             return Decision(admit=True, how=HOW_EXEMPT,
@@ -547,6 +592,8 @@ class OwnerGate:
         roles = self.registry.roles()
         voice_says, voice_running = self._voice_leg(stats, rejected)
         face_says, face_on = self._face_leg(face, face_running)
+        if legs is not None:
+            legs["voice"], legs["face"] = voice_running, face_on
         named = recognise(Legs(voice_says=voice_says,
                                voice_running=voice_running,
                                face_says=face_says, face_running=face_on),

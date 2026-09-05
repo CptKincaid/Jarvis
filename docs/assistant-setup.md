@@ -4856,3 +4856,256 @@ grep "brain: window" /tmp/vss_voice/jarvis.log | tail -1
 grep "ctx: prompt" /tmp/vss_voice/jarvis.log | tail -5   # estimate vs real
 ```
 If the model will not load at all, put `num_ctx` back to 8192 and restart.
+
+## 87. The owner gate: enrolling yourself, shadow, and the scorecard
+
+The gate (`jarvis/gate.py`) decides whether a voice turn is answered and in
+whose name. **Right now it is doing nothing at all**, and not for the reason
+you would guess. Measured from the startup line at 11:57:59 on 2026-09-05:
+
+```
+owner-gate: OFF -- nobody is enrolled yet:
+/home/hunterp/.local/state/jarvis/people.json does not exist.
+Everyone is being answered.
+```
+
+Your face identity is enrolled and your voiceprint exists. What does not
+exist is a **person record** tying them to a name and a role, and without one
+`people.json` the gate is `off` no matter what `owner.mode` says. Three
+features are inert until you fix that: the gate itself, sign-in by name, and
+Knightfall (§84 — the phrase and the typed code).
+
+Nobody else can do this step for you. It is your identity data, and this
+repository will not write a row into your people book on your behalf.
+
+### 1. Look at what is there now
+
+```bash
+cd ~/Jarvis
+~/vss_env/bin/python scripts/jarvis_people.py list
+```
+
+It prints the startup line, the path to the registry, and one row per
+person — labels, roles and *whether* a phrase or code is set, never the
+secrets. With nothing enrolled it says `nobody is enrolled`.
+
+If you want the face leg as well, find the gallery name your face was
+enrolled under first:
+
+```bash
+~/vss_env/bin/python scripts/face_enrol.py --status
+```
+
+Take the **label** from its `loaded generation …, labels …` line. That is
+the gallery name to hand to `--face`.
+
+**It does not print an embedding width, and you must not go looking for
+one.** An earlier draft of this section told you to read the width off that
+command; it never prints one, and the number it then handed you (512) was
+the *other* recogniser's. The width is a property of the model this tree
+ships, and one file states it:
+
+```bash
+~/vss_env/bin/python -c "from jarvis.facegallery import DEFAULT_MODEL, EMBED_DIM; print(DEFAULT_MODEL, EMBED_DIM)"
+```
+
+Today that prints `sface 128`. Use whatever it prints. It matters because a
+row enrolled at one width and read by a recogniser at the other is *no
+opinion* — never a refusal — and Jarvis says so at startup rather than
+leaving you to work it out from a face leg that has quietly gone dark. If
+you would rather not think about it at all, leave `--face-dim` off: the
+width is then simply not recorded, which costs you that one explanatory
+sentence and nothing else.
+
+### 2. Enrol yourself as the owner
+
+```bash
+~/vss_env/bin/python scripts/jarvis_people.py add hunter \
+    --name Hunter --role owner --voice
+```
+
+With the face leg too — the label from `--status`, the width from the
+one-liner above:
+
+```bash
+~/vss_env/bin/python scripts/jarvis_people.py add hunter \
+    --name Hunter --role owner --voice --face hunter --face-dim 128
+```
+
+* `--role owner` is what makes the gate treat you as the owner rather than a
+  known guest. There is no separate "make owner" step.
+* `--voice` says the voiceprint is yours. It does **not** re-record anything.
+* `--face` is the *gallery* name, which need not equal the label.
+* `--face-dim` is the number the one-liner above printed — `128` on this
+  tree, from `jarvis/facegallery.py`. Not 512, unless that command says so.
+* The first owner needs no confirmation — the CLI says so out loud. A
+  *second* one needs `--confirm-owner <existing label>`, on purpose.
+* Adding anyone who is **not** an owner takes their own typed consent at the
+  terminal, by the same rule `face_enrol.py` already uses.
+
+### 3. Confirm it took
+
+```bash
+~/vss_env/bin/python scripts/jarvis_people.py list
+```
+
+You want to see `hunter owner voice=True`, and the first line to have stopped
+saying `OFF`. Then restart Jarvis and check the line he prints himself:
+
+```bash
+grep "owner-gate:" /tmp/vss_voice/jarvis.log | tail -1
+```
+
+It should read `owner-gate: SHADOW -- 1 owner (hunter), … Nothing is being
+refused.` **`shadow` is the default**; you do not have to set anything to get
+it. If it still says `OFF`, the registry is the thing to look at, not the
+mode.
+
+### 4. What shadow then does
+
+Shadow means: the gate reaches a verdict on every voice turn, writes it down,
+and **refuses nobody**. Nothing about how Jarvis answers you changes. The
+point of running it is that it produces evidence.
+
+Every gated verdict is appended to **`/tmp/vss_voice/gate.jsonl`** — one JSON
+object per turn, carrying the decision and the numbers behind it: the mode,
+whether it would have admitted or refused, which leg named you, the role, the
+speaker score, and whether anything was measuring at all.
+**It carries no words** -- not the sentence, not the passphrase, not the
+override code, not an embedding. `jarvis/gateledger.py` is where that rule is written down.
+
+Only the **microphone** is gated. The keyboard, the command socket, the
+phone and the intercom are exempt by construction and appear nowhere in the
+ledger.
+
+**One honest limit, and it decides how you use this.** `/tmp` is wiped at
+boot on this machine, so `gate.jsonl` starts empty after every reboot —
+exactly as `turns.jsonl` does. Asking for `--days 7` a day after a restart
+gives you one day of evidence, not seven; the header prints the window you
+asked for and the trend shows you which days are actually populated. If you
+want a week that survives a reboot, copy the file somewhere else before you
+restart.
+
+### 5. Read the scorecard
+
+```bash
+cd ~/Jarvis
+~/vss_env/bin/python scripts/gate_scorecard.py             # the last 7 days
+~/vss_env/bin/python scripts/gate_scorecard.py --days 1
+~/vss_env/bin/python scripts/gate_scorecard.py --hours 6
+~/vss_env/bin/python scripts/gate_scorecard.py --json      # for a plot
+```
+
+It is safe to run while Jarvis is live. The only file of yours it touches is
+the one it reads — `gate.jsonl` — and it never writes it, never speaks to the
+running process, and never opens your log, your people book, your voiceprint
+or your gallery. Measured: `/tmp/vss_voice` is byte-for-byte unchanged after
+a run, and a row half-written by the app is skipped rather than parsed.
+
+It is not *side-effect-free*, and the honest version is worth a line: like
+every other script here, importing `jarvis.config` appends a startup line to
+this repository's own ad-hoc log under `/tmp/jarvis-adhoc` and probes the
+GPU. Nothing of yours is in that and your live log directory is untouched —
+but the script used to advertise itself as writing nothing at all, that was
+measured, and it was false.
+
+The summary at the top is the whole point, and it is in your terms:
+
+* **Turns the gate judged** — how many voice turns it had a view on.
+* **It would have ANSWERED you** / **answered someone else** / **REFUSED**.
+* Refusals split into *nobody was named* and *named, but out of scope* (a
+  known guest asking for something that is yours — §84's scope rules).
+* **It had NO OPINION** — nothing was measuring. That is not "nobody was
+  there"; it is a dark instrument, and the two must never be added together.
+* **You opened the floor yourself** — turns the phrase or the code answered.
+
+Then two sections named after the two ways this feature can hurt you: being
+locked out of your own house, and somebody else being let in. The second one
+counts **window admits** separately, because a phrase or a code opens the
+floor to the *room* for five minutes, not to your voice.
+
+After that: a trend split by day rather than one lump, a per-leg breakdown,
+and the assumptions.
+
+### 6. What number should make you comfortable switching to enforce
+
+**There is not one, and the scorecard will not invent one.** That is the
+honest answer and it is worth being plain about why.
+
+The ledger records *what the gate decided*, never who was actually speaking.
+Nothing in Jarvis knows that — it is the whole reason the gate is a judgement
+and not a lookup. So a refusal in that column may have been you, or the
+television, or a guest, and no amount of arithmetic over the file can tell
+them apart. Any "false refusal rate" printed here would be a number with no
+source, and this project has twice been damaged by exactly that.
+
+What the scorecard *can* give you is two things you can watch go to zero:
+
+1. **Refusals you answered with the phrase or the code.** If you were refused
+   and then reached for Knightfall within five minutes, that is you saying at
+   the time that the gate had it wrong. It is the only real evidence in the
+   file. While that number is above zero, enforce would have cost you turns.
+2. **Turns with no opinion.** A high count means the gate was guessing blind
+   — the voice leg or the camera was not running — and enforce on a blind
+   gate is the failure mode you actually fear.
+
+The other half of the argument is that the cost of being wrong is small and
+reversible. Enforce is one key back to shadow; the spoken phrase and the
+typed code both work in *every* mode; and after three consecutive turns with
+nothing measuring, the gate stands itself down to shadow out loud rather than
+holding the door against you (`DEADMAN_TURNS`). So the reasonable test is:
+run shadow for a normal week, look at those two numbers, and if they are at
+or near zero, try enforce for a day knowing you can undo it in a line.
+
+### 7. Switching to enforce, and switching back
+
+`owner.mode` lives in `~/.config/jarvis/assistant.json` — a file that also
+holds app passwords and tokens, so edit the one key and do not print the
+file:
+
+```json
+{ "owner": { "mode": "enforce" } }
+```
+
+`off`, `shadow` and `enforce` are the three values; anything else is treated
+as `shadow` and logged as a mistake. It takes a restart. Put it back to
+`"shadow"` the same way. Deleting `people.json` also turns the gate off
+completely — which is a way back in, not a security property, and §84 says
+why.
+
+### 8. If the scorecard is empty — or worse, if it could not read
+
+**A scorecard that quietly reports 0 when it could not read something is
+worse than no scorecard at all**, because you would act on it. So an empty
+card is never one message. It is one of these, and it says which, at the
+top, above everything else:
+
+* **`SOMETHING IS WRONG WITH THE LEDGER — this is NOT a quiet week`.** The
+  file does not exist, or the path is a directory, or this account has no
+  permission to read it, or every line in it is unreadable. It then tells
+  you not to read the rest as a measurement. It will **not** tell you to go
+  and enrol yourself — that advice is right for an empty file and wrong for
+  an unreadable one, and sending you back to redo an enrolment you have
+  already done is exactly the failure this wording exists to avoid.
+* **`n of m lines in the ledger could not be read`.** Partial corruption.
+  The counts below are real but incomplete, and the card says by how much.
+* **`No verdicts in THIS WINDOW — but the ledger is not empty`.** It holds
+  verdicts, all of them older than the window you asked for; it prints how
+  many and when the newest was. Widen `--days`.
+* **`No verdicts in this window.`** The file was read and held nothing. Now
+  — and only now — the likely reasons are: nobody is enrolled (step 2
+  above), Jarvis has not been restarted since the ledger was added, or he
+  has heard no voice turn in the window.
+
+One benign case is told apart from all of these on purpose: Jarvis appends
+to `gate.jsonl` while you read it, so the last line can be half-written.
+That prints as a quiet `Note`, not an alarm — crying wolf on every run is
+how the loud message above gets ignored.
+
+**One more thing the card is careful about.** A clip the speaker filter drops
+and a window rescues is judged *twice* by the gate — once inside the rescue,
+once after — so it reaches the file as two verdicts for one thing you said.
+That is the path your first Knightfall test takes. The rows carry a turn
+stamp and the card folds them back into **one turn**, so "turns the gate
+judged" means turns; the raw count appears under *Detail* as *verdicts
+recorded*.
