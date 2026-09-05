@@ -118,6 +118,160 @@ def to_second_person(text):
     return out
 
 
+# ----------------------------------------------------------------------
+# Filing what he SAID: the remember rung and the remember tool (2026-09-04)
+# ----------------------------------------------------------------------
+# to_second_person above turns POSSESSIVES only, on every write, because a
+# garden note in Jarvis's own voice ("he told me this himself") must keep
+# its "me". A fact that arrives from the REMEMBER RUNG is different: it is
+# a sentence he spoke about himself -- "remember that I graduate December
+# 10th 2026" -- and rendered under "Known facts", where the model is
+# Jarvis, a bare "I" says that Jarvis graduates (measured 2026-09-04: the
+# prompt line read "i graduate december 10th 2026 ...: i graduate ...").
+# So at that one door, and only there, the subject pronouns turn as well:
+# I -> you, I'm -> you're, me -> you, with the verb that has to agree
+# (I am -> you are, I was -> you were). Word-boundary; the casing of the
+# rest of the sentence is kept (Whisper's capitals on names and months are
+# evidence), and the sentence keeps its opening capital if it had one.
+#
+# Everything the rung stores goes through store_fact_from_speech, and the
+# remember TOOL (the model's door to the same store) is to call the same
+# helper: one cleaning, one turning, one key rule.
+_SPEECH_PRONOUN_RULES = [
+    (re.compile(r"\bi[’']m\b", re.I), "you're"),
+    (re.compile(r"\bi[’']ve\b", re.I), "you've"),
+    (re.compile(r"\bi[’']ll\b", re.I), "you'll"),
+    (re.compile(r"\bi[’']d\b", re.I), "you'd"),
+    (re.compile(r"\bi am\b", re.I), "you are"),
+    (re.compile(r"\bi was\b", re.I), "you were"),
+    (re.compile(r"\bi\b(?![’'])", re.I), "you"),
+    (re.compile(r"\bme\b", re.I), "you"),
+]
+
+
+def speech_to_second_person(text):
+    """A sentence he said about himself, as Jarvis should read it back:
+    "I graduate December 10th" -> "You graduate December 10th", "Heather
+    emailed me the form" -> "Heather emailed you the form". Idempotent
+    (second-person text has nothing left to turn), and a superset of
+    to_second_person, so the store's own write-time pass is a no-op on
+    what comes out of here."""
+    if not isinstance(text, str) or not text:
+        return text
+    out = to_second_person(text)
+    for rx, repl in _SPEECH_PRONOUN_RULES:
+        out = rx.sub(repl, out)
+    if text[0].isupper() and out and out[0].islower():
+        out = out[0].upper() + out[1:]
+    return out
+
+
+# The head the rung already consumed can leave a stray "that," / "this:" /
+# ":" at the front, and speech leaves courtesies and punctuation at the
+# back ("...December 10th 2026, please."). Measured on 7539478: six of 31
+# stored values carried "please", ", please", "!", "that," or "this:".
+_FACT_LEAD_RX = re.compile(r"^\s*(?:(?:that|this)\s*[,:]\s*|[,:]\s*)+", re.I)
+_FACT_TAIL_RX = re.compile(
+    r"(?:[,\s]+(?:please|jarvis|sir|thanks|thank you|would you|will you)"
+    r"[.!?,]*)+\s*$", re.I)
+_FACT_PUNCT_RX = re.compile(r"[\s.!?,;:]+$")
+FACT_KEY_WORDS = 6
+
+
+def clean_spoken_fact(text) -> str:
+    """The fact as said, minus what is not the fact: a leading "that," /
+    "this:" / ":", a trailing courtesy ("please", "thanks", "would you",
+    "sir", "jarvis") and trailing punctuation."""
+    out = (text or "").strip()
+    out = _FACT_LEAD_RX.sub("", out, count=1)
+    out = _FACT_TAIL_RX.sub("", out, count=1)
+    out = _FACT_PUNCT_RX.sub("", out)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def is_spoken_question(text) -> bool:
+    """True when what he said, courtesy tail aside, ends in a question
+    mark: "remember i asked?" is not a fact, "remember that I graduate
+    December 10th 2026, will you?" is."""
+    return _FACT_TAIL_RX.sub("", (text or "").strip(), count=1).rstrip().endswith("?")
+
+
+def fact_key(value) -> str:
+    """The key a spoken fact is filed under: its first six words. A
+    truncated copy of the value, which is why format_for_context prints
+    such a fact once, not as 'key: value'."""
+    return " ".join(str(value or "").split()[:FACT_KEY_WORDS])
+
+
+def store_fact_from_speech(memory, text) -> str:
+    """File a fact he SAID: clean it, turn it to the second person, key it
+    on its first six words, write it through ``memory.remember``. Returns
+    the value as stored. ONE door for the rung and the remember tool."""
+    value = speech_to_second_person(clean_spoken_fact(text))
+    memory.remember(fact_key(value), value)
+    return value
+
+
+def _fact_line(key, entry) -> str:
+    """One 'Known facts' line. A fact filed under a name ("dentist",
+    "gpu", the garden's keys) reads 'key: value'; a fact whose key is the
+    head of its own value (store_fact_from_speech, and the old rung's
+    value[:60]) reads as the value alone -- printing both printed the
+    sentence twice, cut mid-phrase the first time."""
+    value = str(entry.get("value", "")) if isinstance(entry, dict) else str(entry)
+    k = str(key or "").strip().lower()
+    if k and value.strip().lower().startswith(k):
+        return value
+    return f"{key}: {value}"
+
+
+# Recall by STEM when the substring misses: "my graduation" is not a
+# substring of "you graduate december 10th 2026", and measured on
+# 7539478 every "graduation" phrasing came back "I don't have anything
+# stored about that, sir." with the fact sitting right there. Lexical
+# evidence is free; the semantic index costs a chat-model swap (the
+# one-slot rule above) and is not always there.
+_RECALL_STOP = frozenset("""
+    the a an my your our his her their its i you me we he she they it
+    of to in on at for about with and or is are was were be been am do
+    does did what when where who how why say said tell told that this
+    these those have has had
+""".split())
+_STEM_SUFFIXES = ("ations", "ation", "ings", "ing", "ions", "ion", "ies",
+                  "ers", "er", "ed", "es", "s", "ates", "ate", "al", "ly")
+_STEM_MIN = 4
+
+
+def _stem(word: str) -> str:
+    w = word.lower().strip("'’")
+    for suf in _STEM_SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= _STEM_MIN:
+            return w[:-len(suf)]
+    return w
+
+
+def _content_stems(text) -> list:
+    words = re.findall(r"[a-z0-9]+(?:['’][a-z]+)?", (text or "").lower())
+    return [_stem(w) for w in words if w not in _RECALL_STOP and len(w) >= 3]
+
+
+def _stems_overlap(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    return (len(a) >= _STEM_MIN and len(b) >= _STEM_MIN
+            and (a.startswith(b) or b.startswith(a)))
+
+
+def stem_match(query, text) -> bool:
+    """True when EVERY content word of ``query`` shares a stem with a word
+    of ``text``. No content words (all function words) is no match."""
+    q = _content_stems(query)
+    if not q:
+        return False
+    t = _content_stems(text)
+    return all(any(_stems_overlap(qs, ts) for ts in t) for qs in q)
+
+
 FACTS_COLLECTION = "jarvis_memory"
 # Measured 2026-08-30 against nomic-embed-text with the task prefixes: a
 # matching fact scores 0.60-0.87 ("who's my dentist" vs "my dentist is Dr
@@ -738,6 +892,12 @@ class JarvisMemory:
                 log.exception("semantic memory write-through failed")
         return key
 
+    def store_fact_from_speech(self, text) -> str:
+        """The method form of ``store_fact_from_speech`` (module level):
+        a fact he SAID, cleaned, turned to the second person, keyed on
+        its first six words. Returns the value as stored."""
+        return store_fact_from_speech(self, text)
+
     def _substring_recall(self, query, since=None):
         # Asked in the second person, because that is the language the
         # store is written in (see to_second_person): "my dentist" has to
@@ -752,6 +912,17 @@ class JarvisMemory:
                 if since is not None and not self._newer_than(entry, since):
                     continue
                 matches.append({"key": key, **entry, "score": 1.0})
+        if matches:
+            return matches
+        # The substring missed. Stemmed word overlap next (stem_match):
+        # "graduation" finds "you graduate ...", "my degree" finds "... an
+        # electrical engineering degree". Scored under the substring hits
+        # so an exact phrase still ranks first when both are present.
+        for key, entry in self._facts.items():
+            if stem_match(q, f"{key} {entry.get('value', '')}"):
+                if since is not None and not self._newer_than(entry, since):
+                    continue
+                matches.append({"key": key, **entry, "score": 0.9})
         return matches
 
     @staticmethod
@@ -1149,7 +1320,7 @@ class JarvisMemory:
                 parts.append(f"Known facts ({len(self._facts)}):")
                 rows = list(self._facts.items())
                 for key, entry in (rows if fits else rows[-5:]):
-                    parts.append(f"  {key}: {entry['value']}")
+                    parts.append(f"  {_fact_line(key, entry)}")
 
         people_text = self.format_people()
         if people_text:
