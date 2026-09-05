@@ -722,6 +722,35 @@ _QUESTION_RX = re.compile(
 _POLITE_ORDER_RX = re.compile(
     r"^\s*(?:please\s+|jarvis[\s,]+)*(?:can|could|would|will|should)\s+you\b",
     re.I)
+# "Do not forget that I graduate December 10th 2026" is an ORDER that opens
+# with the question word `do`. _QUESTION_RX called it a question, the
+# unbacked-action guard stood down, and "I have noted that, sir" was spoken
+# with nothing stored (2026-09-04 refuter, probe e: the 09-02 incident
+# reachable verbatim). An imperative "do" -- "do not", "don't", "do
+# remember / keep / note / make / bear" -- asks nothing; "do you ...?"
+# still does.
+#
+# A negative auxiliary before a SUBJECT PRONOUN asks. The first cut
+# exempted only "don't you", so "Don't I have milk on my list already?"
+# became an order: the guard armed, the retry called notes(add, milk) and
+# he heard "Noted, sir." -- a question performing the write it asked
+# about, the 09-02 bug the question gate exists to prevent (2026-09-04
+# verifier, M15). "don't I / we / they / he / she / it", "didn't you",
+# "isn't it", "haven't we" have no imperative reading at all, so they ask
+# with or without the '?' the voice path drops (_NEGATIVE_QUESTION_RX);
+# only "don't you" keeps both readings ("don't you forget" / "don't you
+# think?") and is left to the '?' rule. Measured over twenty questions
+# and twenty orders in tests/test_claim_guard_memory.py.
+_ASK_PREFIX = r"^\s*(?:please[\s,]+|jarvis[\s,]+)*"
+_SUBJECTS = r"(?:you|i|we|they|he|she|it)"
+_IMPERATIVE_DO_RX = re.compile(
+    _ASK_PREFIX + r"(?:do not|don['’]t)\b(?!\s+" + _SUBJECTS + r"\b)"
+    r"|" + _ASK_PREFIX + r"do\s+(?:remember|keep|note|make|bear)\b",
+    re.I)
+_NEGATIVE_QUESTION_RX = re.compile(
+    _ASK_PREFIX + r"(?:(?:do not|don['’]t)\s+(?:i|we|they|he|she|it)"
+    r"|(?:did|does|is|are|was|were|have|has|had)n['’]t\s+" + _SUBJECTS + r")\b",
+    re.I)
 
 
 def is_question(text: str) -> bool:
@@ -732,11 +761,14 @@ def is_question(text: str) -> bool:
     outside the router want (jarvis/brain.py's unbacked-action guard, which
     must never retry -- and so never execute -- a question). It adds the
     trailing '?' that routing does not need: "you already added milk?" is a
-    question with no wh-word in front of it."""
+    question with no wh-word in front of it -- and the negative question
+    ("don't I have milk on my list") that routing never had to tell from
+    the imperative "do" (_IMPERATIVE_DO_RX), which it takes away."""
     t = str(text or "").strip()
-    if not t or _POLITE_ORDER_RX.match(t):
+    if not t or _POLITE_ORDER_RX.match(t) or _IMPERATIVE_DO_RX.match(t):
         return False
-    return bool(_QUESTION_RX.match(t) or t.endswith("?"))
+    return bool(_QUESTION_RX.match(t) or _NEGATIVE_QUESTION_RX.match(t)
+                or t.endswith("?"))
 
 
 @dataclass

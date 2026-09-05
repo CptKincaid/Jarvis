@@ -4272,7 +4272,10 @@ assistant.json:
 | `filler_prompt_hint` | `false` | adds "Um, uh, hmm, er." to the *preview's* Whisper prompt so it writes fillers down instead of dropping them. **Unmeasured — ships off; the probe below decides.** |
 
 The hint never reaches the final transcription: your commands stay clean
-of ums whatever the preview saw.
+of ums whatever the preview saw. And the preview's own prompt-echo gate
+judges the text against the *hinted* prompt, so if Whisper ever runs away
+and simply reads "Um, uh, hmm, er." back at you, the ghost card stays
+blank and no hold is bought on it.
 
 What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
 per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one

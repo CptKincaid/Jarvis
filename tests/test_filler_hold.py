@@ -561,3 +561,72 @@ def test_the_hint_is_absent_from_both_passes_when_off(firewall, monkeypatch, mak
 def test_the_hint_names_only_fillers_the_endpoint_list_knows():
     words = {w.strip(".,").lower() for w in tr_mod.FILLER_PROMPT_HINT.split()}
     assert words and words <= set(ep_mod.FILLER_WORDS), words
+
+
+# ------------------------------------- (6) the hint and the prompt-echo gate
+#
+# jarvis-v3 (fix-prompt-echo ecc3666) hoisted `prompt = self._prompt()` to
+# ONE call per preview pass and feeds that same string to a new echo gate,
+# _preview_text(text, prompt), which blanks a preview that is just the
+# prompt read back. This branch rewrote the same two lines to
+# `initial_prompt=self._partial_prompt()`. Keeping both sides literally --
+# the resolution the conflict invites, because the hunks look independent
+# -- costs a second prompt build per preview AND makes the hint invisible
+# to the gate that most needs it: "Um, uh, hmm, er." is a comma-separated
+# list, exactly the shape fix-prompt-echo's own comment names as what a
+# greedy decoder runs away on. Measured 09-05 (verdict round 1).
+def test_the_preview_builds_its_prompt_once_even_with_the_hint_on(firewall, monkeypatch):
+    """The provider is jarvis.vocab.build_prompt: a calendar cache and the
+    people store, several times a second while he is talking. One build
+    per pass, hint or no hint."""
+    monkeypatch.setattr(tr_mod.CONFIG, "filler_prompt_hint", True)
+    calls = []
+
+    def provider():
+        calls.append(1)
+        return "Peyrovi, BIOSENSORS"
+
+    tr = _gpu(provider)
+    tr.partial(AUDIO)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("make", [_gpu, _cpu], ids=["gpu", "cpu"])
+def test_an_echoed_hint_is_blanked_by_the_preview_gate(firewall, monkeypatch, make):
+    """The decoder is given the hint, so the gate must judge against the
+    HINTED prompt. Measured under the naive resolution: partial() returned
+    'Um, uh, hmm, er. Um, uh, hmm, er. Um, uh, hmm, er.' verbatim onto the
+    ghost card -- and trailing_filler of that is 'er', so note_partial then
+    bought a 1.5 s hold on a decoder runaway."""
+    monkeypatch.setattr(tr_mod.CONFIG, "filler_prompt_hint", True)
+    echo = "Um, uh, hmm, er. Um, uh, hmm, er. Um, uh, hmm, er."
+    tr = make(lambda: "Peyrovi, BIOSENSORS")
+
+    def transcribe(audio, **kw):
+        tr._model.prompts.append(kw.get("initial_prompt"))
+        if tr._gpu:
+            return {"segments": [{"text": echo}], "language": "en", "text": echo}
+        return iter([SimpleNamespace(text=echo, avg_logprob=-0.3)]), \
+            SimpleNamespace(language="en")
+
+    tr._model.transcribe = transcribe
+    assert tr.partial(AUDIO) == ""
+    assert tr._model.prompts == ["Peyrovi, BIOSENSORS Um, uh, hmm, er."]
+
+
+def test_the_hinted_prompt_does_not_blank_a_real_command(firewall, monkeypatch):
+    """The gate is judged against a LONGER prompt with the hint on, so
+    check it costs nothing: none of his ordinary commands -- including one
+    with a real um in it -- is caught as an echo of the hinted prompt."""
+    hinted = "Peyrovi, BIOSENSORS " + tr_mod.FILLER_PROMPT_HINT
+    caught = {said: tr_mod.prompt_echo(said, hinted)
+              for said in ("set a timer for ten minutes",
+                           "set a timer for, um, ten minutes",
+                           "um, what is the weather",
+                           "stop stop stop",
+                           "turn it up turn it up turn it up",
+                           "yes")
+              if tr_mod.prompt_echo(said, hinted)[1]}
+    assert caught == {}
+    # ...while a pure stutter still is, and only in the preview.
+    assert tr_mod.prompt_echo("um um um", hinted)[1] >= 2
