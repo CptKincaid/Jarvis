@@ -614,6 +614,34 @@ def test_an_echoed_hint_is_blanked_by_the_preview_gate(firewall, monkeypatch, ma
     assert tr._model.prompts == ["Peyrovi, BIOSENSORS Um, uh, hmm, er."]
 
 
+@pytest.mark.parametrize("make", [_gpu, _cpu], ids=["gpu", "cpu"])
+def test_the_echo_gate_is_handed_the_very_string_the_decoder_was_given(
+        firewall, monkeypatch, make):
+    """The DIRECT pin on the merge resolution, one assertion deep rather
+    than through a behaviour: the hint text must be INSIDE what the echo
+    gate sees, and what it sees must be the identical string the model was
+    given. The naive resolution -- keeping both conflict sides literally --
+    hands `self._partial_prompt()` to initial_prompt and `self._prompt()`
+    to _preview_text, so this fails on both halves at once: the hint is
+    absent from the gate's prompt AND the two strings differ. Measured
+    red on that resolution 09-05 (see the merge commit)."""
+    monkeypatch.setattr(tr_mod.CONFIG, "filler_prompt_hint", True)
+    seen = []
+
+    def spy(text, prompt):
+        seen.append(prompt)
+        return text
+
+    monkeypatch.setattr(Transcriber, "_preview_text", staticmethod(spy))
+    tr = make(lambda: "Peyrovi, BIOSENSORS")
+    tr.partial(AUDIO)
+
+    assert len(seen) == 1, seen
+    assert tr_mod.FILLER_PROMPT_HINT in seen[0], seen[0]
+    # ...and it is the SAME string, not a second build that merely matches.
+    assert seen == tr._model.prompts, (seen, tr._model.prompts)
+
+
 def test_the_hinted_prompt_does_not_blank_a_real_command(firewall, monkeypatch):
     """The gate is judged against a LONGER prompt with the hint on, so
     check it costs nothing: none of his ordinary commands -- including one

@@ -973,17 +973,36 @@ class Transcriber:
         with self._lock:
             try:
                 lang = self._language()
-                # ONE build per pass, and the SAME string to the decoder
-                # and to the echo gate. Both matter. _partial_prompt() is
-                # _prompt() plus FILLER_PROMPT_HINT when the hint is on:
-                # the provider (jarvis.vocab.build_prompt -- calendar cache
-                # plus people store) must not run twice several times a
-                # second while he is talking, and the gate below must judge
-                # the text against the prompt the model was ACTUALLY given.
-                # Judging the hint's own echo against the un-hinted prompt
-                # let "Um, uh, hmm, er." x3 through onto the ghost card,
-                # where its trailing "er" then bought a filler hold on a
-                # decoder runaway (measured 09-05).
+                # MERGE CONFLICT, RESOLVED -- DO NOT RE-PICK THE OTHER
+                # SIDE. jarvis-v3 (fix-prompt-echo) hoisted
+                # `prompt = self._prompt()` to one call per pass and feeds
+                # that same string to _preview_text below; filler-hold
+                # rewrote the same two lines to
+                # `initial_prompt=self._partial_prompt()`. The hunks look
+                # independent, so the hand-merge keeps BOTH sides
+                # literally -- and that resolution is measurably wrong
+                # twice over (09-05):
+                #   * two prompt builds per preview. The provider is
+                #     jarvis.vocab.build_prompt -- a calendar cache and the
+                #     people store -- run several times a second while he
+                #     is talking. test_prompt_echo.py::
+                #     test_the_preview_fetches_the_prompt_once_per_pass
+                #     goes red as `assert [1, 1] == [1]`.
+                #   * the hint becomes INVISIBLE to the gate. The decoder
+                #     is handed the hint but the gate judges against the
+                #     un-hinted prompt, so "Um, uh, hmm, er." x3 -- the
+                #     comma-separated-list runaway this gate exists for --
+                #     lands verbatim on the ghost card, and its trailing
+                #     "er" then buys a 1.5 s filler hold on a decoder
+                #     runaway. test_filler_hold.py::
+                #     test_an_echoed_hint_is_blanked_by_the_preview_gate
+                #     and ::test_the_echo_gate_is_handed_the_very_string_
+                #     the_decoder_was_given both go red.
+                # THE RESOLUTION: ONE build per pass, and the SAME string
+                # to the decoder and to the echo gate. _partial_prompt()
+                # is _prompt() plus FILLER_PROMPT_HINT when the hint is
+                # on; transcribe() still calls _prompt() itself, so the
+                # hint can never reach a command.
                 prompt = self._partial_prompt()
 
                 budget = token_budget(_seconds(audio))
