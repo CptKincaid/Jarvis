@@ -1662,12 +1662,13 @@ class VoiceGallery:
                 "second label of one voice locks him out: the gallery ranks "
                 "the two against each other and no margin can separate a man "
                 "from himself. One voice, one label. If you have renamed "
-                "yourself, move it rather than adding to it:\n"
+                "yourself, MOVE it rather than adding to it -- this file is "
+                "read and never written, so it is still the rollback:\n"
                 "    scripts/voice_enrol.py --delete --label %s\n"
                 "    scripts/voice_enrol.py --migrate\n"
-                "If %s no longer matches voiceprint.npz, repair it in place "
-                "instead: scripts/voice_enrol.py --reanchor --label %s"
-                % (", ".join(already), already[0], already[0], already[0]))
+                "(--reanchor repairs the label the config spells TODAY, so it "
+                "cannot repair %s once the name has changed.)"
+                % (", ".join(already), already[0], already[0]))
             return out
         staged = self._stage_voiceprint(src, out)
         if staged is None:

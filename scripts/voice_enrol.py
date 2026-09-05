@@ -376,23 +376,25 @@ def delete_ok(gallery, label, owner, vectors=None):
     guest enrolled it walked straight back to the layout ``owner_ready``
     refuses to BUILD -- him in ``voiceprint.npz`` only, her in the gallery --
     where ``identify`` cannot rank him against her at all and answers his own
-    voice with the one label it has: measured 80 of 100 of his turns admitted
-    at apart 0.7 and 34 of 100 at apart 1.0, against 100 of 100 migrated.
+    voice with the one label it has: measured 100 of 100 -> 89 of 100 at
+    apart 0.7 and 99 of 100 -> 19 of 100 at apart 1.0.
 
-    THE RULE IS "NOT THE LAST ONE, WHILE SOMEBODY ELSE IS ENROLLED", and each
-    half is load-bearing:
+    THE REFUSAL IS NARROW ON PURPOSE, AND THE FIRST DRAFT OF IT WAS WRONG.
+    It refused his last pool whenever anybody else was enrolled -- which
+    would have refused the recovery ``migrate_voiceprint``'s own message
+    tells him to run (delete the old slug, then ``--migrate`` under the new
+    name). A guard that blocks the way out of another guard is not a guard.
 
-    * NOT THE LAST. With two labels of his (the blocker's layout) either may
-      go -- that IS the tidy-up, and refusing it would leave him with a fault
-      --status names and no command that clears it.
-    * WHILE SOMEBODY ELSE IS ENROLLED. With nobody else in the gallery,
-      removing his label returns the box to exactly what it was before this
-      feature existed: him in ``voiceprint.npz``, matched nameless, admitted.
-      Nothing to protect him from, so nothing to refuse.
+    So the line is RECOVERABILITY WITHOUT A MICROPHONE, which is this lane's
+    one hard rule. With a readable format-2 ``voiceprint.npz`` on disk, this
+    delete is one ``--migrate`` away from being undone and it is ALLOWED --
+    loudly, see ``delete_warning``. With no voiceprint to carry back in, the
+    only way to a pool of his is eight takes at the microphone, and that is
+    the bill this lane promised he would never be sent: REFUSED.
 
-    ``--yes`` OVERRIDES IT, because it is his voice and his machine and a
-    withdrawal of his own consent must not be something the tool can veto.
-    The refusal exists to make the cost visible, not to lock a door.
+    ``--yes`` overrides even that, because it is his voice and his machine
+    and a withdrawal of his own consent must not be something a tool can
+    veto. The refusal makes the cost visible; it does not lock a door.
     """
     label = str(label or "")
     if label not in gallery.labels():
@@ -402,21 +404,50 @@ def delete_ok(gallery, label, owner, vectors=None):
         return True, ""
     others = [x for x in gallery.labels() if x != label]
     if not others:
+        # The gallery becomes EMPTY, which is no instrument at all: the
+        # verifier fails open exactly as it did before this feature existed.
+        # There is nothing here to protect him from.
         return True, ""
+    if vectors is None:
+        vectors = voiceprint_vectors(PATHS.VOICEPRINT)
+    if vectors:
+        return True, ""                    # one --migrate brings it back
     return False, (
-        "%s is the ONLY pool in the gallery that is the owner's, and %s "
-        "is still enrolled. Deleting it leaves the gallery holding other "
-        "people and not him -- the layout enrolment refuses to build, "
-        "because the gallery then cannot rank him against anybody and "
-        "answers his own voice with somebody else's label (measured: 34 of "
-        "100 of his turns admitted at the widest separation the script will "
-        "enrol, against 100 of 100 with his pool present).\n"
-        "If his pool has come APART from voiceprint.npz, repair it rather "
-        "than removing it -- no microphone needed:\n"
-        "    %s %s --reanchor\n"
-        "If you mean to take his voice out of the gallery anyway, remove the "
-        "others first, or say so: --delete --label %s --yes"
-        % (label, ", ".join(others), sys.executable, __file__, label))
+        "%s is the ONLY pool in the voice gallery that is the owner's, %s "
+        "stay(s) enrolled, and there is no readable %s to carry back in -- "
+        "so removing it leaves Jarvis listening for them and not for him, "
+        "and the only way back is eight takes at the microphone. That is the "
+        "one bill this feature promised never to send him.\n"
+        "Remove the others first, or if you mean it anyway: "
+        "--delete --label %s --yes"
+        % (label, ", ".join(others), PATHS.VOICEPRINT.name, label))
+
+
+def delete_warning(gallery, label, vectors=None):
+    """``""`` or the cost of a delete that IS recoverable, said out loud.
+
+    Deleting his only gallery pool while somebody else is enrolled leaves the
+    layout the enrolment script refuses to build. It is undoable in one
+    command with no microphone, which is why ``delete_ok`` allows it -- but
+    "allowed" is not "free", and nothing used to say so at all.
+    """
+    label = str(label or "")
+    if label not in gallery.labels():
+        return ""
+    mine = his_labels(gallery, vectors)
+    if label not in mine or len(mine) > 1:
+        return ""
+    others = [x for x in gallery.labels() if x != label]
+    if not others:
+        return ""                          # back to the pre-feature box
+    return (
+        "NOTE: %s is the owner's own pool and %s stay(s) enrolled. Without "
+        "his\npool the gallery cannot rank him against them and answers his "
+        "own voice with\nthe one label it has -- measured, his own turns fall "
+        "from 99 of 100 to 19 of\n100 at the widest separation the script "
+        "will enrol. Put it back when you are\ndone, no microphone needed:"
+        "\n    %s %s --migrate"
+        % (label, ", ".join(others), sys.executable, __file__))
 
 
 def pool_ok(gallery, label, vectors, owner="", owner_vectors=None):
@@ -789,6 +820,9 @@ def main(argv=None) -> int:
         if not ok and not args.yes:
             print("REFUSED: %s" % why, file=sys.stderr)
             return 6
+        note = delete_warning(gallery, args.label)
+        if note:
+            print("%s\n" % note)
         out = gallery.purge_label(args.label, reason="consent withdrawn")
         print("removed from %d generation(s); %d file(s) overwritten and "
               "unlinked." % (len(out["generations_with"]), out["removed"]))

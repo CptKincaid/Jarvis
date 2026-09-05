@@ -394,22 +394,54 @@ def test_his_labels_finds_his_pool_by_provenance_and_by_measurement(gal):
     assert voice_enrol.his_labels(gal, []) == ["hunterpeyrovi"]
 
 
-def test_delete_refuses_his_last_pool_while_somebody_else_is_enrolled(gal):
+def test_delete_refuses_his_last_pool_when_it_cannot_be_carried_back(gal,
+                                                                    monkeypatch,
+                                                                    tmp_path):
     """C1-THIRD, THE ROUND-3 REVIEW'S THIRD REMAINING HOLE, and it had no
     guard at all. ``--delete --label <his own label>`` walked back to the
     layout ``owner_ready`` refuses to BUILD -- him in voiceprint.npz only, a
-    guest in the gallery -- where his own turns measured 80 of 100 at apart
-    0.7 and 34 of 100 at apart 1.0 against 100 of 100 migrated."""
+    guest in the gallery -- where his own turns measured 89 of 100 at apart
+    0.7 and 19 of 100 at apart 1.0 against 100 and 99 with his pool present.
+
+    THE LINE IS RECOVERABILITY WITHOUT A MICROPHONE. With no readable
+    voiceprint to carry back in, the only way to a pool of his is eight takes
+    at the microphone -- the one bill this lane promised never to send him."""
+    monkeypatch.setattr(voice_enrol.PATHS, "VOICEPRINT", tmp_path / "gone.npz")
     world = Voices(seed=42, apart=0.3)
     him = world.takes("hunter", 14)
     _carry(gal, "hunter", him)
     _fill(gal, world, "mara", 10, src="enrol")
-    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", him)
+    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", [])
     assert not ok
-    assert "--reanchor" in why and "--yes" in why
+    assert "--yes" in why
     # ...and taking HER away is untouched: consent withdrawal is not gated.
-    ok, _why = voice_enrol.delete_ok(gal, "mara", "hunter", him)
-    assert ok
+    assert voice_enrol.delete_ok(gal, "mara", "hunter", [])[0]
+
+
+def test_delete_allows_a_recoverable_one_and_says_what_it_costs(gal):
+    """A guard that blocked this would block the recovery
+    ``migrate_voiceprint``'s own refusal names -- delete the old slug, then
+    --migrate under the new name. One --migrate undoes it with no
+    microphone, so it is ALLOWED, and the cost is printed rather than
+    hidden."""
+    world = Voices(seed=142, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunter", him)
+    _fill(gal, world, "mara", 10, src="enrol")
+    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", him)
+    assert ok, why
+    note = voice_enrol.delete_warning(gal, "hunter", him)
+    assert "mara" in note and "--migrate" in note and "19 of" in note
+
+
+def test_no_warning_when_his_pool_is_the_only_one(gal):
+    """Nothing to protect him from: with nobody else in the gallery, removing
+    his label returns the box to what it was before this feature."""
+    world = Voices(seed=143, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunter", him)
+    assert voice_enrol.delete_warning(gal, "hunter", him) == ""
+    assert voice_enrol.delete_warning(gal, "nobody", him) == ""
 
 
 def test_delete_allows_the_spare_when_two_labels_hold_his_voice(gal):
@@ -425,17 +457,18 @@ def test_delete_allows_the_spare_when_two_labels_hold_his_voice(gal):
         assert ok, why
 
 
-def test_delete_allows_his_label_when_nobody_else_is_enrolled(gal):
-    """Nothing to protect him from: removing his label with an otherwise
-    empty gallery returns the box to what it was before this feature -- him
-    in voiceprint.npz, matched nameless, admitted."""
+def test_delete_allows_his_label_when_nobody_else_is_enrolled(gal, monkeypatch,
+                                                              tmp_path):
+    """Nothing to protect him from even with no voiceprint: removing his
+    label with an otherwise empty gallery returns the box to what it was
+    before this feature."""
+    monkeypatch.setattr(voice_enrol.PATHS, "VOICEPRINT", tmp_path / "gone.npz")
     world = Voices(seed=44, apart=0.3)
-    him = world.takes("hunter", 14)
-    _carry(gal, "hunter", him)
-    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", him)
+    _carry(gal, "hunter", world.takes("hunter", 14))
+    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", [])
     assert ok, why
     # and a label nobody enrolled is nothing to refuse
-    assert voice_enrol.delete_ok(gal, "nobody", "hunter", him)[0]
+    assert voice_enrol.delete_ok(gal, "nobody", "hunter", [])[0]
 
 
 def test_status_names_two_labels_of_his_voice_and_the_command(gal, capsys,
