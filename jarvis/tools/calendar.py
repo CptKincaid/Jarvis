@@ -755,9 +755,39 @@ def _pair_tail_ok(rest: str) -> bool:
 _PAIR_RX = re.compile(rf"^\s*,?\s*(?:and|or)\s+(?:the\s+)?\d{{1,2}}{_ORD}\b", re.I)
 
 
+# A RANK WITH ITS NOUN LEFT OUT.  "the 2nd he walked in", "the 1st you
+# mentioned", "the 3rd we tried", "it was the 2nd best I'VE seen": the
+# ordinal stands for a noun the sentence never says, and the relative
+# clause after it is the rank's, not a day's.  These were NON-DATES on
+# 61f0945 and became days when round five put the pronouns on _TAIL_WORDS
+# (MEASURED 2026-09-06, 4 grid rows at all nine instants).
+#
+# What separates them from "on the 12th I HAVE a thing", which is a day, is
+# the FRAME: his date-shaped ordinals carry a preposition ("on the 12th",
+# "for the 12th") and the elided rank carries a bare "the".  So this shape
+# is a rank only behind a bare "the" -- a prepositional frame beats it.
+_ORD_PRONOUN_RX = re.compile(
+    r"^\s+(?:i|i'm|i'll|i've|i'd|you|you're|you'll|you've|he|he's|she|she's|"
+    r"we|we're|we'll|we've|they|they're|they've|it|it's|that|that's|"
+    r"these|those|him|her|them|us|who|whom)\b", re.I)
+
+
+def _elided_rank(rest: str) -> bool:
+    """True when a pronoun follows the ordinal, through any adjective:
+    "the 2nd BEST i've seen"."""
+    if _ORD_PRONOUN_RX.match(rest or ""):
+        return True
+    match = _TAIL_WORD_RX.match(rest or "")
+    if match is not None and match.group(1).lower().rstrip(".") in _TAIL_ADJ:
+        return _elided_rank(rest[match.end():])
+    return False
+
+
 def _ord_ok(text: str, match) -> bool:
     """The rank rule behind a BARE ORDINAL -- the round-seven direction."""
     rest = text[match.end():]
+    if not _PREP_LEAD_RX.match(match.group(0)) and _elided_rank(rest):
+        return False                         # "the 2nd he walked in"
     pair = _PAIR_RX.match(rest)
     if pair is not None and not _ord_tail_ok(rest[pair.end():]):
         return False                         # "the 1st or 2nd FLOOR"
