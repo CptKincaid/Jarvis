@@ -138,6 +138,11 @@ class PATHS:
     # keep a hash out of a log is to keep it out of that object. Written
     # 0600 in a 0700 directory by Registry.save.
     OWNER_REGISTRY = STATE_DIR / "people.json"
+    # jarvis/knightfall_weekly.py: what the weekly override-code lane last
+    # did, as one small JSON file the drawer caption and `jarvis -q status`
+    # read. Beside people.json, and never /tmp, which is wiped at boot:
+    # the pull that resolves a Sunday push can run days later.
+    KNIGHTFALL_WEEKLY = STATE_DIR / "knightfall-weekly.json"
 
 
 # ------------------------------------------------------------- settings

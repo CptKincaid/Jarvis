@@ -2018,6 +2018,16 @@ def format_knightfall_status(status) -> tuple:
     """
     if not isinstance(status, dict):
         status = {}
+    text, can_press = _knightfall_base(status)
+    # The weekly lane's one sentence (jarvis/knightfall_weekly.py), when
+    # there is one: what Sunday's backup email did to his code, or why it
+    # did nothing. Appended, never substituted, so the caption without a
+    # weekly line is exactly what it was.
+    weekly = str(status.get("weekly") or "")
+    return (f"{text} {weekly}" if weekly else text), can_press
+
+
+def _knightfall_base(status: dict) -> tuple:
     problem = str(status.get("problem") or "")
     if problem:
         return f"{KNIGHTFALL_LEAD} {problem}.", False

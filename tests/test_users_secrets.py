@@ -59,6 +59,9 @@ class Stub:
     _gate_mode_quietly = app_mod.JarvisApp._gate_mode_quietly
     knightfall_new_code = app_mod.JarvisApp.knightfall_new_code
     _knightfall_rotate = app_mod.JarvisApp._knightfall_rotate
+    # The locked half of the rotate, split out 2026-09-06 so the
+    # weekly issuer and the drawer share one file lock.
+    _knightfall_store = app_mod.JarvisApp._knightfall_store
     _people_gate = app_mod.JarvisApp._people_gate
 
 

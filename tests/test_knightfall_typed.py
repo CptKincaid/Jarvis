@@ -51,8 +51,12 @@ def _app(tmp_path, *, code=True, cfg=None, mode="shadow"):
     a.get_option = lambda k, d=None: opts.get(k, d)
     a.gate = gate_mod.OwnerGate(registry=reg, owner="hunter",
                                 get_option=a.get_option)
+    # The real methods on a bare namespace, so every helper they call has
+    # to be bound too: _knightfall_check_registry (the drawer now decides
+    # from the FILE) and _knightfall_store (the locked half of the rotate).
     for name in ("knightfall_code", "knightfall_new_code",
-                 "_knightfall_rotate"):
+                 "_knightfall_rotate", "_knightfall_store",
+                 "_knightfall_check_registry", "_people_registry"):
         setattr(a, name, getattr(app_mod.JarvisApp, name).__get__(a))
     return a
 
@@ -107,12 +111,17 @@ def test_the_right_code_opens_the_window_and_rotates_by_mail(tmp_path, caplog):
 def test_the_gates_own_code_counter_is_the_one_used(tmp_path, monkeypatch):
     a = _app(tmp_path)
     seen = []
-    real = gate_mod.check_override_code
+    # The DRAWER asks check_override_code_leg (2026-09-06), which answers
+    # which hash matched so a typed weekly code can be promoted on the
+    # spot; check_override_code is now a two-tuple wrapper around it. The
+    # question this test asks -- which attempt counter is handed in -- is
+    # unchanged, so it spies on the function the drawer actually calls.
+    real = gate_mod.check_override_code_leg
 
     def spy(registry, code, *, attempts=None):
         seen.append(attempts)
         return real(registry, code, attempts=attempts)
-    monkeypatch.setattr(gate_mod, "check_override_code", spy)
+    monkeypatch.setattr(gate_mod, "check_override_code_leg", spy)
     a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
     assert seen == [a.gate.code_attempts]
     assert a.gate.code_attempts is not a.gate.phrase_attempts
