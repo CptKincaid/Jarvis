@@ -1114,6 +1114,8 @@ class Recorder:
         and could newly hold a short word said after a run, so it is not
         here. The filler hold is untouched by any of this."""
         latest = self._latest_partial
+        if latest is None and self._decoding is None:
+            return 0.0            # nothing noted and nothing running: the ordinary stop
         last = ep.last_speech_seconds
         if last is None:
             return 0.0
