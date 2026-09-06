@@ -560,6 +560,21 @@ DEFAULTS: dict = {
                  "rooms_poll_s": 2.0, "rooms_enter_hold_s": 2.0,
                  "rooms_leave_hold_s": 8.0, "rooms_switch_min_s": 6.0,
                  "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0,
+                 # HIS THREE-LEG VOTER (jarvis/presencevote.py): camera,
+                 # then phone, then room sensor, in his order. OFF BY
+                 # DEFAULT. Turning it on changes what "away" means: every
+                 # poll asks all three legs, so a room reading occupied no
+                 # longer stops the phone being asked and a latched radar
+                 # cannot cost him the greeting (2026-09-05, 20:43). Off,
+                 # the room-or-phone composition runs exactly as before.
+                 "three_legs": False,
+                 # With the voter on: how fresh an agreement (phone, camera
+                 # or a spoken turn) must be, in minutes, for a room reading
+                 # occupied to still count as him when his phone is silent
+                 # and the camera cannot look. DERIVED from away_after_min,
+                 # not measured (presencevote.RECENCY_S_PROVENANCE); the
+                 # right value is how long his short trips are.
+                 "corroboration_recency_min": 15,
                  # THE DOOR ROOM (jarvis/arrival.py, app._on_room_changed).
                  # His words: "kitchen to see if i enter my apartment since
                  # the kitchen and door are next to each other". That room
@@ -897,6 +912,62 @@ DEFAULTS: dict = {
     # out and grab at the screen (in the air) where the camera is and then
     # gesture towards almost throwing the cast onto the HPCOMPUTER".
     #
+    # ==================================================================
+    # READ THIS BEFORE YOU SET enabled TO True. IT IS THE ONLY THING ON
+    # THIS KEY THAT MATTERS.
+    #
+    # This gesture FIRES WHEN HE IS NOT MAKING IT, and the rate is not
+    # close. MEASURED at his own desk geometry on an independent
+    # adversarial grid (castgrid/), same seeds across every round:
+    #
+    #   P(fire | NOT a cast gesture), 262 families, 4192 sequences
+    #     7.5 fps   0.4986   95% CI [0.4834, 0.5137]
+    #     6.0 fps   0.4945   95% CI [0.4794, 0.5096]
+    #   ...of which the preserved 172-family grid alone, 2752 sequences,
+    #   is 0.2362 [0.2207, 0.2524] at 7.5 and 0.2322 at 6.0 -- unchanged
+    #   from round 4, because round 5 changed no bar that ships.
+    #
+    # THE BAR IS 0.005. HALF the brisk motions near that monitor that
+    # anyone could invent -- a mug carried out in a second, a thing handed
+    # to someone beside him, a mug pulled toward him and then taken away --
+    # fire a cast, and what a cast does is put a desktop on a monitor he is
+    # using.
+    #
+    # IT CANNOT BE TUNED DOWN FROM HERE, AND THREE SIGNALS HAVE NOW BEEN
+    # TRIED. Speed: his brisk desk motion sits on the same side of the bar
+    # as his own throw, and tightening it cuts into his gesture (round 3
+    # did exactly that and the gesture stopped firing when his swing was
+    # 10 mm shorter). Head yaw: a switch and not a dial -- ``yaw_hold_deg``
+    # at or under 25 deg vetoes nothing, over 25 deg it refuses every
+    # throw he makes, nothing between.
+    #
+    # AND THE WIND-UP, WHICH IS ROUND 5 AND IS THE END OF THE LINE. He was
+    # asked whether his throw pulls back before it swings and HE SAID YES,
+    # so it was built and measured (``windup_min_u``,
+    # castgrid/test_r5_windup.py). It is real -- an injected 40 mm
+    # retraction measures 0.247 hand-units -- and it does not separate,
+    # because his ORDINARY CARRIES retract by the same amount: at 40 mm,
+    # his throw 0.218 u against a carry that pulls back first at 0.239.
+    # The best bar in the sweep, 0.60 u, leaves the rate at 0.1054 (still
+    # 21x the bar) and needs a 120 mm pull-back before every throw. Worse,
+    # a wind-up made TOWARD HIS BODY reads 0.000 u at any amplitude,
+    # because it barely moves in the image plane -- so if that is the one
+    # he makes, any bar refuses every throw. His own amplitude and
+    # direction are UNKNOWN; the instrument is
+    #   ~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30 \
+    #       --windup
+    # and NOTHING it reports would change this switch.
+    #
+    # SO THIS SWITCH STAYS OFF, AND HERE IS THE WHOLE OF WHY. Three
+    # signals were tried: speed, head yaw, and the wind-up he confirmed
+    # his throw has. The best any of them reaches is 0.1054 against a bar
+    # of 0.005. The wind-up is real, but an ordinary carry pulls back by
+    # the same amount -- slightly more -- and pulled straight toward his
+    # body it cannot be seen at all. It stays off until a signal nobody
+    # has thought of yet exists. The spoken cast does everything the
+    # gesture would have, in both directions; that is the product.
+    # ==================================================================
+    #
     # OFF by default, like every other lens key. It RIDES THE CAMERA
     # PREVIEW: the hand stage runs inside the preview's own capture, on the
     # frame it already pulled, so camera.preview must be on and the console
@@ -957,17 +1028,76 @@ DEFAULTS: dict = {
                 # or a resting fist drifting into the zone becomes a grab;
                 # anchor_drift_u is how still "still" is, in hand-units
                 # (~7x the 0.05-0.09 landmark noise floor).
+                #
+                # THESE FIVE WERE RESCALED BY 0.86 IN ROUND 3 AND THIS FILE
+                # DID NOT FOLLOW, WHICH IS A DEFECT ROUND 4 FOUND. The
+                # hand-unit changed under them -- it is measured every frame
+                # and pose-corrected now -- so each bar was multiplied by
+                # 225/262 to keep the millimetres it was measured at. But
+                # ``handstage.thresholds_from_options`` applies whatever is
+                # in THIS file ON TOP of the module's defaults, so on his
+                # actual box round 3's rescale was silently put back:
+                # anchor_drift_u 0.52 -> 0.6, throw_release_u 0.86 -> 1.0,
+                # throw_exit_u 0.22 -> 0.25, throw_lost_u 0.43 -> 0.5,
+                # exit_step_u 0.30 -> 0.35. MEASURED cost on the preserved
+                # grid: about one sequence in 2752, so it was invisible --
+                # and a documented value the shipped file overrides is not
+                # a documented value. tests/test_gesture_round4.py pins
+                # that this file and jarvis/gesture.py agree, field by
+                # field, from here on.
                 "dwell_frames": 3, "open_lookback_frames": 12,
-                "open_frames_req": 1, "anchor_drift_u": 0.60,
+                "open_frames_req": 1, "anchor_drift_u": 0.52,
                 # The throw, in hand-units of travel from the anchor: opened
                 # in frame needs a full hand-width (he opens his hand
                 # hundreds of times an hour); left the picture within
-                # edge_frac of a half-field needs only 0.25 (leaving is the
-                # evidence); vanished in open space needs 0.50 AND a last
-                # step of exit_step_u. Anything less is a DROP -- the cheap,
-                # reversible outcome.
-                "throw_release_u": 1.00, "throw_exit_u": 0.25,
-                "throw_lost_u": 0.50, "exit_step_u": 0.35, "edge_frac": 0.30,
+                # edge_frac of a half-field needs only a fifth of one
+                # (leaving is the evidence); vanished in open space needs
+                # more AND a last step of exit_step_u. Anything less is a
+                # DROP -- the cheap, reversible outcome, and round 4 makes
+                # it say WHY (screens_status()["refused"]).
+                "throw_release_u": 0.86, "throw_exit_u": 0.22,
+                "throw_lost_u": 0.43, "exit_step_u": 0.30, "edge_frac": 0.30,
+                # THE FLING, and it is the bar that decides most refusals.
+                # A carry becomes a throw only if the hand was travelling
+                # at throw_speed_us within fling_window_s of the moment the
+                # throw would fire. 2.45 is in HAND-UNITS PER SECOND and
+                # is deliberately not quoted in mm/s: one hand-unit
+                # measures 112-113 mm on the synthetic hand at his working
+                # pitch, about 11% under the 127 mm it is documented as,
+                # so a millimetre figure here would be a number this rig
+                # cannot support. What it IS defended by: his own slow
+                # throw measures 2.51-3.18 u/s across the surface, so 2.45
+                # sits just below all of it and 2.65 sat inside it. 2.45 is
+                # the highest value that is at or
+                # above round 2's recall in every one of the 84 cells of
+                # the measured surface (swings 270-330 mm x end depths
+                # 420-470 mm x both directions x 5.5-8.0 fps x 0/3/5 px).
+                # Raising it cuts into his own throw; lowering it raises
+                # the false-fire rate above.
+                "throw_speed_us": 2.45, "fling_window_s": 0.55,
+                # ROUND 5's third signal, SHIPPED INERT AT 0.0. How far the
+                # hand must pull BACK along the throw axis before it swings,
+                # in hand-units. It is a real measurement and it does not
+                # separate -- see the block above and
+                # castgrid/test_r5_windup.py. It is a key here so he can
+                # raise it from his own room after running the self-check
+                # with --windup, and so a value he sets is printed beside
+                # the refusals it causes (screens_status()["bars"]).
+                "windup_min_u": 0.0,
+                # The pose-corrected fist scalar. MEASURED and shipped as a
+                # sanity floor rather than a gate (jarvis/gesture.py says
+                # why); open_ratio_min is deliberately at a value nothing
+                # reaches. Both are here so he can tighten them from his
+                # own room, where the pose distribution is real.
+                "closed_ratio_max": 1.05, "open_ratio_min": 99.0,
+                # The second signal: his head still on the screen he
+                # grabbed. yaw_required decides what NO CLEAN FACE ROW
+                # costs, and it refuses -- watch yaw_miss_pct.
+                "yaw_hold_deg": 25.0, "yaw_required": True,
+                # Association during a carry, and the two cheap identity
+                # locks round 3 added with it.
+                "assoc_max_u": 2.15, "assoc_scale_frac": 0.45,
+                "assoc_step_u": 2.00,
                 # A carry survives lost_grace_frames of missed detection,
                 # and ends at carry_max_frames OR carry_max_s, whichever
                 # first (the seconds are the wall-clock backstop for a

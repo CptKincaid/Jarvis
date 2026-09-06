@@ -400,6 +400,12 @@ def main(argv=None) -> int:
                          "hand and it has no face, so R is 0.0")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable, and just as pixel-free")
+    ap.add_argument("--windup", action="store_true",
+                    help="THE ONE HE WAS ASKED FOR. Summarise the WIND-UP "
+                         "on every throw: how far his hand pulled back "
+                         "before it swung, in hand-units and in "
+                         "millimetres. He said his throw has one; nothing "
+                         "here has ever measured it. Numbers only.")
     args = ap.parse_args(argv)
 
     report: dict = {"banner": BANNER}
@@ -599,9 +605,14 @@ def _report_run(report, args, run, thresholds, say, *, synthetic,
     say("   events: grabs %d  throws %d  drops %d"
         % (run["grabs"], run["throws"], run["drops"]))
     for e in run["events"]:
-        say("      f%-4d %-5s sector=%-5s toward=%-5s dist %.2f u  %s"
+        say("      f%-4d %-5s sector=%-5s toward=%-5s dist %.2f u  "
+            "%.2f u/s in the fling window (carry peak %.2f)  "
+            "wind-up %.3f u  %s"
             % (e["frame"], e["kind"], e["sector"] or "-", e["toward"] or "-",
-               e["dist_u"], e["why"]))
+               e["dist_u"], e.get("fling_us", 0.0), e.get("speed_us", 0.0),
+               e.get("windup_u", 0.0), e["why"]))
+    if getattr(args, "windup", False):
+        _report_windup(report, run, thresholds, say)
     asked = float(report.get("capture_fps", 0.0))
     got = float(run["fps"])
     fps_ok = (not asked or not got or synthetic
@@ -639,6 +650,74 @@ def _report_run(report, args, run, thresholds, say, *, synthetic,
     if synthetic:
         say("   (n/a = not measurable on a drawn hand; run it on the camera)")
     return _finish(report, args, 1 if failed else 0)
+
+
+# One hand-unit in millimetres, for the ONE conversion this instrument
+# prints. BOTH NUMBERS ARE GUESSED, AND NEITHER IS HIS. 127.0 is standard
+# adult anthropometry, hypot(107 mm palm length, 68.2 mm knuckle breadth),
+# never measured on him. 112.2 is what the pose-corrected unit reads on
+# the SYNTHETIC hand at 425 mm and his working pitch
+# (castgrid/r4recall.py mm_per_unit(425.0)): measured on a drawn hand
+# built from that same anthropometry, so it is the guess seen through the
+# lens model, about 11% under the documented figure, not a second source.
+# Both are printed so he can see the spread rather than trust one. THE
+# MEASUREMENT EACH WANTS is one ruler reading of his own hand: palm length
+# (wrist crease to the middle knuckle) and knuckle breadth (index to
+# little-finger knuckle), in millimetres; hypot of those replaces both.
+HAND_UNIT_MM_DOC = 127.0
+HAND_UNIT_MM_MEASURED = 112.2
+
+
+def _report_windup(report, run, thresholds, say) -> None:
+    """THE QUESTION HE ANSWERED, TURNED INTO A NUMBER.
+
+    Asked on 2026-09-05 -- "when you throw, does your hand pull back a
+    little first, before it swings?" -- he said YES. Nothing in this repo
+    has ever seen his hand, so HOW FAR and HOW LONG are unknown, and every
+    figure the round-5 grid reports is recall AT AN ASSUMED AMPLITUDE. This
+    is the instrument that replaces the assumption.
+
+    WHAT IT CANNOT SEE, and he should read this before he reads the number:
+    the wind-up is measured in the IMAGE PLANE, along the axis the throw
+    took. A pull-back TOWARD HIS BODY produces almost no image movement --
+    MEASURED on the synthetic hand at 0.018 u whatever the amplitude, right
+    up to 120 mm. So a small number here does not mean he did not wind up;
+    it may mean he wound up in the one direction the lens cannot resolve.
+    """
+    winds = [(e["frame"], float(e.get("windup_u", 0.0)), e["kind"],
+              e["sector"] or e["toward"] or "-")
+             for e in run["events"] if e["kind"] in ("throw", "drop")]
+    report["windup"] = {"n": len(winds),
+                        "values_u": [round(w, 4) for _f, w, _k, _s in winds]}
+    say("")
+    say("   WIND-UP -- how far your hand pulled BACK before it swung")
+    if not winds:
+        say("      no carry ended in this run, so there is nothing to "
+            "measure. Reach, close your hand, hold it still, then throw.")
+        return
+    vals = sorted(w for _f, w, _k, _s in winds)
+    med = vals[len(vals) // 2]
+    report["windup"].update({"min_u": round(vals[0], 4),
+                             "median_u": round(med, 4),
+                             "max_u": round(vals[-1], 4)})
+    say("      frame  kind   toward  wind-up (hand-units)   ~mm (112 / 127)")
+    for f, w, kind, where in winds:
+        say("      %5d  %-5s  %-6s  %18.3f   %5.0f / %.0f"
+            % (f, kind, where, w, w * HAND_UNIT_MM_MEASURED,
+               w * HAND_UNIT_MM_DOC))
+    say("      n %d   min %.3f   median %.3f   max %.3f  (hand-units)"
+        % (len(vals), vals[0], med, vals[-1]))
+    say("      = about %.0f mm at the median, on GUESSED hand size."
+        % (med * HAND_UNIT_MM_MEASURED))
+    say("")
+    say("      WHAT THIS BUYS, measured (castgrid/test_r5_windup.py):")
+    say("      a wind-up bar of 0.15 u needs about 40 mm to fire reliably")
+    say("      and leaves P(fire | NOT a cast gesture) at 0.2600; a bar of")
+    say("      0.60 u needs about 120 mm and still leaves 0.1054. The bar")
+    say("      is 0.005. THE WIND-UP DOES NOT CLOSE THE GAP, so the")
+    say("      gesture stays off whatever this run says -- but this number")
+    say("      is the one piece of it that was never measured, and it is")
+    say("      yours to take.")
 
 
 def _finish(report: dict, args, code: int) -> int:

@@ -31,6 +31,7 @@ import uuid
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 from jarvis import gateledger
 from jarvis.config import CONFIG, MACHINE, PATHS
@@ -66,6 +67,8 @@ from jarvis.logs import get_logger
 from jarvis import address as address_mod
 from jarvis import arc as arc_mod
 from jarvis import board as board_mod
+from jarvis import castview as castview_mod
+from jarvis import procnet
 from jarvis import brain as brain_mod
 from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
@@ -385,7 +388,10 @@ DISCORD_ACTIVE_S = 600.0        # a Discord exchange stays "active" this long
 # minutes apart on the same walk through the door, and that is ONE return:
 # both greetings go through _greet_return, which speaks at most once per
 # damper. release() already drains atomically, so only the LINE could double.
-GREET_DAMPER_S = 600.0
+# The number lives in jarvis/arrival.py, which owns the choreography and has
+# to be able to NAME this gate in a refusal (arrival.greet_refusal); this is
+# an alias so the two can never drift apart.
+GREET_DAMPER_S = arrival_mod.GREET_DAMPER_S
 
 
 def _same_clause(a: str, b: str) -> bool:
@@ -667,6 +673,13 @@ class JarvisApp:
 
         # ---- routing ------------------------------------------------------
         self.services = self._build_services()
+        # The Windows cast poller's only way in (jarvis/castview.CastRelay
+        # through webapp's one gated /api/cast route). Attached here because
+        # this is the first line where both objects exist; with it absent
+        # the route answers "none" forever, which is the honest degradation
+        # for a startup script polling a Jarvis that cannot cast.
+        if self.webapp is not None and self.gesture is not None:
+            self.webapp.cast_relay = getattr(self.gesture, "relay", None)
         self._register_tools()
         # The mixer was built at 372, before any tool existed; the Connect
         # ducker it asks on every hold alongside the local one (#72) is the
@@ -762,6 +775,9 @@ class JarvisApp:
                      if self.assistant is not None
                      else arrival_mod.DEFAULT_DOOR_ROOM))
         self._warn_door_room_names_nothing()
+        # HIS DEPARTURE RULE, as an ordered sequence. Pure and silent; see
+        # _departure_seq_room.
+        self._departure_seq = self._make_departure_seq()
         # A radar whose gates have gone back to 0 sees 0.75 m and reads the
         # room as EMPTY -- measured twice on real hardware, 2026-09-03. The
         # check is a daemon thread that waits before its first read (the
@@ -873,7 +889,89 @@ class JarvisApp:
             # A sensor with no owner does not sense: that is the ruling.
             sens = _import_optional("jarvis.sensing")
             policy = None if sens is None else sens.DENIED
-        return mod.PresenceSentinel(self.assistant, policy=policy)
+        sentinel = mod.PresenceSentinel(self.assistant, policy=policy)
+        legs = getattr(sentinel, "legs", None)
+        if legs is not None:
+            # Guarded on ``legs`` rather than called unconditionally:
+            # tests/test_sensing.py drives this method with a partial self
+            # (types.SimpleNamespace) on purpose, and that path has no
+            # fabric, so no legs, so nothing to wire.
+            self._wire_camera_leg(legs)
+            self._wire_mic_leg(legs)
+        return sentinel
+
+    def _wire_mic_leg(self, legs) -> bool:
+        """Attach the mic leg: SECONDS SINCE A TURN, off the turn ledger.
+
+        The voter's cell 6 -- radar on, phone silent past the grace, camera
+        unable to look -- reads identically for a latched radar with him
+        out and for him sitting still at his desk with his phone asleep. A
+        spoken turn is the one fact that tells those apart, and
+        ``arrival.departure_ready`` already reads it off the same ledger
+        for its own veto. This hands the voter the same number.
+
+        Late-bound on purpose: ``self.turns`` is built by
+        ``_wire_turn_clock`` AFTER ``_construct`` builds presence, so the
+        leg looks the ledger up at call time (``_mic_leg``) rather than
+        capturing an attribute that does not exist yet.
+        """
+        if legs is None:
+            return False
+        legs.mic = self._mic_leg
+        return True
+
+    def _mic_leg(self):
+        """``TurnLedger.idle_s()`` or None. A number, never audio: the
+        ledger holds timestamps, and this reads one of them."""
+        turns = getattr(self, "turns", None)
+        idle = getattr(turns, "idle_s", None)
+        if not callable(idle):
+            return None
+        try:
+            return idle()
+        except Exception:  # noqa: BLE001 - the ledger must not cost the vote
+            return None
+
+    def _wire_camera_leg(self, legs) -> bool:
+        """Attach the camera leg and SAY OUT LOUD whether it can answer.
+
+        His ruling, 2026-09-05: "The camera should be the number one
+        understanding for if I'm in. Followed by phone connection then
+        sensor." The voter obeys that -- a camera that NAMES him ends the
+        vote in every one of the 27 cells.
+
+        BUT NOTHING IN THIS TREE EVER ASSIGNS ``services.camera_feed``
+        (grep for "camera_feed ="), so ``_eye_leg`` answers BLIND
+        unconditionally today, and BLIND is "could not look", which never
+        votes. That makes the running voter a TWO-leg voter wearing a
+        three-leg name, and the one thing it must not do is claim
+        otherwise: this is his number one signal, and he is entitled to
+        know it is dark rather than to find out from a missed greeting.
+        So the dark case is a WARNING that names the missing wiring and
+        says what the vote is actually standing on.
+
+        The slot is wired either way, so the leg goes live the moment
+        something finally attaches a feed -- no second restart.
+        """
+        if legs is None:
+            return False
+        legs.eye = self._eye_leg
+        live = False
+        try:
+            identity, faces, live = self._eye_leg()
+        except Exception:  # noqa: BLE001 - a broken eye is not a boot failure
+            live = False
+        if live:
+            log.info("presence: the camera leg is live -- his number one "
+                     "signal can vote")
+            return True
+        log.warning(
+            "presence: HIS NUMBER ONE SIGNAL IS DARK. Nothing on this tree "
+            "assigns services.camera_feed, so the camera leg answers "
+            '"could not look" to everything and never votes. The verdict is '
+            "standing on the phone and the room sensors only, in that "
+            "order. It goes live by itself the moment a feed is attached.")
+        return False
 
     def _make_room_light(self):
         mod = _import_optional("jarvis.room")
@@ -1598,11 +1696,236 @@ class JarvisApp:
                 speak=lambda text: self._say(text),
                 board_show=self._board_show,
                 transfer=self._spotify_transfer,
+                view_launch=self._rustdesk_view,
+                view_stop=self._rustdesk_close,
+                view_alive=self._rustdesk_alive,
+                view_connected=self._rustdesk_connected,
+                view_served=self._hpcomputer_watching,
+                view_serve_arm=self._hpcomputer_watch_arm,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
                           "stays off")
             return None
+
+    # -- the screen viewer, the one place a RustDesk window is opened -----
+    # NOTHING IN THE DESIGN OR TEST SESSION EVER RAN THESE. They are the
+    # injected seam jarvis/castview.py refuses to own: that module holds no
+    # process spawner at all, so the only way a viewer window can appear is
+    # through these two methods, in the running app, on his say-so.
+    #
+    # THE ONE THING I COULD NOT VERIFY FROM NUMBERS, and he should read it:
+    # I do not know whether the RustDesk viewer steals focus when it opens,
+    # whether it can be launched minimised, or whether --connect honours a
+    # window-state flag. I did not start a session and would not. It is the
+    # same class of harm as the 08-26 desktop freeze, so it is his to try
+    # once, deliberately, when he is not mid-sentence in something.
+    def _rustdesk_view(self, host: str) -> None:
+        """Open the Spark's own RustDesk viewer on ``host``. Outbound only.
+
+        A FIXED argument list built here, never a string from anywhere
+        else: the host comes from castview's own constant and the flag is a
+        literal. There is no shell, so nothing can be interpolated into
+        one.
+        """
+        import shutil                                       # noqa: PLC0415
+
+        binary = shutil.which("rustdesk") or os.path.expanduser(
+            "~/.local/bin/rustdesk")
+        if not os.path.exists(binary):
+            raise OSError("no rustdesk viewer on this box")
+        self._close_rustdesk()
+        self._rustdesk = subprocess.Popen(          # noqa: S603 - fixed argv
+            [binary, "--connect", str(host)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info("cast: opened a viewer on %s", host)
+
+    def _rustdesk_alive(self) -> bool:
+        """Is the viewer THIS app started still running?
+
+        ``Popen`` returning is only evidence that the fork worked, and
+        jarvis/castview.py may not call a cast landed on that: a viewer
+        that cannot reach the host, cannot open a window or dies on a
+        missing display is gone within a moment, and this is what notices.
+        ``poll()`` is None while the child lives.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        return proc is not None and proc.poll() is None
+
+    # How long the byte counter is sampled over. Long enough that one
+    # frame of a desktop stream is unmistakable, short enough to sit
+    # inside the settle the sink already waits.
+    _STREAM_SAMPLE_S = 0.35
+
+    def _rustdesk_connected(self) -> Optional[bool]:
+        """Is the viewer this app started actually RECEIVING a desktop?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. ``Popen.poll() is None`` is not evidence: a
+        RustDesk viewer sitting on an accept-or-password prompt on the
+        Windows side is a perfectly live process, and round 2 called that
+        a cast (MEASURED).
+
+        THE EVIDENCE IS LOCAL AND IT IS NUMBERS. Two readings out of
+        /proc, both about THIS process and no other:
+
+          * an ESTABLISHED TCP socket that this pid owns, to
+            castview.HPCOMPUTER_HOST. That is necessary and it is not
+            sufficient -- the password prompt holds one open too.
+          * bytes actually arriving. ``/proc/<pid>/io``'s ``rchar`` over a
+            short window: a viewer painting a desktop pulls hundreds of
+            kilobytes a second, one waiting to be let in pulls a
+            keepalive. ``castview.VIEWER_STREAM_BPS`` is the floor and it
+            is GUESSED between those two orders of magnitude.
+
+        NOTHING HERE OPENS A WINDOW, A CAPTURE DEVICE OR THE PICTURE, and
+        nothing leaves this box. It cannot prove a window is visible or on
+        the right monitor; it proves a live connection carrying a stream,
+        which is as far as local evidence goes. That last step is his.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        if proc is None or proc.poll() is not None:
+            return False
+        pid = int(proc.pid)
+        try:
+            if not procnet.has_socket_to(pid, castview_mod.HPCOMPUTER_HOST):
+                return False
+            first = procnet.rchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._STREAM_SAMPLE_S)
+            second = procnet.rchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the connection probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._STREAM_SAMPLE_S
+        log.info("cast: viewer pid %d is pulling %.0f B/s", pid, rate)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
+
+    # How long the byte counter is sampled over on the SERVING side. The
+    # same idea as _STREAM_SAMPLE_S and the same GUESS.
+    _SERVE_SAMPLE_S = 0.35
+
+    def _hpcomputer_watch_arm(self) -> None:
+        """Remember which RustDesk connections from HPCOMPUTER were ALREADY
+        there, so the probe below can answer about THIS cast.
+
+        ROUND 5. ``_hpcomputer_watching`` said True for ANY established
+        socket from HPCOMPUTER on a screen-sharing port -- including a
+        RustDesk session he opened himself an hour earlier, which is a live
+        connection carrying a stream and is not a cast Jarvis landed. The
+        sink calls this before it parks the verb; anything in this set is
+        not evidence for what happens next.
+
+        THE LIMIT, and it is real: inode numbers are reused, and a
+        reconnect of his own session inside the same cast would look new.
+        This narrows the probe from "he has RustDesk open" to "a connection
+        appeared after I asked" and no further. It reads /proc/net and
+        nothing else -- no socket is opened, nothing leaves this box.
+        """
+        try:
+            self._serve_seen = set(procnet.established_to(
+                castview_mod.HPCOMPUTER_HOST, castview_mod.RUSTDESK_PORTS))
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving baseline could not be read",
+                      exc_info=True)
+            self._serve_seen = set()
+        log.info("cast: %d RustDesk connection(s) from HPCOMPUTER were "
+                 "already up before this cast", len(self._serve_seen))
+
+    def _hpcomputer_watching(self) -> Optional[bool]:
+        """Is HPCOMPUTER actually PULLING the Spark's screen?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. This is the Spark -> HPCOMPUTER direction
+        and it is NOT the mirror of ``_rustdesk_connected``: there is no
+        viewer process on this box to ask about. The viewer runs in HIS
+        Windows session; the Spark is the end being VIEWED. So the
+        evidence is what arrives here:
+
+          * an ESTABLISHED TCP socket INBOUND from castview.HPCOMPUTER_HOST
+            on one of ``castview.RUSTDESK_PORTS``. THE PORT SCOPING IS THE
+            WHOLE POINT: the Windows helper's own long poll is also an
+            established socket to that host, held open 25 s at a time
+            about 2.4 times a minute, so "is there a connection to
+            HPCOMPUTER" is true almost always and is worth nothing. The
+            poll's own port (webapp's 8765) is deliberately not in that
+            tuple.
+          * bytes actually leaving over it. The socket alone is not
+            enough for the same reason it was not enough in the other
+            direction -- a viewer negotiating a password holds one open --
+            so the inode is traced back to the process serving it and its
+            ``wchar`` is sampled. ``castview.VIEWER_STREAM_BPS`` is the
+            floor and it is GUESSED.
+
+        THE HONEST WEAKNESS, stated rather than buried: ``wchar`` is that
+        process's WHOLE output, not this socket's. If his RustDesk were
+        serving a second viewer at the same moment, this would read that
+        traffic too and could say yes to a cast that is not carrying. It
+        cannot say yes to a machine that is not connected at all, which is
+        the failure this exists to catch, and per-socket byte counters are
+        not in /proc -- reading them means opening a netlink socket, which
+        this lane does not do.
+
+        NOTHING HERE OPENS A WINDOW, A SOCKET, A CAPTURE DEVICE OR THE
+        PICTURE, and nothing leaves this box. It proves a live connection
+        carrying a stream. It does NOT prove a window is visible or on his
+        middle monitor. That last step is his.
+        """
+        try:
+            inodes = procnet.established_to(castview_mod.HPCOMPUTER_HOST,
+                                            castview_mod.RUSTDESK_PORTS)
+            # TIED TO THIS CAST, as far as local evidence reaches: a
+            # connection that was already up when the cast was asked for is
+            # his own session, not this one. With no baseline taken the
+            # behaviour is round 4's exactly.
+            inodes = set(inodes) - set(getattr(self, "_serve_seen", ()) or ())
+            if not inodes:
+                return False
+            pid = None
+            for inode in sorted(inodes):
+                pid = procnet.pid_for_inode(inode)
+                if pid is not None:
+                    break
+            if pid is None:
+                return None                # not ours to look into
+            first = procnet.wchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._SERVE_SAMPLE_S)
+            second = procnet.wchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._SERVE_SAMPLE_S
+        log.info("cast: HPCOMPUTER is pulling %.0f B/s from pid %d",
+                 rate, pid)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
+
+    def _rustdesk_close(self) -> None:
+        self._close_rustdesk()
+
+    def _close_rustdesk(self) -> None:
+        """Stop ONLY the viewer this app started. A session he opened
+        himself is never touched -- which was the first thing the design
+        got wrong: killing every rustdesk process would have closed his
+        own window."""
+        proc = getattr(self, "_rustdesk", None)
+        self._rustdesk = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:                          # noqa: BLE001 - teardown
+            log.debug("cast: the viewer would not close", exc_info=True)
 
     def _eye_identity(self) -> str:
         """The camera's name for whoever is in frame, "" for no opinion.
@@ -1629,6 +1952,47 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - the eye
             return ""
         return str(getattr(state, "identity", "") or "")
+
+    def _eye_leg(self):
+        """(identity, faces, live) for the camera leg of the three-leg
+        voter. A NAME AND A COUNT, NEVER A FRAME.
+
+        ``live`` is the whole value of this leg and the reason tonight is
+        not covered by his rule 1. A camera that is off, inside its curfew,
+        or -- as on this box today -- never attached to
+        ``services.camera_feed`` at all has NOT "failed to see him". It did
+        not look, and its silence is not evidence of an empty room. Only a
+        usable feed reporting a face count has actually looked.
+
+        NOTHING IN THIS TREE EVER ASSIGNS ``services.camera_feed`` (grep
+        for "camera_feed ="), so this returns ("", None, False) -- BLIND --
+        unconditionally today, and the camera leg is a stub with a real
+        shape rather than a leg that votes. campreview builds its own feed
+        and logs "no services.camera_feed" instead.
+        """
+        feed = getattr(getattr(self, "services", None), "camera_feed", None)
+        eye = getattr(feed, "eye", None)
+        state = getattr(eye, "state", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:                      # noqa: BLE001 - the eye
+                return ("", None, False)
+        if state is None:
+            return ("", None, False)
+        usable = getattr(state, "usable", None)
+        try:
+            live = bool(usable()) if callable(usable) else bool(usable)
+        except Exception:                          # noqa: BLE001 - the eye
+            return ("", None, False)
+        if not live:
+            return ("", None, False)
+        faces = getattr(state, "faces", None)
+        try:
+            faces = None if faces is None else int(faces)
+        except (TypeError, ValueError):
+            faces = None
+        return (str(getattr(state, "identity", "") or ""), faces, True)
 
     def _spotify_transfer(self, device):
         """HpcomputerSink's one working route: a TRACK moves by Spotify's
@@ -1962,10 +2326,12 @@ class JarvisApp:
         """
         now = time.monotonic()
         last = getattr(self, "_last_greeted", 0.0)
-        if last and now - last < GREET_DAMPER_S:
-            log.info("presence: %s return within the damper; not greeting again",
-                     source)
-            return
+        if last:
+            why = arrival_mod.greet_refusal(source=source, since_s=now - last,
+                                            damper_s=GREET_DAMPER_S)
+            if why:
+                log.info("arrival: no greeting -- %s", why)
+                return
         # GREET AT THE DOOR, ASK AT THE DESK. The catch-up is dropped from
         # the door plan and owed to his desk -- but ONLY if some leg can
         # actually deliver it there (_settle_legs). A deferral nothing can
@@ -2734,6 +3100,7 @@ class JarvisApp:
             door = getattr(self, "_door", None)
             if door is not None:
                 door.left()
+            self._departure_seq_phone(ev)
             self._arm_departure(ev)
             return
         if ev.returned:
@@ -2750,6 +3117,9 @@ class JarvisApp:
             # not say "Welcome back, sir" a second time.
             self._greet_return("phone")
             return
+        seq = getattr(self, "_departure_seq", None)
+        if seq is not None:
+            seq.home(at=time.time())      # a genuine second outing is a new one
         # Home but not a return (a poll that merely confirms he is here):
         # the console gets the state, nothing is spoken.
         bus.publish(Status(text="Home", kind="info"))
@@ -2785,6 +3155,7 @@ class JarvisApp:
         spend it.
         """
         self._door_from_room(ev)
+        self._departure_seq_room(ev)
         # A NAME, never a frame. _eye_identity answers "" for a camera
         # that is off, blind, or inside its 21:00-07:00 curfew, and "" is
         # no opinion rather than an absence.
@@ -2796,13 +3167,26 @@ class JarvisApp:
         self._settle(room=getattr(ev, "room", "") or "", camera=seen)
 
     def _door_from_room(self, ev) -> None:
-        """The door half of _on_room_changed. See its docstring."""
+        """The door half of _on_room_changed. See its docstring.
+
+        EVERY REFUSAL HERE NAMES ITS GATE, at INFO, once per reason.
+        On 2026-09-05 he walked in at 20:43:13, the fabric published the
+        kitchen, and nothing happened -- no arrival line, no greeting, and
+        no word anywhere on disk about which gate had said no. The refusal
+        was arguably correct (the sentinel had never reached "away",
+        because a latched office pinned the house occupied); the SILENCE
+        was the defect. DoorWatch.observe now writes the reason itself.
+        """
         door = getattr(self, "_door", None)
         if door is None:
             return
-        away = getattr(getattr(self, "presence", None), "state", "") == "away"
+        # The sentinel's own verdict WORD, not a bool: "home" and "unknown"
+        # both refuse here, and telling them apart in the log is the whole
+        # point at boot.
+        state = getattr(getattr(self, "presence", None), "state", "") or "unknown"
         try:
-            if not door.observe(room=getattr(ev, "room", ""), away=away):
+            if not door.observe(room=getattr(ev, "room", ""),
+                                away=(state == "away"), state=state):
                 return
         except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
             log.exception("arrival: the door watch failed")
@@ -2810,6 +3194,65 @@ class JarvisApp:
         log.info("arrival: %s is the door and the house was away",
                  getattr(ev, "room", "?"))
         self._greet_return("room:%s" % (getattr(ev, "room", "") or "?"))
+
+    def _make_departure_seq(self):
+        """office -> kitchen -> the phone drops. None if it cannot be built:
+        a missing sequence costs the log line, never the presence leg."""
+        try:
+            from jarvis import presencevote
+            get = self.assistant.get if self.assistant is not None else \
+                (lambda k, d=None: d)
+            return presencevote.DepartureSequence(
+                # ``presence.desk_room``, NOT ``presence.desk`` -- the
+                # latter is deskpresence.py's boolean switch and is True on
+                # his box, which made this sequence compare every room
+                # against "True" and never arm. Same key ``self._desk``
+                # already uses. tests/test_presence_desk_key.py pins it.
+                desk_room=str(get("presence.desk_room",
+                                  arrival_mod.DEFAULT_DESK_ROOM)
+                              or arrival_mod.DEFAULT_DESK_ROOM),
+                door_room=str(get("presence.door_room",
+                                  arrival_mod.DEFAULT_DOOR_ROOM)
+                              or arrival_mod.DEFAULT_DOOR_ROOM))
+        except Exception:  # noqa: BLE001 - optional lane
+            log.exception("departure: the sequence could not be built")
+            return None
+
+    def _departure_seq_room(self, ev) -> None:
+        """HIS departure rule: "if you see office sensor then kitchen then
+        phone disconnect assume he left the building".
+
+        An ORDERED sequence with a window, not three independent facts --
+        three facts that merely happen to be true together would fire on
+        him making coffee and then his phone napping in his pocket. The
+        ORDER is what makes it a departure, because his flat is a corridor
+        and leaving means passing the kitchen after the office and then
+        going out of range. See presencevote.DepartureSequence for the two
+        windows and why they are 120 s and 900 s.
+
+        SILENT. There is no speak path here and there must never be one:
+        arrival.py is explicit that a valediction to an empty room is a
+        notification pretending to be a presence.
+        """
+        seq = getattr(self, "_departure_seq", None)
+        if seq is None:
+            return
+        try:
+            seq.room(room=getattr(ev, "room", ""), at=time.time())
+        except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
+            log.debug("departure: the sequence failed", exc_info=True)
+
+    def _departure_seq_phone(self, ev) -> None:
+        """The third step: his phone stopped answering."""
+        seq = getattr(self, "_departure_seq", None)
+        if seq is None:
+            return
+        try:
+            import jarvis.presencevote as _pv
+            if seq.phone_gone(at=time.time()):
+                log.info("%s", _pv.departure_note(seq))
+        except Exception:  # noqa: BLE001
+            log.debug("departure: the sequence failed", exc_info=True)
 
     # ------------------------------------------------------ departure
     def _cancel_departure(self) -> None:
@@ -3158,6 +3601,19 @@ class JarvisApp:
             except Exception:
                 log.exception("barge-in interrupt failed")
         self.turns.mark("wake")            # accepted: this turn starts now
+        # THE MIC IS THE FOURTH LEG, and it is the one corroboration source
+        # neither the phone nor the camera can supply: he just spoke, so he
+        # is in the flat whatever his phone's radio is doing. It feeds the
+        # stuck-room detector (jarvis/stuckroom.py), which is what tells a
+        # radar latched on by a fan apart from a man sitting still at his
+        # desk. arrival.departure_ready already reads the same ledger for
+        # its own 10-minute veto.
+        try:
+            presence = getattr(self, "presence", None)
+            if presence is not None and hasattr(presence, "corroborate"):
+                presence.corroborate("mic")
+        except Exception:  # noqa: BLE001 - never block a turn
+            log.debug("presence: mic corroboration failed", exc_info=True)
         # The power-up sweep's fallback trigger. Presence is idle until
         # phone_ip is configured (it is not, on this box), so without this
         # the feature would never fire on the machine that runs it. The date
