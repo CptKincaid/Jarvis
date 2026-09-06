@@ -298,6 +298,31 @@ _SAID_ADDR_RX = re.compile(
     + _SAID_SEP + r"(?P<tld>[A-Za-z]{2,24})))"
     r"(?![\w\-])", re.I)
 _AT_HINT_RX = re.compile(r"\bat\b", re.I)
+# The SPELLED shape: how whisper writes an address he said one character
+# at a time, in every punctuation it has been seen to hang on the letters
+# -- "q. z. v. k. b. w. 7. at example.com" (the 09-06 verdict), "q-z-v,
+# k-b-w-7, at example dot com" (the fourth fragment he was left with on
+# 09-05), "q z v k b w seven at example dot com", "d.a.n at example.com".
+# The said-shape mask below reads ONE label as the local part, so on a
+# run it keeps the last group's first letter and leaves the rest raw:
+# "q-z-v, k… at example.com", three characters of seven in a log line.
+# Here the local part is the whole run -- two or more single characters,
+# whatever separates them, plus at most one trailing label ("seven") --
+# and the whole of it is cut to its first character, the way every other
+# local part is. The domain has to be a domain (said "dot", or punctuated
+# and ending on a top level in use, the _one_said rule), so "grades a, b,
+# c at noon. Come by" is left alone.
+_SPELLED_CHAR = r"[A-Za-z0-9]"
+_SPELLED_SEP = r"(?:\s*[.,;:\-–—]\s*|\s+)"
+_SPELLED_ADDR_RX = re.compile(
+    r"(?<![\w@.\-'’])"
+    r"(?P<local>" + _SPELLED_CHAR + r"(?:" + _SPELLED_SEP + _SPELLED_CHAR + r")+"
+    r"(?:\s+[A-Za-z0-9][\w+\-]*)?)"
+    r"(?![\w\-])[.,;:]?"
+    r"(?P<rest>\s+at\s+"
+    r"(?P<domain>" + _SAID_LABEL + r"(?:" + _SAID_SEP + _SAID_LABEL + r")*"
+    + _SAID_SEP + r"(?P<tld>[A-Za-z]{2,24})))"
+    r"(?![\w\-])", re.I)
 # Top levels a SPACED punctuated domain may end on ("gmail. com").
 # English words that are also top levels (in, me, us, it, is, be, no, to,
 # at, so, info) are left out on purpose: after a full stop they are the
@@ -369,33 +394,6 @@ def _one_said(m) -> str:
     return _mask_local(m.group("local")) + m.group("rest")
 
 
-def _mask_spelled(text: str) -> str:
-    """The local part of an address he SPELLED, masked in the RAW text.
-
-    The three passes below all read the raw text, where a spelled local
-    part is not one token: `_SPOKEN_ADDR_RX` matches "q z v at example dot
-    com" from the last single letter, so `_one_drafted` masks "v" and
-    leaves "q z " in the log line. This pass finds the same spans in the
-    FOLDED text (jarvis.spelling), maps them back through the index map
-    and masks the whole run, so what reaches the log is "q… at example dot
-    com" -- the first character and the domain, which is the mask this
-    module already applies to an address he typed.
-
-    Right-to-left, so an earlier span's offsets are still valid after a
-    later one has been replaced. Text with no spelling run in it folds to
-    itself and is returned untouched."""
-    folded, imap = spelling.fold_spans(text)
-    if folded == text:
-        return text
-    cuts = []
-    for m in _SPOKEN_ADDR_RX.finditer(folded):
-        s_i, e_i = m.start(1), m.end(1)
-        cuts.append((imap[s_i], imap[e_i - 1] + 1))
-    for s_i, e_i in reversed(cuts):
-        text = text[:s_i] + _mask_local(text[s_i:e_i]) + text[e_i:]
-    return text
-
-
 def mask_addresses(text) -> str:
     """"yes, to hjones@example.com" -> "yes, to h…@example.com", and
     "send it to dana at example dot com" -> "send it to d… at example dot
@@ -405,8 +403,11 @@ def mask_addresses(text) -> str:
     is the line's whole point -- the domain stays as he put it, and a
     trailing full stop stays outside the mask.
 
-    Three passes, in this order: the typed address; then the punctuated
-    shapes the parser cannot read (_one_said, which may exempt prose); then
+    Four passes, in this order: the typed address; then the SPELLED run
+    (_SPELLED_ADDR_RX: the characters he said one at a time, in whatever
+    whisper hung on them, which the one-label rule below would leave
+    mostly raw); then the punctuated shapes the parser cannot read
+    (_one_said, which may exempt prose); then
     -- last, and over everything -- every span the PARSER would draft from,
     masked with the parser's own regex, so the exemption above can never
     leave an address raw. Prose pays for that: a sentence the parser would
@@ -425,10 +426,7 @@ def mask_addresses(text) -> str:
 
         text = _ADDRESS_IN_TEXT_RX.sub(_one, text)
     if _AT_HINT_RX.search(text):
-        # The SPELLED pass first: it is the only one that can see a local
-        # part he said one character at a time, and the two below would
-        # otherwise mask its last letter and leave the rest in the line.
-        text = _mask_spelled(text)
+        text = _SPELLED_ADDR_RX.sub(_one_said, text)
         text = _SAID_ADDR_RX.sub(_one_said, text)
         text = _SPOKEN_ADDR_RX.sub(_one_drafted, text)
     return text

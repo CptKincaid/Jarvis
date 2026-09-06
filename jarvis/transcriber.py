@@ -92,6 +92,37 @@ MIN_AVG_LOGPROB = -2.90
 # the transcriber must not depend on the gate.
 REDACTED_WORDS = "«passphrase»"
 
+
+def shown_words(text, *, redact: bool = False) -> str:
+    """What a ``Transcribed:`` line -- or any other line that writes the
+    words down -- is allowed to carry.
+
+    The redaction first: while an owner phrase is set and nothing has yet
+    ruled these words are not it, the line says ``«passphrase»`` and
+    nothing else (tests/test_knightfall_log_leak.py). Otherwise the words,
+    with every address in them masked the way the commander's own lines
+    mask one -- "send it to d… at example dot com", "q… at example.com"
+    for a run he spelled -- because the round-2 verdict on the spelled
+    address (09-06) found this line, upstream of every masked one, writing
+    the whole address verbatim at INFO. The rule he wants is that an
+    address he said never reaches a log line raw; a rule with one hole is
+    not the rule.
+
+    An EMPTY decode has no secret in it and no address either, and it must
+    stay legible as the diagnosis it is (the VAD pass found no words), so
+    it is returned untouched. The mask is for the LOG: what the commander
+    receives is the decode, unmasked.
+
+    The import is deferred because jarvis.outbox's chain reaches this
+    module (through jarvis.commander); at call time everything is loaded.
+    """
+    if not text:
+        return text
+    if redact:
+        return REDACTED_WORDS
+    from jarvis.outbox import mask_addresses
+    return mask_addresses(text)
+
 # ------------------------------------------------------------------
 # The bound on the decode
 # ------------------------------------------------------------------
@@ -997,8 +1028,9 @@ class Transcriber:
         # An EMPTY decode has no secret in it, and saying
         # "«passphrase»" for one would be a lie in the log: the
         # empty transcript is a diagnosis of its own (the VAD pass
-        # found no words) and must stay legible.
-        shown = REDACTED_WORDS if (redact and text) else text
+        # found no words) and must stay legible. Otherwise the words go
+        # through the one function that masks an address in them.
+        shown = shown_words(text, redact=redact)
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)
             log.info("Transcribed: %r (avg_logprob=%.2f)", shown, avg_conf)

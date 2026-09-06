@@ -882,7 +882,8 @@ class MainWindow:
 
         self.drawer = SettingsDrawer(
             root, services=self.services,
-            on_config_change=self._on_config_change, toast=self.toast)
+            on_config_change=self._on_config_change, toast=self.toast,
+            on_open_tab=self._open_tab)
 
         self.tray = TrayIcon(root, self._toggle_visibility,
                              self._toggle_recording, self._on_close)
@@ -1526,20 +1527,40 @@ class MainWindow:
 
     def _users_closed(self):
         """The page hid itself. Put the strip back on CHAT so the lit tab
-        matches the screen; select() is idempotent, so the strip's own CHAT
-        press -- which is what called hide() -- does not come back round."""
+        matches the screen -- but ONLY if the strip still says USERS.
+
+        MEASURED 2026-09-06 (both looks): pressing SENSORS then USERS lit
+        CHAT with the Users page open. hide() is the strip's own leave
+        callback, and by the time it runs the strip has already moved to
+        the new key, so the unconditional select("chat") here was not the
+        idempotent no-op the old comment assumed: it clobbered the switch.
+        The strip now refuses a select() mid-switch as well; this guard
+        says the intent at the call site."""
         strip = getattr(self, "tabs", None)
-        if strip is not None:
+        if strip is not None and strip.selected == "users":
             strip.select("chat")
 
     def _sensors_closed(self):
         """The page hid itself (quit, or anything else that calls hide()).
-        Put the strip back on CHAT so the lit tab matches the screen.
-        select() is idempotent, so the strip's own CHAT press -- which is
-        what called hide() in the first place -- does not come back round."""
+        Put the strip back on CHAT so the lit tab matches the screen --
+        only if the strip still says SENSORS; see _users_closed for the
+        USERS -> SENSORS clobber this guards against."""
         strip = getattr(self, "tabs", None)
-        if strip is not None:
+        if strip is not None and strip.selected == "sensors":
             strip.select("chat")
+
+    def _open_tab(self, key: str) -> None:
+        """Light a tab from somewhere that is not the strip -- the settings
+        drawer's "Open the Users tab" button (jarvis/ui/views.py). Through
+        the strip when there is one, so the lit tab and the surface on
+        screen stay one state; straight to the page when there is not."""
+        strip = getattr(self, "tabs", None)
+        if strip is not None and key in strip.keys:
+            strip.select(key)
+            return
+        page = getattr(self, str(key), None)
+        if page is not None and hasattr(page, "show"):
+            page.show()
 
     def _camera_numbers(self) -> dict:
         """The preview worker's numbers-only status, or {} when there is no

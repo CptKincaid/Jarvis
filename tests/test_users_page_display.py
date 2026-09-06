@@ -23,6 +23,7 @@ from jarvis.ui import widgets as wg
 
 FORBIDDEN_DISPLAYS = (":0", ":1")
 FD_SETSIZE = 1024
+FONT_GLOBALS = ("_FAMILY", "_FAMILY_MONO", "_HAS_DISPLAY", "_DISPLAY")
 HIS_W, HIS_H = 1040, 1760
 OLD_W, OLD_H = 920, 1440
 SCALE = 2.0
@@ -55,6 +56,11 @@ def root():
         fds = 0
     if fds >= FD_SETSIZE - 32:
         pytest.skip("this process already holds %d descriptors" % fds)
+    # resolve_fonts() flips theme._HAS_DISPLAY and the family names for
+    # the whole process; put them back, or tests/test_theme_look.py's
+    # no-display oracle fails when this file runs first (seen 2026-09-06
+    # in a hand-picked order; the alphabetical suite never showed it).
+    fonts = {k: getattr(theme, k) for k in FONT_GLOBALS}
     try:
         r = tk.Tk(screenName=display)
     except tk.TclError as exc:
@@ -71,6 +77,8 @@ def root():
     theme.apply_scale(1.0)
     wg.set_scale(1.0)
     theme.select_look(theme.DEFAULT_LOOK)
+    for k, v in fonts.items():
+        setattr(theme, k, v)
 
 
 class Svc:
@@ -581,12 +589,24 @@ def test_the_module_captures_no_look_at_import_time():
 
 # ======================================================= the add form itself
 def _open_form(root, page, **fields):
+    """Open the form and fill it. THE FORM IS TWO STEPS since 2026-09-06
+    (who, then their agreement): the step-1 boxes are filled, Next is
+    pressed, and only then the consent box -- the way he walks it. A
+    step-1 refusal (a bad label) leaves the form on step 1, and the
+    consent typed here then lands in a box that is built but not shown,
+    which is what Create refuses."""
     page._lock.unlock()
     page._add_pressed()
     root.update_idletasks()
+    consent = fields.pop("consent", None)
     for key, value in fields.items():
         page._add_fields[key].delete(0, "end")
         page._add_fields[key].insert(0, value)
+    if consent is not None:
+        page._next_pressed()
+        root.update_idletasks()
+        page._add_fields["consent"].delete(0, "end")
+        page._add_fields["consent"].insert(0, consent)
     return page._add_fields
 
 
@@ -762,7 +782,13 @@ def test_the_delete_command_wraps_inside_its_own_slot_not_the_page(root, geom):
     The invariant, checked at BOTH his sizes: a label never wraps to more
     room than it was given.
     """
-    page, _svc, _host = _page(root, snapshot=_snapshot(n=2), geometry=geom)
+    snap = _snapshot(n=2)
+    # guest0 HAS face measurements, so the warning prints the command that
+    # removes them (since 2026-09-06 the command is printed in the warning
+    # only, and the Copy button beside it went: the panel has to sit whole
+    # inside a 771-px viewport at 920x1440).
+    snap["gallery"] = ["alderman", "guest0"]
+    page, _svc, _host = _page(root, snapshot=snap, geometry=geom)
     page._lock.unlock()
     page._forget_pressed("guest0")
     root.update_idletasks()
@@ -835,7 +861,10 @@ def test_no_label_on_this_page_wraps_wider_than_its_own_slot(root, geom):
         root.update_idletasks()
         root.update()
         for w in _walk(page):
-            if w.__class__.__name__ != "Label":
+            # MAPPED labels only: a label in a sheet that is not placed
+            # (the note sheet, until READ is pressed) has no slot to wrap
+            # to, and the width Tk reports for it is nobody's allocation.
+            if w.__class__.__name__ != "Label" or not w.winfo_ismapped():
                 continue
             try:
                 wrap = int(w.cget("wraplength"))
@@ -858,12 +887,20 @@ def test_create_is_pinned_where_add_is_and_never_scrolls_away(root, geom):
     page._lock.unlock()
     page._add_pressed()
     root.update_idletasks()
-    btn = page._create_btn
-    assert btn.winfo_ismapped(), "Create is not on screen"
     bottom = page.winfo_rooty() + page.winfo_height()
+    # step 1's primary is Next; step 2's is Create. Both pinned.
+    btn = page._next_btn
+    assert btn.winfo_ismapped(), "Next is not on screen"
     assert btn.winfo_rooty() + btn.winfo_height() <= bottom, geom
     assert not page._add_btn.winfo_ismapped(), \
-        "Add and Create must not both be offered"
+        "Add and the form's buttons must not both be offered"
+    page._add_fields["label"].insert(0, "pemberton")
+    page._next_pressed()
+    root.update_idletasks()
+    btn = page._create_btn
+    assert btn.winfo_ismapped(), "Create is not on screen"
+    assert btn.winfo_rooty() + btn.winfo_height() <= bottom, geom
+    assert not page._next_btn.winfo_ismapped()
 
 
 def test_opening_the_form_shows_its_first_field(root):
@@ -894,22 +931,24 @@ def test_every_form_row_fits_the_window(root, geom):
     page._add_pressed()
     root.update_idletasks()
     width = page.winfo_width()
-    for entry in page._add_fields.values():
-        right = (entry.winfo_rootx() - page.winfo_rootx()
-                 + entry.winfo_width())
-        assert right <= width, (geom, right, width)
-    for w in _walk(page._body):
-        if w.__class__.__name__ == "Label":
-            assert w.winfo_reqwidth() <= width, (geom, w.cget("text")[:50])
+    for step in (1, 2):
+        if step == 2:
+            page._add_fields["label"].insert(0, "pemberton")
+            page._next_pressed()
+            root.update_idletasks()
+        for entry in page._add_fields.values():
+            if not entry.winfo_ismapped():
+                continue                       # the other step's box
+            right = (entry.winfo_rootx() - page.winfo_rootx()
+                     + entry.winfo_width())
+            assert right <= width, (geom, step, right, width)
+        for w in _walk(page._body):
+            if w.__class__.__name__ == "Label" and w.winfo_ismapped():
+                assert w.winfo_reqwidth() <= width, (geom, step,
+                                                     w.cget("text")[:50])
 
 
 # ------------------------------------------- the foot row: buttons take first
-def _foot_widget(page, kind):
-    """The live widget for 'create'/'cancel'/'path' out of the pinned foot."""
-    return {"create": page._create_btn, "cancel": page._cancel_btn,
-            "path": page._path_lbl}[kind]
-
-
 # 920x1440 is the geometry the console was PHOTOGRAPHED at on 2026-09-05
 # (scripts/ui_shots.py --geometry 920x1440 --scale 2.0), and it is the
 # narrow end of what he uses; 1040x1760 is the stage size the rest of this
@@ -920,112 +959,63 @@ SHOT_W, SHOT_H = 920, 1440
 
 @pytest.mark.parametrize("geometry", [(SHOT_W, SHOT_H), (HIS_W, HIS_H)],
                          ids=["photographed-920x1440", "his-stage-1040x1760"])
-def test_the_cancel_button_is_drawn_whole_beside_a_long_people_path(
-        root, geometry):
+def test_every_foot_button_is_drawn_whole_in_every_state(root, geometry):
     """MEASURED on the shipped merge, 2026-09-05: the foot read
     "Create  Cance|/home/example/.local/state/jarvis/people.json" -- the
     path label had been packed at BUILD time, before Create and Cancel were
     packed at paint time, so the packer gave it its full width and cut the
     right-hand end off Cancel.
 
-    This is the SECOND time this exact defect has been fixed in this file;
-    the destructive panel's row carries the first. The rule both share: the
-    BUTTONS take their width first and the path takes what is left."""
+    Since 2026-09-06 there is no path in the foot at all (it is under
+    DETAILS, where the log's strings live), and the row is re-packed from
+    scratch at every paint, buttons first. The rule both fixes share:
+    BUTTONS TAKE THEIR WIDTH FIRST. Every state of the row, both windows.
+    """
     snap = dict(_snapshot())
     snap["path"] = "/home/hunterp/.local/state/jarvis/people.json"
     page, _, host = _page(root, snapshot=snap, geometry=geometry)
-    page._adding = True
-    page._paint()
-    root.update_idletasks()
-    root.update()
-    cancel = _foot_widget(page, "cancel")
-    create = _foot_widget(page, "create")
-    assert cancel.winfo_ismapped() and create.winfo_ismapped()
-    # THE SQUEEZE IS THE SIGNAL. Tk does not overflow the parent; it hands
-    # the LEFT-packed buttons whatever the right-packed label left and
-    # narrows them, so a cut button keeps its winfo_reqwidth() and loses
-    # winfo_width(). MEASURED pre-fix at 2.0 scale, with the path label
-    # asking for 524 px at every window width:
-    #     1040 px window -> Cancel 159 of 159   (fits; the defect is hidden)
-    #      920 px window -> Cancel 138 of 159   (the photograph)
-    #      880 px window -> Cancel  98 of 159
-    #      800 px window -> Cancel  18 of 159
-    #      760 px window -> Cancel   1 of 159   (gone entirely)
-    # 1040 is why this pin carries both geometries: at his wider stage the
-    # bug is invisible, and a pin that only measured there would have
-    # passed on the broken build.
-    row = cancel.master
-    for name, btn in (("Create", create), ("Cancel", cancel)):
-        assert btn.winfo_width() >= btn.winfo_reqwidth(), (
-            "%s is drawn %d px wide in a %d px row but needs %d -- the "
-            "path label took the room" % (name, btn.winfo_width(),
-                                          row.winfo_width(),
-                                          btn.winfo_reqwidth()))
+    page._lock.unlock()
+    for state in ("list", "who", "agreement"):
+        if state == "who":
+            page._add_pressed()
+        elif state == "agreement":
+            page._add_fields["label"].insert(0, "pemberton")
+            page._next_pressed()
+        root.update_idletasks()
+        root.update()
+        row = page._act_row
+        buttons = [w for w in row.winfo_children()
+                   if isinstance(w, wg.RoundButton) and w.winfo_ismapped()]
+        assert buttons, state
+        for btn in buttons:
+            assert btn.winfo_width() >= btn.winfo_reqwidth(), (
+                "%s is drawn %d px wide in a %d px row but needs %d (%s)"
+                % (btn._text, btn.winfo_width(), row.winfo_width(),
+                   btn.winfo_reqwidth(), state))
+        assert page._path_lbl.master is not row
+        assert not any(w.__class__.__name__ == "Label" and w.winfo_ismapped()
+                       and "people.json" in str(w.cget("text"))
+                       for w in row.winfo_children())
 
 
-def test_the_path_gives_up_its_width_and_keeps_the_tail(root):
-    """The tail names the file, so the HEAD is what goes. An elided path
-    must still end in the file name, and must never be wider than the room
-    the buttons left it."""
+def test_the_people_file_path_is_one_press_away_and_never_cut(root):
+    """The path names the file for the log. It is behind DETAILS with the
+    gate's raw line, wrapped to the page, and shown whole -- never elided,
+    never cut, never on the page he reads by default."""
     snap = dict(_snapshot())
     snap["path"] = ("/home/hunterp/some/deliberately/very/long/path/that/"
-                    "cannot/possibly/fit/beside/two/buttons/people.json")
+                    "cannot/possibly/fit/on/one/line/people.json")
     page, _, host = _page(root, snapshot=snap, geometry=(SHOT_W, SHOT_H))
-    page._adding = True
-    page._paint()
+    root.update_idletasks()
+    assert not page._path_lbl.winfo_ismapped()
+    page._details_pressed()
     root.update_idletasks()
     root.update()
-    shown = page._path_lbl.cget("text")
-    assert shown != snap["path"], "the path was not trimmed at all"
-    if shown:
-        assert shown.endswith("people.json") or shown.startswith("…")
-        row_w = page._path_lbl.master.winfo_width()
-        assert page._path_lbl.winfo_reqwidth() < row_w, (
-            "the trimmed path still asks for %d px of a %d px row"
-            % (page._path_lbl.winfo_reqwidth(), row_w))
-    # ...and Cancel is still whole beside it.
-    cancel = _foot_widget(page, "cancel")
-    assert cancel.winfo_width() >= cancel.winfo_reqwidth()
-
-
-@pytest.mark.parametrize("geometry", [(SHOT_W, SHOT_H), (HIS_W, HIS_H)],
-                         ids=["photographed-920x1440", "his-stage-1040x1760"])
-def test_the_path_is_never_cut_without_an_ellipsis_to_say_so(root, geometry):
-    """A label with anchor="e" that is narrower than its text shows the
-    RIGHT end and silently drops the left. PHOTOGRAPHED on the first
-    version of this fix: "ome/example/.local/state/jarvis/people.json" --
-    the head was gone and nothing said so, because the fit ran before the
-    geometry manager had given the row a width.
-
-    THE RULE: whatever the label ends up showing, it must ASK FOR no more
-    room than it has. If it was shortened, the ellipsis is what says so."""
-    snap = dict(_snapshot())
-    snap["path"] = "/home/hunterp/.local/state/jarvis/people.json"
-    page, _, host = _page(root, snapshot=snap, geometry=geometry)
-    page._adding = True
-    page._paint()
+    assert page._path_lbl.winfo_ismapped()
+    assert snap["path"] in page._path_lbl.cget("text")
+    assert page._path_lbl.winfo_reqwidth() <= page._path_lbl.winfo_width()
+    assert int(page._path_lbl.cget("wraplength")) <= \
+        page._path_lbl.winfo_width()
+    page._details_pressed()
     root.update_idletasks()
-    root.update()
-    lbl = _foot_widget(page, "path")
-    if not lbl.winfo_ismapped():
-        return
-    assert lbl.winfo_reqwidth() <= lbl.winfo_width(), (
-        "the path asks for %d px of the %d it was given, so %r is being "
-        "drawn with its head cut off"
-        % (lbl.winfo_reqwidth(), lbl.winfo_width(), lbl.cget("text")))
-    shown = lbl.cget("text")
-    if shown and shown != snap["path"]:
-        assert shown.startswith("\u2026"), (
-            "%r was shortened but does not say so" % shown)
-
-
-def test_a_short_path_is_shown_in_full(root):
-    """The fix must not trim what already fits."""
-    snap = dict(_snapshot())
-    snap["path"] = "/tmp/p.json"
-    page, _, host = _page(root, snapshot=snap)
-    page._adding = True
-    page._paint()
-    root.update_idletasks()
-    root.update()
-    assert page._path_lbl.cget("text") == "/tmp/p.json"
+    assert not page._path_lbl.winfo_ismapped()

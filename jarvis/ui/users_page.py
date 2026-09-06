@@ -298,6 +298,38 @@ def foot_lines(services=None) -> Tuple[str, ...]:
     return tuple(out)
 
 
+# THE ONE LINE THAT STAYS PINNED, beside the READ button that opens the nine
+# sentences. A NEW short string, deliberately not derived: it names the sheet,
+# and the sheet renders ``foot_lines()`` verbatim and nothing else. It is
+# short on purpose -- MEASURED 2026-09-06 at 920x1440, the slot it shares with
+# "Add a person" and READ is 442 px, and a longer opener wrapped to two lines
+# and cost the list 32 px on every state of the page.
+NOTE_OPENER = "what this page cannot do"
+
+# THE GATE LINE HE READS. "owner-gate: SHADOW -- 1 owner (alderman), voice leg
+# live, face leg unavailable (the gallery is empty). Nothing is being refused."
+# is the log's sentence, and until 2026-09-06 it OPENED the page for him, two
+# lines of it. He is a user, not an operator. The plain line says what the raw
+# one says from the two facts it can honestly derive -- the mode word and the
+# number of rows -- and NEVER more; the raw string stays one press away under
+# DETAILS, because it is the diagnostic.
+GATE_PLAIN = {"off": "Recognition is off",
+              "shadow": "Recognition is watching, not enforcing",
+              "enforce": "Recognition is enforcing",
+              "": "Recognition: nothing has been read yet"}
+
+
+def plain_gate_line(mode: str, people: int) -> str:
+    """One caption line. MEASURED to fit beside the DETAILS chip at his 920-px
+    window for every mode word and up to twelve people
+    (tests/test_ui_easy_to_add.py); a wording that wraps fails there."""
+    n = max(0, int(people or 0))
+    who = ("nobody known" if n == 0 else "1 person known" if n == 1
+           else "%d people known" % n)
+    return "%s · %s" % (GATE_PLAIN.get(str(mode or "").lower(),
+                                        GATE_PLAIN[""]), who)
+
+
 # EVERY DOOR INTO THE PEOPLE BOOK OR A GALLERY IS IN HERE. "set_face" was in
 # this tuple and was DEAD: the string appeared in its own definition and
 # nowhere else in the tree -- no action, no button, no seam, and nothing ever
@@ -1162,7 +1194,8 @@ from tkinter import font as tkfont                     # noqa: E402
 _INK_SLACK = 16
 
 from jarvis.ui import theme                            # noqa: E402
-from jarvis.ui.widgets import RoundButton, px, ui_display, ui_font  # noqa: E402
+from jarvis.ui.widgets import (RoundButton, ellipsize, measure,  # noqa: E402
+                               px, ui_display, ui_font)
 
 # Design units, at the 96-dpi baseline; px() scales them by S. Every COLOUR
 # below is read inside a method, never bound here: tests/test_theme_look.py
@@ -1171,6 +1204,162 @@ from jarvis.ui.widgets import RoundButton, px, ui_display, ui_font  # noqa: E402
 BLOCK_GAP = 10
 ROLE_WORDS = {ROLE_OWNER: "OWNER", ROLE_KNOWN: "KNOWN"}
 LOCK_TICK_MS = 1000
+# How long a freshly created row keeps its tinted ground.
+FLASH_MS = 2000
+
+
+def _btn_kind() -> str:
+    """The kind every ACTING button on this page is drawn in.
+
+    In holo that is "default" -- an outlined ring -- because to him a bare
+    word is not a button: MEASURED 2026-09-06, 1 of the 17 buttons on this
+    page was outlined and he asked whether the tab existed at all. Classic
+    keeps "ghost": its filled/ghost ink is frozen
+    (tests/test_ui_classic_frozen.py). Read at CALL time, never captured.
+    """
+    return "default" if theme.LOOK == "holo" else "ghost"
+
+
+class NoteSheet(tk.Frame):
+    """WHERE THE NINE SENTENCES LIVE NOW: a sheet over the page, opened by
+    READ, with its own scrolling body, the 2-px mark that says there is
+    more, and a pinned CLOSE -- the SetupSheet pattern.
+
+    WHY. The note is 18 lines (576 px) at his 920x1440 window and it was
+    PINNED in the foot, over the form: with it there the list had 88 px of
+    a 1044-px page, 0 of the add form's 5 boxes were on screen and every
+    confirm panel showed its box with its warning scrolled off. Every one
+    of those sentences was hard-won and every one is still here, still
+    built from ``foot_lines(services)`` at every paint -- the page's
+    ``_note_lbl`` IS this sheet's label, so the tests that read it read
+    the derived tuple and nothing hand-copied.
+    """
+
+    def __init__(self, host):
+        bg = theme.TV_BG
+        super().__init__(host, bg=bg)
+        self.host = host
+        self._open = False
+        foot = tk.Frame(self, bg=bg)
+        foot.pack(side="bottom", fill="x", padx=theme.PAD,
+                  pady=(theme.PAD_S, px(12)))
+        self.close_btn = RoundButton(foot, text="CLOSE", kind=_btn_kind(),
+                                     size=theme.SIZE_CAPTION, bg=bg, pad_y=5,
+                                     command=self.close)
+        self.close_btn.pack(side="left")
+        view = tk.Frame(self, bg=bg)
+        view.pack(side="top", fill="both", expand=True)
+        self.canvas = tk.Canvas(view, bg=bg, highlightthickness=0, bd=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.thumb = tk.Frame(self.canvas, bg=theme.CYAN_DIM,
+                              width=max(2, px(2)))
+        self.body = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window(0, 0, anchor="nw",
+                                              window=self.body)
+        tk.Label(self.body,
+                 text=theme.caption("WHAT THIS PAGE CANNOT DO", surface=False),
+                 font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                 fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0,
+                 pady=0).pack(fill="x", padx=theme.PAD, pady=(px(8), px(4)))
+        self.label = tk.Label(self.body, text="",
+                              font=ui_display(theme.SIZE_CAPTION),
+                              fg=theme.MUTED, bg=bg, anchor="w",
+                              justify="left", bd=0, padx=0, pady=0)
+        self.label.pack(fill="x", padx=theme.PAD, pady=(0, px(8)))
+        self.canvas.bind("<Configure>", lambda e: self.sync(), add=True)
+        self.body.bind("<Configure>", lambda e: self.sync(), add=True)
+        self.canvas.bind("<Enter>", self._grab_wheel, add=True)
+        self.canvas.bind("<Leave>", self._drop_wheel, add=True)
+        self.bind("<Configure>", self._wrap, add=True)
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def open(self) -> None:
+        self._open = True
+        self.place(in_=self.host, x=0, y=0, relwidth=1.0, relheight=1.0)
+        self.lift()
+        try:
+            self.update_idletasks()
+            self.canvas.yview_moveto(0.0)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("note sheet: could not settle", exc_info=True)
+        self._wrap()
+        self.sync()
+
+    def close(self) -> None:
+        if not self._open:
+            return
+        self._open = False
+        self._drop_wheel()
+        try:
+            self.place_forget()
+        except Exception:                 # noqa: BLE001 - a dead widget
+            log.debug("note sheet: unplace failed", exc_info=True)
+
+    def _wrap(self, event=None) -> None:
+        try:
+            width = max(px(160), int(self.winfo_width()) - 2 * theme.PAD)
+            self.label.configure(wraplength=width)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("note sheet: wrap failed", exc_info=True)
+
+    def sync(self) -> None:
+        try:
+            self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
+            self.canvas.configure(
+                scrollregion=self.canvas.bbox("all") or (0, 0, 0, 0))
+        except Exception:                 # noqa: BLE001 - torn down
+            return
+        self._sync_thumb()
+
+    def overflow_px(self) -> int:
+        """How much of the sentences is below the fold (0 = they all fit)."""
+        try:
+            return max(0, self.body.winfo_reqheight()
+                       - max(1, self.canvas.winfo_height()))
+        except Exception:                 # noqa: BLE001 - torn down
+            return 0
+
+    def _sync_thumb(self) -> None:
+        over = self.overflow_px()
+        try:
+            if over <= 0:
+                self.thumb.place_forget()
+                return
+            height = max(1, self.canvas.winfo_height())
+            span = max(px(20), int(height * height / (height + over)))
+            top = self.canvas.canvasy(0)
+            frac = max(0.0, min(1.0, top / float(over)))
+            self.thumb.place(relx=1.0, x=-px(3), anchor="nw",
+                             y=int(frac * (height - span)), height=span)
+            # LIFTED above the body window, or it is placed and invisible
+            # (the 09-05 stacking bug on the setup sheet).
+            self.thumb.lift()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("note sheet: the thumb could not be placed",
+                      exc_info=True)
+
+    def _scroll(self, units: int) -> None:
+        if self.overflow_px() <= 0:
+            return
+        try:
+            self.canvas.yview_scroll(units, "units")
+        except Exception:                 # noqa: BLE001 - torn down
+            return
+        self._sync_thumb()
+
+    def _grab_wheel(self, _e=None) -> None:
+        self.canvas.bind_all("<Button-4>", lambda e: self._scroll(-2))
+        self.canvas.bind_all("<Button-5>", lambda e: self._scroll(2))
+
+    def _drop_wheel(self, _e=None) -> None:
+        for seq in ("<Button-4>", "<Button-5>"):
+            try:
+                self.canvas.unbind_all(seq)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("note sheet: wheel unbind failed", exc_info=True)
 
 
 class UsersPage(tk.Frame):
@@ -1238,6 +1427,14 @@ class UsersPage(tk.Frame):
         self._panel = ("", "")
         self._role_arm = ""               # the label whose promotion is armed
         self._adding = False
+        self._add_step = 1                # 1 = who, 2 = their agreement
+        self._add_fields: dict = {}
+        self._add_rows: dict = {}
+        self._add_caps: dict = {}
+        self._details_open = False
+        self._flash = ""                  # the label whose row was just made
+        self._unflash_job = None
+        self._note_sheet = None
         self._lock_tick = None
         self._canvas = None
         self._body = None
@@ -1266,26 +1463,73 @@ class UsersPage(tk.Frame):
 
     # -------------------------------------------------------------- build
     def _build(self) -> None:
-        """ONE COLUMN: a pinned head, a scrolling body, a pinned foot.
+        """ONE COLUMN: a pinned head, a scrolling body, a pinned foot -- and
+        a NOTE SHEET over the lot, placed only when he presses READ.
 
-        The head carries the gate's own sentence and the lock, and it is
-        pinned for the same reason the foot is: an unlock box he has to
+        THE HEAD IS SHORT ON PURPOSE. It carried the gate's raw log line
+        (two lines) and the admin line (two lines) above the lock row; both
+        are for the log, and with the 18-line note pinned in the foot they
+        left 88 px of a 1044-px page for the list at his 920x1440 window
+        (MEASURED 2026-09-06). It now carries ONE plain line and a DETAILS
+        chip that opens the raw strings under it. The unlock row stays
+        pinned, for the reason it always was: an unlock box he has to
         scroll to find is an unlock box he types his code into twice.
+
+        THE FOOT IS ONE ROW: Add (or the form's own buttons), the sheet's
+        opener caption, READ. The nine sentences moved into the sheet --
+        moved, not deleted, and still built from ``foot_lines()`` at every
+        paint (tests/test_users_footnote.py, tests/test_ui_easy_to_add.py).
         """
         bg = theme.TV_BG
         self._head = tk.Frame(self, bg=bg)
         self._head.pack(side="top", fill="x", padx=theme.PAD,
                         pady=(theme.PAD_S, 0))
+        self._gate_row = tk.Frame(self._head, bg=bg)
+        self._gate_row.pack(fill="x")
+        # DETAILS is packed FIRST so it keeps its width; the line takes the
+        # rest and wraps to ITS OWN slot, never to the page width.
+        self._details_btn = RoundButton(
+            self._gate_row, text="DETAILS", kind=_btn_kind(), bg=bg,
+            size=theme.SIZE_CAPTION, pad_x=8, pad_y=3,
+            command=self._details_pressed)
+        self._details_btn.pack(side="right")
         self._gate_lbl = tk.Label(
-            self._head, text="", font=ui_display(theme.SIZE_CAPTION),
+            self._gate_row, text="", font=ui_display(theme.SIZE_CAPTION),
             fg=theme.MUTED, bg=bg, anchor="w", justify="left", bd=0,
             padx=0, pady=0)
-        self._gate_lbl.pack(fill="x")
+        self._gate_lbl.pack(side="left", fill="x", expand=True,
+                            padx=(0, theme.PAD_S))
+        self._gate_lbl.bind("<Configure>", self._wrap_to_own_slot, add=True)
+        # UNDER THE LINE: the bootstrap fault (a missing or broken file),
+        # packed only when there is one, and the DETAILS block -- the raw
+        # owner-gate line, the admin line and the people-file path -- packed
+        # only while he has it open. Both live in ONE container so their
+        # place under the gate row never depends on which of the lock
+        # widgets happen to be packed at the time (_sync_head).
+        self._under_gate = tk.Frame(self._head, bg=bg)
+        self._fault_lbl = tk.Label(
+            self._under_gate, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="w", justify="left", bd=0,
+            padx=0, pady=0)
+        self._details = tk.Frame(self._under_gate, bg=bg)
+        self._gate_raw_lbl = tk.Label(
+            self._details, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.MUTED, bg=bg, anchor="w", justify="left", bd=0,
+            padx=0, pady=0)
+        self._gate_raw_lbl.pack(fill="x", pady=(px(3), 0))
         self._admin_lbl = tk.Label(
-            self._head, text="", font=ui_display(theme.SIZE_CAPTION),
+            self._details, text="", font=ui_display(theme.SIZE_CAPTION),
             fg=theme.FAINT, bg=bg, anchor="w", justify="left", bd=0,
             padx=0, pady=0)
         self._admin_lbl.pack(fill="x", pady=(px(2), 0))
+        # THE PATH IS FOR THE LOG, so it lives here and not in the foot of
+        # a page meant for him, where it used to be elided into the action
+        # row beside Create and Cancel.
+        self._path_lbl = tk.Label(
+            self._details, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="w", justify="left", bd=0,
+            padx=0, pady=0)
+        self._path_lbl.pack(fill="x", pady=(px(2), 0))
         self._lock_row = tk.Frame(self._head, bg=bg)
         self._lock_row.pack(fill="x", pady=(px(6), 0))
         self._code_entry = tk.Entry(
@@ -1295,12 +1539,12 @@ class UsersPage(tk.Frame):
             font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
         self._code_entry.pack(side="left", ipady=px(3))
         self._unlock_btn = RoundButton(self._lock_row, text="Unlock",
-                                       kind="ghost", bg=bg, pad_x=8, pad_y=4,
-                                       command=self._unlock_pressed)
+                                       kind=_btn_kind(), bg=bg, pad_x=8,
+                                       pad_y=4, command=self._unlock_pressed)
         self._unlock_btn.pack(side="left", padx=(theme.PAD_S, 0))
-        self._lock_btn = RoundButton(self._lock_row, text="Lock", kind="ghost",
-                                     bg=bg, pad_x=8, pad_y=4,
-                                     command=self._lock_pressed)
+        self._lock_btn = RoundButton(self._lock_row, text="Lock",
+                                     kind=_btn_kind(), bg=bg, pad_x=8,
+                                     pad_y=4, command=self._lock_pressed)
         self._lock_btn.pack(side="left", padx=(px(4), 0))
         # BELOW the row, not beside it. Beside the entry and two buttons it
         # had ~340 px of his 1040-px window and "locked -- the override code
@@ -1317,73 +1561,56 @@ class UsersPage(tk.Frame):
         self._foot = tk.Frame(self, bg=bg)
         act = tk.Frame(self._foot, bg=bg)
         act.pack(fill="x")
+        self._act_row = act
         # THE PRIMARY ACTION IS ALWAYS IN THE PINNED FOOT. The consent
         # paragraph is twenty lines, so a Create button at the bottom of
         # the scrolling body sits below the fold the moment there are
         # people on the page -- the same defect as a SAVE button that
         # scrolls away, which is the one he photographed on 2026-09-05.
-        # Add is swapped FOR Create while the form is open rather than
-        # sitting beside it: two primary buttons is a question about which
-        # one finishes the job.
+        # Add is swapped FOR the form's buttons while the form is open
+        # rather than sitting beside them: two primary buttons is a
+        # question about which one finishes the job. NOTHING IS PACKED
+        # HERE: _paint_foot packs the row for the state it is in, in the
+        # order that gives the buttons their width first.
         self._add_btn = RoundButton(act, text="Add a person", kind="accent",
                                     bg=bg, pad_x=12, pad_y=5,
                                     command=self._add_pressed)
-        self._add_btn.pack(side="left")
+        self._next_btn = RoundButton(act, text="Next: their agreement",
+                                     kind="accent", bg=bg, pad_x=12, pad_y=5,
+                                     command=self._next_pressed)
         self._create_btn = RoundButton(act, text="Create", kind="accent",
                                        bg=bg, pad_x=12, pad_y=5,
                                        command=self._create_pressed)
-        self._cancel_btn = RoundButton(act, text="Cancel", kind="ghost",
+        self._back_btn = RoundButton(act, text="Back", kind=_btn_kind(),
+                                     bg=bg, pad_x=10, pad_y=5,
+                                     command=self._back_pressed)
+        self._cancel_btn = RoundButton(act, text="Cancel", kind=_btn_kind(),
                                        bg=bg, pad_x=10, pad_y=5,
                                        command=self._cancel)
-        # THE PATH IS THE LEAST IMPORTANT THING IN THIS ROW, so it gives up
-        # its width first. It is NOT packed here: the packer allocates in
-        # pack-call order, and packing it at build time -- before Create and
-        # Cancel are packed at paint time -- gave it the full 380 px of the
-        # people.json path and cut the right-hand end off "Cancel".
-        # MEASURED 2026-09-05 at 920x1440, on the shipped merge: the foot
-        # read "Create  Cance|/home/example/.local/state/jarvis/people.json".
-        # This is the SECOND time this exact defect has been fixed in this
-        # file -- see the destructive panel's row, which solved it the same
-        # way -- so the rule is written down rather than fixed again:
-        # BUTTONS TAKE THEIR WIDTH FIRST, the path takes what is left, and
-        # what is left is measured, not guessed.
-        self._path_lbl = tk.Label(
-            act, text="", font=ui_display(theme.SIZE_CAPTION),
-            fg=theme.FAINT, bg=bg, anchor="e", bd=0, padx=0, pady=0)
-        self._path_full = ""
-        self._act_row = act
-        # AND AGAIN WHENEVER THE ROW IS RESIZED. _fit_path is called from
-        # _paint_foot, but at that moment the geometry manager has not run
-        # yet and winfo_width() is still 1 or the PREVIOUS width -- so the
-        # first fit measures a row that does not exist yet and leaves the
-        # full path in a label that is then drawn right-anchored in a
-        # narrower slot, cutting its LEFT end with no ellipsis to say so
-        # ("ome/example/.local/state/jarvis/people.json", photographed
-        # 2026-09-05 on the first version of this fix). The Configure
-        # binding is the one that runs against real numbers.
-        # THE LABEL MEASURES ITSELF, and nothing else. An earlier version
-        # of this fix worked out the leftover from the row's width minus
-        # each sibling's requested width and padding, and it was wrong in
-        # both directions depending on WHEN it ran: during a repaint the
-        # row is still 1 px wide, and between repaints the foot holds a
-        # different set of buttons ("Add a person" is 272 px where Create
-        # and Cancel are 337), so a fit taken in one state was applied in
-        # the other and left the full path in a slot 21 px too small --
-        # drawn right-anchored, so its HEAD was cut, with no ellipsis to
-        # say so. The label's own allocated width needs no arithmetic and
-        # is never a guess.
-        self._path_lbl.bind("<Configure>", self._fit_path, add=True)
-        self._note_lbl = tk.Label(
-            self._foot, text="",
-            font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
-            anchor="w", justify="left", bd=0, padx=0, pady=0)
-        self._note_lbl.pack(fill="x", pady=(px(6), 0))
+        self._read_btn = RoundButton(act, text="READ", kind=_btn_kind(),
+                                     bg=bg, size=theme.SIZE_CAPTION, pad_x=10,
+                                     pad_y=5, command=self.open_note)
+        self._opener_lbl = tk.Label(
+            act, text=NOTE_OPENER, font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="e", justify="right", bd=0,
+            padx=0, pady=0)
+        # It shares its row with buttons, so it wraps to its OWN slot.
+        self._opener_lbl.bind("<Configure>", self._wrap_to_own_slot,
+                              add=True)
+
+        # ---- the note sheet: built now (so its label is in the tree and
+        # wrapped like every other paragraph), PLACED on READ.
+        self._note_sheet = NoteSheet(self)
+        self._note_lbl = self._note_sheet.label
+        self._note_close_btn = self._note_sheet.close_btn
+        self._note_canvas = self._note_sheet.canvas
+        self._note_thumb = self._note_sheet.thumb
 
         # ---- the scrolling view, packed FIRST and sized to its content
         view = tk.Frame(self, bg=bg)
         view.pack(side="top", fill="x")
         self._foot.pack(side="top", fill="x", padx=theme.PAD,
-                        pady=(theme.PAD_S, px(12)))
+                        pady=(theme.PAD_S, px(8)))
         self._canvas = tk.Canvas(view, bg=bg, highlightthickness=0, bd=0,
                                  height=px(40))
         self._canvas.pack(side="left", fill="x", expand=True)
@@ -1438,8 +1665,11 @@ class UsersPage(tk.Frame):
         (measured 1395 px of a 1040-px window, 2026-09-05)."""
         width = (max(px(160), int(event.width) - 2 * theme.PAD)
                  if event is not None else self._wrap_px())
-        for label in ([self._gate_lbl, self._admin_lbl, self._note_lbl,
-                       self._lock_lbl] + list(self._wrapped)):
+        # NOT _gate_lbl and NOT _opener_lbl: each shares a row with a button
+        # and wraps to its own slot (_wrap_to_own_slot).
+        for label in ([self._gate_raw_lbl, self._admin_lbl, self._path_lbl,
+                       self._fault_lbl, self._note_lbl, self._lock_lbl]
+                      + list(self._wrapped)):
             try:
                 label.configure(wraplength=width)
             except Exception:             # noqa: BLE001 - torn down
@@ -1497,6 +1727,14 @@ class UsersPage(tk.Frame):
         self._panel = ("", "")
         self._role_arm = ""
         self._adding = False
+        self._add_step = 1
+        self._details_open = False
+        self._flash = ""
+        self._cancel_unflash()
+        # The sheet, the details and a half-typed form all go with the
+        # tab: a page reopened is never mid-form or mid-sheet.
+        if self._note_sheet is not None:
+            self._note_sheet.close()
         self._untick()
         # bind_all is GLOBAL: a wheel binding left behind would scroll a
         # hidden page from anywhere in the console.
@@ -1543,14 +1781,21 @@ class UsersPage(tk.Frame):
             return
         bg = theme.TV_BG
         self._gate_lbl.configure(
+            text=plain_gate_line(self._gate_mode(), len(self._rows)),
+            fg=theme.MUTED)
+        self._gate_raw_lbl.configure(
             text=self._snapshot.get("gate_line")
-            or "owner-gate: nothing has been read yet", fg=theme.MUTED)
+            or "owner-gate: nothing has been read yet")
         plan = self._plan()
-        self._admin_lbl.configure(
-            text=plan.line or self._snapshot.get("admin_line") or "",
+        self._fault_lbl.configure(
+            text=plan.line or "",
             fg=theme.WARN if (plan.line and not plan.may_create)
             else theme.FAINT)
-        self._path_full = self._snapshot.get("path") or ""
+        self._admin_lbl.configure(text=self._snapshot.get("admin_line") or "")
+        path = str(self._snapshot.get("path") or "")
+        self._path_lbl.configure(text=("people file: %s" % path) if path
+                                 else "")
+        self._sync_head()
         for child in list(self._body.winfo_children()):
             child.destroy()
         self._row_widgets = {}
@@ -1565,95 +1810,104 @@ class UsersPage(tk.Frame):
                      bg=bg, anchor="w", justify="left").pack(
                 fill="x", padx=theme.PAD, pady=(theme.PAD_S, 0))
         for row in self._rows:
-            self._build_block(self._body, bg, row)
+            # The row he has JUST made wears the tinted ground for a
+            # moment, so the eye lands on it (FLASH_MS).
+            self._build_block(self._body,
+                              theme.CYAN_SOFT if row.label == self._flash
+                              else bg, row)
         self._paint_foot()
         self._paint_lock()
         self._wrap()
         self._sync_view()
+        if self._note_sheet is not None and self._note_sheet.is_open:
+            self._note_sheet.sync()
+
+    def _sync_head(self) -> None:
+        """Pack what belongs under the gate line for the state the page is
+        in: the bootstrap fault when there is one, the DETAILS block while
+        he has it open, nothing otherwise."""
+        plan = self._plan()
+        try:
+            for w in (self._fault_lbl, self._details):
+                w.pack_forget()
+            if plan.line:
+                self._fault_lbl.pack(fill="x", pady=(px(3), 0))
+            if self._details_open:
+                self._details.pack(fill="x")
+            if plan.line or self._details_open:
+                self._under_gate.pack(fill="x", after=self._gate_row)
+            else:
+                self._under_gate.pack_forget()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the head could not be repacked",
+                      exc_info=True)
+
+    def _details_pressed(self) -> None:
+        self._details_open = not self._details_open
+        self._sync_head()
+        self._sync_view()
+
+    def gate_detail_text(self) -> str:
+        """The gate's OWN line, verbatim -- what DETAILS opens."""
+        try:
+            return str(self._gate_raw_lbl.cget("text"))
+        except Exception:                 # noqa: BLE001 - torn down
+            return ""
+
+    def open_note(self) -> None:
+        """READ: the nine sentences, over the page, for THIS wiring."""
+        if self._note_sheet is None:
+            return
+        self._paint_foot()
+        self._note_sheet.open()
+
+    def close_note(self) -> None:
+        if self._note_sheet is not None:
+            self._note_sheet.close()
 
     def _paint_foot(self) -> None:
-        """Add, or Create and Cancel -- never both."""
+        """Add, or the form's own buttons -- never both -- then READ and its
+        caption. Everything is re-packed from scratch: the packer allocates
+        in pack-call order, and this row has been cut twice before by a
+        label packed at build time taking the width a button needed."""
         self._add_btn.set_enabled(self._may_add())
         try:
+            for w in (self._add_btn, self._next_btn, self._create_btn,
+                      self._back_btn, self._cancel_btn, self._read_btn,
+                      self._opener_lbl):
+                w.pack_forget()
             if self._adding:
-                self._add_btn.pack_forget()
-                if not self._create_btn.winfo_ismapped():
+                two = "consent" in self._add_fields
+                if two and self._add_step == 1:
+                    self._next_btn.pack(side="left")
+                else:
                     self._create_btn.pack(side="left")
-                    self._cancel_btn.pack(side="left",
-                                          padx=(theme.PAD_S, 0))
+                    if two:
+                        self._back_btn.pack(side="left",
+                                            padx=(theme.PAD_S, 0))
+                self._cancel_btn.pack(side="left", padx=(theme.PAD_S, 0))
             else:
-                self._create_btn.pack_forget()
-                self._cancel_btn.pack_forget()
-                if not self._add_btn.winfo_ismapped():
-                    self._add_btn.pack(side="left")
-            # LAST, always: re-packing it here is what puts it behind the
-            # buttons in the packer's allocation order, whichever buttons
-            # this state has.
-            # EMPTY FIRST, THEN EXPAND INTO THE LEFTOVER. With no text the
-            # label asks for nothing, so the buttons take their natural
-            # width; expand=True then gives the label whatever is left, and
-            # its own <Configure> fills it in against that real number. It
-            # is repacked here rather than at build time so that it is
-            # behind the buttons in the packer's allocation order.
-            self._path_lbl.configure(text="")
-            self._path_lbl.pack_forget()
-            self._path_lbl.pack(side="right", fill="x", expand=True,
-                                padx=(theme.PAD_S, 0))
+                self._add_btn.pack(side="left")
+            self._read_btn.pack(side="right", padx=(theme.PAD_S, 0))
+            if not self._adding:
+                # The caption is a lure, not a control: while he is typing
+                # it gives its width to the form's buttons and READ stays.
+                self._opener_lbl.pack(side="right", fill="x", expand=True,
+                                      padx=(theme.PAD_S, 0))
             # THE NOTE IS BUILT HERE, from the seams this console was
             # actually handed, rather than being a tuple somebody edits by
             # hand a hundred lines from the code it describes. That is the
             # whole fix for the defect he caught on 2026-09-05: a capability
             # that lands turns its own sentence off, and a half-wired UI
             # describes itself correctly instead of promising a button it
-            # has not got.
+            # has not got. The label is the sheet's; it is configured
+            # whether or not the sheet is up, so READ always shows the
+            # sentences for THIS wiring.
             lines = list(foot_lines(self.services))
             self._note_lbl.configure(
                 text="\n".join("· " + line for line in lines))
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the foot could not be repacked",
-                      exc_info=True)
-
-    def _fit_path(self, event=None) -> None:
-        """Trim the people-file path from the LEFT until it fits the room
-        the buttons left it, with a leading ellipsis.
-
-        The TAIL is the part that identifies the file, so the head is what
-        goes. A path that will not fit at all becomes the bare file name,
-        and a file name that still will not fit becomes nothing -- an empty
-        label is honest; half a word beside a half-drawn button is not.
-        """
-        full = getattr(self, "_path_full", "") or ""
-        try:
-            lbl = self._path_lbl
-            room = int(lbl.winfo_width()) - _INK_SLACK
-            if int(lbl.winfo_width()) <= 1:
-                # Not laid out yet. Show NOTHING rather than guess: the
-                # Configure that gives it a width fits it a moment later
-                # against a real number, and an empty label for one frame
-                # is better than a path with its head cut off.
-                lbl.configure(text="")
-                return
-            font = tkfont.Font(font=lbl.cget("font"))
-            if room <= 0 or not full:
-                lbl.configure(text="")
-                return
-            if font.measure(full) <= room:
-                lbl.configure(text=full)
-                return
-            # Give up leading path segments first; then characters.
-            parts = full.split("/")
-            while len(parts) > 1:
-                parts.pop(0)
-                shown = "\u2026/" + "/".join(parts)
-                if font.measure(shown) <= room:
-                    lbl.configure(text=shown)
-                    return
-            name = parts[-1] if parts else ""
-            while name and font.measure("\u2026" + name) > room:
-                name = name[1:]
-            lbl.configure(text=("\u2026" + name) if name else "")
-        except Exception:                 # noqa: BLE001 - torn down
-            log.debug("users page: the path could not be fitted",
                       exc_info=True)
 
     def _may_add(self) -> bool:
@@ -1792,31 +2046,54 @@ class UsersPage(tk.Frame):
         block.pack(fill="x", padx=theme.PAD, pady=(0, px(BLOCK_GAP)))
         head = tk.Frame(block, bg=bg)
         head.pack(fill="x")
-        tk.Label(head, text=row.display,
-                 font=ui_display(theme.SIZE_BODY, "semibold"), fg=theme.INK,
-                 bg=bg, anchor="w", bd=0, padx=0, pady=0).pack(side="left")
-        tk.Label(head, text=row.label, font=ui_display(theme.SIZE_CAPTION),
-                 fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0,
-                 pady=0).pack(side="left", padx=(theme.PAD_S, 0))
-        tk.Label(head, text=ROLE_WORDS.get(row.role, row.role.upper()),
-                 font=ui_display(theme.SIZE_CAPTION, "semibold"),
-                 fg=theme.CYAN if row.role == ROLE_OWNER else theme.MUTED,
-                 bg=bg, anchor="w", bd=0, padx=0,
-                 pady=0).pack(side="left", padx=(theme.PAD_S, 0))
-        forget = RoundButton(head, text="Forget", kind="ghost", bg=bg,
+        # THE BUTTONS ARE PACKED FIRST and take their width first; the NAME
+        # is what gives way, with an ellipsis that says so (_fit_head).
+        # MEASURED 2026-09-06 at 920x1440: with the name packed first,
+        # "Make owner" on a ten-letter name was drawn 219 px wide against
+        # its natural 236, and a longer name cut it more.
+        forget = RoundButton(head, text="Forget", kind=_btn_kind(), bg=bg,
                              pad_x=8, pad_y=4,
                              command=lambda who=row.label: self._forget_pressed(who))
         forget.pack(side="right")
         role = RoundButton(
             head, text=("Make known" if row.role == ROLE_OWNER
                         else "Make owner"),
-            kind="ghost", bg=bg, pad_x=8, pad_y=4,
+            kind=_btn_kind(), bg=bg, pad_x=8, pad_y=4,
             command=lambda who=row.label, r=row.role: self._role_pressed(who, r))
         role.pack(side="right", padx=(0, px(4)))
+        name_lbl = tk.Label(head, text=row.display,
+                            font=ui_display(theme.SIZE_BODY, "semibold"),
+                            fg=theme.INK, bg=bg, anchor="w", bd=0, padx=0,
+                            pady=0)
+        name_lbl.pack(side="left")
+        # THE LABEL CHIP IS DRAWN ONLY WHEN IT SAYS SOMETHING THE NAME DOES
+        # NOT: "Marchbanks  marchbanks  KNOWN" spent 150 px repeating the
+        # name in lower case, and at 920 that is what pushed the name into
+        # an ellipsis ("Marchba…", measured on the rig, 2026-09-06). Every
+        # panel that asks him to type the label prints it in full.
+        fixed = [forget, role]
+        if str(row.display).strip().lower() != str(row.label).strip().lower():
+            label_lbl = tk.Label(head, text=row.label,
+                                 font=ui_display(theme.SIZE_CAPTION),
+                                 fg=theme.FAINT, bg=bg, anchor="w", bd=0,
+                                 padx=0, pady=0)
+            label_lbl.pack(side="left", padx=(theme.PAD_S, 0))
+            fixed.append(label_lbl)
+        role_lbl = tk.Label(head, text=ROLE_WORDS.get(row.role,
+                                                       row.role.upper()),
+                            font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                            fg=theme.CYAN if row.role == ROLE_OWNER
+                            else theme.MUTED,
+                            bg=bg, anchor="w", bd=0, padx=0, pady=0)
+        role_lbl.pack(side="left", padx=(theme.PAD_S, 0))
+        fixed.append(role_lbl)
+        head.bind("<Configure>",
+                  lambda e, h=head, n=name_lbl, d=row.display, o=tuple(fixed):
+                  self._fit_head(h, n, d, o), add=True)
         forget.set_enabled(row.can_forget)
         role.set_enabled(row.can_change_role)
         self._row_widgets[row.label] = {"forget": forget, "role": role,
-                                        "block": block}
+                                        "block": block, "name": name_lbl}
         detail = tk.Label(block, text=row.detail,
                           font=ui_display(theme.SIZE_CAPTION),
                           fg=theme.MUTED, bg=bg, anchor="w",
@@ -1855,6 +2132,26 @@ class UsersPage(tk.Frame):
         if self._role_arm == row.label:
             self._build_role_panel(block, bg, row.label)
 
+    def _fit_head(self, head, name_lbl, display: str, others) -> None:
+        """Trim the NAME with an ellipsis until the head row fits the width
+        it was actually given. Buttons keep their width; a label with a
+        chip and a ROLE word keep theirs; the name takes what is left. Runs
+        on the row's own <Configure>, against a real number."""
+        try:
+            room = int(head.winfo_width())
+            if room <= 1:
+                return
+            taken = sum(int(w.winfo_reqwidth()) for w in others)
+            slot = room - taken - px(4) - 2 * theme.PAD_S - _INK_SLACK
+            font = name_lbl.cget("font")
+            want = (display if measure(font, display) <= slot
+                    else ellipsize(display, font, max(0, slot)))
+            if str(name_lbl.cget("text")) != want:
+                name_lbl.configure(text=want)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the head row could not be fitted",
+                      exc_info=True)
+
     def _build_forget_panel(self, parent, bg, label) -> None:
         warn = tk.Label(parent, text="\n".join(forget_warning(
                             label,
@@ -1866,58 +2163,45 @@ class UsersPage(tk.Frame):
                         pady=0)
         warn.pack(fill="x", pady=(px(4), 0))
         self._wrapped.append(warn)
-        cmd = tk.Frame(parent, bg=bg)
-        cmd.pack(fill="x", pady=(px(2), 0))
-        command = forget_face_command(label)
-        RoundButton(cmd, text="Copy", kind="ghost", bg=bg, pad_x=8, pad_y=4,
-                    command=lambda c=command: self._copy(c)).pack(side="right")
-        cmd_lbl = tk.Label(cmd, text=command, font=ui_font(theme.SIZE_CAPTION),
-                           fg=theme.FAINT, bg=bg, anchor="w", justify="left",
-                           bd=0, padx=0, pady=0)
-        # PACKED AFTER Copy, deliberately: pack() hands out parcels in
-        # call order, so a label asking for the whole command on one line
-        # (MEASURED 1395 px) would take the cavity and leave the button
-        # squeezed. The button goes first and keeps its natural width.
-        cmd_lbl.pack(side="left", fill="x", expand=True)
-        # DELIBERATELY NOT in self._wrapped. That list wraps to the PAGE
-        # width, and this label shares its row with Copy -- so the page
-        # width overstates its room by the whole button, and every line
-        # that lands in the difference is drawn past the label's own
-        # window and clipped mid-word (MEASURED 2026-09-05: wraplength 856
-        # inside a 790 px slot at 920x1440). It follows its OWN allocation
-        # instead, which stays right at any window size and whatever the
-        # button beside it happens to measure.
-        cmd_lbl.bind("<Configure>", self._wrap_to_own_slot, add=True)
-        row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(4), 0))
-        # ASKS FOR LITTLE AND GROWS. pack() never shrinks a widget below
-        # its requested width -- fill and expand only ever ADD space -- so
-        # a fixed 18-character entry is a hard floor that pushed the
-        # buttons off the edge at 920x1440. Asking for 8 and expanding
-        # into whatever is left fits every window and still gives him a
-        # wide field at his own.
-        entry = tk.Entry(row, width=8, bd=0, relief="flat",
-                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
-                         fg=theme.INK, insertbackground=theme.CYAN,
-                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        # THE BUTTONS TAKE THEIR WIDTH FIRST, anchored right, and the entry
-        # gives up whatever is left. MEASURED 2026-09-05 at 920x1440: with
-        # a fixed 18-character entry and both buttons packed left this row
-        # asked for 977 px of a 920 px body, and because the body scrolls
-        # only VERTICALLY the missing 57 px were not scrolled to -- they
-        # were cut, and what was cut was the right-hand end of "Cancel".
-        # A confirm entry 57 px narrower still takes a typed label; half a
-        # Cancel button on the destructive panel is not acceptable.
-        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="right",
-                                                        padx=(px(4), 0))
-        RoundButton(row, text="Forget %s" % label, kind="ghost", bg=bg,
-                    pad_x=10, pad_y=4,
-                    command=lambda who=label, e=entry:
-                    self._forget_confirm(who, e.get())).pack(
-            side="right", padx=(theme.PAD_S, 0))
-        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
-        self._row_widgets.setdefault(label, {})["confirm"] = entry
+        # THE COMMAND IS PRINTED IN THE WARNING ("Once the row is gone these
+        # are the only way left"). A button that COPIES it is offered only
+        # for a store this console cannot purge itself: where the seam is
+        # wired the row already carries "Remove face measurements", which
+        # the warning tells him to press BEFORE he confirms here. It used to
+        # be printed a second time beside a Copy button, two lines the panel
+        # cannot spare: MEASURED 2026-09-06 the whole panel -- question,
+        # box, buttons -- has to sit inside a 771-px viewport at 920x1440,
+        # and with the fully wired console it measures 755. ONE PER ROW:
+        # "Copy the face command" is 441 px and the voice one 458, which side
+        # by side is 911 of the 856 px the body has at 920.
+        # ...and only for a store that EXISTS: a copy of a delete command
+        # for measurements nobody took is a button whose only answer is
+        # "there was nothing", which reads as a failure.
+        can = console_can(self.services)
+        faces = {str(g) for g in (self._snapshot.get("gallery") or ())}
+        voices = {str(v) for v in (self._snapshot.get("voices") or ())}
+        for offered, text, command in (
+                (label in faces and not can["purge_face"],
+                 "Copy the face command", forget_face_command(label)),
+                (label in voices and not can["purge_voice"],
+                 "Copy the voice command", forget_voice_command(label))):
+            if not offered:
+                continue
+            cmd = tk.Frame(parent, bg=bg)
+            cmd.pack(fill="x", pady=(px(4), 0))
+            RoundButton(cmd, text=text, kind=_btn_kind(), bg=bg, pad_x=8,
+                        pad_y=4, command=lambda c=command: self._copy(c)
+                        ).pack(side="left")
+        # ONE SHAPE FOR EVERY CONFIRM ROW: _confirm_row carries the two
+        # measurements it stands on (the cut Cancel of 09-05, and the box a
+        # long label squeezed to 1 px on 09-06).
+        row, entry = self._confirm_row(
+            parent, bg, label, "Forget %s",
+            lambda typed, who=label: self._forget_confirm(who, typed))
+        widgets = self._row_widgets.setdefault(label, {})
+        widgets["confirm"] = entry
+        # The SPAN _reveal keeps on screen: the question down to the box.
+        widgets["panel"] = (warn, row)
 
     def _build_role_panel(self, parent, bg, label) -> None:
         owners = [r.label for r in self._rows if r.role == ROLE_OWNER]
@@ -1929,33 +2213,123 @@ class UsersPage(tk.Frame):
                        pady=0)
         ask.pack(fill="x", pady=(px(4), 0))
         self._wrapped.append(ask)
+        row, entry = self._confirm_row(
+            parent, bg, label, "Make %s an owner",
+            lambda typed, who=label: self._role_confirm(who, typed), pady=2)
+        widgets = self._row_widgets.setdefault(label, {})
+        widgets["role_confirm"] = entry
+        widgets["panel"] = (ask, row)
+
+    # ------------------------------------------- the confirm rows' one shape
+    def _confirm_row(self, parent, bg, label: str, verb: str, confirm,
+                     *, pady: int = 4):
+        """The acting row every confirm panel ends in -- the typed box, then
+        the two buttons anchored RIGHT with Cancel outermost -- built ONE
+        way, because this project shipped a cut Cancel four times by
+        building it four ways. ``verb`` is the confirm button's words with
+        one %s for the label; ``confirm`` is called with what was typed.
+
+        THE BUTTONS TAKE THEIR WIDTH FIRST and the box gives way. pack()
+        never shrinks a widget below what it asked for and hands the LAST
+        one packed whatever is left, so with a fixed 18-character box and
+        both buttons packed left the make-owner row asked 1130 px of the
+        976 it has at his own 1040x1760 (856 at 920x1440) on a 12-letter
+        label and drew Cancel 1 px wide of 151 at BOTH windows -- MEASURED
+        2026-09-06, S=2; the forget row had done the same on 09-05 (977 of
+        920), and the body scrolls only downwards, so the excess is cut,
+        never reached.
+
+        THE NAME GIVES WAY NEXT, not the box. Packed right, a long label
+        squeezes the box instead: at 920 a 20-letter label left it 11 px
+        and a 24-letter one cut the confirm button itself (681 of 759).
+        Labels run to 31 characters (facegallery._LABEL_RE). So the row
+        fits itself on its own <Configure>, like the head row does: the
+        box keeps the width it asked for and the label inside the button
+        is trimmed with an ellipsis to what is left. The block's head still
+        names the person in full.
+        """
         row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(2), 0))
-        entry = tk.Entry(row, width=18, bd=0, relief="flat",
+        row.pack(fill="x", pady=(px(pady), 0))
+        entry = tk.Entry(row, width=8, bd=0, relief="flat",
                          bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
                          fg=theme.INK, insertbackground=theme.CYAN,
                          font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        entry.pack(side="left", ipady=px(3))
-        RoundButton(row, text="Make %s an owner" % label, kind="ghost",
-                    bg=bg, pad_x=10, pad_y=4,
-                    command=lambda who=label, e=entry:
-                    self._role_confirm(who, e.get())).pack(
-            side="left", padx=(theme.PAD_S, 0))
-        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="left",
-                                                        padx=(px(4), 0))
+        cancel = RoundButton(row, text="Cancel", kind=_btn_kind(), bg=bg,
+                             pad_x=8, pad_y=4, command=self._cancel)
+        cancel.pack(side="right", padx=(px(4), 0))
+        btn = RoundButton(row, text=verb % label, kind=_btn_kind(), bg=bg,
+                          pad_x=10, pad_y=4,
+                          command=lambda e=entry: confirm(e.get()))
+        btn.pack(side="right", padx=(theme.PAD_S, 0))
+        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        floor = int(entry.winfo_reqwidth())
+        row.bind("<Configure>",
+                 lambda e, r=row, b=btn, c=cancel, f=floor, v=verb, n=label:
+                 self._fit_confirm(r, b, c, f, v, n), add=True)
+        return row, entry
+
+    def _fit_confirm(self, row, btn, cancel, floor: int, verb: str,
+                     label: str) -> None:
+        """Trim the label inside the confirm button until the row fits the
+        width it was given with the box no narrower than ``floor``. Runs on
+        the row's own <Configure>, against real numbers. A RoundButton
+        sizes itself ONCE, from its first text, so the width is re-asked
+        here along with the words -- measured with the button's own ruler
+        (tkfont, as RoundButton.__init__ does), so the two agree."""
+        try:
+            room = int(row.winfo_width())
+            if room <= 1:
+                return
+            font = tkfont.Font(font=btn._font)
+            pad = int(btn._btn_w) - font.measure(str(btn._text))
+            taken = (int(cancel.winfo_reqwidth()) + px(4) + theme.PAD_S
+                     + floor + pad + 2 + _INK_SLACK)
+            slot = max(0, room - taken)
+            full = verb % label
+            if font.measure(full) <= slot:
+                want = full
+            else:
+                want = verb % ellipsize(
+                    label, font, max(0, slot - font.measure(verb % "")))
+            if str(btn._text) != want:
+                btn._btn_w = font.measure(want) + pad
+                btn.configure(width=btn._btn_w)
+                btn.set_text(want)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: a confirm row could not be fitted",
+                      exc_info=True)
 
     # ------------------------------------------------------- the add form
     def _build_add_form(self, parent, bg) -> None:
+        """TWO STEPS: who, then their agreement. Both are BUILT here; one
+        is packed at a time (_show_step), so nothing typed is lost between
+        them and the tests that read ``_add_fields`` find every box.
+
+        WHY TWO. MEASURED 2026-09-06: the one-step form was 1345 px tall at
+        920x1440 (the consent paragraph alone is 608), so with a person on
+        the page 0 of its 5 boxes were on screen there and the consent box
+        -- which Create refuses without -- was 712 px below the fold at his
+        own 1040x1760. Step 1 (heading, name, label, face, role) is ~650 px
+        and step 2 (the paragraph, the caption, the box) ~770, and each is
+        measured to sit whole inside the viewport at both windows
+        (tests/test_ui_easy_to_add.py). The paragraph is READ before it is
+        typed to: Create checks it is on screen (_create_pressed).
+        """
         plan = self._plan()
         box = tk.Frame(parent, bg=bg)
         box.pack(fill="x", padx=theme.PAD, pady=(0, px(BLOCK_GAP)))
         first_only = plan.first_owner_only
-        tk.Label(box, text=("Create the first owner" if first_only
-                            else "Add a person"),
-                 font=ui_display(theme.SIZE_BODY, "semibold"), fg=theme.INK,
-                 bg=bg, anchor="w", bd=0, padx=0, pady=0).pack(fill="x")
-        self._add_fields = {}
+        # A CAPTION, like the setup sheet's own title, not a person's name:
+        # step 2 is MEASURED at 757 px in a 771-px viewport at 920x1440,
+        # and with the body-size heading (53 px) it was 778 -- the consent
+        # box under the fold by 7 px, which is the whole defect again.
+        self._form_heading = tk.Label(
+            box, text="", font=ui_display(theme.SIZE_CAPTION, "semibold"),
+            fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0, pady=0)
+        self._form_heading.pack(fill="x")
+        self._add_fields, self._add_rows, self._add_caps = {}, {}, {}
+        self._step1 = tk.Frame(box, bg=bg)
+        self._step2 = tk.Frame(box, bg=bg)
         # THE CAPTION SITS ABOVE ITS BOX, not beside it. A 26-CHARACTER
         # caption column is ~410 px of his 1040-px window at S=2, which
         # left "existing owner's label (owners only)" running into its own
@@ -1964,7 +2338,8 @@ class UsersPage(tk.Frame):
         for key, caption in (("name", "name, as he should say it"),
                              ("label", "label (lower-case, no spaces)"),
                              ("face", "face gallery label (optional)")):
-            self._add_fields[key] = self._form_field(box, bg, caption)
+            self._add_fields[key] = self._form_field(self._step1, bg,
+                                                     caption, key)
         # THE CONSENT NAMES THE PERSON, and follows what he types. A
         # paragraph about "this person" is a paragraph nobody agreed to.
         self._add_fields["label"].bind("<KeyRelease>", self._retitle_consent,
@@ -1976,8 +2351,9 @@ class UsersPage(tk.Frame):
         # is still off.
         self._add_owner = bool(first_only)
         if not first_only:
-            row = tk.Frame(box, bg=bg)
+            row = tk.Frame(self._step1, bg=bg)
             row.pack(fill="x", pady=(px(6), 0))
+            self._role_row = row
             cap = tk.Label(row, text="role", font=ui_display(theme.SIZE_CAPTION),
                            fg=theme.FAINT, bg=bg, anchor="w", bd=0,
                            padx=0, pady=0)
@@ -1986,36 +2362,70 @@ class UsersPage(tk.Frame):
             # buttons, so the page width is not its room either (856 px
             # claimed inside a 43 px slot). One word needs no wrapping.
             self._role_btn = RoundButton(
-                row, text="known", kind="ghost", bg=bg, pad_x=10, pad_y=4,
+                row, text="known", kind=_btn_kind(), bg=bg, pad_x=10, pad_y=4,
                 command=self._toggle_new_role)
             self._role_btn.pack(side="left")
+            # Only when OWNER is chosen: an 89-px row about a second owner
+            # is noise on the form for a guest (_toggle_new_role packs it).
             self._add_fields["confirm_owner"] = self._form_field(
-                box, bg, "the EXISTING owner's label — needed only to make "
-                         "a second owner")
+                self._step1, bg, "the EXISTING owner's label — needed only "
+                                 "to make a second owner", "confirm_owner")
+            self._add_rows["confirm_owner"].pack_forget()
             # THEIR AGREEMENT, in the shared words, shown before it is asked
             # for -- a consent nobody could read is not a consent.
             self._consent_lbl = tk.Label(
-                box, text=self._consent_text(""),
+                self._step2, text=self._consent_text(""),
                 font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED,
                 bg=bg, anchor="w", justify="left", bd=0, padx=0, pady=0)
             self._consent_lbl.pack(fill="x", pady=(px(6), 0))
             self._wrapped.append(self._consent_lbl)
             self._add_fields["consent"] = self._form_field(
-                box, bg, "they type their own label here to agree")
-        # Create and Cancel are in the PINNED FOOT (_paint_foot), not here.
-        tail = tk.Label(box, text=("A face and a voice are still enrolled "
-                                   "at a terminal; this only says who "
-                                   "Jarvis knows."),
-                        font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
-                        bg=bg, anchor="w", justify="left", bd=0, padx=0,
-                        pady=0)
-        tail.pack(fill="x", pady=(px(4), 0))
-        self._wrapped.append(tail)
+                self._step2, bg, "they type their own label here to agree",
+                "consent")
+        else:
+            # The first owner sees no consent paragraph, so this is where
+            # the form says what a ROW is. True whatever ships: a face and
+            # a voice are separate enrolments, taken afterwards.
+            tail = tk.Label(self._step1,
+                            text=("This only says who Jarvis knows. A face "
+                                  "and a voice are enrolled separately, "
+                                  "afterwards."),
+                            font=ui_display(theme.SIZE_CAPTION),
+                            fg=theme.FAINT, bg=bg, anchor="w",
+                            justify="left", bd=0, padx=0, pady=0)
+            tail.pack(fill="x", pady=(px(4), 0))
+            self._wrapped.append(tail)
+        # Create/Next/Back/Cancel are in the PINNED FOOT (_paint_foot).
+        self._show_step(self._add_step)
 
-    def _form_field(self, parent, bg, caption: str):
+    def _show_step(self, step) -> None:
+        """Pack one step of the form. A one-step form (the first owner)
+        only ever shows step 1."""
+        two = "consent" in self._add_fields
+        self._add_step = 2 if (two and int(step) == 2) else 1
+        try:
+            self._step1.pack_forget()
+            self._step2.pack_forget()
+            (self._step2 if self._add_step == 2 else self._step1).pack(
+                fill="x")
+            if not two:
+                heading = "Create the first owner"
+            elif self._add_step == 1:
+                heading = "Add a person — step 1 of 2 — who"
+            else:
+                heading = "Add a person — step 2 of 2 — their agreement"
+            self._form_heading.configure(
+                text=theme.caption(heading, surface=False))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the form step could not be shown",
+                      exc_info=True)
+
+    def _form_field(self, parent, bg, caption: str, key: str = ""):
         """One labelled box: the caption on its own line, the entry under
-        it filling the width. Stacked so a long caption wraps instead of
-        squeezing its own entry off the right edge."""
+        it filling the width, and an amber line under THAT for a refusal
+        (_form_fault), packed only when there is one. Stacked so a long
+        caption wraps instead of squeezing its own entry off the right
+        edge."""
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", pady=(px(6), 0))
         cap = tk.Label(row, text=caption, font=ui_display(theme.SIZE_CAPTION),
@@ -2029,7 +2439,56 @@ class UsersPage(tk.Frame):
             fg=theme.INK, insertbackground=theme.CYAN,
             font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
         entry.pack(fill="x", ipady=px(3), pady=(px(2), 0))
+        fault = tk.Label(row, text="", font=ui_display(theme.SIZE_CAPTION),
+                         fg=theme.WARN, bg=bg, anchor="w", justify="left",
+                         bd=0, padx=0, pady=0)
+        self._wrapped.append(fault)
+        if key:
+            self._add_rows[key] = row
+            self._add_caps[key] = fault
         return entry
+
+    def _form_fault(self, key: str, why: str) -> None:
+        """A refusal STAYS on the form. The toast vanishes before he has
+        read it; the box that was refused gets the focus and an amber
+        line under it saying why."""
+        lbl = self._add_caps.get(key)
+        entry = self._add_fields.get(key)
+        try:
+            if lbl is not None:
+                lbl.configure(text=str(why or ""))
+                lbl.pack(fill="x", pady=(px(2), 0))
+            self._sync_view()
+            if entry is not None:
+                self.update_idletasks()
+                entry.focus_set()
+                self._reveal(entry)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the fault could not be shown",
+                      exc_info=True)
+
+    def _clear_faults(self) -> None:
+        for lbl in self._add_caps.values():
+            try:
+                lbl.configure(text="")
+                lbl.pack_forget()
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("users page: a fault line is gone", exc_info=True)
+
+    def _refuse(self, key: str, why: str) -> None:
+        self.toast(why, "warn")
+        self._form_fault(key, why)
+
+    def _focus_field(self, key: str) -> None:
+        entry = self._add_fields.get(key)
+        if entry is None:
+            return
+        try:
+            self.update_idletasks()
+            entry.focus_set()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the box could not take focus",
+                      exc_info=True)
 
     @staticmethod
     def _consent_text(label: str) -> str:
@@ -2053,6 +2512,13 @@ class UsersPage(tk.Frame):
         self._add_owner = not self._add_owner
         try:
             self._role_btn.set_text("owner" if self._add_owner else "known")
+            row = self._add_rows.get("confirm_owner")
+            if row is not None:
+                if self._add_owner:
+                    row.pack(fill="x", pady=(px(6), 0), after=self._role_row)
+                else:
+                    row.pack_forget()
+            self._sync_view()
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the role button is gone", exc_info=True)
 
@@ -2139,6 +2605,7 @@ class UsersPage(tk.Frame):
         self._panel = ("", "")
         self._role_arm = ""
         self._adding = False
+        self._add_step = 1
         self._paint()
         self._to_top()
 
@@ -2175,7 +2642,7 @@ class UsersPage(tk.Frame):
         self._role_arm = ""
         self._forget.press(label)
         self._paint()
-        self._reveal(self._row_widgets.get(label, {}).get("confirm"))
+        self._reveal_panel(label)
 
     def _forget_confirm(self, label: str, typed) -> None:
         if not self._guard("forget"):
@@ -2202,7 +2669,7 @@ class UsersPage(tk.Frame):
             return
         self._role_arm = label
         self._paint()
-        self._reveal(self._row_widgets.get(label, {}).get("block"))
+        self._reveal_panel(label)
 
     def _role_confirm(self, label: str, typed) -> None:
         if not self._guard("set_role"):
@@ -2218,9 +2685,16 @@ class UsersPage(tk.Frame):
 
     def _add_pressed(self) -> None:
         if not self._guard("add"):
+            # The toast says to type the override code; put the cursor
+            # where that code goes rather than leaving it on the button.
+            if self._lock.locked():
+                self._focus_code()
             return
         self._adding = not self._adding
+        self._add_step = 1
         self._forget.disarm()
+        self._purge.disarm()
+        self._panel = ("", "")
         self._role_arm = ""
         self._paint()
         # THE FORM OPENS AT ITS TOP. The body kept whatever scroll offset
@@ -2228,17 +2702,20 @@ class UsersPage(tk.Frame):
         # above the fold the moment the form appeared -- visible in the
         # 31-users-add render, which opened on "role".
         self._to_top()
+        if self._adding:
+            self._focus_field("name")
 
-    def _create_pressed(self) -> None:
-        if not self._guard("add"):
-            return
-        fields = getattr(self, "_add_fields", {})
+    def _who_faults(self):
+        """Check step 1 -- the label, the face label, the owner
+        confirmation -- and return ``(key, why)`` for the first refusal or
+        ``("", "")``. Shared by Next and Create so the two cannot
+        disagree about who may be added."""
+        fields = self._add_fields
         label = str(fields["label"].get() if "label" in fields else "")
         label = label.strip().lower()
         fault = label_fault(label)
         if fault:
-            self.toast(fault, "warn")
-            return
+            return "label", fault
         face = str(fields["face"].get() if "face" in fields
                    else "").strip().lower()
         if face:
@@ -2247,24 +2724,79 @@ class UsersPage(tk.Frame):
             # two stores disagree about who exists.
             fault = label_fault(face)
             if fault:
-                self.toast("the face label: %s" % fault, "warn")
-                return
+                return "face", "the face label: %s" % fault
         role = ROLE_OWNER if self._add_owner else ROLE_KNOWN
         owners = [r.label for r in self._rows if r.role == ROLE_OWNER]
         confirm = str(fields["confirm_owner"].get()
                       if "confirm_owner" in fields else "").strip().lower()
         ok, why = owner_confirmed(role, owners, confirm)
         if not ok:
-            self.toast(why, "warn")
+            return "confirm_owner", why
+        return "", ""
+
+    def _next_pressed(self) -> None:
+        """Step 1 -> step 2: WHO is checked before their agreement is asked
+        for, so a label fault is found on the box it belongs to. A one-step
+        form (the first owner) has no step 2 and creates instead."""
+        if not self._guard("add"):
             return
+        if "consent" not in self._add_fields:
+            self._create_pressed()
+            return
+        self._clear_faults()
+        key, why = self._who_faults()
+        if key:
+            self._refuse(key, why)
+            return
+        self._retitle_consent()
+        self._show_step(2)
+        self._paint_foot()
+        self._sync_view()
+        self._to_top()
+        self._focus_field("consent")
+
+    def _back_pressed(self) -> None:
+        self._clear_faults()
+        self._show_step(1)
+        self._paint_foot()
+        self._sync_view()
+        self._to_top()
+        self._focus_field("label")
+
+    def _create_pressed(self) -> None:
+        if not self._guard("add"):
+            return
+        self._clear_faults()
+        fields = self._add_fields
+        key, why = self._who_faults()
+        if key:
+            self._refuse(key, why)
+            return
+        label = str(fields["label"].get()).strip().lower()
+        face = str(fields["face"].get() if "face" in fields
+                   else "").strip().lower()
+        role = ROLE_OWNER if self._add_owner else ROLE_KNOWN
+        confirm = str(fields["confirm_owner"].get()
+                      if "confirm_owner" in fields else "").strip().lower()
         how = "owner"
         if role != ROLE_OWNER:
             typed = fields["consent"].get() if "consent" in fields else ""
-            ok, how = take_consent(label, owner="", show=None,
-                                   ask=lambda: typed,
-                                   mapped=self.winfo_ismapped)
+            lbl = getattr(self, "_consent_lbl", None)
+            # THE PARAGRAPH IS READ BEFORE IT IS TYPED TO. The taker's
+            # precondition used to be "the page is on screen"; it is now
+            # "the words are on screen" -- step 2, where the box is.
+            ok, how = take_consent(
+                label, owner="", show=None, ask=lambda: typed,
+                mapped=lambda: bool(self.winfo_ismapped() and lbl is not None
+                                    and lbl.winfo_ismapped()))
             if not ok:
-                self.toast(how, "warn")
+                if self._add_step != 2:
+                    # Show him the words the refusal is about.
+                    self._show_step(2)
+                    self._paint_foot()
+                    self._sync_view()
+                    self._to_top()
+                self._refuse("consent", how)
                 return
         if face and face not in set(self._snapshot.get("gallery") or ()):
             # NOT a refusal: enrolling the face is a separate minute at a
@@ -2294,12 +2826,17 @@ class UsersPage(tk.Frame):
         except Exception:                 # noqa: BLE001 - the app boundary
             log.exception("users page: %s failed", service)
             ok, line = False, "That did not work, sir; see the log."
+        made = ""
         if ok:
             # Each successful action re-arms the dwell, so a run of edits
             # is one code rather than five. The app re-armed its own; this
             # is the mirror, corrected by the next tick either way.
             self._lock.touch()
             self._adding = False
+            self._add_step = 1
+            if service == "people_add":
+                made = str(kw.get("label") or "")
+                self._flash = made
         self.toast(str(line), "ok" if ok else "warn")
         # THE SEAM IS THE GUARD, so a press may be refused here even when
         # the page thought it was allowed -- a code set at a terminal, or a
@@ -2311,6 +2848,37 @@ class UsersPage(tk.Frame):
         self.refresh()
         if owed:
             self._focus_code()
+        if made:
+            # The new row is scrolled INTO view and wears the tinted ground
+            # for a moment: the toast says "enrolled", the page shows where.
+            self._reveal(self._row_widgets.get(made, {}).get("block"))
+            self._cancel_unflash()
+            try:
+                self._unflash_job = self.after(FLASH_MS, self._unflash)
+            except Exception:             # noqa: BLE001 - torn down
+                self._unflash_job = None
+
+    def _cancel_unflash(self) -> None:
+        job, self._unflash_job = self._unflash_job, None
+        if job is None:
+            return
+        try:
+            self.after_cancel(job)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: unflash cancel failed", exc_info=True)
+
+    def _unflash(self) -> None:
+        self._unflash_job = None
+        self._flash = ""
+        if not self._open:
+            return
+        # A repaint would empty a box he may have started typing into in
+        # the meantime; if anything is open, the tint simply goes at the
+        # next paint.
+        busy = (self._forget.armed_for or self._purge.armed_for
+                or self._panel[0] or self._role_arm or self._adding)
+        if not busy:
+            self._paint()
 
     # -------------------------------------------------- the per-row actions
     def _btn_row(self, parent, bg):
@@ -2424,8 +2992,8 @@ class UsersPage(tk.Frame):
                 lambda who=row.label: self._purge_pressed(who, "voice"))
 
     def _action(self, parent, bg, text, command):
-        btn = RoundButton(parent, text=text, kind="ghost", bg=bg, pad_x=8,
-                          pad_y=4, command=command)
+        btn = RoundButton(parent, text=text, kind=_btn_kind(), bg=bg,
+                          pad_x=8, pad_y=4, command=command)
         btn.pack(side="left", padx=(0, px(6)))
         return btn
 
@@ -2460,10 +3028,12 @@ class UsersPage(tk.Frame):
                 font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
             entry.pack(fill="x", ipady=px(3), pady=(px(2), 0))
             boxes.append(entry)
-        self._row_widgets.setdefault(label, {})["phrase_boxes"] = tuple(boxes)
+        widgets = self._row_widgets.setdefault(label, {})
+        widgets["phrase_boxes"] = tuple(boxes)
         act = self._btn_row(parent, bg)
         self._action(act, bg, "Set", lambda who=label: self._phrase_confirm(who))
         self._action(act, bg, "Cancel", self._cancel)
+        widgets["panel"] = (text, act)
 
     # -------------------------------------------------------- the code panel
     def _build_code_panel(self, parent, bg, label) -> None:
@@ -2492,6 +3062,7 @@ class UsersPage(tk.Frame):
                             lambda who=label: self._code_confirm(who))
         send.set_enabled(plan.enabled)
         self._action(act, bg, "Cancel", self._cancel)
+        self._row_widgets.setdefault(label, {})["panel"] = (text, act)
 
     def _knightfall_status(self) -> dict:
         fn = self._service("knightfall_status")
@@ -2521,26 +3092,13 @@ class UsersPage(tk.Frame):
                         pady=0)
         warn.pack(fill="x", pady=(px(4), 0))
         self._wrapped.append(warn)
-        row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(4), 0))
-        entry = tk.Entry(row, width=8, bd=0, relief="flat",
-                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
-                         fg=theme.INK, insertbackground=theme.CYAN,
-                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        # THE BUTTONS TAKE THEIR WIDTH FIRST and the entry gives up what is
-        # left -- the rule this file already learned twice, most recently
-        # when a fixed 18-character entry pushed "Cancel" off the right edge
-        # at 920x1440 on the destructive panel. A confirm box 57 px narrower
-        # still takes a typed label; half a Cancel button does not.
-        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8, pad_y=4,
-                    command=self._cancel).pack(side="right", padx=(px(4), 0))
-        RoundButton(row, text="Remove %s" % label, kind="ghost", bg=bg,
-                    pad_x=10, pad_y=4,
-                    command=lambda who=label, k=kind, e=entry:
-                    self._purge_confirm(who, k, e.get())).pack(
-            side="right", padx=(theme.PAD_S, 0))
-        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
-        self._row_widgets.setdefault(label, {})["purge_confirm"] = entry
+        row, entry = self._confirm_row(
+            parent, bg, label, "Remove %s",
+            lambda typed, who=label, k=kind:
+            self._purge_confirm(who, k, typed))
+        widgets = self._row_widgets.setdefault(label, {})
+        widgets["purge_confirm"] = entry
+        widgets["panel"] = (warn, row)
 
     # ------------------------------------------------------- the new presses
     def _open_panel(self, kind: str, label: str, action: str) -> None:
@@ -2551,7 +3109,7 @@ class UsersPage(tk.Frame):
         self._role_arm = ""
         self._panel = (kind, str(label))
         self._paint()
-        self._reveal(self._row_widgets.get(label, {}).get("block"))
+        self._reveal_panel(label)
 
     def _phrase_pressed(self, label: str) -> None:
         self._open_panel("phrase", label, "set_phrase")
@@ -2638,7 +3196,7 @@ class UsersPage(tk.Frame):
         self._purge_kind = str(kind)
         self._purge.press(label)
         self._paint()
-        self._reveal(self._row_widgets.get(label, {}).get("purge_confirm"))
+        self._reveal_panel(label)
 
     def _purge_confirm(self, label: str, kind: str, typed) -> None:
         if not self._guard("purge_%s" % kind):
@@ -2682,7 +3240,7 @@ class UsersPage(tk.Frame):
             if height <= 1:
                 return 0
             head = self._head.winfo_reqheight() + theme.PAD_S
-            foot = self._foot.winfo_reqheight() + theme.PAD_S + px(12)
+            foot = self._foot.winfo_reqheight() + theme.PAD_S + px(8)
             return max(px(40), height - head - foot)
         except Exception:                 # noqa: BLE001 - torn down
             return 0
@@ -2720,8 +3278,18 @@ class UsersPage(tk.Frame):
         except Exception:                 # noqa: BLE001 - torn down
             return 0
 
-    def _reveal(self, widget) -> None:
-        """Scroll the body until ``widget`` is in the viewport.
+    def _reveal_panel(self, label: str) -> None:
+        """Bring a row's open panel -- its question down to its box and
+        buttons -- into the viewport, as one span."""
+        panel = self._row_widgets.get(label, {}).get("panel")
+        if panel:
+            self._reveal(panel[1], head=panel[0])
+        else:
+            self._reveal(self._row_widgets.get(label, {}).get("block"))
+
+    def _reveal(self, widget, head=None) -> None:
+        """Scroll the body until ``widget`` -- and ``head`` above it, when
+        one is given -- is in the viewport.
 
         FOUND BY LOOKING at the 1040x1760 render: the forget warning is
         ten lines, so arming one on anybody but the first person pushed
@@ -2729,6 +3297,15 @@ class UsersPage(tk.Frame):
         press Forget, read a wall of amber and find no way to confirm --
         the same shape of defect as a SAVE button that scrolls away, which
         is the one he photographed this morning.
+
+        THEN THE OTHER WAY ROUND (MEASURED 2026-09-06): putting the entry's
+        bottom at the fold scrolled the WARNING off -- 0% of it on screen
+        at 920x1440, and at his own 1040 the question "Forget pemberton?"
+        sat above the viewport. So a panel is revealed as a SPAN from its
+        question to its box: if the span fits, its bottom sits at the fold
+        (the box and the button are what he needs next); if it is taller
+        than the viewport, its TOP sits at the ceiling, so the question is
+        read before the box is reached.
         """
         if self._canvas is None or widget is None:
             return
@@ -2738,15 +3315,18 @@ class UsersPage(tk.Frame):
             view = self._canvas.winfo_height()
             if body_h <= view or view <= 1:
                 return
-            y = widget.winfo_rooty() - self._body.winfo_rooty()
-            bottom = y + widget.winfo_height()
+            top_w = head if head is not None else widget
+            y0 = top_w.winfo_rooty() - self._body.winfo_rooty()
+            y1 = (widget.winfo_rooty() - self._body.winfo_rooty()
+                  + widget.winfo_height())
             top = self._canvas.canvasy(0)
-            if top <= y and bottom <= top + view:
+            if top <= y0 and y1 <= top + view:
                 return                    # already in sight
-            # Put its BOTTOM at the fold rather than its top at the ceiling:
-            # what he needs to see is the entry and the button under it,
-            # and the warning above them is what he has just read.
-            want = min(max(0.0, bottom - view + px(8)), float(body_h - view))
+            if (y1 - y0) + px(4) <= view:
+                want = max(0.0, y1 - view + px(4))
+            else:
+                want = max(0.0, y0 - px(4))
+            want = min(want, float(body_h - view))
             self._canvas.yview_moveto(want / float(body_h))
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: reveal failed", exc_info=True)
