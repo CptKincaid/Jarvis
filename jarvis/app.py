@@ -717,6 +717,10 @@ class JarvisApp:
         # glass (commander._standing_questions).
         self.commander.uncertain_open = self._uncertain_open
         self._pending_uncertain: dict = {}      # request_id -> utterance
+        # The turn sequence number of the turn that is waiting on the open
+        # "Was that for me?" -- what an unanswered ask may close, and what
+        # _on_hotword names when it refuses a wake word meanwhile.
+        self._uncertain_turn = None
         # The open debrief question (jarvis/debrief.py), modelled on
         # _pending_uncertain: a context dict the NEXT transcript is filed
         # against instead of being routed to commander.handle. Cleared on
@@ -3577,7 +3581,7 @@ class JarvisApp:
         speaking = getattr(getattr(self, "tts", None), "busy", False) is True or \
             getattr(self, "_tts_active", False)
         barge = CONFIG.barge_in and speaking
-        if self._audio_busy.is_set() or (self._turn_busy.is_set() and not barge):
+        if self._audio_busy.is_set():
             # Transcription of the previous utterance is still running (~20 s
             # for a long clip). Starting a second capture here raced two
             # transcripts into the commander. Say so rather than ignoring it
@@ -3585,6 +3589,24 @@ class JarvisApp:
             log.info("hotword ignored: still transcribing the previous clip")
             bus.publish(Status(text="One moment — still on the last one",
                                kind="warn"))
+            return
+        if self._turn_busy.is_set() and not barge:
+            # THE OTHER FLAG, NAMED AS ITSELF. Until 2026-09-06 this clause
+            # shared the line above, and the log of that night's soft lock
+            # said "still transcribing" five times about a decode thread
+            # that had returned fifteen seconds earlier. What held the
+            # floor was an unanswered "Was that for me?" (done=False), and
+            # the shared line sent the whole investigation after the wrong
+            # flag. Say which one it is.
+            if self._asking_uncertain():
+                log.info("hotword ignored: waiting on your answer to "
+                         "'Was that for me?'")
+                bus.publish(Status(text="Waiting on your answer — YES or NO?",
+                                   kind="warn"))
+            else:
+                log.info("hotword ignored: waiting on the reply to the last turn")
+                bus.publish(Status(text="One moment — still on the last one",
+                                   kind="warn"))
             return
         if barge:
             try:
@@ -6274,6 +6296,7 @@ class JarvisApp:
     _filler_lock = threading.Lock()
     _turn_seq = 0
     _turn_answered = False
+    _uncertain_turn = None
 
     def _dispatch(self, text, source, confidence=None, addressee=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
@@ -6350,14 +6373,19 @@ class JarvisApp:
         """Open a turn: arm the slow-answer filler and a watchdog."""
         self._turn_cancel_timers()
         self._stream_muted = False
-        self._turn_busy.set()
         # A new turn: nothing has been said for it yet, and any filler timer
         # still in flight from the previous turn belongs to a turn that is
         # over -- it carries the old sequence number and drops itself.
+        # The flag is raised INSIDE the same lock as the sequence bump, so
+        # an expiry that checks the sequence under this lock
+        # (_uncertain_unanswered) sees either the old number with the old
+        # turn or the new number with this one -- never a raised flag it
+        # could mistake for the turn it is allowed to close.
         with self._filler_lock:
             self._turn_seq += 1
             self._turn_answered = False
             seq = self._turn_seq
+            self._turn_busy.set()
         if CONFIG.talkback:
             self._turn_timer = threading.Timer(self._filler_delay_s(),
                                                self._say_thinking, args=(seq,))
@@ -6601,6 +6629,14 @@ class JarvisApp:
             stale = list(self._pending_uncertain)
             self._pending_uncertain.clear()
             self._pending_uncertain[rid] = text
+        # WHICH TURN is waiting on this question. The commander asks only on
+        # the voice path, and _dispatch opened that turn (_turn_start)
+        # before calling it, so this is the prompt's own sequence number:
+        # the one the unanswered exit may close, and the one _on_hotword
+        # names when it refuses a wake word in the meantime.
+        with self._filler_lock:
+            seq = self._turn_seq
+            self._uncertain_turn = seq
         for old in stale:
             bus.publish(UncertainResolved(request_id=old, yes=False,
                                           source="superseded"))
@@ -6610,52 +6646,83 @@ class JarvisApp:
         # "Was that for me?" is speech but not an answer: close the ledger
         # before the ask thread can publish SpeakingState for it.
         self.turns.abandon("uncertain")
-        threading.Thread(target=self._ask_uncertain, args=(rid,), daemon=True,
-                         name="uncertain-ask").start()
+        # One argument, as before: the ask thread reads the turn number off
+        # _uncertain_turn at entry, so a stub bound as `lambda rid: None`
+        # (test_app_wiring) still fits the seam.
+        threading.Thread(target=self._ask_uncertain, args=(rid,),
+                         daemon=True, name="uncertain-ask").start()
 
-    def _ask_uncertain(self, rid: str):
+    def _ask_uncertain(self, rid: str, seq=None):
         """Say it out loud, then listen briefly for a spoken yes/no.
 
         Blocks on the TTS before recording: talk-back holds the mic arbiter,
         but the arbiter is a depth counter rather than a mutex, so without the
         wait we would happily record Jarvis asking the question.
+
+        EVERY WAY OUT OF HERE ENDS THE TURN. The prompt left it open
+        (done=False) so an answer could arrive; when none does -- an
+        enrolment owns the mic, there is no mic, nothing was captured, the
+        speaker filter refused the reply, the words were not a yes or a no
+        -- nothing else was ever going to close it. On 2026-09-06 at 00:29
+        the reply parsed to None, this function returned, and _turn_busy
+        held the floor until the 60 s watchdog while five wake words at
+        0.85-0.98 were refused (12:25 and 21:53 the same, via the speaker
+        filter). The CARD stays up for a click; the TURN does not wait for
+        one. `seq` is the asking turn's sequence number; left None it is
+        read off _uncertain_turn, where _on_uncertain put it before this
+        thread started (a newer prompt overwriting it in between has also
+        superseded this rid, so the expiry finds nothing pending and
+        leaves the newer turn alone).
         """
-        # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens. The
-        # arbiter cannot do this: it is a re-entrant DEPTH COUNTER whose only
-        # job is pausing the hotword, so two consumers on two threads both
-        # get their context manager and both proceed, and record_fixed's own
-        # `self.recording` guard is a flag it never sets. Found by the
-        # verdict that cleared the enrolment lane, 2026-09-05: the new
-        # exclusion covered the two enrolment runs and `runs_live` appeared
-        # nowhere in this file, so the other two doors were never taught to
-        # ask. Pinned by tests/test_mic_one_consumer_everywhere.py, whose
-        # census fails on any new caller of record_fixed that does not ask.
+        if seq is None:
+            with self._filler_lock:
+                seq = getattr(self, "_uncertain_turn", None)
+        why = "the follow-up window closed without an answer"
         try:
-            from jarvis.voicerun import runs_live
-            live = runs_live(getattr(self, "services", None))
-        except Exception:      # noqa: BLE001 - an unreadable seam is not a yes
-            log.debug("mic: could not ask which enrolments are live",
-                      exc_info=True)
-            live = ("unknown",)
-        if live:
-            log.info("uncertain: not asking aloud -- a %s enrolment is "
-                     "running and it owns the microphone", "/".join(live))
-            return
-        try:
+            # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens.
+            # The arbiter cannot do this: it is a re-entrant DEPTH COUNTER
+            # whose only job is pausing the hotword, so two consumers on two
+            # threads both get their context manager and both proceed, and
+            # record_fixed's own `self.recording` guard is a flag it never
+            # sets. Found by the verdict that cleared the enrolment lane,
+            # 2026-09-05: the new exclusion covered the two enrolment runs
+            # and `runs_live` appeared nowhere in this file, so the other
+            # two doors were never taught to ask. Pinned by
+            # tests/test_mic_one_consumer_everywhere.py, whose census fails
+            # on any new caller of record_fixed that does not ask.
+            try:
+                from jarvis.voicerun import runs_live
+                live = runs_live(getattr(self, "services", None))
+            except Exception:  # noqa: BLE001 - an unreadable seam is not a yes
+                log.debug("mic: could not ask which enrolments are live",
+                          exc_info=True)
+                live = ("unknown",)
+            if live:
+                log.info("uncertain: not asking aloud -- a %s enrolment is "
+                         "running and it owns the microphone", "/".join(live))
+                why = "a %s enrolment owns the microphone" % "/".join(live)
+                return
             if CONFIG.talkback:
                 self.tts.speak("Was that for me?", block=True)
-            if not MACHINE.has_mic or self.recorder.recording:
+            if not MACHINE.has_mic:
+                why = "no microphone to listen on"
+                return
+            if self.recorder.recording:
+                why = "the microphone was already open"
                 return
             with self._uncertain_lock:
                 if rid not in self._pending_uncertain:
-                    return                      # already answered by a click
+                    why = None                  # answered by a click meanwhile
+                    return
             audio = self.recorder.record_fixed(self.UNCERTAIN_LISTEN_S)
             if audio is None or len(audio) == 0:
+                why = "nothing was captured"
                 return
             if CONFIG.speaker_verify and self.speaker.enrolled:
                 filtered, _ = self.speaker.filter_segments(audio)
                 if filtered is None:
                     log.info("uncertain reply ignored: not the enrolled speaker")
+                    why = "the reply was not the enrolled speaker"
                     return
                 audio = filtered
             result = self.transcriber.transcribe(audio)
@@ -6666,10 +6733,61 @@ class JarvisApp:
                 # Never route an unrecognised reply: it could classify as
                 # uncertain again and the two prompts would ping-pong. The
                 # card stays up for a click instead.
+                why = ("the reply was not a yes or a no" if heard
+                       else "nothing was heard")
                 return
+            why = None                          # uncertain_answer owns the turn
             self.uncertain_answer(rid, answer, source="voice")
         except Exception:
             log.exception("uncertain follow-up failed")
+            why = "the follow-up failed"
+        finally:
+            if why is not None:
+                self._uncertain_unanswered(rid, seq, why)
+
+    def _uncertain_unanswered(self, rid: str, seq, why: str) -> bool:
+        """The spoken window closed with no answer: END THE TURN, keep the card.
+
+        Closes only the turn that asked -- the sequence number _on_uncertain
+        handed the ask thread -- and only while the card is still his to
+        click. A click in the meantime (uncertain_answer pops the id and
+        opens its own turn) or a newer utterance (a new sequence number)
+        has already taken the floor, and closing THAT turn would be the
+        clobber _dispatch guards against for the socket sources. The check
+        and the release happen under the lock _turn_start bumps the number
+        under, so there is no window between them. Returns whether a turn
+        was released. Safe on a stand-in that owns no turn state.
+        """
+        pending = getattr(self, "_pending_uncertain", None) or {}
+        lock = getattr(self, "_uncertain_lock", None)
+        if lock is None:
+            still = rid in pending
+        else:
+            with lock:
+                still = rid in pending
+        if not still or getattr(self, "_turn_busy", None) is None:
+            return False
+        with self._filler_lock:
+            if seq is not None and seq != self._turn_seq:
+                log.info("uncertain question expired (%s); a newer turn holds "
+                         "the floor, leaving it", why)
+                return False
+            log.info("uncertain question expired (%s): releasing the turn; "
+                     "the card stays up for a click", why)
+            self._turn_finished()
+        try:
+            bus.publish(Status(text="No answer caught — the card's still up",
+                               kind="info"))
+        except Exception:      # noqa: BLE001 - the pane is not the point here
+            log.debug("could not publish the expiry status", exc_info=True)
+        return True
+
+    def _asking_uncertain(self) -> bool:
+        """Is the turn holding the floor the one waiting on "Was that for
+        me?" -- as opposed to a card left up after its window expired, or a
+        reply still coming from the router. Safe on a bare stand-in."""
+        with self._filler_lock:
+            return getattr(self, "_uncertain_turn", None) == self._turn_seq
 
     def _uncertain_open(self) -> int:
         """Commander hook: how many "Was that for me?" cards are still up.
