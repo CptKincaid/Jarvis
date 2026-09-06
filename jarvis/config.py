@@ -189,6 +189,24 @@ class Config:
     filler_hold: bool = True
     filler_hold_s: float = 1.5
     filler_max_holds: int = 3
+    # THE SPELLING HOLD (jarvis/spelling.py, Hunter 09-05: "i did the email
+    # test where i spelled out the name and he made it weirdish"). Same seam
+    # as the filler hold: when the preview's newest decode ends on a run of
+    # single characters -- somebody spelling -- the stop waits spell_hold_s
+    # beyond endpoint_silence, so the pause between two letters does not end
+    # the capture. MEASURED on a scripted VAD: at the shipped 0.8 s a
+    # seven-character address spelled with 0.99 s between characters was cut
+    # after the FIRST one; with the hold on, all seven land in one capture.
+    # 2.0 s, not the filler's 1.5: a pause between letter GROUPS is longer
+    # than a pause after an um -- that figure is a judgement from his
+    # transcript's 1.6-2.8 s between fragments, not a measurement of his
+    # speech, and it is the knob to raise if he is still cut off.
+    # spell_max_holds is 16 rather than 3 because an address has many more
+    # characters than an utterance has ums; the 60 s cap and the 2.5 s
+    # energy timer still end the capture regardless.
+    spell_hold: bool = True
+    spell_hold_s: float = 2.0
+    spell_max_holds: int = 16
     # Add "Um, uh, hmm, er." to the PREVIEW's initial_prompt so whisper
     # writes fillers down instead of dropping them (it is trained on clean
     # transcripts). The final transcribe() never carries it, so commands

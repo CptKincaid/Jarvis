@@ -44,6 +44,7 @@ from typing import Optional
 from jarvis import contacts as contacts_mod
 from jarvis.config import PATHS
 from jarvis import filephrase
+from jarvis import spelling
 from jarvis.logs import get_logger
 from jarvis.tools import filepick
 from jarvis.tools import mail as mail_mod
@@ -277,11 +278,14 @@ _ADDRESS_IN_TEXT_RX = re.compile(r"[^\s@<>,;]+@[^\s@<>,;]+")
 # "period") or punctuated (". ", ".").
 #
 # This regex is now the SECOND of the two the masker runs, and it earns
-# its place on the punctuated shapes ALONE -- "Dana at gmail. com",
-# "dana.ruiz at example dot com" -- which address_span refuses to read and
-# _SPOKEN_ADDR_RX therefore does not match. Everything said with the word
-# "dot" is masked by the parser's own regex instead (see _one_drafted), so
-# no hand-written list decides whether an address is an address any more.
+# its place on the punctuated shapes the PARSER still refuses: a domain
+# punctuated with a SPACE after the stop ("Dana at gmail. com") and a
+# local part joined by a bare dot ("dana.ruiz at example dot com").
+# (09-05, HIS RULING B) It no longer earns it on "dana at gmail.com": a
+# TIGHT punctuated domain is an address the parser reads now, so
+# _SPOKEN_ADDR_RX matches it and _one_drafted masks it either way.
+# Everything said with the word "dot" is masked by the parser's own regex
+# too, so no hand-written list decides whether an address is an address.
 _SAID_JOIN = (r"(?:\s+(?:dot|period|full\s+stop|under\s*score|dash|hyphen)\s+"
               r"|\.(?!\s))")
 _SAID_SEP = r"(?:\s+(?:dot|period|full\s+stop)\s+|\.\s*)"
@@ -319,12 +323,14 @@ _SPELLED_ADDR_RX = re.compile(
     r"(?P<domain>" + _SAID_LABEL + r"(?:" + _SAID_SEP + _SAID_LABEL + r")*"
     + _SAID_SEP + r"(?P<tld>[A-Za-z]{2,24})))"
     r"(?![\w\-])", re.I)
-# Top levels a PUNCTUATED domain may end on ("gmail. com", "example.edu").
+# Top levels a SPACED punctuated domain may end on ("gmail. com").
 # English words that are also top levels (in, me, us, it, is, be, no, to,
 # at, so, info) are left out on purpose: after a full stop they are the
 # next sentence far more often than an address -- "we stopped at noon.
-# Then we left". Said with the WORD "dot" they need no list at all: the
-# parser reads them as an address, so the parser rule below masks them.
+# Then we left". Said with the WORD "dot", and (09-05) written with a
+# TIGHT dot, they need no list at all: the parser reads them as an
+# address, so the parser rule below masks them. This list is therefore
+# down to ONE job -- the spaced shape the parser still will not read.
 _SAID_TLDS = frozenset("""
     com org net edu gov mil int io co ai dev app biz tv uk ca au de fr
     nl es ie ch eu nz jp cn br mx ru se fi dk pl cz pt gr tr za kr
@@ -367,11 +373,16 @@ def _one_drafted(m) -> str:
 
 def _one_said(m) -> str:
     """The runs the parser does NOT read, and this still must: a domain
-    Whisper PUNCTUATED instead of spelling out "dot" -- "Dana at gmail.
-    com", "dana at gmail.com" -- and a local part joined the same way
-    ("dana.ruiz at example dot com"). address_span refuses these, so no
-    mail can go to them, but they are still the address he said and the
-    log is read by more eyes than the mailbox is.
+    Whisper punctuated with a SPACE after the stop ("Dana at gmail. com")
+    and a local part joined by a bare dot ("dana.ruiz at example dot
+    com"). address_span refuses these, so no mail can go to them, but they
+    are still the address he said and the log is read by more eyes than
+    the mailbox is.
+
+    (09-05, HIS RULING B) "dana at gmail.com" is no longer in that set --
+    a TIGHT punctuated domain is one the parser reads. This pass still
+    matches it and still masks it; _one_drafted would now mask it anyway,
+    so the two agree instead of one covering for the other.
 
     Ordinary prose has the same skeleton ("we stopped at noon. Then we
     left"), so a punctuated domain has to end on a top level actually in
@@ -587,12 +598,63 @@ _DOMAIN_DOT = r"(?:dot|period|full\s+stop)"
 _DOMAIN_DASH = r"(?:dash|hyphen)"
 _LOCAL_LABEL = r"[A-Za-z0-9][\w+\-]*"
 _DOMAIN_LABEL = r"[A-Za-z0-9][\w\-]*"
+# HIS RULING (B), 2026-09-05: "example.com" said as ONE WORD is a domain.
+# Whisper wrote his domain down exactly like that on 09-05 and the parser
+# refused it -- which cost him more than the draft, because
+# unresolved_address reads this same regex, so there was nothing to hand
+# back and he got NO RE-ASK AT ALL. That refusal was deliberate once (see
+# the _SAID_TLDS note above: ordinary prose has the same skeleton) and he
+# has now overruled it.
+#
+# It is read under TWO guards, and they are what keep prose out:
+#   * the dot must be TIGHT -- no space on either side. Every sentence
+#     boundary has a space after the full stop ("we stopped at noon. Then
+#     we left", "I'm at home. In the morning"), so no prose row in
+#     tests/test_contacts.py's corpus changed by a byte.
+#   * the last label must be ALPHABETIC, 2-24 characters. That is what
+#     keeps "meet me at 4.30" and "at 3.5 tomorrow" from becoming
+#     me@4.30 -- and it is a SHAPE, not a hand-written list of top levels,
+#     because rounds 5 and 6 proved a list here is always missing one
+#     (.site, .xyz, .info were all missing, and all three were drafted).
+# The trailing (?!\.?\w) lets a full stop that ENDS the sentence sit
+# after the domain ("dana at example.com.") without eating into it, while
+# still preferring the longest real domain ("example.co.uk").
+#
+# WHAT RULING (B) COSTS, MEASURED (09-06, an invented 93-phrase corpus of
+# ordinary non-spelling sentences, numbers only). A verb before "at" and
+# a domain after it drafts a mailbox out of prose: "have a look at
+# example.com" -> look@example.com. That class is NOT new -- jarvis-v3
+# already drafted look@example.com from "have a look at example dot com"
+# and is@example.com from "the site is at example dot com"; the tight
+# dot only adds the same sentence spelt the way whisper spells it. The
+# ONE sub-shape that is new is a file extension read as a top level:
+# "have a look at notes.txt" -> look@notes.txt. On that corpus: 2 of 93
+# drafted at HEAD, both this class; 0 of 93 at 996408d for the tight
+# shape. Neither can reach the wire without a read-back
+# (tests/test_send_file.py section 27), and a hand-written extension
+# list here would be the always-missing-one list rounds 5 and 6 buried.
+# Pinned, not hidden: tests/test_spelling_hold.py
+# ::test_what_ruling_b_costs_is_measured_and_pinned.
+_DOMAIN_TIGHT = (_DOMAIN_LABEL + r"(?:\." + _DOMAIN_LABEL + r")*"
+                 r"\.[A-Za-z]{2,24}\b(?!\.?\w)")
+_DOMAIN_SPOKEN = (_DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
+                  r"(?:\s+" + _DOMAIN_DOT + r"\s+" + _DOMAIN_LABEL
+                  + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*)+")
+# THE TIGHT DOT IN A LOCAL PART (09-06, a default taken for him): "d.a.n at
+# example.com" and "j.r.smith at example.com" are read WHOLE -- d.a.n@,
+# j.r.smith@ -- and read back "d dot a dot n at example dot com". Before,
+# the fold flattened "d.a.n" to "dan" and _LOCAL_LABEL (no dot in it) took
+# the LAST label of "j.r.smith" as the local part: dan@ and smith@, two
+# silently different mailboxes, drafted, read back almost right, and sent
+# on a yes. Whisper wrote his spoken "dot" as "." for the domain on 09-05,
+# so it will for a local part too. Keeping the dots means his ear hears
+# exactly what will be sent, whichever he meant (jarvis.spelling.fold_spans
+# keeps them; this alternative reads them). The tight dot is the same
+# shape _DOMAIN_TIGHT already reads on the other side of the "at".
 _SPOKEN_ADDR_RX = re.compile(
-    r"\b(" + _LOCAL_LABEL + r"(?:\s+" + _LOCAL_JOINER + r"\s+" + _LOCAL_LABEL + r")*)"
+    r"\b(" + _LOCAL_LABEL + r"(?:(?:\s+" + _LOCAL_JOINER + r"\s+|\.)" + _LOCAL_LABEL + r")*)"
     r"\s+at\s+"
-    r"(" + _DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
-    r"(?:\s+" + _DOMAIN_DOT + r"\s+" + _DOMAIN_LABEL
-    + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*)+)", re.I)
+    r"((?:" + _DOMAIN_TIGHT + r")|(?:" + _DOMAIN_SPOKEN + r"))", re.I)
 _JOINER_RX = re.compile(
     r"\s+(dot|period|full\s+stop|under\s*score|dash|hyphen)\s+", re.I)
 # Words that name a character an address cannot carry, or one this parser
@@ -655,7 +717,34 @@ def address_span(text: str) -> Optional[tuple]:
     A match that is only the TAIL of what he said (a joiner word the
     parser does not read in front of it, a character an address cannot
     carry) is no address at all: None, and unresolved_address says what
-    was heard."""
+    was heard.
+
+    SPELLED ALOUD (09-05). The spoken pass runs over the text with every
+    spelling run folded into one word (jarvis.spelling), so "q-z-v at
+    example dot com" -- and every other way whisper punctuates a man
+    saying letters -- reads as "qzv at example dot com" and needs no new
+    grammar here. That is not cosmetic: BEFORE the fold this parser read
+    "q z v at example dot com" as the local part "v", because
+    _LOCAL_LABEL matched the last single letter and _spoken_lead only
+    refuses a SYMBOL word in front of it. It drafted v@example.com -- a
+    different, possibly real mailbox, and the one class of mistake a
+    read-back is least likely to catch, because it sounds almost right.
+    The returned span is mapped back through fold_spans's index map, so
+    it still cuts the raw sentence. Text with no run in it folds to
+    itself and every existing caller is unchanged.
+
+    The TYPED pass runs on the raw text first and is never folded:
+    "a.b@example.com" is already an address and rewriting it to
+    "ab@example.com" would be a fold inventing a mailbox.
+
+    A RUN-TOGETHER DOMAIN (09-05, HIS RULING B). "dana at example.com" --
+    whisper's own transcript of a domain he SAID -- is read now. It used
+    to be refused on purpose, and the refusal cost him more than the
+    draft: unresolved_address reads this same regex, so there was nothing
+    to hand back either and he got no re-ask at all. The two guards that
+    keep prose out are in the _DOMAIN_TIGHT comment above: the dot must be
+    tight (a sentence boundary has a space after it) and the last label
+    must be alphabetic (so "meet me at 4.30" is not me@4.30)."""
     raw = str(text or "")
     if not raw.strip():
         return None
@@ -665,15 +754,16 @@ def address_span(text: str) -> Optional[tuple]:
             return None
         addr = m.group(0).rstrip(".,;:")
         return addr, m.start(), m.start() + len(addr)
-    m = _SPOKEN_ADDR_RX.search(raw)
+    folded, imap = spelling.fold_spans(raw)
+    m = _SPOKEN_ADDR_RX.search(folded)
     if m:
-        if _spoken_lead(raw, m.start()) is not None:
+        if _spoken_lead(folded, m.start()) is not None:
             return None
         local = _JOINER_RX.sub(_joined, " ".join(m.group(1).split())).strip()
         domain = _JOINER_RX.sub(_joined, " ".join(m.group(2).split())).strip()
         addr = f"{local}@{domain}".replace(" ", "")
         if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
-            return addr, m.start(), m.end()
+            return addr, imap[m.start()], imap[m.end() - 1] + 1
     return None
 
 
@@ -691,11 +781,12 @@ def unresolved_address(text: str) -> str:
         if lead is None:
             return ""
         return spoken_address(raw[lead:m.end()].rstrip(".,;:")).strip()
-    m = _SPOKEN_ADDR_RX.search(raw)
+    folded = spelling.fold(raw)
+    m = _SPOKEN_ADDR_RX.search(folded)
     if m:
-        lead = _spoken_lead(raw, m.start())
+        lead = _spoken_lead(folded, m.start())
         if lead is not None:
-            return raw[lead:m.end()]
+            return folded[lead:m.end()]
     return ""
 
 
