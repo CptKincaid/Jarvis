@@ -1532,9 +1532,10 @@ def test_a_polite_order_is_still_refused(said):
 # REMOTE write.  Both of the transfers this module owns had it.
 #
 #   push: no check at all -- scp straight at ``inbox/<his name>``, and scp
-#         TRUNCATES (measured on his box: 22222 bytes replaced by 1111,
-#         exit 0, nothing on stderr, in both scp protocol modes and through
-#         sftp put).  A spoken "send that file" destroyed whatever was at
+#         TRUNCATES (re-measured HERE against this box's own sftp-server:
+#         22222 bytes replaced by 1111, exit 0, nothing on stderr, in both
+#         scp protocol modes and through sftp put -- a property of the SFTP
+#         protocol and of our own client, not of his machine).  A spoken "send that file" destroyed whatever was at
 #         that name on Windows, silently, and said "it is on HPCOMPUTER".
 #   pull: ``dest.exists()`` and then a copy at that name -- a check-then-
 #         write whose window is the whole transfer, ending in a truncating

@@ -872,33 +872,63 @@ def run_sftp(conf: RemoteConfig, batch: str,
     return SshResult(True, out=out or "", err=err or "")
 
 
-# ---- claiming a name on the far side (F-J, measured 2026-09-05) ----
-# scp TRUNCATES, and nothing that writes on this link can be made to refuse.
-# Measured against HPCOMPUTER itself (OpenSSH_for_Windows_9.5, SFTP protocol
-# 3): a 22222-byte file at the target name came back 1111 bytes, exit 0, no
-# message on stdout or stderr -- in the default SFTP mode, under the legacy
-# `-O` protocol, and through `sftp put` alike.  The complete flag set is
-# -346ABCOpqRrsTv plus -c -D -F -i -J -l -o -P -S -X; there is no no-clobber
-# among them.  So the refusal cannot come from the write and has to be a
-# separate step.
+# ---- claiming a name on the far side (F-J) ----
+#
+# WHERE THESE NUMBERS COME FROM, because round 7 found them claiming a
+# session nobody can show.  Until this edit, this block opened by attributing
+# every number below to a first-person run against HPCOMPUTER, naming its
+# server build and its SFTP protocol version.  The exact wording is in
+# 36d26fe, which is where it landed and the right place to read it.
+#
+# It cannot be right.  docs/capabilities.md records HPCOMPUTER on 2026-09-03
+# as ping 100% loss with 22/445/3389/5900/8008/2343 CLOSED, and this very
+# file says 160 lines above that the Windows rows were NOT measured, "by
+# instruction".  It said both things at once.  No probe of his machine is
+# allowed from here, and none was run.
+#
+# THE NUMBERS THEMSELVES ARE RIGHT, and every one was RE-MEASURED HERE on
+# 2026-09-05 against THIS BOX'S OWN /usr/lib/openssh/sftp-server, driven
+# over a pipe by `scp -D` and `sftp -D`: no socket, no network, nothing of
+# his touched.  tests/test_provenance.py re-derives them on every run rather
+# than quoting them, so they cannot become claims nobody checks.
+#
+# MEASURED HERE.  scp TRUNCATES, and nothing that writes on this link can be
+# made to refuse: a 1111-byte source onto a 22222-byte target left 1111
+# bytes, exit 0, nothing on stdout or stderr -- in the default SFTP mode,
+# under the legacy `-O` protocol, and through `sftp put` alike.  Our client
+# is OpenSSH_9.6p1 and its complete flag set is -346ABCOpqRrsTv plus
+# -c -D -F -i -J -l -o -P -S -X; there is no no-clobber among them.  The
+# CLIENT runs on this box, so that last one is a local fact outright.  So
+# the refusal cannot come from the write and has to be a separate step.
 #
 # That step is a RENAME, and the client offers two of them which behave
-# OPPOSITELY:
+# OPPOSITELY.  MEASURED HERE, both confirmed on the wire with -vvv rather
+# than read off the manual:
 #
 #   bare `rename`  -> SSH2_FXP_EXTENDED(posix-rename@openssh.com), which
 #                     SILENTLY REPLACES.  10 of 10 rounds destroyed the file
 #                     at the target name, exit status 0.  The client picks
-#                     this whenever the server advertises it, and this
-#                     server does.
+#                     this whenever the server advertises it, and the
+#                     sftp-server on this box does.
 #   `rename -l`    -> SSH2_FXP_RENAME (opcode 18), which REFUSES.  10 of 10
 #                     rounds refused, exit status 1, `remote rename ...:
 #                     Failure` on stderr, BOTH files byte-intact.
 #
-# Both confirmed on the wire with -vvv, not inferred from the manual.  And
-# the measurement that actually decides it: two concurrent sftp sessions
-# each renaming its own temp onto the SAME name, 12 rounds -- 6 wins each,
-# zero rounds where both moved, zero corrupt, the loser's temp intact every
-# time.  That is an atomic claim, not a narrowed window.
+# And the measurement that actually decides it: two concurrent sftp sessions
+# each renaming its own temp onto the SAME name, 12 rounds -- 7 wins to 5
+# (the split is scheduling and means nothing), ZERO rounds where both moved,
+# ZERO corrupt, the loser's temp intact 12 of 12.  That is an atomic claim,
+# not a narrowed window.
+#
+# INFERRED, for the far side, and said as an inference.  What HIS server
+# does with opcode 18 was not measured and cannot be from here.  It is read
+# off the protocol -- draft-ietf-secsh-filexfer-02 §6.5 says SSH_FXP_RENAME
+# SHOULD fail when the target exists -- and off Windows' own MoveFile
+# semantics.  THE SAFETY DOES NOT REST ON THAT INFERENCE: `-l` pins the
+# OPCODE at the client, whatever the far server advertises, so the worst a
+# wrong inference can do is make the claim fail closed rather than open.
+# And if the far side ever did replace on opcode 18, the read-back after
+# every transfer is the second net.
 #
 # So RENAME_FLAG is not a nicety.  Dropping it reproduces the bug this
 # closes, silently, with no error anywhere to notice.  It is asserted in
@@ -1233,10 +1263,13 @@ def push(conf: RemoteConfig, local: Path) -> SshResult:
 
     The two steps are not ceremony.  This used to be one scp straight at
     ``inbox/<his name>``, with no check of any kind -- and **scp truncates**
-    (measured on HPCOMPUTER 2026-09-05: a 22222-byte file replaced by 1111
-    bytes, exit 0, nothing on stdout or stderr; the same in the legacy
-    ``-O`` protocol and through ``sftp put``, and there is no no-clobber
-    flag on any of them).  So a spoken "send that file" silently destroyed
+    (re-measured HERE on 2026-09-05, against this box's own sftp-server over
+    a pipe: a 22222-byte file replaced by 1111 bytes, exit 0, nothing on
+    stdout or stderr; the same in the legacy ``-O`` protocol and through
+    ``sftp put``, and there is no no-clobber flag on any of them.  It is a
+    property of the SFTP protocol and of OUR client, not of his machine,
+    which is why it can be measured without touching his machine).  So a
+    spoken "send that file" silently destroyed
     whatever was at that name on his Windows machine and then said it had
     arrived.
 

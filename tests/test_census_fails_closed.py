@@ -229,7 +229,8 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
 
     from tests.write_census import (_assigned_in, _classify, _first_party,
                                     _lane_names, _method_names,
-                                    _module_bindings, _resolve, _scopes)
+                                    _module_bindings, _resolve, _scope_imports,
+                                    _scopes)
     walked = _first_party(MODULES)
     escapes = set()
     for rel in MODULES:
@@ -238,12 +239,20 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
                       _lane_names(tree))
         for _q, calls, owner in _scopes(tree):
             local = _assigned_in(owner)
+            # THE SAME BINDINGS THE CENSUS ITSELF USES, scope imports and
+            # all.  This test rebuilds the resolver by hand, and a hand
+            # rebuild that drifts from the real one is an instrument wearing
+            # a new sign -- without the scope imports it missed
+            # AssistantConfig.load() entirely and reported one escape where
+            # there are two.
+            scoped = dict(b, **_scope_imports(owner))
             for node in calls:
-                r = _resolve(node.func, b, m, lane, local)
+                r = _resolve(node.func, scoped, m, lane, local)
                 is_row, prim = _classify(r, walked)
                 if is_row and prim == "?uncensused":
                     escapes.add(str(r))
-    assert escapes == {"jarvis.logs.get_logger"}, (
+    assert escapes == {"jarvis.logs.get_logger",
+                       "jarvis.assistant_config.AssistantConfig.load"}, (
         "a call leaves this lane into a first-party module the census does "
         f"not walk: {sorted(escapes)}.  Either walk it (add it to MODULES) "
         "or give it a line in KNOWN -- it may not be silent.")

@@ -55,8 +55,11 @@ class FakeTransport:
     NOT -- the measured permission on the real box -- and this fake refuses
     a write there so a puller that ever tries to tidy up fails a test.
 
-    The two write primitives behave the way they were MEASURED to behave
-    against HPCOMPUTER on 2026-09-05 (OpenSSH_for_Windows_9.5, SFTP 3):
+    The two write primitives behave the way they were MEASURED HERE to
+    behave on 2026-09-05 -- against this box's own sftp-server driven over a
+    pipe by ``scp -D``/``sftp -D``, with no socket and no probe of his
+    machine.  They are properties of the SFTP protocol and of OUR client;
+    tests/test_provenance.py re-derives both on every run:
 
     * :meth:`send` is scp, and scp TRUNCATES.  It writes at the name it is
       given whatever is there -- 10 of 10 rounds destroyed a 22222-byte
@@ -1481,8 +1484,9 @@ def test_measure_the_window_that_is_left_after_the_race_is_closed(tmp_path,
 # ROUND 3.  The same shape as the pull race, found on the OTHER side.
 #
 # FINDING J: a push listed the remote Inbox ONCE at the top of a pass, chose
-# a free name, and then scp'd straight at it.  scp TRUNCATES -- measured
-# against the real box, a 22222-byte file replaced by 1111 bytes, exit 0, no
+# a free name, and then scp'd straight at it.  scp TRUNCATES -- re-measured
+# HERE against this box's own sftp-server, a 22222-byte file replaced by
+# 1111 bytes, exit 0, no
 # message -- so a file of his that appeared at that name between the listing
 # and the copy was destroyed, the pass said "sent", and his LOCAL original
 # was then moved into Sent.  Both copies ours, his gone.  And the window is
@@ -1882,10 +1886,14 @@ def test_measure_the_push_race_after_the_claim(home, capsys):
     SHAPE: a file of his is planted at the exact target name during every
     single send, and if the push were still "list, pick a name, scp at it"
     every round would destroy one.  It cannot measure the kernel underneath
-    -- that was measured against HPCOMPUTER itself on 2026-09-05 (two
-    concurrent sftp sessions renaming onto one name, 12 rounds, 6-6, zero
-    lost, zero both-moved), and the fake reproduces the two behaviours that
-    measurement established: scp truncates, `rename -l` refuses.
+    -- that was MEASURED HERE on 2026-09-05, against this box's own
+    sftp-server with no socket (two concurrent sftp sessions renaming onto
+    one name, 12 rounds, 7 wins to 5, zero lost, zero both-moved; the split
+    is scheduling and means nothing).  The fake reproduces the two
+    behaviours that measurement established: scp truncates, `rename -l`
+    refuses.  What HIS server does with opcode 18 is INFERRED from the
+    protocol, and `-l` pins the opcode at our end so the inference cannot
+    make the claim fail open.
     """
     rounds = 300
     t = FakeTransport()
@@ -1918,8 +1926,9 @@ def test_measure_the_push_race_after_the_claim(home, capsys):
               f"destroyed, {ours_wrong} of ours wrong."
               f"\n    Every one landed beside his as \"notes (2).txt\" and "
               f"left no temp\n      behind.  The kernel underneath was "
-              f"measured on HPCOMPUTER itself:\n      `rename -l` refused "
-              f"10/10, and 12 racing rounds gave 6-6, 0 lost.")
+              f"measured HERE, on this box's own sftp-server:"
+              f"\n      `rename -l` refused 10/10, and 12 racing rounds gave "
+              f"7-5, 0 lost, 0 both-moved.")
 
 
 def test_a_real_outage_takes_the_folder_complaint_down_with_it(home):

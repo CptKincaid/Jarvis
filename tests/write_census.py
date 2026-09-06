@@ -49,7 +49,38 @@ the row-per-call-site table and the pinned guard kinds (both of those earned
 their place in round 5), and change the one thing that was actually wrong --
 the default, from SKIP to REPORT.
 
-THE FOUR RULES.  They are structural, not a list of tricks, and between them
+AND ROUND 7 INVERTED IT AGAIN, ONE LEVEL DOWN.  Round 6 fixed the default for
+the CALLEE and left the same branch wearing a new sign: `_classify` still
+answered "not a row" for `<method>.X` -- an attribute call on a receiver the
+resolver cannot type -- whenever X was not one of the sixty words in WRITES.
+The fixer named that hole itself ("p.shred()") and argued it was narrow
+because os, shutil, subprocess, pathlib and tempfile "are not vouched
+wholesale".  That is true only of the MODULE-LEVEL spelling of the import,
+and an adversary then destroyed a 100000-byte file of his TWO independent
+ways with the row count frozen at 90/90 and the lane suite at its baseline:
+
+    logging.FileHandler(p, "w")     `logging` was vouched WHOLESALE in
+                                    HARMLESS_MODULES.  A logger is a thing
+                                    that writes to a file; that is what a
+                                    logger IS.  No indirection at all.
+    import subprocess (LAZY)        the resolver walked imports at module
+    subprocess.getoutput("del ..")  level only, so a name imported inside a
+                                    function was untypable and "getoutput"
+                                    is not a word in WRITES.
+    p.hardlink_to / symlink_to      three real pathlib methods that create
+    p.lchmod                        or change a name.  No trick needed at
+                                    all: this route already lived in that
+                                    branch.
+
+Enumerating the METHOD vocabulary is the same losing race round 6 correctly
+refused for the callee, run again on the receiver -- the author of the attack
+picks the name.  So the method-name free pass is DELETED.  Silence now
+requires a RESOLVED, VOUCHED, FULLY-QUALIFIED name.  MEASURED PRICE: 394 more
+rows over 65 distinct method names, and two names out of HARMLESS_MODULES
+(`logging`, `argparse`) after re-reading that list against the question its
+own comment asks.
+
+THE FIVE RULES.  They are structural, not a list of tricks, and between them
 they are total over `ast.Call`:
 
   U  UNRESOLVED.  The callee does not resolve to a name through a binding
@@ -62,10 +93,18 @@ they are total over `ast.Call`:
   R  REACH.  The call leaves the walked set: a first-party module that is
      not censused, or a third-party/stdlib module nobody has vouched for.
      ROW.
-  S  SAFE.  It resolves to a def or class in a censused module (its body is
-     a scope of its own, walked separately), or to a fully-qualified name in
-     PROVEN_SAFE, or to a safe builtin, or it is a method name on an unknown
-     receiver that is not in the mutator vocabulary.
+  T  UNTYPED RECEIVER.  An attribute call whose receiver this file cannot
+     follow to a type: a parameter, a local, an injected seam, the result of
+     another call, a lazily imported module before round 7's fix.  ROW,
+     WHATEVER THE METHOD IS CALLED.  This branch used to be silence when the
+     name was not in WRITES, and that silence is what routes A, B and C
+     walked through.
+  S  SAFE.  It resolves to a BARE def or class in a censused module (its
+     body is a scope of its own, walked separately), or to a
+     fully-qualified name in PROVEN_SAFE, or to a safe builtin.  Note BARE:
+     `<lane>.helper` is safe, `<lane>._Ops.rm` is NOT -- a class ATTRIBUTE
+     is not a scope and can hold anything, which is how `_Ops.rm = os.remove`
+     stayed silent through the first nine routes of round 7.
 
 There is no per-call-site ignore list any more.  IGNORE_CALLEES is gone: it
 was matched by SPELLING, so a dead entry in it was a live hole.  Its honest
@@ -74,24 +113,31 @@ MODULE'S REAL IMPORTS -- `raw.replace` cannot resolve to `dataclasses.replace`
 because `raw` is a local, so it stays a row and gets a line in KNOWN.
 
 WHAT THIS STILL CANNOT SEE, said out loud rather than discovered next round.
-MEASURED, not assumed -- each line below was planted and the result recorded:
-  * AN INVENTED MUTATOR NAME ON AN UNTYPED RECEIVER.  `p.shred()` is MISSED:
-    the receiver cannot be typed, so the NAME is all rule M has, and "shred"
-    is not in the mutator vocabulary.  This is the one real hole left, and
-    it is narrow rather than open: for it to destroy anything, `p` must be
-    an object with a destructive method whose name is not a Python
-    filesystem word, and such an object has to come from somewhere -- from a
-    censused module (its class's methods are walked as scopes, so the write
-    surfaces there) or from an uncensused one (the call that produced it is
-    already a rule-R row).  A name reached through os, shutil, subprocess,
-    pathlib or tempfile is NOT this case: those modules are not vouched
-    wholesale, so `os.pwrite` and `shutil.disk_usage` -- neither of them in
-    WRITES -- both came back as rows when planted.
-  * a method call on an object obtained from a CENSUSED module is trusted by
-    its name.  The object's class is in a censused module, so its methods
-    are walked as scopes -- the write shows up there instead.
+MEASURED, not assumed -- each line below was planted and the result recorded.
+The round-6 version of this list led with `p.shred()` and called it narrow;
+it was neither narrow nor still theoretical by the time the round ended, and
+it is CLOSED now by rule T.  What is left:
+
+  * A SECOND CALL SITE OF A METHOD NAME ALREADY VOUCHED FOR.  `p.shred()` is
+    a row and needs a sentence; a 72nd `out.append(x)` is a row that needs
+    only a line in UNTYPED_SITES.  So changing what an EXISTING receiver IS
+    -- `out = []` becoming `out = EvilThing()` -- keeps the key, the name
+    and the row, and the prose about `append` goes quietly false.  This is
+    the same blind spot a sentence-per-call-site table would have had; the
+    bound on it is unchanged: such an object comes either from a censused
+    module, whose class methods are walked as scopes so the write surfaces
+    there, or from an uncensused one, whose constructing call is already a
+    rule-R row.
+  * THE MODULE SET IS STILL A LIST.  Rule R makes a call into an unwalked
+    first-party module a row, so a write cannot be hidden by moving house --
+    but the census only walks what MODULES names, and a FOURTH module of
+    this lane appears as one `?uncensused` row rather than as its own rows.
+    tests/test_census_fails_closed.py pins the escape set at exactly two
+    names for that reason.
   * the ordinal is positional: swapping two calls of one primitive inside
     one scope keeps the key set (round 5's stated blind spot, unchanged).
+    Two lambdas in one scope used to COLLIDE outright; round 7 numbers them
+    by line, which rule T is what made visible.
   * this reads source, not runtime.  A module rewritten on disk after import
     is out of scope here and always was.
 
@@ -166,12 +212,32 @@ READS = frozenset({
 # os.path, pathlib, shutil, subprocess, tempfile, glob and operator are
 # deliberately NOT here -- reaching into any of those needs a line in
 # PROVEN_SAFE naming the exact function.
+#
+# TWO NAMES CAME OUT OF THIS LIST IN ROUND 7, both found by re-reading it
+# against the question this comment asks rather than against a memory of what
+# a module is "for":
+#   logging   -- logging.FileHandler(path, mode="w") OPENS A PATH AND
+#                TRUNCATES IT.  MEASURED by the fifth adversary destroying a
+#                100000-byte file of his, fully qualified, no indirection of
+#                any kind, with the census green at 90/90.  A logger is a
+#                thing that writes to a file; that is what a logger IS.  The
+#                cost of taking it out is that every `log.warning(...)` in
+#                the lane is a row now -- and those rows are honest, because
+#                `log` is bound to the RESULT OF A CALL and this file cannot
+#                prove what it is.
+#   argparse  -- argparse.FileType("w") is a callable that opens a path for
+#                writing.  Same shape, found by the same question.
+# Everything left below was re-read one at a time.  The test for it is that
+# each survives the sentence "this module has no function that takes a name
+# and creates, truncates or destroys the thing at it".  json.dump, textwrap,
+# traceback.print_exc and contextlib.redirect_stdout all take an ALREADY OPEN
+# file object -- the open is the row, and it is somebody else's line.
 HARMLESS_MODULES = frozenset({
     "json", "re", "time", "errno", "stat", "shlex", "dataclasses",
-    "argparse", "threading", "itertools", "difflib", "typing", "sys",
+    "threading", "itertools", "difflib", "typing", "sys",
     "contextlib", "fcntl", "collections", "math", "textwrap", "string",
     "unicodedata", "hashlib", "base64", "uuid", "warnings", "types",
-    "functools", "enum", "abc", "copy", "traceback", "logging",
+    "functools", "enum", "abc", "copy", "traceback",
 })
 
 # Fully-qualified names from a module that is NOT wholly harmless, each one
@@ -255,6 +321,43 @@ def _module_bindings(tree: ast.AST) -> dict:
         for name, value in pending:
             got = _resolve(value, out, set(), set(), set())
             out[name] = None if isinstance(got, _Unresolved) else got
+    return out
+
+
+def _scope_imports(node) -> dict:
+    """Names THIS scope imports, as ``_module_bindings`` would spell them.
+
+    ROUTE B.  ``_module_bindings`` walked ``ast.Import`` at module level only,
+    so ``import subprocess`` written inside a function bound nothing this file
+    could see: `subprocess` became an untypable receiver, the method name was
+    all rule M had, and ``subprocess.getoutput("del ...")`` was silent.  An
+    import is an import wherever it is written, so a lazy one resolves like a
+    module-level one now.
+
+    Imports nested in a ``try``/``if``/``with`` inside the scope count -- the
+    ``try: import x except ImportError:`` shape is the ordinary spelling of a
+    lazy import.  A nested def or class does NOT: that is its own scope and
+    gets its own dict, so a closure over an outer function's import stays
+    untypable, which is fail-closed and the direction to be wrong in.
+    """
+    out = {}
+    body = getattr(node, "body", [])
+    stack = list(body) if isinstance(body, list) else [body]
+    while stack:
+        child = stack.pop()
+        if isinstance(child, SCOPED):
+            continue
+        if isinstance(child, ast.Import):
+            for a in child.names:
+                out[a.asname or a.name.split(".")[0]] = (
+                    a.name if a.asname else a.name.split(".")[0])
+        elif isinstance(child, ast.ImportFrom):
+            base = child.module or ""
+            for a in child.names:
+                out[a.asname or a.name] = (f"{base}.{a.name}" if base
+                                           else a.name)
+        else:
+            stack.extend(ast.iter_child_nodes(child))
     return out
 
 
@@ -346,10 +449,28 @@ def _resolve(node: ast.AST, bindings: dict, methods: set, lane: set,
             # Bound at module level to something we cannot follow -- a call,
             # a comprehension.  `log = get_logger(...)` is this, and so is
             # `_rm = getattr(os, "remove")`.  With an attribute after it the
-            # NAME still decides (log.warning is safe, x.unlink is not);
-            # called bare, there is nothing left to judge: rule U.
+            # receiver is untypable, which is rule T and a ROW since round 7
+            # -- `log.warning` included; called bare, rule U.
             return ("<method>." + attrs[-1]) if attrs else _Unresolved(
                 "opaque-alias:" + root)
+        if attrs and base.startswith("<lane>."):
+            # A DEF OR CLASS OF THIS MODULE WITH AN ATTRIBUTE AFTER IT.
+            # `<lane>.helper` is safe because helper's BODY is a scope of its
+            # own, walked separately -- but `<lane>._Ops.rm` is not a scope,
+            # it is an ATTRIBUTE, and a class attribute can hold anything:
+            #
+            #     class _Ops:
+            #         rm = os.remove
+            #     ...
+            #     _Ops.rm(p)
+            #
+            # is a plain dotted name in the source with no getattr, no
+            # subscript and no import trick, and joining the attrs blindly
+            # made it "<lane>._Ops.rm", which rule S waved through on the
+            # `<lane>.` prefix.  Found by planting it in round 7 after the
+            # other nine routes were already caught.  The attribute cannot be
+            # typed, so it is rule T like any other untypable receiver.
+            return "<method>." + attrs[-1]
         return ".".join([base] + attrs) if attrs else base
 
     if root in lane:
@@ -370,7 +491,7 @@ def _resolve(node: ast.AST, bindings: dict, methods: set, lane: set,
 
 
 def _classify(resolved, walked: set):
-    """(is_row, primitive).  Rules U, S, M, R applied in that order."""
+    """(is_row, primitive).  Rules U, S, M, T, R applied in that order."""
     if isinstance(resolved, _Unresolved):
         return True, "?unresolved"                              # rule U
 
@@ -379,8 +500,35 @@ def _classify(resolved, walked: set):
         return False, tail
     if tail in WRITES:                                          # rule M
         return True, tail
-    if resolved.startswith("<lane>.") or resolved.startswith("<method>."):
-        return False, tail                                      # rule S
+    if resolved.startswith("<lane>."):                          # rule S
+        return False, tail
+    if resolved.startswith("<method>."):                        # rule T
+        # ROUND 7, AND IT IS THE WHOLE ROUND.  This branch used to return
+        # "not a row".  A call on a receiver this file cannot type was
+        # judged BY ITS METHOD NAME: in WRITES it was a row, and otherwise
+        # it was silence.  Round 6 named the hole itself ("p.shred()") and
+        # called it narrow on the grounds that os, shutil, subprocess,
+        # pathlib and tempfile "are not vouched wholesale" -- true only of
+        # the MODULE-LEVEL spelling of the import.  The fifth adversary then
+        # destroyed a 100000-byte file of his TWO independent ways with the
+        # count frozen at 90/90: logging.FileHandler(p, mode="w") through a
+        # module vouched wholesale, and subprocess.getoutput("del ...")
+        # through a lazy import.  A third route -- hardlink_to, symlink_to,
+        # lchmod -- needed no trick at all and lived in this branch already.
+        #
+        # Enumerating the method vocabulary is the same losing race round 6
+        # correctly refused for the CALLEE, run again one level down: Python
+        # has unboundedly many method names and the author of the attack
+        # picks his.  So the default is inverted here too.  SILENCE NOW
+        # REQUIRES A RESOLVED, VOUCHED, FULLY-QUALIFIED NAME.  An untypable
+        # receiver is a row, whatever the method is called.
+        #
+        # MEASURED PRICE: 396 additional rows, 67 distinct method names.
+        # That is the price of the design, not an argument against it -- the
+        # same trade round 6 took when KNOWN went 75 to 90.  The name is
+        # carried in the primitive so the pin fails on a NEW NAME rather
+        # than only on a new call site.
+        return True, "?untyped:" + tail
     if resolved.startswith("<builtin>."):
         return (False, tail) if tail in SAFE_BUILTINS else (True, "?builtin")
     root = resolved.split(".")[0]
@@ -423,6 +571,14 @@ def _calls_in_scope(node) -> list:
             if args is not None:
                 stack.extend([d for d in (list(args.defaults) +
                                           list(args.kw_defaults)) if d])
+            # ROUTE D.  A ClassDef's BASES and KEYWORDS run where the class
+            # is WRITTEN, in this scope, exactly as its decorators do -- and
+            # they were collected by nobody: not here (only decorators and
+            # defaults were), and not by the ClassDef's own scope (which gets
+            # its body).  `class _C(self._registry.obliterate(p)): pass` had
+            # no owner at all.
+            stack.extend(getattr(child, "bases", []))
+            stack.extend([k.value for k in getattr(child, "keywords", [])])
     while stack:
         child = stack.pop()
         if isinstance(child, SCOPED):
@@ -452,10 +608,38 @@ def _scopes(tree: ast.AST):
             elif isinstance(child, ast.Lambda):
                 out.append((f"{prefix}<lambda>", _calls_in_scope(child),
                             child))
+                # ROUTE E.  A lambda used to be appended and not RECURSED
+                # into, and `_calls_in_scope` skips every SCOPED child -- so
+                # a lambda inside a lambda was walked by nobody and every
+                # call in it vanished.  One line, and it was a whole scope.
+                walk(child, f"{prefix}<lambda>.")
             else:
                 walk(child, prefix)
     walk(tree)
-    return [(n, c, o) for n, c, o in out if c]
+
+    # TWO LAMBDAS IN ONE FUNCTION SHARE A NAME, and a shared name is a
+    # COLLIDED KEY: `Ledger._trim` has two of them, both called
+    # "Ledger._trim.<lambda>", so their rows landed on the same
+    # (module, scope, primitive, ordinal) and one silently covered the
+    # other.  Round 6 could not see this because a lambda in this lane
+    # holds no MUTATOR -- rule T is what made its calls into rows and the
+    # collision visible.  Disambiguate by line so the second one gets its
+    # own key, and number only where there IS a clash, so the ordinary
+    # single-lambda name does not churn.
+    clashing = {n for n in {e[0] for e in out}
+                if sum(1 for e in out if e[0] == n) > 1}
+    order = {}
+    for name in clashing:
+        lines = sorted(getattr(o, "lineno", 0) for n, _c, o in out
+                       if n == name)
+        order[name] = lines
+    ranked = []
+    for name, calls, owner in out:
+        if name in clashing:
+            rank = order[name].index(getattr(owner, "lineno", 0)) + 1
+            name = f"{name} #{rank}"
+        ranked.append((name, calls, owner))
+    return [(n, c, o) for n, c, o in ranked if c]
 
 
 def _method_names(tree: ast.AST) -> set:
@@ -513,9 +697,11 @@ def census(paths=MODULES, sources=None) -> list:
         lane = _lane_names(tree)
         for qual, calls, owner in _scopes(tree):
             local = _assigned_in(owner)
+            # ROUTE B: an import written INSIDE this scope binds here too.
+            scoped = dict(bindings, **_scope_imports(owner))
             checks, claims, writes = [], [], []
             for node in calls:
-                resolved = _resolve(node.func, bindings, methods, lane, local)
+                resolved = _resolve(node.func, scoped, methods, lane, local)
                 is_row, prim = _classify(resolved, walked)
                 line = getattr(node, "lineno", 0)
                 if not isinstance(resolved, _Unresolved):
@@ -560,10 +746,30 @@ def _excl_open(node: ast.Call, tail: str) -> bool:
 
 
 def table(rows=None, known=None) -> str:
-    """The census as the table that used to be hand-written."""
-    from tests.test_write_census import KNOWN          # noqa: PLC0415
+    """The census as the table that used to be hand-written.
+
+    Two halves since round 7, because the prose is split two ways: a named
+    write gets its own sentence per CALL SITE, and an untypable receiver
+    gets one per METHOD NAME.  Both are printed here so the reader sees one
+    table -- the split is in where the sentence is kept, not in what is
+    reported.
+    """
+    from tests.test_write_census import (KNOWN, UNTYPED,  # noqa: PLC0415
+                                         UNTYPED_SITES)
     rows = census() if rows is None else rows
     known = KNOWN if known is None else known
+
+    def sentence(m, f, w, n):
+        row = known.get((m, f, w, n))
+        if row:
+            return row[1]
+        if w.startswith("?untyped:"):
+            name = w.split(":", 1)[1]
+            if (m, f, w, n) in UNTYPED_SITES and name in UNTYPED:
+                return UNTYPED[name]
+            if name in UNTYPED:
+                return "*** THE SITE IS NOT PINNED ***"
+        return "*** NOT IN THE TABLE ***"
 
     def where(m, f, w, n):
         return f"{m}:{f}" + (f" #{n}" if n > 1 else "")
@@ -573,8 +779,7 @@ def table(rows=None, known=None) -> str:
            "  WINDOW"]
     out.append("-" * (width + gwidth + 40))
     for mod, fn, write, n, guard in rows:
-        row = known.get((mod, fn, write, n))
-        note = row[1] if row else "*** NOT IN THE TABLE ***"
+        note = sentence(mod, fn, write, n)
         out.append(where(mod, fn, write, n).ljust(width) +
                    f"  {guard or 'NOTHING'} -> {write}".ljust(gwidth + 2) +
                    f"  {note}")

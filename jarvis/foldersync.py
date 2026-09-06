@@ -55,11 +55,14 @@ a way to see what happened.
    exists because the step before it is not evidence.
 
    The CLAIM is the part that took three rounds to get right.  **scp
-   truncates**, measured against HPCOMPUTER on 2026-09-05: a 22222-byte
-   file at the target name came back 1111 bytes, exit 0, nothing on
-   stderr -- in the default SFTP mode, under the legacy ``-O`` protocol,
-   and through ``sftp put`` alike, and there is no no-clobber flag on any
-   of them.  So choosing a free name from a listing and then writing at it
+   truncates** -- re-measured HERE on 2026-09-05, against this box's own
+   ``/usr/lib/openssh/sftp-server`` over a pipe rather than against his
+   machine: a 22222-byte file at the target name came back 1111 bytes,
+   exit 0, nothing on stderr -- in the default SFTP mode, under the legacy
+   ``-O`` protocol, and through ``sftp put`` alike, and there is no
+   no-clobber flag on any of them.  It is a property of the SFTP protocol
+   and of OUR OWN client, which is why it needs no session with HPCOMPUTER
+   to establish; tests/test_provenance.py re-derives it every run.  So choosing a free name from a listing and then writing at it
    is a guess about the future, and the guess was wrong for minutes at a
    time: the sends are sequential after ONE listing, so the tenth file in
    a queue was written long after its name was checked.  Instead the bytes
@@ -649,6 +652,53 @@ def _unlink_after_landing(source: Path, dest: Path) -> None:
                     "the original; nothing has been lost", source, dest)
 
 
+def _replace_ours(path: Path, text: str, *, fsync: bool = False,
+                  mode: Optional[int] = None) -> None:
+    """Replace a file of OURS atomically.  The ONE place that dance lives.
+
+    THE CHOKEPOINT, round 7, and it is deliberately narrow.  ``land_beside``
+    is already the one function allowed to put a file into a folder of HIS;
+    this is its counterpart for the three files this lane owns -- the ledger,
+    status.txt and anything that follows them.  ``Ledger.save`` and
+    ``Syncer.write_status`` each hand-rolled the same four steps and only one
+    of the two fsynced.  Two copies of a dance where one has the safety step
+    is exactly how the safety step goes missing on the third copy.
+
+    ``fsync`` is not ceremony and it is not a default.  The landing record is
+    what makes a duplicate send impossible rather than unlikely, and a record
+    that is only in the page cache is not a record: a power cut between
+    writing it and taking the name would lose exactly the fact the next pass
+    needs.  A process kill survives the page cache; the wall socket does not.
+    Both the file and the directory entry, which is the standard pair.
+    status.txt is a courtesy for his file manager and is rewritten every pass,
+    so it does not earn two fsyncs of his disk.
+
+    The temp name sits beside the target, so the rename is within one
+    filesystem and is therefore atomic.  It carries the target's whole name
+    plus ".tmp" rather than replacing the suffix: ``ledger.json`` and
+    ``ledger.jsonl`` would otherwise fight over ``ledger.tmp``.
+
+    NOT for a name of his -- there is no claim here at all, and a plain
+    replace at a name he chose is the shape that destroyed a 100000-byte
+    file in round 5.  That is ``land_beside``, which takes the name first.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True,
+                      **({"mode": mode} if mode is not None else {}))
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        if fsync:
+            fh.flush()
+            os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    if fsync:
+        dirfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+
+
 # -------------------------------------------------------------- quiescence
 def stat_key(path: Path) -> str:
     """``size|mtime_ns`` for a regular file, "" for anything else or gone."""
@@ -1205,27 +1255,15 @@ class Ledger:
     def save(self) -> None:
         self._trim()
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            tmp = self.path.with_suffix(".tmp")
-            # FSYNC, and it is not ceremony.  The landing record is what
-            # makes a duplicate impossible rather than unlikely (finding L),
-            # and a record that is only in the page cache is not a record: a
-            # power cut between writing it and taking the name would lose
-            # exactly the fact the next pass needs.  A process kill survives
-            # the cache; the wall socket does not.  Both the file and the
-            # directory entry, which is the standard pair.
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(
-                    {"version": 1, "pulled": self.pulled,
-                     "fails": self.fails, "landed": self.landed}))
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-            dirfd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
+            # THROUGH THE CHOKEPOINT since round 7.  The four steps and the
+            # fsync pair are unchanged and now live in ONE place
+            # (_replace_ours); fsync=True is the whole reason this call is
+            # not the same as write_status's, and saying it here is better
+            # than a second copy of the dance that might one day lose it.
+            _replace_ours(self.path, json.dumps(
+                {"version": 1, "pulled": self.pulled,
+                 "fails": self.fails, "landed": self.landed}),
+                fsync=True, mode=0o700)
         except OSError:
             log.warning("foldersync: cannot write the ledger at %s",
                         self.path, exc_info=True)
@@ -1779,9 +1817,9 @@ class Syncer:
         method rather than two lines in the loop.  The old shape listed the
         remote Inbox once at the top of a pass, picked a free name with
         dedupe_name, and then scp'd straight at it -- and **scp truncates**:
-        measured on his own box, a 22222-byte file replaced by 1111 bytes,
-        exit 0, nothing on stderr, in both scp protocol modes and through
-        sftp put alike.  A file of his that appeared at that name in between
+        re-measured HERE against this box's own sftp-server, a 22222-byte
+        file replaced by 1111 bytes, exit 0, nothing on stderr, in both scp
+        protocol modes and through sftp put alike.  A file of his that appeared at that name in between
         was destroyed, the pass said "sent", and his LOCAL original was then
         moved into Sent -- both copies ours, his gone, and the verify could
         not catch it because the evidence it would have compared against was
@@ -1792,9 +1830,13 @@ class Syncer:
         So the bytes go at a name of OURS (:func:`remote.remote_temp_name` --
         pid, second, counter) and the name he will see is then TAKEN with a
         ``rename -l``, which the far side refuses if anything holds it.
-        MEASURED 2026-09-05 against HPCOMPUTER: refused 10 of 10 with both
-        files byte-intact, and two concurrent sessions racing for one name
-        gave exactly one winner in 12 of 12 rounds, zero losses.  A refusal
+        MEASURED HERE 2026-09-05, against this box's own sftp-server with
+        no socket: refused 10 of 10 with both files byte-intact, and two
+        concurrent sessions racing for one name gave exactly one winner in
+        12 of 12 rounds, zero losses.  What HIS server does with that opcode
+        is INFERRED from the protocol and not measured -- but ``-l`` pins
+        the opcode at OUR client, so a wrong inference can only make the
+        claim fail closed.  A refusal
         costs one more round trip and the next "(2)"; it never costs a file.
 
         ``taken`` is only the first GUESS now -- the freshest listing we
@@ -2515,11 +2557,12 @@ class Syncer:
             return                              # do not churn his folder
         self._status_text = text
         try:
-            self.paths.status.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.paths.status.with_name(
-                self.paths.status.name + ".tmp")
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, self.paths.status)
+            # THROUGH THE CHOKEPOINT since round 7.  No fsync: status.txt is
+            # a courtesy for his file manager, rewritten on every pass that
+            # changes it, and nothing downstream depends on it having
+            # survived a power cut.  The ledger is the opposite case and
+            # passes fsync=True.
+            _replace_ours(self.paths.status, text)
         except OSError:
             log.debug("foldersync: cannot write the status file", exc_info=True)
 
