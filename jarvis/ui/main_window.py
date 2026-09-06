@@ -2315,8 +2315,17 @@ class MainWindow:
     def _console_busy(self) -> bool:
         """A turn is live — the console stays awake however idle the desk
         looks. `_recording` covers the mic being open, and the pill's own
-        inputs cover the rest of the turn."""
-        return bool(self._recording or self._speaking or self._thinking)
+        inputs cover the rest of the turn.
+
+        AND A QUESTION HE HAS NOT ANSWERED. ``_pending`` holds the YES/NO
+        cards waiting on him. On 2026-09-06 "Was that for me?" went up,
+        the 5 s answer window opened (``record_fixed`` publishes no
+        RecordingStarted, so it is not ``_recording`` here) and the console
+        dropped to the clock over the card. He described it as "stuck in
+        standby". A console that is waiting for him is not idle.
+        """
+        return bool(self._recording or self._speaking or self._thinking
+                    or self._pending)
 
     def _note_activity(self):
         """Anything HE did — a wake word, an utterance, the mic opening.
