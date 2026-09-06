@@ -189,11 +189,21 @@ def test_put_writes_a_private_spool_and_refuses_junk(ov, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["ok"] is False
 
 
-def test_receipt_prints_once_and_deletes(ov, capsys):
+def test_receipt_prints_and_only_an_ack_deletes(ov, capsys):
+    """2026-09-06, defect (B): the read and the delete are two verbs, so a
+    Spark that read a receipt and then failed to write its own registry
+    has not destroyed the only record that the email went out. The wider
+    rules are in tests/test_knightfall_weekly_defects.py."""
     _push(ov)
     _compose(ov)
     assert ov.main(["receipt"]) == 0
     assert json.loads(capsys.readouterr().out)["id"] == PUSH_ID
+    assert ov.RECEIPT.exists(), "a read deletes nothing"
+    assert ov.main(["receipt"]) == 0
+    assert json.loads(capsys.readouterr().out)["id"] == PUSH_ID
+
+    assert ov.main(["receipt", "--ack", PUSH_ID]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "acked": True}
     assert not ov.RECEIPT.exists()
     assert ov.main(["receipt"]) == 0
     assert json.loads(capsys.readouterr().out) == {"status": "none"}

@@ -54,7 +54,15 @@ REPO = Path(jarvis.__file__).parent.parent
 # ------------------------------------------------------------------ fakes
 class FakeOracle:
     """The far side, in memory. ``spool`` is spool/pending.json, ``receipt``
-    is spool/receipt.json; ``calls`` is every ssh round trip in order."""
+    is spool/receipt.json; ``calls`` is every ssh round trip in order.
+
+    THE RECEIPT IS READ AND ACKED SEPARATELY (2026-09-06, defect B): a
+    ``receipt`` leaves the file where it is and only ``receipt --ack <id>``
+    deletes it, so a Spark that read one and then failed to write its own
+    registry has not lost it. This models deploy/oracle/jarvis_override.py
+    verb for verb, and tests/test_knightfall_weekly_defects.py pins the
+    real module against the same rules.
+    """
 
     def __init__(self):
         self.spool = None
@@ -64,6 +72,7 @@ class FakeOracle:
         self.fail_puts = 0
         self.fail_revoke = False
         self.fail_receipt = False
+        self.fail_ack = False
 
     def __call__(self, verb, stdin=None):
         self.calls.append((verb, stdin))
@@ -75,11 +84,18 @@ class FakeOracle:
                 return kw.SshReply(False, "", "timeout")
             self.spool = json.loads(stdin)
             return kw.SshReply(True, json.dumps({"ok": True, "id": self.spool["id"]}))
+        if verb.startswith("receipt --ack "):
+            if self.fail_ack:
+                return kw.SshReply(False, "", "timeout")
+            code_id = verb.split()[2]
+            hit = bool(self.receipt and self.receipt.get("id") == code_id)
+            if hit:
+                self.receipt = None
+            return kw.SshReply(True, json.dumps({"ok": True, "acked": hit}))
         if verb == "receipt":
             if self.fail_receipt:
                 return kw.SshReply(False, "", "timeout")
-            got, self.receipt = self.receipt, None
-            return kw.SshReply(True, json.dumps(got or {"status": "none"}))
+            return kw.SshReply(True, json.dumps(self.receipt or {"status": "none"}))
         if verb.startswith("revoke "):
             if self.fail_revoke:
                 return kw.SshReply(False, "", "timeout")
@@ -196,7 +212,10 @@ def test_the_happy_week_pushes_stores_pending_and_promotes_on_receipt(tmp_path):
 
     out = kw.pull(lane, PULL)
     assert out.ok and out.status == "promoted", out
-    assert oracle.calls[-1][0] == "receipt" and oracle.receipt is None
+    # READ, then written down here, and only THEN acked away (defect B)
+    assert [v for v, _ in oracle.calls][-2:] == \
+        ["receipt", "receipt --ack %s" % st["id"]]
+    assert oracle.receipt is None
     assert _works(lane, WEEKLY) and not _works(lane, FAKE_CODE)
     assert _pending_id(lane) == ""
     assert lane.reloads == [1, 1]
@@ -369,7 +388,7 @@ def test_row6b_force_after_oracle_composed_names_the_dead_emailed_code(tmp_path)
     assert first_id != new_id and _works(lane, FAKE_CODE)
 
 
-def test_row7_a_manual_rotate_keeps_the_pending_and_the_receipt_retires_it(tmp_path):
+def test_row7_a_manual_rotate_keeps_the_pending_and_then_BEATS_it(tmp_path):
     from tests.test_notes_mail import GMAIL_CFG, FakeCfg
     from tests.test_send_file import FakeSMTP
     import jarvis.app as app_mod
@@ -392,11 +411,16 @@ def test_row7_a_manual_rotate_keeps_the_pending_and_the_receipt_retires_it(tmp_p
     assert not _works(lane, FAKE_CODE)
     assert _pending_id(lane), "the rotate did not touch the pending"
 
+    # 2026-09-06, defect (C). This used to promote, which retired the code
+    # he had been handed MOST RECENTLY and left him holding a dead one.
+    # The rotate wins; Sunday's code is dropped and the caption says why.
     oracle.compose(COMPOSE)
     out = kw.pull(lane, PULL)
-    assert out.status == "promoted"
-    assert _works(lane, WEEKLY) and not _works(lane, manual)
-    assert "replaced the code from your rotate" in kw.caption(lane.state_path)
+    assert out.status == "dropped-rotated", out
+    assert _works(lane, manual) and not _works(lane, WEEKLY)
+    assert _pending_id(lane) == ""
+    assert "not applied" in kw.caption(lane.state_path)
+    assert "rotated your own" in kw.caption(lane.state_path)
 
 
 def test_row8_a_stale_spool_is_discarded_unread(tmp_path):
@@ -477,8 +501,9 @@ def test_typed_before_the_pull_is_the_receipt_in_person(tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         out = kw.pull(lane, PULL)
     assert out.status == "promoted-by-use"
-    assert oracle.calls[-1][0] == "receipt" and oracle.receipt is None, \
-        "the receipt is still drained"
+    assert [v for v, _ in oracle.calls][-2:] == \
+        ["receipt", "receipt --ack %s" % code_id], "the receipt is still drained"
+    assert oracle.receipt is None
     assert any("already" in r.getMessage() for r in caplog.records)
     assert "when you typed it" in kw.caption(lane.state_path)
     calls = len(oracle.calls)
@@ -575,7 +600,10 @@ def test_at_no_point_in_any_sequence_is_there_zero_working_codes(
                 out = kw.push(lane, now, force=(op == "push-force"))
                 if out.status == "pushed":
                     should.add(oracle.spool["code"])
-                    if before.pending_code_hash and op == "push-force":
+                    # A push only reaches "pushed" over an existing pending
+                    # when it REPLACED it: --force, or (2026-09-06) a
+                    # scheduled push over one Oracle can no longer send.
+                    if before.pending_code_hash:
                         should.discard(_plain_of(should, before.pending_code_hash))
             elif op == "oracle-down":
                 oracle.down = True
