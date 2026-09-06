@@ -6272,22 +6272,28 @@ _FILE_ANSWER_TAIL_RX = re.compile(
     r"(?:[,\s]+(?:please|thanks|thank you|sir|jarvis))*[.!?,\s]*$", re.I)
 
 
+# THE FILLED PAUSE COMES OFF FIRST in all three (jarvis.endpoint.strip_fillers,
+# the one list). Each LEAD regex is anchored at ^ on purpose -- "it's the",
+# "from my", "send it to" -- so a filler in front of the lead left the whole
+# lead on: "uh, it's the lab report" was handed to prepare as a file called
+# "uh, it's the lab report", and "um, the work one" became the account hint
+# "um, the work". Nothing but fillers strips to "" and names nothing.
 def _file_answer(text: str) -> str:
-    t = " ".join(str(text or "").split())
+    t = " ".join(strip_fillers(text).split())
     t = _FILE_ANSWER_LEAD_RX.sub("", t, count=1)
     t = _FILE_ANSWER_TAIL_RX.sub("", t, count=1)
     return t.strip(" ,.!?")
 
 
 def _account_answer(text: str) -> str:
-    t = " ".join(str(text or "").split())
+    t = " ".join(strip_fillers(text).split())
     t = _ACCOUNT_ANSWER_LEAD_RX.sub("", t, count=1)
     t = _ACCOUNT_ANSWER_TAIL_RX.sub("", t, count=1)
     return t.strip(" ,.!?")
 
 
 def _recipient_answer(text: str) -> str:
-    t = " ".join(str(text or "").split())
+    t = " ".join(strip_fillers(text).split())
     t = _RECIPIENT_ANSWER_LEAD_RX.sub("", t, count=1)
     t = _RECIPIENT_ANSWER_TAIL_RX.sub("", t, count=1)
     return t.strip(" ,.!?")
@@ -10136,7 +10142,9 @@ def day_shift_followup(prev_text: str, text: str,
     before: either the utterance is not a bare day-shift fragment, or the
     question before it named no day to move.
     """
-    t = (text or "").strip().strip("?.!,")
+    # The filled pause first: the fragment is anchored on "and" / "what
+    # about", and "uh, what about the next day" is the same follow-up.
+    t = strip_fillers(text).strip().strip("?.!,")
     if not t:
         return None
     tail = _DAY_SHIFT_RX.sub("", t, count=1).strip()
@@ -11790,7 +11798,12 @@ class Commander:
 
     # -- corrections, feedback, read-back ---------------------------------
     def _try_correction(self, text: str, source: str) -> Optional[CommandResult]:
-        meant = correction_kind(strip_address(text))
+        # A filler can sit on EITHER side of the address ("uh, jarvis, I
+        # said Lisbon" / "jarvis, uh, I said Lisbon"), and strip_address
+        # is anchored at ^: taken first, it left the address on behind a
+        # leading filler, and _CORRECTION_RX takes no address of its own.
+        # So: fillers, address, fillers (correction_kind strips again).
+        meant = correction_kind(strip_address(strip_fillers(text)))
         if not meant:
             return None
         prev = self._last_turn
@@ -11847,7 +11860,9 @@ class Commander:
         # below is the right place for it.
         if time.monotonic() - prev.ts > FOLLOWUP_DAY_WINDOW_S:
             return None
-        meant = day_shift_followup(prev.text, strip_address(text))
+        # Fillers, then the address, then fillers again inside
+        # day_shift_followup -- see _try_correction for why.
+        meant = day_shift_followup(prev.text, strip_address(strip_fillers(text)))
         if not meant:
             return None
         log.info("day-shift follow-up: %r + %r -> %r", prev.text, text, meant)
@@ -12246,7 +12261,13 @@ class Commander:
             # yes whose correction names nobody ("yes, one to her and one
             # to Dana", "yes send it to the") are asked again the same way
             # (the fourth review).
-            vague = bool(_SEND_MAYBE_RX.match(cleaned)) or (
+            # The maybe word strips at ITS OWN call site: _send_clean hands
+            # the ORIGINAL back whole when its clean leaves no letters --
+            # right for "okay" (the maybe it always was), and it is also
+            # how "uh, okay" came back with the filler on and was refused
+            # the one re-ask that "okay" earns. The lane's two lists are
+            # untouched; this is the canonical strip, once more.
+            vague = bool(_SEND_MAYBE_RX.match(strip_fillers(cleaned))) or (
                 len(cleaned.split()) <= 6 and parse_yes_no(cleaned) is True) \
                 or _send_near_yes(folded) or gendered or clash or (
                     parse_yes_no(cleaned) is True
@@ -13014,7 +13035,13 @@ class Commander:
         None of these speak from here: the run is on its own thread and says
         its own lines at the moment they become true, so a reply here would
         arrive either twice or in the wrong order.
+
+        The filled pause comes off first. All three grammars are anchored
+        on the control word, and "uh, stop" not stopping a CAMERA is the
+        unsafe direction; nothing but fillers strips to "" and steers
+        nothing.
         """
+        text = strip_fillers(text)
         if _ENROL_STOP_RX.match(text):
             from jarvis import enrolrun as er
             run.abort(er.STOP_SPOKEN)
@@ -13232,6 +13259,18 @@ class Commander:
                 getattr(self._svc("reader"), "active", False) is True:
             log.debug("briefing offer: a reading owns %r", text[:40])
             return None
+        # NOTHING BUT A FILLED PAUSE -- one rule for BOTH offers. A bare
+        # "Uh..." is not an answer, and it is not a new subject either, so
+        # it leaves the question standing: the terminal offer already
+        # read it that way (_try_terminal_offer), and this rung used to
+        # argue the other way in the same commit, spending the day's ONE
+        # briefing offer on a hesitation and logging it as a new subject.
+        # Anything with words in it still takes the branch below: a yes
+        # runs it, a no declines it, a change of subject drops it.
+        if not strip_fillers(text).strip():
+            log.debug("briefing offer: %r is a hesitation; the offer stands",
+                      text[:40])
+            return None
         try:
             self.services.briefing_offer = None
         except Exception:
@@ -13342,7 +13381,13 @@ class Commander:
         if session.stale() or session.finished or quiz_kind(tl) or review_kind(tl):
             self._pending_quiz = None
             return None
-        if quiet_kind(t) or cancel_kind(t):
+        # quiet_kind / cancel_kind are COMMAND grammars shared with the
+        # registry; in ANSWER position they end the quiz here and nothing
+        # is re-dispatched, so the strip is complete at this call site.
+        # Unstripped, "uh, cancel that" fell past every stop word to the
+        # GRADER: "Not quite, sir; the answer I have is..." -- the card
+        # marked wrong, the quiz carrying on.
+        if quiet_kind(strip_fillers(t)) or cancel_kind(strip_fillers(t)):
             self._pending_quiz = None
             _cut_speech(self)
             return CommandResult(handled=True, reply="Very good, sir.", speak=False,
@@ -13447,11 +13492,15 @@ class Commander:
             log.exception("session %s state failed", name)
             self._pending_session = None
             return None
-        if dialogue_mod.enough_kind(t):
+        # The filled pause first, on the three judgements only: settle()
+        # below still hears his words as he said them. Unstripped, "uh,
+        # that's enough" was not "enough" -- it went to settle() as an
+        # ANSWER, and the read-back he asked for never came.
+        if dialogue_mod.enough_kind(strip_fillers(t)):
             self._pending_session = None
             return CommandResult(handled=True, reply=self._session_stop(session),
                                  speak=True, status=f"{name} ended")
-        if quiet_kind(t) or cancel_kind(t):
+        if quiet_kind(strip_fillers(t)) or cancel_kind(strip_fillers(t)):
             self._pending_session = None
             _cut_speech(self)
             return CommandResult(handled=True, reply="Very good, sir.", speak=False,
@@ -13516,7 +13565,7 @@ class Commander:
             # "uh, no idea" closes the question for good, like "no idea":
             # the grammar is start-anchored, so the filler comes off first.
             if _LEAVE_DECLINE_RX.match(
-                    strip_fillers(strip_address(text) or text or "")):
+                    strip_fillers(strip_address(strip_fillers(text)) or text or "")):
                 self._pending_leave = None
                 return CommandResult(handled=True, speak=True,
                                      reply=LEAVE_DROPPED_LINE,
@@ -13619,7 +13668,8 @@ class Commander:
         t = strip_fillers(text.strip())
         if not t:
             # Nothing but a filled pause: not an answer, and not a new
-            # subject either. The offer stands.
+            # subject either. The offer stands -- the same rule, and the
+            # one comment for it, at _try_briefing_offer.
             return None
         if _YES_RX.match(t) or _OPEN_IT_RX.match(t):
             self._pending_terminal_slug = ""

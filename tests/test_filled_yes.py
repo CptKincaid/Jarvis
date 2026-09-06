@@ -961,69 +961,11 @@ class TestTheDestructiveVagueAnswer:
         assert res is not None and res.status == "Done"
 
 
-def test_the_ast_sweep_finds_no_unstripped_answer_grammar_left():
-    """The sweep itself, in one assertion: every start-anchored grammar in
-    an ANSWER position either strips or is on the named exception list.
-
-    Kept as a test, not a one-off script, because the next answer rung
-    someone adds is the next "Uh, yeah." thrown away. It reads the AST of
-    jarvis/commander.py -- no import-time behaviour, no regex over source.
-    """
-    import ast
-    import pathlib
-    src = pathlib.Path(cm_path()).read_text()
-    tree = ast.parse(src)
-    # Every function that judges an answer while a question is parked.
-    rungs = {"pick_from_answer", "_person_from_answer", "correction_kind",
-             "feedback_kind", "briefing_answer", "parse_yes_no",
-             "_try_filepick_answer", "_try_sendask_answer", "_try_leave_answer",
-             "_try_quiz_answer", "_try_teach_offer", "_try_enrol",
-             "_try_approval", "_try_terminal_offer", "_try_briefing_offer",
-             "_try_destructive_confirm"}
-    # Matched inside a rung but NOT an answer grammar, each for a reason
-    # written down above: the two COMMAND grammars the registry shares.
-    exempt = {"_QUIZ_RX", "_REVIEW_RX"}
-    missing = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, ast.FunctionDef) or fn.name not in rungs:
-            continue
-        for node in ast.walk(fn):
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in ("match", "fullmatch")
-                    and isinstance(node.func.value, ast.Name)):
-                continue
-            name = node.func.value.id
-            if not name.isupper() and not name.startswith("_"):
-                continue
-            if name in exempt:
-                continue
-            arg = ast.unparse(node.args[0]) if node.args else ""
-            if "strip_fillers" in arg:
-                continue
-            # ...or the variable it is handed was stripped on its way in
-            hit = False
-            for a in ast.walk(fn):
-                if (isinstance(a, ast.Assign) and "strip_fillers" in ast.unparse(a.value)
-                        and any(isinstance(t, ast.Name) and t.id in arg
-                                for t in a.targets)):
-                    hit = True
-                    break
-                # _send_clean strips on the caller's behalf (its own tests
-                # pin that); a name assigned from it counts.
-                if (isinstance(a, ast.Assign) and "_send_clean(" in ast.unparse(a.value)
-                        and any(isinstance(t, ast.Name) and t.id in arg
-                                for t in a.targets)):
-                    hit = True
-                    break
-            if not hit and "_send_clean(" not in arg:
-                missing.append(f"{fn.name}(): {name}.match({arg})")
-    assert missing == [], "answer grammars still handed an unstripped filled pause"
-
-
-def cm_path():
-    import jarvis.commander
-    return jarvis.commander.__file__
+# The AST sweep that used to sit here fed a HAND-WRITTEN set of rung names
+# to a walker -- the same mistake as the two inventories before it, one
+# level down. It is superseded by tests/test_answer_census.py, which
+# derives the rungs from the code (any function that reads a parked
+# question) and follows his words from each one into every parser.
 
 
 # ===================================================================
@@ -1076,3 +1018,475 @@ def test_the_pin_is_the_shipped_default_while_a_test_runs():
     from jarvis.config import Config
     default = {f.name: f.default for f in fields(Config)}["filler_prompt_hint"]
     assert CONFIG.filler_prompt_hint == default
+
+
+# ===================================================================
+# 14. What the DERIVED census found (tests/answercensus.py)
+# ===================================================================
+# The eight-item inventory was a list, the adversary's six were a list,
+# and the AST sweep in section 12 was a list too (a hand-written set of
+# rung names, fed to a walker). tests/test_answer_census.py derives the
+# rungs from the code instead -- a rung is any function that reads a
+# parked question -- and follows his words from each one into every
+# parser. These are the sites it found that the lists had not, each
+# measured bare vs filled BEFORE the fix, each the same one-line move.
+class TestTheSendAskAnswers:
+    """"Which file, sir?" / "Which account?" / "To whom?" -- the three
+    answer parsers of the send-ask lane. Each strips a LEAD ("it's the",
+    "from my", "send it to") anchored at ^, so a filler in front of the
+    lead left the whole lead on:
+
+        _file_answer("it's the lab report")      -> "the lab report"
+        _file_answer("uh, it's the lab report")  -> "uh, it's the lab report"
+        _account_answer("the work one")          -> "work"
+        _account_answer("um, the work one")      -> "um, the work"
+        _recipient_answer("to dana")             -> "dana"
+        _recipient_answer("um, to dana")         -> "um, to dana"
+    """
+
+    def test_bare_the_control(self):
+        from jarvis.commander import _account_answer, _file_answer, _recipient_answer
+        assert _file_answer("it's the lab report") == "the lab report"
+        assert _account_answer("the work one") == "work"
+        assert _recipient_answer("to dana") == "dana"
+
+    @pytest.mark.parametrize("prefix", ["uh, ", "Um, ", "er ", "hmm, uh, "])
+    def test_a_filled_file_answer_names_the_same_file(self, prefix):
+        from jarvis.commander import _file_answer
+        assert _file_answer(prefix + "it's the lab report") == "the lab report", prefix
+        assert _file_answer(prefix + "the lab report") == "the lab report", prefix
+
+    @pytest.mark.parametrize("prefix", ["uh, ", "Um, ", "er ", "hmm, uh, "])
+    def test_a_filled_account_answer_names_the_same_account(self, prefix):
+        from jarvis.commander import _account_answer
+        assert _account_answer(prefix + "the work one") == "work", prefix
+        assert _account_answer(prefix + "school") == "school", prefix
+
+    @pytest.mark.parametrize("prefix", ["uh, ", "Um, ", "er ", "hmm, uh, "])
+    def test_a_filled_recipient_answer_names_the_same_person(self, prefix):
+        from jarvis.commander import _recipient_answer
+        assert _recipient_answer(prefix + "to dana") == "dana", prefix
+        assert _recipient_answer(prefix + "it's dana at example dot com") == \
+            "dana at example dot com", prefix
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_names_nothing(self, said):
+        from jarvis.commander import _account_answer, _file_answer, _recipient_answer
+        assert _file_answer(said) == ""
+        assert _account_answer(said) == ""
+        assert _recipient_answer(said) == ""
+
+    def test_the_trailing_filler_comes_off_too(self):
+        from jarvis.commander import _file_answer
+        assert _file_answer("the lab report, uh") == "the lab report"
+
+    @pytest.mark.parametrize("said", ["it's the lab report", "uh, it's the lab report",
+                                      "Um, the lab report."])
+    def test_the_file_question_hands_prepare_the_same_phrase(
+            self, cmdr, monkeypatch, said):
+        """Through the rung: the phrase that reaches outbox.prepare is the
+        file phrase, bare or filled -- never "uh, it's the lab report"."""
+        import jarvis.commander as cm
+        from jarvis.commander import SendAsk
+        handed = []
+
+        def fake_prepare(cfg, memory, phrase, who, **kw):
+            handed.append(phrase)
+            return object()
+
+        monkeypatch.setattr(cm.outbox, "prepare", fake_prepare)
+        monkeypatch.setattr(cm, "_send_file_finish", lambda *a, **k: CommandResult(
+            handled=True, status="Prepared"))
+        cmdr._pending_sendask = SendAsk(kind="file", said_file="", who="dana@example.com",
+                                        hint="", source="voice", made_at=_t.monotonic())
+        res = cmdr._try_sendask_answer(said, "voice")
+        assert res is not None and res.status == "Prepared", said
+        assert handed == ["the lab report"], said
+
+
+class TestTheSessionEnough:
+    """"That's enough" inside a working session ends it WITH its read-back
+    (dialogue.enough_kind). Filled, it was not "enough" at all: the words
+    went to settle() as an ANSWER. For the week planner that is a None
+    from settle and the plan he just built is dropped; for the echo double
+    below it is echoed back and the session carries on. Either way the
+    read-back he asked for never comes."""
+
+    @pytest.fixture
+    def session_cmdr(self, cmdr):
+        from jarvis.dialogue import EchoSession
+        session = EchoSession()
+        session.ask()
+        cmdr._pending_session = session
+        return cmdr, session
+
+    def test_bare_the_control(self, session_cmdr):
+        cmdr, session = session_cmdr
+        res = cmdr._try_session("that's enough")
+        assert res is not None and res.status == "echo ended"
+        assert res.reply == "0 noted, sir."
+        assert cmdr._pending_session is None
+        assert session.heard == []
+
+    @pytest.mark.parametrize("said", ["uh, that's enough", "Um, that'll do.",
+                                      "er, enough for now", "that's enough, uh"])
+    def test_a_filled_enough_still_ends_it_with_the_read_back(self, session_cmdr, said):
+        cmdr, session = session_cmdr
+        res = cmdr._try_session(said)
+        assert res is not None and res.status == "echo ended", said
+        assert res.reply == "0 noted, sir.", said
+        assert session.heard == [], said
+
+    @pytest.mark.parametrize("said", ["uh, quiet", "um, cancel that", "er, stop that"])
+    def test_a_filled_quiet_or_cancel_still_drops_it_silently(self, session_cmdr, said):
+        cmdr, session = session_cmdr
+        res = cmdr._try_session(said)
+        assert res is not None and res.status == "echo stopped", said
+        assert res.speak is False
+        assert session.heard == [], said
+
+    def test_a_filled_answer_is_still_the_answer(self, session_cmdr):
+        cmdr, session = session_cmdr
+        res = cmdr._try_session("uh, Tuesday")
+        assert res is not None and res.status != "echo ended"
+        assert session.heard == ["uh, Tuesday"]     # settle() sees his words
+
+
+class TestTheQuizCancel:
+    """The same teeth as the skip: "cancel that" / "quiet" over an open
+    card end the quiz silently and grade nothing. Filled, they were not
+    a cancel, not a stop word, and fell through to the GRADER -- the card
+    was marked wrong."""
+
+    @pytest.fixture
+    def quiz_cmdr(self, cmdr, tmp_path):
+        from jarvis.tools.quiz import FlashcardStore, QuizSession
+        store = FlashcardStore(tmp_path / "cards.db")
+        cards = store.add_cards(
+            [{"question": "What is impedance?", "answer": "V over I"},
+             {"question": "Name a transducer", "answer": "thermistor"}],
+            source="example.md", topic="example")
+        cmdr.services.flashcards = store
+        cmdr._pending_quiz = QuizSession(cards, topic="example")
+        cmdr._pending_quiz.ask()
+        yield cmdr, store, cards
+        store.close()
+
+    def test_bare_the_control(self, quiz_cmdr):
+        cmdr, store, cards = quiz_cmdr
+        cid = cards[0]["id"]
+        res = cmdr.handle("cancel that", "voice")
+        assert res is not None and res.status == "Quiz stopped"
+        assert cmdr._pending_quiz is None
+        assert store.get(cid)["seen"] == 0 and store.get(cid)["box"] == 1
+
+    @pytest.mark.parametrize("said", ["uh, cancel that", "Um, cancel that.",
+                                      "uh, quiet", "er, stop that", "cancel that, uh"])
+    def test_a_filled_cancel_grades_nothing(self, quiz_cmdr, said):
+        cmdr, store, cards = quiz_cmdr
+        cid = cards[0]["id"]
+        session = cmdr._pending_quiz
+        res = cmdr.handle(said, "voice")
+        assert res is not None and res.status == "Quiz stopped", said
+        assert session.results == [], said
+        assert store.get(cid)["seen"] == 0, said
+        assert store.get(cid)["box"] == 1, said
+
+
+class TestTheEnrolControls:
+    """"Stop" / "ready" / "hold on" while the CAMERA is capturing. The stop
+    is the safe direction and takes the widest door -- every source -- and
+    a filled "uh, stop" went through none of them."""
+
+    class FakeRun:
+        running = True
+
+        def __init__(self):
+            self.aborted, self.skipped, self.paused = [], 0, 0
+
+        def abort(self, reason=""):
+            self.aborted.append(reason)
+
+        def skip(self):
+            self.skipped += 1
+
+        def pause(self):
+            self.paused += 1
+
+    @pytest.fixture
+    def run_cmdr(self, cmdr):
+        run = self.FakeRun()
+        cmdr.services.enrol_run = run
+        cmdr.services.enrol_offer = None
+        return cmdr, run
+
+    def test_bare_the_control(self, run_cmdr):
+        cmdr, run = run_cmdr
+        assert cmdr._try_enrol("stop").status == "Enrolment stopped"
+        assert run.aborted
+        assert cmdr._try_enrol("ready").status == "Enrolment: capturing"
+        assert cmdr._try_enrol("hold on").status == "Enrolment: holding"
+
+    @pytest.mark.parametrize("said", ["uh, stop", "Um, cancel.", "er, that's enough",
+                                      "stop, uh"])
+    def test_a_filled_stop_still_shuts_the_lens(self, run_cmdr, said):
+        cmdr, run = run_cmdr
+        res = cmdr._try_enrol(said)
+        assert res is not None and res.status == "Enrolment stopped", said
+        assert run.aborted, said
+
+    def test_a_filled_ready_and_a_filled_wait(self, run_cmdr):
+        cmdr, run = run_cmdr
+        assert cmdr._try_enrol("uh, ready").status == "Enrolment: capturing"
+        assert run.skipped == 1
+        assert cmdr._try_enrol("um, hold on").status == "Enrolment: holding"
+        assert run.paused == 1
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_a_pure_filler_steers_nothing(self, run_cmdr, said):
+        cmdr, run = run_cmdr
+        assert cmdr._try_enrol(said) is None, said
+        assert not run.aborted and run.skipped == 0 and run.paused == 0
+
+    def test_a_new_subject_that_starts_with_a_filler_steers_nothing(self, run_cmdr):
+        cmdr, run = run_cmdr
+        assert cmdr._try_enrol("uh, what time is it") is None
+        assert not run.aborted
+
+
+class TestTheDayShift:
+    """"And the next day?" after "what do I have on tomorrow" -- a reply
+    to the last turn, the same class as a correction, and start-anchored
+    on "and / what about"."""
+
+    PREV = "what do I have on tomorrow"
+
+    def test_bare_the_control(self):
+        from jarvis.commander import day_shift_followup
+        assert day_shift_followup(self.PREV, "what about the next day") == \
+            "what do I have on Tuesday"
+
+    @pytest.mark.parametrize("said", ["uh, what about the next day",
+                                      "Um, and the day after that?",
+                                      "er, the next day", "and the next day, uh"])
+    def test_a_filled_follow_up_still_moves_the_day(self, said):
+        from jarvis.commander import day_shift_followup
+        assert day_shift_followup(self.PREV, said) == "what do I have on Tuesday", said
+
+    @pytest.mark.parametrize("said", PURE_FILLER + ["uh, what's the weather"])
+    def test_a_pure_filler_or_a_new_subject_moves_nothing(self, said):
+        from jarvis.commander import day_shift_followup
+        assert day_shift_followup(self.PREV, said) is None, said
+
+
+class TestTheLeaveTimeList:
+    """leavetime._ANSWER_FILLER is a second, pre-existing filler list and is
+    LEFT ALONE. It is named in the census as known; this is the probe that
+    keeps "not a live gap" a measured claim rather than a remembered one:
+    every word in the one vocabulary, in front of and behind a duration."""
+
+    @pytest.mark.parametrize("word", sorted(FILLER_WORDS))
+    def test_every_filler_word_in_front_of_a_duration(self, word):
+        from jarvis.leavetime import answer_minutes
+        assert answer_minutes(f"{word}, ten minutes") == 10, word
+        assert answer_minutes(f"{word} ten minutes") == 10, word
+        assert answer_minutes(f"ten minutes, {word}") == 10, word
+
+
+class TestABareHesitationLeavesTheQuestionStanding:
+    """Integration note (b). The terminal offer left a bare "Uh..." parked
+    -- "not an answer, and not a new subject either" -- while the briefing
+    offer SPENT the day's one offer on it. One rule now, for both: a
+    hesitation is not an answer to either question. (Taken as the default
+    for him; flagged in the report.)"""
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_the_briefing_offer_stands_and_the_next_yes_runs_it(self, cmdr, said):
+        ran = _offer(cmdr)
+        cmdr.handle(said, "voice")
+        assert ran == [], said
+        assert isinstance(cmdr.services.briefing_offer, dict), \
+            f"{said!r} spent the day's offer"
+        assert cmdr.question_open()
+        res = cmdr.handle("yeah", "voice")
+        assert ran == [1], said
+        assert res is not None and res.status.startswith("Briefing")
+
+    @pytest.mark.parametrize("said", PURE_FILLER)
+    def test_the_terminal_offer_stands_and_the_next_yes_opens_it(self, cmdr, said):
+        cmdr.services.claude = MagicMock()
+        cmdr.services.claude.open_terminal.return_value = True
+        cmdr._pending_terminal_slug = "example"
+        cmdr._pending_terminal_made = _t.monotonic()
+        cmdr.handle(said, "voice")
+        assert cmdr._pending_terminal_slug == "example", said
+        res = cmdr.handle("yes", "voice")
+        assert res is not None and res.status == "Terminal", said
+        assert cmdr._pending_terminal_slug == ""
+
+    def test_a_new_subject_still_drops_the_briefing_offer(self, cmdr):
+        """The other half of the rule is untouched: a real change of
+        subject drops the offer, as it always did."""
+        ran = _offer(cmdr)
+        cmdr.handle("uh, what time is it", "voice")
+        assert ran == []
+        assert cmdr.services.briefing_offer is None
+
+
+class TestTheSendReadBackMaybe:
+    """The send lane's own two filler lists (_SEND_FILLER_LEAD_RX and
+    _SEND_FILLER_MID_RX) are backstopped by the canonical strip after them
+    -- with ONE hole, found by probing the "backstopped" claim rather than
+    repeating it. _send_clean hands the ORIGINAL back whole when the clean
+    leaves no letters, which is right for "okay" (a maybe, and the re-ask
+    it earns) and wrong for "uh, okay": the whole of "uh, okay" came back
+    with the filler on, and _SEND_MAYBE_RX -- anchored on the maybe word
+    -- refused it. Bare "okay" was asked again; "uh, okay" was not.
+
+    The lists are left alone. The maybe judgement strips at its own call
+    site, the same one-line move as everywhere else."""
+
+    @pytest.fixture
+    def readback_cmdr(self, cmdr, tmp_path):
+        from jarvis import outbox
+        root = tmp_path / "Desktop"
+        root.mkdir()
+        f = root / "lab_report.pdf"
+        f.write_bytes(b"%PDF-1.4 body")
+        st = f.stat()
+        draft = outbox.Draft(
+            path=f, size=st.st_size, mtime=st.st_mtime,
+            to_addr="dana@example.com", to_name="Dana",
+            account={"label": "school", "address": "me@example.com",
+                     "password": "example-secret"},
+            subject="Lab report", roots=[str(root)], made_at=_t.monotonic(),
+            asked_from="voice")
+        cmdr._pending_send = draft
+        cmdr.services.smtp = None            # nothing here may send
+        return cmdr, draft
+
+    def test_the_hole_in_the_backstop_is_real(self):
+        """Pinned as it stands: the lane's own clean hands "uh, okay" back
+        whole. The fix is downstream of it, not in it."""
+        from jarvis.commander import _send_clean
+        assert _send_clean("okay") == "okay"
+        assert _send_clean("uh, okay") == "uh, okay"
+
+    def test_bare_the_control(self, readback_cmdr):
+        cmdr, draft = readback_cmdr
+        res = cmdr._try_send_confirm("okay", "voice")
+        assert res is not None and res.status == "Confirm?"
+        assert cmdr._pending_send is draft and draft.reasked
+
+    @pytest.mark.parametrize("said", ["uh, okay", "Um, sure.", "er, alright",
+                                      "okay, uh", "uh, uh-huh"])
+    def test_a_filled_maybe_still_earns_the_re_ask(self, readback_cmdr, said):
+        cmdr, draft = readback_cmdr
+        res = cmdr._try_send_confirm(said, "voice")
+        assert res is not None and res.status == "Confirm?", said
+        assert cmdr._pending_send is draft and draft.reasked, said
+
+    @pytest.mark.parametrize("word", sorted(FILLER_WORDS))
+    def test_every_filler_word_still_leaves_a_yes_and_a_no(self, word):
+        """The backstop itself, probed word by word: a filled yes and a
+        filled no on the read-back come through the lane's own lists AND
+        the canonical strip behind them."""
+        from jarvis.commander import parse_send_answer
+        assert parse_send_answer(f"{word}, yes") is True, word
+        assert parse_send_answer(f"{word}, no") is False, word
+
+
+class TestTheAddressAndTheFiller:
+    """What the derived census found LAST, and reading had not: three rungs
+    take the address off BEFORE the filler -- ``correction_kind(
+    strip_address(text))`` and its two siblings -- and strip_address is
+    anchored at ^. So "jarvis, uh, I said Lisbon" was a correction and
+    "uh, jarvis, I said Lisbon" was not: the address was not at the
+    front, stayed on, and the grammar behind it (which does not take an
+    address of its own) refused the sentence. Measured before the fix:
+
+        correction_kind(strip_address("uh, jarvis, I said Lisbon"))  -> None
+        _LEAVE_DECLINE_RX  ... "uh, jarvis, no idea"                  -> no
+        day_shift_followup ... "uh, jarvis, what about the next day"  -> None
+
+    A filler can sit on EITHER side of the address, so the words are
+    stripped, then un-addressed, then stripped again -- the same one
+    function, one more time, at the call site."""
+
+    def _turn(self, cmdr, text):
+        from jarvis.commander import LastTurn
+        cmdr._last_turn = LastTurn(text, "ok", _t.monotonic())
+
+    @pytest.fixture
+    def redispatch(self, cmdr, monkeypatch):
+        meant = []
+
+        def fake_inner(text, source, gate=True, **kw):
+            meant.append(text)
+            return CommandResult(handled=True, status="Re-run")
+
+        monkeypatch.setattr(cmdr, "_handle_inner", fake_inner)
+        return meant
+
+    # -- the correction
+    def test_bare_the_control_correction(self, cmdr, redispatch):
+        self._turn(cmdr, "book a table in Lisburn")
+        res = cmdr._try_correction("jarvis, I said Lisbon", "voice")
+        assert res is not None and res.corrected == "Lisbon"
+        assert redispatch == ["Lisbon"]
+
+    @pytest.mark.parametrize("said", ["uh, jarvis, I said Lisbon",
+                                      "Um, Jarvis, I said Lisbon.",
+                                      "jarvis, uh, I said Lisbon",
+                                      "uh, jarvis, uh, I said Lisbon"])
+    def test_a_filler_on_either_side_of_the_address_is_still_a_correction(
+            self, cmdr, redispatch, said):
+        self._turn(cmdr, "book a table in Lisburn")
+        res = cmdr._try_correction(said, "voice")
+        assert res is not None and res.corrected == "Lisbon", said
+        assert redispatch == ["Lisbon"], said
+
+    # -- the leave-time decline
+    @pytest.fixture
+    def leave_cmdr(self, cmdr):
+        cmdr.services.leavetime = SimpleNamespace(
+            learn=lambda key, minutes: int(minutes))
+        cmdr._pending_leave = ("Example Hall", "Example Hall", _t.monotonic())
+        return cmdr
+
+    def test_bare_the_control_leave(self, leave_cmdr):
+        from jarvis.commander import LEAVE_DROPPED_LINE
+        res = leave_cmdr._try_leave_answer("jarvis, no idea")
+        assert res is not None and res.reply == LEAVE_DROPPED_LINE
+
+    @pytest.mark.parametrize("said", ["uh, jarvis, no idea", "Um, Jarvis, no idea.",
+                                      "jarvis, uh, no idea"])
+    def test_a_filler_on_either_side_of_the_address_still_declines(
+            self, leave_cmdr, said):
+        from jarvis.commander import LEAVE_DROPPED_LINE
+        res = leave_cmdr._try_leave_answer(said)
+        assert res is not None and res.reply == LEAVE_DROPPED_LINE, said
+        assert leave_cmdr._pending_leave is None, said
+
+    # -- the day-shift follow-up
+    def test_bare_the_control_day_shift(self, cmdr, redispatch):
+        self._turn(cmdr, "what do I have on tomorrow")
+        res = cmdr._try_day_shift("jarvis, what about the next day", "voice")
+        assert res is not None and res.corrected == "what do I have on Tuesday"
+
+    @pytest.mark.parametrize("said", ["uh, jarvis, what about the next day",
+                                      "jarvis, uh, and the day after that?"])
+    def test_a_filler_on_either_side_of_the_address_still_moves_the_day(
+            self, cmdr, redispatch, said):
+        self._turn(cmdr, "what do I have on tomorrow")
+        res = cmdr._try_day_shift(said, "voice")
+        assert res is not None and res.corrected == "what do I have on Tuesday", said
+        assert redispatch == ["what do I have on Tuesday"], said
+
+    @pytest.mark.parametrize("said", PURE_FILLER + ["uh, jarvis"])
+    def test_a_pure_filler_with_or_without_the_address_is_nothing(
+            self, cmdr, redispatch, said):
+        self._turn(cmdr, "what do I have on tomorrow")
+        assert cmdr._try_correction(said, "voice") is None, said
+        assert cmdr._try_day_shift(said, "voice") is None, said
+        assert redispatch == []
