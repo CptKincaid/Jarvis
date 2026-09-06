@@ -23,6 +23,14 @@ import jarvis.aside as aside_mod
 from jarvis.aside import AsideEngine, kill_phrase
 
 TZ = ZoneInfo("America/Chicago")
+
+# The fixtures below are built in America/Chicago and handed to the product
+# as absolute timestamps, which the product -- rightly -- renders in the
+# MACHINE's local zone. That made the file silently require the machine to
+# be in Chicago: measured 2026-09-05, green there at all 24 hours and red in
+# UTC, Tokyo, Kiritimati, Kolkata and London. A test about a house in Texas
+# should SAY so rather than assume it.
+pytestmark = pytest.mark.local_tz("America/Chicago")
 MON = datetime(2026, 9, 14, tzinfo=TZ)
 
 

@@ -186,6 +186,13 @@ class Match:
     candidates: list = field(default_factory=list)
     reason: str = ""
     size: int = 0
+    # How many candidates there really were before the list was capped at
+    # filepick.MAX_CANDIDATES. Without it the caller cannot tell "these are
+    # the two it could be" from "here are four of six", and offering four of
+    # six invites him to pick from a list the right file may not be in --
+    # which is the ambiguity question lying by omission. 0 means "same as
+    # len(candidates)".
+    total: int = 0
 
     @property
     def ok(self) -> bool:
@@ -384,7 +391,8 @@ def resolve(said: str, roots: Optional[Sequence[str]] = None,
         top = scored[0][0]
         tied = [f for s, f in scored if s >= top - TIE_SCORE]
         if len(tied) > 1:
-            return Match(candidates=tied[:filepick.MAX_CANDIDATES])
+            return Match(candidates=tied[:filepick.MAX_CANDIDATES],
+                         total=len(tied))
         return _final(scored[0][1], root_paths, max_mb)
 
     # No name: the folder, the type and the recency words are the whole
@@ -398,4 +406,5 @@ def resolve(said: str, roots: Optional[Sequence[str]] = None,
     clear = (_mtime(newest) - _mtime(runner)) > TIE_WINDOW_S
     if (ph.latest or ph.just) and fresh and clear:
         return _final(newest, root_paths, max_mb)
-    return Match(candidates=files[:filepick.MAX_CANDIDATES])
+    return Match(candidates=files[:filepick.MAX_CANDIDATES],
+                 total=len(files))

@@ -1301,13 +1301,29 @@ def test_the_empty_page_names_the_address_keys_when_the_switch_is_on():
     assert "presence.room_sensor_enabled" not in line
 
 
-def test_the_empty_page_says_the_fix_is_a_hand_edit_and_a_restart():
-    """Nothing on this page can set either switch, so telling him the key
-    without telling him where it lives is half an answer."""
-    for enabled in (True, False):
-        line = sp.empty_state_line(lambda k, d=None, e=enabled: (
-            e if k == "presence.room_sensor_enabled" else d))
-        assert "assistant.json" in line and "restart" in line.lower()
+def test_the_empty_page_says_where_the_fix_IS_in_the_look_it_is_in():
+    """Telling him the key without telling him where it lives is half an
+    answer -- and WHERE it lives changed on 2026-09-05.
+
+    Until then the only answer was a hand edit and a restart. Holo now has a
+    SETUP button that writes the profile AND both keys, so pointing him at
+    the file would be pointing him at the harder half of a job the page can
+    do. Classic is pixel-frozen and has no such button, so it keeps the old
+    sentence word for word. Read at CALL time, never captured.
+    """
+    from jarvis.ui import theme
+    try:
+        for look, wanted in (("holo", "press SETUP"),
+                             ("classic", "assistant.json")):
+            theme.select_look(look)
+            for enabled in (True, False):
+                line = sp.empty_state_line(lambda k, d=None, e=enabled: (
+                    e if k == "presence.room_sensor_enabled" else d))
+                assert wanted in line, (look, enabled)
+                if look == "classic":
+                    assert "restart" in line.lower()
+    finally:
+        theme.select_look(theme.DEFAULT_LOOK)
 
 
 # ------------------------------------------ MINOR: no staleness signal

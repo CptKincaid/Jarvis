@@ -24,6 +24,17 @@ from jarvis.tools.calendar import Event
 from jarvis.ui.views import briefing_rows
 
 TZ = timezone(timedelta(hours=-5))
+
+# These fixtures are written at a FIXED -05:00 offset (the TZ constant just
+# above) and handed to the product as absolute timestamps, which the product
+# -- rightly -- renders in the MACHINE's local zone. That made the file
+# silently require the machine to be at -05:00: measured 2026-09-05, it was
+# green in America/Chicago at all 24 hours and red in UTC, Tokyo, Kiritimati,
+# Kolkata and London. Saying which zone the fixtures are written in fixes
+# that without weakening anything. "XXX5" is a POSIX TZ string for a fixed
+# -05:00 with no DST, so it matches the constant exactly on every date and
+# needs no tzdata -- which keeps this file's "no tzdata needed" promise.
+pytestmark = pytest.mark.local_tz("XXX5")
 MON = datetime(2026, 8, 31, tzinfo=TZ)
 
 

@@ -46,7 +46,7 @@ DEFAULT_WORKFLOWS = {
                   " --format=csv"),
         ("shell", "df -h / /storage 2>/dev/null"),
         ("shell", "uptime"),
-        ("speak", "Good morning sir. Systems are online. GPU and storage"
+        ("speak", "Good morning, sir. Systems are online. GPU and storage"
                   " look healthy."),
     ],
     "training check": [
