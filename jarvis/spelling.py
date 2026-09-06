@@ -85,34 +85,62 @@ After the digit repair, 9 of the 20 measured false holds remain, and
 every one of them is the DANGLING-LETTER case: a phrase that ends on one
 bare letter after a function word ("switch to b", "the answer is c").
 **He ruled to keep them.** He accepts about 1.8 s occasionally on such a
-phrase, because that same rule is what buys him the FIRST character when
-he starts spelling an address, and being chopped off mid-address is worse
-than a pause. That is a DECISION, not a defect: it is not to be removed
-or watered down without asking him again.
+phrase, because that same rule is the one that can hold the FIRST
+character when he starts spelling an address, and being chopped off
+mid-address is worse than a pause. That is a DECISION, not a defect: it
+is not to be removed or watered down without asking him again. What the
+rule was SOLD as on 09-05 -- "buys the first spelled character" -- was
+not what the numbers said: the rule only names the text, and the decode
+that carries the text has to land before the stop. With the greedy
+preview as the only reporter it landed in time 4 phases in 9 (MEASURED,
+tests/test_spelling_survival.py); the recorder side that makes it land
+is described under THE [1, 6] SPLIT below. And with the speculative pass
+reporting, those six phrases are held ~every time rather than by the
+accident of preview timing -- the same 1.8 s, paid consistently.
 
-KNOWN LIMIT -- THE [1, 6] SPLIT (named by the 09-05 verdict)
-------------------------------------------------------------
-The hold reads the PREVIEW's newest decode, and the preview runs at a
-0.9 s cadence against a 0.8 s endpoint. When the decode of his first
-letter has not landed by the time the stop is due, that first character
-closes a capture of its own and the remaining six open the next one:
-"send it to q" / "z-v-k-b-w-7 at example.com". The second capture then
-drafts a PLAUSIBLE address missing its first letter -- zvkbw7@example.com
--- where the baseline's four-way chop produced obvious nonsense. This is a
-NEW failure shape, not a fixed one. This module cannot see across
-captures and does not try to. The only thing that catches it is the
-spoken READ-BACK, and that is unconditional by construction: every draft
-in the send lane is armed by ONE function (jarvis/commander.py
-_send_file_finish), which returns outbox.read_back for it, and the ONE
-call to outbox.send sits behind the yes to that sentence.
-tests/test_send_file.py section 27 drives the split end to end through
-the fake transport -- "email ... to q", then "z-v-k-b-w-7 at
-example.com" -- and pins both counts: zero sends before the read-back,
-one after the yes, and the To: on the wire is the address the read-back
-spoke (test_nothing_reassembled_goes_on_the_wire_unread). A source-level
-test (test_every_draft_is_read_back_before_it_can_be_sent_by_construction)
-holds the arming point and the send call at one each, so a second of
-either is a deliberate act. A wrong address is heard before it can go;
+THE [1, 6] SPLIT -- what it was, what it is now (09-06)
+---------------------------------------------------------
+The hold reads the newest DECODE, and a decode has to land before the
+stop is due. When the decode of his first letter has not landed by then,
+that first character closes a capture of its own and the remaining six
+open the next one: "send it to q" / "z-v-k-b-w-7 at example.com". The
+second capture then drafts a PLAUSIBLE address missing its first letter
+-- zvkbw7@example.com -- where the baseline's four-way chop produced
+obvious nonsense. The 09-05 verdict called that "a new failure shape";
+the 09-06 adversary showed it was the COMMON path, twice over:
+
+* THE SPECULATIVE PASS PARKED THE PREVIEW THAT FED THE HOLD. Only the
+  greedy preview reported to the recorder, and the app's speculative
+  full decode runs from 0.3 s into EVERY pause and pushes the greedy
+  back 0.9 s. MEASURED on the recorder's real poll cadence with his own
+  log's speculative decode times (n=238, p50 0.24 s, p90 0.46 s; the
+  greedy latency swept 0.2-0.6 s because it is not logged;
+  tests/test_spelling_survival.py): after "send an email to" the first
+  letter survived 4 of 9 preview phases (3 of 9 at 0.6 s) and the whole
+  seven-character address at his 0.99 s pace 0 of 9. The 09-05 harness
+  had no speculative pass, which is why it showed all seven landing.
+  Now the speculative pass REPORTS a decode that ends on a run
+  (Recorder.note_speculative, additive only), and the recorder WAITS,
+  bounded, for a decode that is still running and whose snapshot covers
+  the pause (Recorder.note_decoding, DECODE_WAIT_MAX_S) instead of
+  stopping past it -- the measured rates are in that test and in
+  Recorder._hold_extra.
+* A BARE SPELLED ANSWER WAS NEVER HELD, BY THE RULE. spelling_run("q") is
+  0 -- no function word in front of it -- so answering "What is it?" by
+  spelling straight away ALWAYS split [1, 6]. Now the recorder is told
+  when an address is OWED (the question just asked is the function word:
+  ``address_owed`` below) and a bare answer is held from its first
+  character.
+
+What has not changed: this module cannot see across captures and does
+not try to, and the spoken READ-BACK stays the last line. It is
+unconditional by construction: every draft in the send lane is armed by
+ONE function (jarvis/commander.py _send_file_finish), which returns
+outbox.read_back for it, and the ONE call to outbox.send sits behind the
+yes to that sentence. tests/test_send_file.py section 27 drives the split
+end to end through the fake transport and pins both counts: zero sends
+before the read-back, one after the yes, and the To: on the wire is the
+address the read-back spoke. A wrong address is heard before it can go;
 nothing reassembled is ever sent unread.
 
 THE REASSEMBLY
@@ -181,15 +209,24 @@ _CHAR = r"[A-Za-z0-9]"
 # rewritten to "ab@example.com" — a different mailbox, from a fold that was
 # only ever meant to help a SPOKEN one.
 _EDGE = r"[A-Za-z0-9_'@]"
-# The trailing ",?" is whisper's own punctuation, not his: it writes a comma
-# between two spelled groups AND after the last one ("q-z-v, k-b-w-7, at
-# example dot com" -- the exact shape of the fourth fragment he was left
-# with on 09-05). The comma before "at" broke the address parser, which
-# wants the local part and "at" separated by nothing but space. Only the
-# alphanumerics inside a match are emitted, so including the comma in the
-# match is what drops it.
+# The trailing comma OR full stop is whisper's own punctuation, not his: it
+# writes a comma between two spelled groups AND after the last one ("q-z-v,
+# k-b-w-7, at example dot com" -- the exact shape of the fourth fragment he
+# was left with on 09-05), and just as often a full stop after the LAST
+# spelled character ("q. z. v. k. b. w. 7. at example.com", "q-z-v,
+# k-b-w-7. at example.com"). Either one before "at" broke the address
+# parser, which wants the local part and "at" separated by nothing but
+# space, and the 09-06 adversary showed the full stop left him with NO
+# re-ask at all (parse "" and unresolved_address "" alike). The stop is
+# consumed only when whitespace or the end follows it: a stop glued to a
+# word ("q-z-v.txt") is part of that word, and so is a joiner glued to one
+# ("j-r.smith", "d.a.n.smith") -- the `(?![-–—.]\w)` guard refuses a run
+# that continues into a longer token, INCLUDING by backtracking to a
+# shorter run, so "j.r.smith@example.com" (typed) is never touched (the
+# 09-06 adversary caught it folding to "jr.smith@").
 _RUN_RX = re.compile(
-    r"(?<!" + _EDGE + r")" + _CHAR + r"(?:" + _SEP + _CHAR + r")+(?!" + _EDGE + r"),?")
+    r"(?<!" + _EDGE + r")" + _CHAR + r"(?:" + _SEP + _CHAR + r")+(?!" + _EDGE + r")"
+    r"(?![-–—.]\w)(?:,|\.(?=\s|$))?")
 
 # Tokenising for the RULE (not the fold): whitespace and the punctuation
 # whisper hangs on letters both split. "example.com" splits into two
@@ -201,14 +238,51 @@ def _tokens(text: str) -> list:
     return [t for t in _TOKENS_RX.split(text) if t]
 
 
-def spelling_run(text) -> int:
+_JOINER_WORDS = frozenset({"dot", "period", "dash", "hyphen", "underscore"})
+
+
+def _unfinished_domain_at(toks: list):
+    """The index of the LAST "at" whose tail is an unfinished domain --
+    nothing, one label, or anything ending on a joiner word -- or None
+    when the text does not end that way. "example.com" tokenises to two
+    labels, which is a finished domain, exactly as the parser reads it.
+
+    A tail of ONE single character ("dana at g") is not a label: it is
+    the first letter of a domain being SPELLED, and the ordinary rules
+    below hold it through the dangling case ("at" is in DANGLING_WORDS).
+    Cutting there returned 0 for it -- the first attempt at this round
+    did, and a spelled domain lost its first letter."""
+    for i in range(len(toks) - 1, -1, -1):
+        if toks[i].lower() == "at":
+            tail = toks[i + 1:]
+            if not tail or tail[-1].lower() in _JOINER_WORDS:
+                return i
+            if len(tail) == 1 and len(tail[0]) > 1:
+                return i
+            return None
+    return None
+
+
+def spelling_run(text, address_owed: bool = False) -> int:
     """How many characters the text's trailing SPELLING RUN is, or 0.
 
     3 for "send it to q-z-v", 4 for "k-b-w-7" (a digit rides inside a
-    run), 1 for "send an email to q" (the dangling case), 0 for "what is
-    plan B", "set a timer for 5", "gate 4 b" (one letter labelling a
-    number is not a run), "q-z-v at example dot com" (the run ended when
-    he started saying the domain) and every ordinary sentence.
+    run), 1 for "send an email to q" (the dangling case), 7 for
+    "q-z-v-k-b-w-7 at" (a bare "at" after a run: the domain is coming),
+    0 for "what is plan B", "set a timer for 5", "gate 4 b" (one letter
+    labelling a number is not a run), "q-z-v at example dot com" (the run
+    ended when he started saying the domain) and every ordinary sentence.
+
+    ``address_owed`` is the recorder's word that the commander has asked
+    for an address and is waiting on it ("I've no address for Dana, sir.
+    What is it?", or a read-back he may be about to correct). Then the
+    question that was just asked IS the function word: a trailing run of
+    ANY length holds, from its first character, whatever stands in front
+    of it and whatever letter it opens on -- "q", "d a", "a l", "no, q",
+    "it's a", "7". Without it the bare answer "q ... z-v-k-b-w-7 at
+    example.com" was split [1, 6] EVERY time, because spelling_run("q") is
+    0 by the ordinary rule, and the draft that followed was a plausible
+    address missing its first letter (the 09-06 adversary's finding B).
 
     A count, never the characters: this is what the recorder is given, and
     a spelled local part is half an address. The recorder logs the number.
@@ -217,6 +291,21 @@ def spelling_run(text) -> int:
     if not raw.strip():
         return 0
     toks = _tokens(raw)
+    if not toks:
+        return 0
+    # An UNFINISHED DOMAIN after a run is still mid-address: "q-z-v-k-b-w-7
+    # at" (drawing breath for the domain), "... at example" (no dot yet),
+    # "... at example dot" (the top level is coming). The run in front of
+    # the "at" is judged by the rules below exactly as if the domain had
+    # not been started. A finished domain ("at example dot com", "at
+    # example.com") ends the run as before. "at" cannot end an English
+    # sentence (it is in DANGLING_WORDS for that reason) and a one-label
+    # domain is not a domain, so an ordinary turn is not held by this;
+    # what it costs is the same ~1.8 s once on the rare "...at" or "...at
+    # <word>" that trails a real run.
+    cut = _unfinished_domain_at(toks)
+    if cut is not None:
+        return spelling_run(" ".join(toks[:cut]), address_owed) if cut else 0
     run: list = []
     for tok in reversed(toks):
         if len(tok) == 1 and tok.isalnum():
@@ -224,6 +313,16 @@ def spelling_run(text) -> int:
         else:
             break
     n = len(run)
+    if address_owed and n:
+        # The question that was just asked is the function word. No letter
+        # floor and no a/i exclusion either: "d a" (dana), "a l" (alice)
+        # and a first letter that IS "a" are all his address one character
+        # in. One bare DIGIT holds only when it is the whole answer ("7"
+        # for a local part that opens on one); after a word it is a number
+        # ("set a timer for 5" while a read-back waits) and not held.
+        if n >= MIN_RUN or run[0].isalpha() or len(toks) == 1:
+            return n
+        return 0
     if n >= MIN_RUN:
         # Two real letters, or it is a label on a number, not spelling.
         letters = sum(1 for c in run
@@ -251,10 +350,19 @@ def spelling_run(text) -> int:
     #   the wait is 2.5 s not 2.8.) Nine of the verdict's 67 realistic
     #   phrases have this shape; an ordinary sentence with no dangling
     #   letter is not delayed by a millisecond.
-    #   WHAT IT BUYS. The FIRST spelled character. Without this rule the
-    #   capture closes 0.8 s after "q", the "q" becomes a turn of its
-    #   own, and the address he then spells has no first letter -- which
-    #   is the 09-05 chop, and the reason this module exists.
+    #   WHAT IT BUYS. The RULE for the first spelled character: without
+    #   it nothing can hold "send an email to q", the capture closes
+    #   0.8 s after the "q", and the address he then spells has no first
+    #   letter -- the 09-05 chop, and the reason this module exists. The
+    #   rule alone did NOT buy the character, and the 09-05 text here
+    #   said it did: a decode has to land before the stop is due, and
+    #   MEASURED on the real poll cadence with the speculative pass
+    #   running (tests/test_spelling_survival.py), the first letter
+    #   survived 4 of 9 preview phases (3 of 9 at a 0.6 s greedy decode)
+    #   with the greedy preview as the only reporter. What makes the rule
+    #   worth its cost is the recorder side -- the speculative pass
+    #   reporting and the bounded wait for a decode in flight -- and the
+    #   rate it buys NOW is the number that test pins, not this comment.
     #   HE CHOSE IT. Asked on 09-05 with the cost in front of him whether
     #   to keep the behaviour: "yeah keep it". A decision, not a defect;
     #   not to be removed or narrowed without asking him again.
@@ -263,6 +371,15 @@ def spelling_run(text) -> int:
         return 0                       # a digit, "a" or "I": an ordinary turn
     prev = toks[-2].lower() if len(toks) >= 2 else ""
     return 1 if prev in DANGLING_WORDS else 0
+
+
+def _tight_dot(raw: str, i: int, start: int, end: int) -> bool:
+    """Is raw[i] a full stop with an alphanumeric glued to BOTH sides of it
+    inside the run [start, end)? "d.a.n" -> yes for both dots; "q. z. v"
+    -> no (a space follows); the stop _RUN_RX consumed at the end of the
+    run -> no (nothing alphanumeric follows inside the match)."""
+    return (raw[i] == "." and start < i < end - 1
+            and raw[i - 1].isalnum() and raw[i + 1].isalnum())
 
 
 def fold_spans(text) -> tuple:
@@ -277,6 +394,21 @@ def fold_spans(text) -> tuple:
 
     With no run in the text the result is the text itself and an identity
     map, so every existing caller is bit-for-bit unchanged.
+
+    A TIGHT DOT IS KEPT (default taken for him, 09-06). "d.a.n" and
+    "j.r.smith" -- a run joined by full stops with no space on either
+    side, which is how whisper wrote his spoken "dot" on 09-05 -- fold to
+    themselves, dots and all, and the parser reads the dotted local part
+    whole (d.a.n@example.com, read back "d dot a dot n at example dot
+    com"). Flattening it to "dan" was a silently different mailbox when he
+    HAD said "dot"; keeping the dots when he had NOT is a read-back with
+    "dot" in it, which his ear catches. Whichever he meant, he hears
+    exactly what will be sent. "q. z. v" (dot AND space) and "q-z-v" fold
+    as before: those are whisper's punctuation of letters, not a dot he
+    said. The cost, named: whisper also writes a spelled run
+    initialism-style ("Q.Z.V.K.B.W.7"), and that shape is now read back
+    with six "dot"s he never said -- a no and a re-spell, never a wrong
+    mailbox.
     """
     raw = str(text or "")
     out: list = []
@@ -287,7 +419,7 @@ def fold_spans(text) -> tuple:
             out.append(raw[i])
             imap.append(i)
         for i in range(m.start(), m.end()):
-            if raw[i].isalnum():
+            if raw[i].isalnum() or _tight_dot(raw, i, m.start(), m.end()):
                 out.append(raw[i])
                 imap.append(i)
         at = m.end()

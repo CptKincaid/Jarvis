@@ -2123,15 +2123,27 @@ def test_the_v3_oracle_is_still_the_floor_after_his_ruling_b():
     (09-05) HIS RULING (B) widened the branch's DOMAIN half: a run-together
     domain ("dana at example.com") is now read, and v3 could not read one
     at all. v3's whole domain pattern is embedded VERBATIM as the second of
-    the branch's two domain alternatives, and the LOCAL half -- the only
-    half _one_drafted replaces -- is byte-identical. So the branch is a
-    superset by construction: an alternation only ever matches more texts,
-    and on every text v3 matches, the branch matches at the same start with
-    the same group(1), so the identical masked line comes out."""
+    the branch's two domain alternatives. So the branch is a superset by
+    construction: an alternation only ever matches more texts, and on
+    every text v3 matches, the branch matches at the same start with the
+    same group(1), so the identical masked line comes out.
+
+    (09-06) The LOCAL half -- the only half _one_drafted replaces -- is
+    v3's with ONE more way to join two labels: a tight dot ("d.a.n",
+    "j.r.smith"), kept and read back as "dot" rather than flattened into
+    a different mailbox. It is v3's local half with `\.` added as an
+    alternative to the spoken joiner, and nothing else: an alternative
+    inside the repeat only ever matches more, and where it starts a match
+    EARLIER ("x.dana at ...": v3 masked from "dana", leaving "x." raw)
+    the line comes out more masked, never less. The floor rows below prove
+    it on the regex itself."""
     v3, mine = _V3_SPOKEN_ADDR_RX.pattern, outbox._SPOKEN_ADDR_RX.pattern
     assert v3 != mine                      # ruling (B) widened it on purpose
     head, sep, v3_domain = v3.partition(r"\s+at\s+")
-    assert mine.startswith(head + sep)                   # the local half is v3's
+    v3_joiner = r"\s+" + _V3_LOCAL_JOINER + r"\s+"
+    assert v3_joiner in head
+    head_with_tight_dot = head.replace(v3_joiner, r"(?:" + v3_joiner + r"|\.)")
+    assert mine.startswith(head_with_tight_dot + sep)    # the local half is v3's plus the tight dot
     assert "(?:" + v3_domain[1:-1] + ")" in mine         # v3's domain, verbatim
     assert _V3_ADDR_RX.pattern == outbox._ADDR_RX.pattern
     for row in V3_FLOOR_ROWS:

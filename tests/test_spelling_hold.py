@@ -537,12 +537,18 @@ def test_the_stop_event_carries_the_spelling_hold_count():
 
 
 @pytest.mark.parametrize("text,folded", [
-    ("q-z-v", "qzv"), ("q z v", "qzv"), ("Q.Z.V", "QZV"),
-    ("q. z. v.", "qzv."), ("q-z-v, k-b-w", "qzvkbw"),
+    ("q-z-v", "qzv"), ("q z v", "qzv"), ("Q.Z.V", "Q.Z.V"),
+    ("q. z. v.", "qzv"), ("q-z-v, k-b-w", "qzvkbw"),
 ])
 def test_every_shape_whisper_writes_a_run_in_reads_the_same(text, folded):
     """Whisper punctuates a spelled run four different ways in one
-    transcript; all four are one man saying letters."""
+    transcript; all four are one man saying letters, and all four HOLD.
+    Three of the four fold to the bare letters. The fourth -- the
+    initialism shape, dots with no space -- is the one shape that could
+    also be a dot he SAID ("d.a.n"), so since 09-06 its dots are KEPT and
+    read back as "dot" (section 13 below): a read-back he can refuse,
+    never a silent pick. "q. z. v." folds to "qzv" and not "qzv." now:
+    the full stop after the last spelled character is whisper's."""
     assert spelling.spelling_run(text) >= 3
     assert spelling.fold(text) == folded
 
@@ -801,3 +807,390 @@ def test_what_ruling_b_costs_is_measured_and_pinned():
     assert outbox.parse_address("the file is notes.txt") == ""      # no "at": never an address
     assert outbox.parse_address("open report.pdf") == ""
     assert outbox.parse_address("have a look at 4.30") == ""        # a digit top level never
+
+
+# ==================== (11) THE FULL STOP AFTER THE LAST CHARACTER (09-06)
+#
+# The 09-06 adversary, finding C: whisper writes a full stop after the
+# LAST spelled character as often as a comma -- "q. z. v. k. b. w. 7. at
+# example.com", and "q-z-v, k-b-w-7. at example.com" (his 09-05 shape with
+# "." where whisper wrote ","). The comma was consumed; the stop was not,
+# so the parse gave "" AND unresolved_address gave "": no draft, no
+# "I heard ..." re-ask, only the generic one -- and "no, send it to
+# <that>" dropped the draft. Seven tests were red through the commander,
+# typed and voice; tests/test_send_file.py section 28 has them. Here: the
+# fold and the parse.
+FULL_STOP_SHAPES = [
+    "q. z. v. k. b. w. 7. at example.com",
+    "q-z-v, k-b-w-7. at example.com",
+    "q-z-v. at example.com",
+    "Q-Z-V, K-B-W-7, at Example.com.",
+]
+
+
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_after_the_last_spelled_character_is_whispers(said):
+    from jarvis import outbox
+    assert outbox.parse_address(said).lower().startswith(
+        spelling.fold(said).split(" at ")[0].lower() + "@"), (said, spelling.fold(said))
+    assert outbox.parse_address(said) != ""
+
+
+def test_the_full_stop_shapes_parse_to_the_characters_he_said():
+    from jarvis import outbox
+    assert outbox.parse_address("q. z. v. k. b. w. 7. at example.com") == "qzvkbw7@example.com"
+    assert outbox.parse_address("q-z-v, k-b-w-7. at example.com") == "qzvkbw7@example.com"
+    assert outbox.parse_address("q-z-v. at example.com") == "qzv@example.com"
+    assert outbox.parse_address("Q-Z-V, K-B-W-7, at Example.com.") == "QZVKBW7@Example.com"
+
+
+def test_a_stop_glued_to_a_word_is_that_words_not_the_runs():
+    """"q-z-v.txt" is a file name, not a spelled run with a stop after it;
+    and a joiner glued to a longer token ("j-r.smith") is not a run at all
+    -- including by backtracking to a shorter one, so a TYPED address is
+    never folded into a different mailbox (the adversary caught
+    "j.r.smith@example.com" folding to "jr.smith@")."""
+    assert spelling.fold("q-z-v.txt") == "q-z-v.txt"
+    assert spelling.fold("j.r.smith@example.com") == "j.r.smith@example.com"
+    assert spelling.fold("send it to j.r.smith@example.com") == "send it to j.r.smith@example.com"
+    assert spelling.fold("j-r.smith at example.com") == "j-r.smith at example.com"
+
+
+# ============ (12) THE DOMAIN THAT IS STILL BEING SAID, and the OWED answer
+def test_a_bare_at_after_a_run_is_still_mid_address():
+    """"q-z-v-k-b-w-7 at" -- drawing breath for the domain -- holds the
+    run in front of the "at"; so do "at example" (no top level yet) and
+    "at example dot" (it is coming). A finished domain ends the run."""
+    run = spelling.spelling_run
+    assert run("q-z-v-k-b-w-7 at") == 7
+    assert run("send it to q-z-v at") == 3
+    assert run("q-z-v at example") == 3
+    assert run("q-z-v at example dot") == 3
+    assert run("q-z-v at example dot com") == 0
+    assert run("q-z-v at example.com") == 0
+    assert run("look at me") == 0
+    assert run("what are you looking at") == 0
+    assert run("meet me at 5") == 0
+
+
+def test_a_spelled_domains_first_letter_is_the_dangling_case_not_a_label():
+    """"dana at g" is the first letter of a domain being spelled, held by
+    the dangling rule ("at" cannot end a sentence). The first attempt at
+    this round cut the text at the "at" and returned 0 for it."""
+    run = spelling.spelling_run
+    assert run("dana at g") == 1
+    assert run("dana at g-m-a") == 3
+    assert run("send it to q-z-v at g") == 1
+
+
+@pytest.mark.parametrize("said,count", [
+    ("q", 1), ("no, q", 1), ("it's q", 1), ("d a", 2), ("a l", 2), ("a", 1),
+    ("7", 1), ("q-z-v-k-b-w-7", 7), ("q. z. v.", 3),
+])
+def test_when_an_address_is_owed_a_bare_answer_holds_from_its_first_character(said, count):
+    """The 09-06 adversary's finding B: spelling_run("q") is 0 by the
+    ordinary rule, so the answer to "What is it?" ALWAYS split [1, 6] and
+    drafted a plausible address missing its first letter. With the
+    recorder told an address is owed, the question just asked IS the
+    function word: no letter floor, no a/i exclusion."""
+    assert spelling.spelling_run(said) in (0, count)
+    assert spelling.spelling_run(said, address_owed=True) == count
+
+
+@pytest.mark.parametrize("said", ["yes", "no", "okay", "never mind", "set a timer for 5",
+                                  "send it", "no, 7"])
+def test_an_owed_address_does_not_hold_the_ordinary_answers(said):
+    """A yes, a no, a sentence: not held even while an address is owed.
+    A bare digit after a word is a number, not a spelled character."""
+    assert spelling.spelling_run(said, address_owed=True) == 0
+
+
+def test_the_recorder_reads_owed_once_per_capture_from_the_apps_probe():
+    """Read at start() through address_owed_probe and never mid-capture,
+    so a question that expires while he is spelling cannot drop the hold
+    under him; a bare Recorder owes nothing; a probe that raises said no."""
+    src = inspect.getsource(Recorder.start)
+    assert "self._address_owed = self._probe_address_owed()" in src
+    rec = object.__new__(Recorder)
+    assert rec._probe_address_owed() is False
+    rec.address_owed_probe = lambda: True
+    assert rec._probe_address_owed() is True
+
+    def boom():
+        raise RuntimeError("no commander")
+    rec.address_owed_probe = boom
+    assert rec._probe_address_owed() is False
+
+
+def test_an_owed_capture_holds_the_bare_first_letter(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec._address_owed = True
+    rec.note_partial("q", 0.96, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False and rec._spell_holds == 1
+    rec = _speaks_then_pauses(monkeypatch)
+    rec._address_owed = False
+    rec.note_partial("q", 0.96, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec._spell_holds == 0
+
+
+def test_the_commander_owes_an_address_only_while_it_has_asked_for_one(tmp_path, monkeypatch):
+    """True while "What is it?" (a recipient SendAsk) or a read-back he
+    may correct is live and unexpired; False for the account and file
+    questions, for "Which one, sir?", and for nothing at all."""
+    import time as _t
+    from jarvis import outbox
+    from jarvis.commander import Commander, SendAsk, SENDASK_TTL_S
+    c = object.__new__(Commander)
+    assert c.address_owed() is False
+    c._pending_sendask = SendAsk(kind="recipient", said_file="f", who="Dana", hint="",
+                                 made_at=_t.monotonic())
+    assert c.address_owed() is True
+    c._pending_sendask = SendAsk(kind="account", said_file="f", who="Dana", hint="",
+                                 made_at=_t.monotonic())
+    assert c.address_owed() is False
+    c._pending_sendask = SendAsk(kind="recipient", said_file="f", who="Dana", hint="",
+                                 made_at=_t.monotonic() - SENDASK_TTL_S - 1)
+    assert c.address_owed() is False, "an expired question owes nothing"
+    c._pending_sendask = None
+    draft = outbox.Draft(path=tmp_path / "f.txt", size=1, mtime=0.0,
+                         to_addr="d@example.com", to_name="", account={},
+                         subject="", made_at=_t.monotonic())
+    c._pending_send = draft
+    assert c.address_owed() is True
+    draft.made_at = _t.monotonic() - outbox.DRAFT_TTL_S - 1
+    assert c.address_owed() is False
+
+
+def test_the_app_installs_the_probe_and_reads_it_through_the_commander():
+    import jarvis.app as app_mod
+    src = inspect.getsource(app_mod.JarvisApp)
+    assert "self.recorder.address_owed_probe = " in src
+    a = object.__new__(app_mod.JarvisApp)
+    assert a._address_owed(object()) is False               # a slim commander
+    assert a._address_owed(type("C", (), {"address_owed": lambda self: True})()) is True
+
+    class Boom:
+        def address_owed(self):
+            raise RuntimeError("x")
+    assert a._address_owed(Boom()) is False
+
+
+# ====================== (13) THE TIGHT DOT IS KEPT AND READ BACK AS "DOT"
+#
+# Default taken for him, 09-06. "d.a.n at example.com" was folded to
+# "dan" and "j.r.smith at example.com" read as the last label, "smith":
+# two silently different mailboxes, drafted, read back almost right, and
+# sent on a yes. Whisper wrote his spoken "dot" as "." for the domain on
+# 09-05, so it will for a local part too. Now the dots are KEPT: the wire
+# carries d.a.n@ / j.r.smith@ and the read-back says every dot, so
+# whichever he meant, his ear hears exactly what will be sent. What it
+# costs: whisper's initialism shape for a run he spelled WITHOUT dots
+# ("Q.Z.V.K.B.W.7") is read back with dots he never said -- a no and a
+# re-spell, never a wrong mailbox.
+@pytest.mark.parametrize("said,addr", [
+    ("d.a.n at example.com", "d.a.n@example.com"),
+    ("j.r.smith at example.com", "j.r.smith@example.com"),
+    ("d.a.n at example dot com", "d.a.n@example.com"),
+    ("send it to d.a.n at example.com please", "d.a.n@example.com"),
+    ("Q.Z.V.K.B.W.7 at example.com", "Q.Z.V.K.B.W.7@example.com"),
+])
+def test_a_tight_dotted_local_part_is_read_whole_dots_and_all(said, addr):
+    from jarvis import outbox
+    assert spelling.fold(said).split(" at ")[0].endswith(addr.split("@")[0])
+    assert outbox.parse_address(said) == addr
+    spoken = outbox.spoken_address(addr)
+    assert spoken.count(" dot ") == addr.count("."), spoken   # every dot is spoken
+    assert outbox.parse_address(spoken) == addr               # and reads back to itself
+
+
+def test_a_tight_dot_is_never_flattened_into_a_different_mailbox():
+    from jarvis import outbox
+    assert outbox.parse_address("d.a.n at example.com") != "dan@example.com"
+    assert outbox.parse_address("j.r.smith at example.com") != "smith@example.com"
+
+
+def test_a_spaced_dot_is_still_whispers_punctuation_of_letters():
+    """"q. z. v" (dot AND space) folds as before: those are letters."""
+    assert spelling.fold("q. z. v at example.com") == "qzv at example.com"
+    assert spelling.fold("d. a. n at example.com") == "dan at example.com"
+
+
+def test_the_tight_dot_maps_back_to_the_raw_text():
+    from jarvis import outbox
+    raw = "send it to d.a.n at example.com now"
+    span = outbox.address_span(raw)
+    assert span is not None
+    addr, start, end = span
+    assert addr == "d.a.n@example.com" and raw[start:end] == "d.a.n at example.com"
+
+
+# ==================== (14) THE DECODE IN FLIGHT: the stop waits for it
+#
+# The seam that makes the pass's report land in time (finding A, the
+# recorder side). tests/test_spelling_survival.py measures it on the real
+# cadence; these pin the rule at the tick.
+def test_a_decode_running_on_a_snapshot_that_covers_the_pause_holds_the_stop(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(1.0, rec.capture_id)           # snapshot past the last speech (0.96)
+    _push(rec, 26)                                    # 0.83 s: the stop is due
+    assert rec._check_endpoint() is False and rec.stops == []
+    assert rec._spell_holds == 0, "a wait is not a hold and is not counted as one"
+    rec.note_speculative("send it to q", 1.0, rec.capture_id)   # it lands: a run
+    _push(rec, 1)
+    assert rec._check_endpoint() is False and rec._spell_holds == 1
+
+
+def test_a_decode_that_lands_on_a_word_lets_the_stop_go_on_the_next_tick(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(1.0, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False
+    rec.note_partial("what time is it", 1.0, rec.capture_id)
+    _push(rec, 1)
+    assert rec._check_endpoint() is True and rec._spell_holds == 0
+    assert rec.stops[0][2] < 1.0
+
+
+def test_a_decode_snapshotted_before_the_burst_ended_cannot_say_and_is_not_waited_for(monkeypatch):
+    """A snapshot taken mid-word holds none of the letter that followed:
+    waiting for it would wait for nothing. DECODE_COVER_SLACK_S is the
+    tolerance: a chunk or three of the last character's decay."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(0.96 - recorder_mod.DECODE_COVER_SLACK_S - 0.05, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec.stops[0][2] < 1.0
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(0.96 - recorder_mod.DECODE_COVER_SLACK_S + 0.02, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False
+
+
+def test_the_wait_is_bounded_by_the_cap_when_the_decode_never_returns(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(1.0, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False
+    _push(rec, int(recorder_mod.DECODE_WAIT_MAX_S / (CHUNK / SAMPLE_RATE)) + 2)
+    assert rec._check_endpoint() is True
+    assert rec.stops[0][2] >= 0.8 + recorder_mod.DECODE_WAIT_MAX_S
+    assert recorder_mod.DECODE_WAIT_MAX_S < 2.0 <= 2.5, "below the spelling hold and the energy timer"
+
+
+def test_the_wait_is_off_with_the_spelling_hold_off(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch, spell_hold=False)
+    rec.note_decoding(1.0, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec.stops[0][2] < 1.0
+
+
+def test_a_decode_announced_by_a_finished_capture_is_not_waited_for(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_decoding(1.0, rec.capture_id - 1)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True
+
+
+def test_a_new_capture_forgets_a_decode_in_flight():
+    rec = object.__new__(Recorder)
+    rec._decoding = (3.0, 1.0)
+    rec._decode_wait_key = 3.0
+    rec._reset_filler_hold()
+    assert rec._decoding is None and rec._decode_wait_key is None
+
+
+def test_the_speculative_report_only_ever_adds_a_hold_and_clears_the_wait(monkeypatch):
+    """Additive: a pass whose text does not end on a run stores nothing
+    (its clean full decode is the one most likely to have dropped a
+    trailing letter, and the greedy stays the one thing that clears a
+    hold) -- but it does clear the decode-in-flight marker, whatever it
+    said, or a pass that came back empty would hold the mic for the cap."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("send it to q-z-v", 0.96, rec.capture_id)
+    rec.note_decoding(1.0, rec.capture_id)
+    rec.note_speculative("", 1.0, rec.capture_id)
+    assert rec._decoding is None
+    assert rec._latest_partial[1] == 3, "the greedy's run is still what the hold reads"
+    rec.note_speculative("send it to q-z-v-k", 1.05, rec.capture_id)
+    assert rec._latest_partial[1] == 4 and rec._latest_partial[0] == ""
+    rec.note_speculative("send it to q-z-v-k, um", 1.1, rec.capture_id)
+    assert rec._latest_partial[1] == 4, "a filler from the pass is never stored"
+
+
+def test_the_partial_loop_announces_every_decode_before_the_model_runs(monkeypatch):
+    """Recorder.note_decoding is called with the buffer end and the
+    capture stamp BEFORE transcriber.partial; note_partial after."""
+    import jarvis.events as events_mod
+    monkeypatch.setattr(events_mod.bus, "publish", lambda ev: None)
+    order = []
+
+    class Rec:
+        recording = True
+        capture_id = 7
+
+        def snapshot_audio(self):
+            return np.zeros(int(SAMPLE_RATE * 2.0), dtype=np.float32)
+
+        def note_decoding(self, end_s, capture_id=None):
+            order.append(("announce", end_s, capture_id))
+
+        def note_partial(self, text, end_s, capture_id=None):
+            order.append(("partial", text, end_s, capture_id))
+            Rec.recording = False
+
+    class Tr:
+        def partial(self, audio):
+            order.append(("decode",))
+            return "send it to q"
+
+    import jarvis.app as app_mod
+    pipe = object.__new__(app_mod.JarvisApp)
+    pipe.recorder, pipe.transcriber = Rec(), Tr()
+    pipe._PARTIAL_INTERVAL_S, pipe._PARTIAL_MIN_S, pipe._PARTIAL_MAX_S = 0.01, 0.5, 1.0
+    pipe._partial_loop()
+    assert order == [("announce", 2.0, 7), ("decode",), ("partial", "send it to q", 2.0, 7)], order
+
+
+def test_the_speculative_pass_announces_itself_and_always_reports_back(monkeypatch):
+    """Announce before _decode_clip; report after it through
+    note_speculative whatever came back -- an empty decode included."""
+    import threading
+    from types import SimpleNamespace
+    import jarvis.app as app_mod
+    import jarvis.events as events_mod
+    monkeypatch.setattr(events_mod.bus, "publish", lambda ev: None)
+    monkeypatch.setattr(recorder_mod.CONFIG, "endpoint_vad", True)
+    monkeypatch.setattr(recorder_mod.CONFIG, "noise_gate", False)
+    monkeypatch.setattr(recorder_mod.CONFIG, "speaker_verify", False)
+    order = []
+
+    class Rec(Recorder):
+        def __init__(self):
+            self.recording = True
+            self.endpointer = SimpleNamespace(silence_since_speech=0.3, last_speech_seconds=1.5)
+            self._record_rate = SAMPLE_RATE
+            self._resample_to_16k = lambda a: a
+            self._audio_frames = [np.zeros((SAMPLE_RATE * 2, 1), dtype=np.float32)]
+
+        def note_decoding(self, end_s, capture_id=None):
+            order.append(("announce", end_s, capture_id))
+
+        def note_speculative(self, text, end_s, capture_id=None):
+            order.append(("report", text, end_s, capture_id))
+
+    for text in ("send it to q", ""):
+        order.clear()
+        rec = Rec()
+        a = object.__new__(app_mod.JarvisApp)
+        a.assistant = SimpleNamespace(get=lambda k, d=None: d, user_name="Hunter")
+        a._init_assistant_state()
+        a.recorder = rec
+        a.speaker = SimpleNamespace(enrolled=False)
+        a._spec_lock = threading.Lock()
+        a.transcriber = SimpleNamespace(
+            loaded=True,
+            transcribe=lambda audio: SimpleNamespace(text=text, confidence=-0.2, accepted=True))
+        a._owner_has_phrase = lambda: False
+        assert a._maybe_speculate() is True
+        assert order == [("announce", 2.0, rec.capture_id), ("report", text, 2.0, rec.capture_id)], order

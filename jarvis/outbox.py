@@ -642,8 +642,19 @@ _DOMAIN_TIGHT = (_DOMAIN_LABEL + r"(?:\." + _DOMAIN_LABEL + r")*"
 _DOMAIN_SPOKEN = (_DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
                   r"(?:\s+" + _DOMAIN_DOT + r"\s+" + _DOMAIN_LABEL
                   + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*)+")
+# THE TIGHT DOT IN A LOCAL PART (09-06, a default taken for him): "d.a.n at
+# example.com" and "j.r.smith at example.com" are read WHOLE -- d.a.n@,
+# j.r.smith@ -- and read back "d dot a dot n at example dot com". Before,
+# the fold flattened "d.a.n" to "dan" and _LOCAL_LABEL (no dot in it) took
+# the LAST label of "j.r.smith" as the local part: dan@ and smith@, two
+# silently different mailboxes, drafted, read back almost right, and sent
+# on a yes. Whisper wrote his spoken "dot" as "." for the domain on 09-05,
+# so it will for a local part too. Keeping the dots means his ear hears
+# exactly what will be sent, whichever he meant (jarvis.spelling.fold_spans
+# keeps them; this alternative reads them). The tight dot is the same
+# shape _DOMAIN_TIGHT already reads on the other side of the "at".
 _SPOKEN_ADDR_RX = re.compile(
-    r"\b(" + _LOCAL_LABEL + r"(?:\s+" + _LOCAL_JOINER + r"\s+" + _LOCAL_LABEL + r")*)"
+    r"\b(" + _LOCAL_LABEL + r"(?:(?:\s+" + _LOCAL_JOINER + r"\s+|\.)" + _LOCAL_LABEL + r")*)"
     r"\s+at\s+"
     r"((?:" + _DOMAIN_TIGHT + r")|(?:" + _DOMAIN_SPOKEN + r"))", re.I)
 _JOINER_RX = re.compile(

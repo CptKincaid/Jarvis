@@ -3407,3 +3407,114 @@ def test_every_draft_is_read_back_before_it_can_be_sent_by_construction():
     assert len(arms) == 1, arms
     finish = inspect.getsource(commander_mod._send_file_finish)
     assert ".stash_send(" in finish and "outbox.read_back(prep.draft)" in finish
+
+
+# ==================================================================
+# 28. The full stop after the last spelled character, and the tight dot
+#     (the 09-06 adversary's finding C, through the commander)
+# ==================================================================
+# Whisper writes a full stop after the LAST spelled character as often as
+# a comma: "q. z. v. k. b. w. 7. at example.com", and "q-z-v, k-b-w-7. at
+# example.com" (his 09-05 shape with "." where whisper wrote ","). The
+# comma was consumed on 09-05; the stop was not, and it left him with NO
+# re-ask -- parse "" and unresolved_address "" alike -- and "no, send it
+# to <that>" dropped the draft. These were red, typed and voice.
+FULL_STOP_SHAPES = [
+    "q. z. v. k. b. w. 7. at example.com",
+    "q-z-v, k-b-w-7. at example.com",
+]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_the_first_sentence_is_read_back_and_the_yes_goes_there(
+        cmd, said, source):
+    res = cmd.handle(f"email the biosensors handout to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert res.reply.endswith("Send it, sir?"), (said, res.reply)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == SPELLED_ADDR
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_the_answer_to_what_is_it(cmd, said, source):
+    res = cmd.handle("email the biosensors handout to Dana", source=source)
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Dana")
+    res = cmd.handle(said, source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_a_correction_keeps_the_draft_and_reads_it_back(
+        cmd, said, source):
+    """"no, send it to <that>" used to DROP the draft ("Very good, sir;
+    nothing sent."): the correction was not seen as an address."""
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(f"no, send it to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.speak and res.reply.endswith("Send it, sir?"), (said, res)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    assert "heather at example dot com" not in res.reply
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_a_parsed_full_stop_shape_has_exactly_the_characters_said(said):
+    """The seventh of the seven: the fold drops whisper's punctuation and
+    nothing else, so the local part is the seven characters and the domain
+    is the domain -- no stop folded into either."""
+    assert outbox.parse_address(said) == SPELLED_ADDR
+    assert outbox.unresolved_address(said) == ""
+
+
+# ---- the tight dot, end to end: the wire carries the dots, the read-back
+# ---- speaks every one of them (default taken for him, 09-06)
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said,addr,heard", [
+    ("d.a.n at example.com", "d.a.n@example.com", "d dot a dot n at example dot com"),
+    ("j.r.smith at example.com", "j.r.smith@example.com", "j dot r dot smith at example dot com"),
+])
+def test_a_tight_dotted_local_part_goes_on_the_wire_whole_and_every_dot_is_read_back(
+        cmd, said, addr, heard, source):
+    """"d.a.n" used to draft dan@ and "j.r.smith" smith@ -- two silently
+    different mailboxes, read back almost right, sent on a yes. Now the
+    read-back says every dot, so whichever he meant, he hears exactly what
+    will be sent; and only the yes sends, to exactly that."""
+    res = cmd.handle(f"email the biosensors handout to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert heard in res.reply and "@" not in res.reply, (said, res.reply)
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == addr
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [addr]
+    msg = FakeSMTP.made[-1].sent[-1]
+    assert msg["To"] == addr and "." in msg["To"].split("@")[0]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_tight_dotted_answer_to_what_is_it_is_read_back_with_its_dots(cmd, source):
+    cmd.handle("email the biosensors handout to Dana", source=source)
+    res = cmd.handle("d.a.n at example.com", source=source)
+    assert _sent_to() == []
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert "d dot a dot n at example dot com" in res.reply, res.reply
+    assert "dan at example dot com" not in res.reply
+    cmd.handle("no", source=source)
+    assert _sent_to() == [] and cmd._pending_send is None
+
+
+def test_the_tight_dot_is_never_flattened_on_the_way_to_the_wire():
+    assert outbox.parse_address("d.a.n at example.com") == "d.a.n@example.com"
+    assert outbox.parse_address("j.r.smith at example.com") == "j.r.smith@example.com"
+    assert outbox.parse_address("d.a.n at example.com") != "dan@example.com"
+    assert outbox.parse_address("j.r.smith at example.com") != "smith@example.com"
