@@ -368,10 +368,43 @@ def test_a_box_with_no_zone_source_and_no_camera_has_no_legs():
 
 
 def test_a_camera_feed_is_the_camera_leg():
+    """UPDATED 2026-09-06 and deliberately TIGHTENED. A feed alone was
+    enough while nothing on the tree ever attached one -- the leg could
+    not be counted, so the gate could not be wrong. Now that the app owns
+    a feed, all three of the things that would actually have to publish
+    this leg are checked: the feed, the producer that looks through it,
+    and a gallery that can put a NAME to what it sees. A leg counted here
+    that cannot fire is his mail question silently never being asked."""
+    a = make_app(legs=None,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          camera_feed=object(),
+                                          eyeloop=object()))
+    a._camera_can_name_cache = True
+    assert a._settle_legs() == ("camera",)
+
+
+def test_a_feed_with_no_producer_is_not_a_camera_leg():
+    """A feed nothing looks through never publishes a reading, so
+    _eye_identity answers "" for ever and the catch-up would wait for a
+    settle that cannot arrive."""
     a = make_app(legs=None,
                  services=SimpleNamespace(panel_wake=None, briefing_offer=None,
                                           camera_feed=object()))
-    assert a._settle_legs() == ("camera",)
+    a._camera_can_name_cache = True
+    assert a._settle_legs() == ()
+
+
+def test_a_camera_that_cannot_name_anybody_is_not_a_camera_leg():
+    """This leg is delivered by a NAME. With identity off, nobody
+    enrolled, or an enrolment belonging to a model that is no longer the
+    active one (a real state on this box since the 09-03 backend swap),
+    the producer counts faces and names nobody -- which never settles."""
+    a = make_app(legs=None,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          camera_feed=object(),
+                                          eyeloop=object()))
+    a._camera_can_name_cache = False
+    assert a._settle_legs() == ()
 
 
 def test_a_zone_source_with_NO_ZONES_CONFIG_is_not_a_leg():

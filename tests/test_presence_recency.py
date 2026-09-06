@@ -197,9 +197,20 @@ def test_the_probe_reads_the_freshest_agreement_across_open_runs(clocked):
     stuck, now = clocked
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
+    # UPDATED 2026-09-06 on two points, neither of them a relaxation.
+    #  * ``now`` -- the probe's phone grace runs on ITS OWN clock, so a
+    #    scenario driven by a fake one has to hand it over or the phone
+    #    never gets past PHONE_UNKNOWN and the cell under test is never
+    #    reached.
+    #  * the False first -- a room whose FIRST reading of a process is True
+    #    is a latch of unknown age and cell 6 now HOLDS on it (see
+    #    tests/test_presence_boot_grace.py). This test is about the
+    #    freshest AGREEMENT across open runs, so it opens an ordinary run.
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
                                  phone=lambda ip, mac: False,
-                                 mic=lambda: None, recency_s=900.0)
+                                 mic=lambda: None, recency_s=900.0,
+                                 now=lambda: now["t"], grace_s=0.0)
+    stuck.observe("office", False)
     stuck.observe("office", True)
     now["t"] += 60.0
     assert leg("1.2.3.4", "") is True          # 60 s old: fresh
@@ -208,16 +219,22 @@ def test_the_probe_reads_the_freshest_agreement_across_open_runs(clocked):
     assert leg.verdict.cell == 6
 
 
-def test_the_mic_leg_is_reported_alongside_the_other_three(clocked):
+def test_every_leg_that_can_move_a_verdict_is_reported(clocked):
+    """The three legs of his design, plus the two witnesses that can veto an
+    away. The DESK joined them on 2026-09-06 (see
+    tests/test_presence_desk_and_switch.py); a leg that decided a vote and
+    does not appear in the line that reports it is how "why did he not
+    greet me" stops having an answer on disk."""
     stuck, _now = clocked
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
                                  phone=lambda ip, mac: False,
-                                 mic=lambda: 30.0)
+                                 mic=lambda: 30.0, desk=lambda: 45.0)
     leg("1.2.3.4", "")
     assert leg.legs["mic"] == pv.MIC_HEARD
-    assert set(leg.legs) == {"phone", "camera", "rooms", "mic"}
+    assert leg.legs["desk"] == pv.DESK_AT
+    assert set(leg.legs) == {"phone", "camera", "rooms", "mic", "desk"}
 
 
 def test_a_mic_reader_that_throws_is_unknown_and_never_breaks_the_vote(clocked):
@@ -324,7 +341,11 @@ def desk_run(tmp_path, *, warm_min, mic_s_ago, recency_min=15.0, limit=180):
                                  phone=lambda i, m: phone["up"],
                                  mic=(None if mic_s_ago is None
                                       else (lambda: mic_s_ago)),
-                                 recency_s=recency_min * 60.0)
+                                 recency_s=recency_min * 60.0,
+                                 # The phone leg's grace runs on the
+                                 # probe's own clock, so a fake-clock
+                                 # scenario has to hand it the same one.
+                                 now=now)
     s = presence.PresenceSentinel(
         Cfg(**{"presence.phone_ip": "1.2.3.4", "presence.enabled": True}),
         publish=lambda e: None, probe_fn=leg, now=now, poll_s=60.0)
