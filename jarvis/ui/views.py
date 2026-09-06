@@ -2142,13 +2142,19 @@ class SettingsDrawer(tk.Frame):
 
     def __init__(self, host, services=None,
                  on_config_change: Optional[Callable] = None,
-                 toast: Optional[Toast] = None):
+                 toast: Optional[Toast] = None,
+                 on_open_tab: Optional[Callable] = None):
         self.WIDTH = px(type(self).WIDTH)
         super().__init__(host, bg=theme.RAISED, width=self.WIDTH)
         self.host = host
         self.services = services
         self.on_config_change = on_config_change
         self.toast = toast
+        # The console's "light this tab" seam (main_window._open_tab). The
+        # drawer has no line to the tab strip of its own; without this the
+        # only pointer from where he looks first for "add a user" was a
+        # caption saying to go to the Users tab (2026-09-06).
+        self.on_open_tab = on_open_tab
         self._open = False
         self._anim = None
         self._x = self.WIDTH          # offset past the right edge
@@ -2170,14 +2176,29 @@ class SettingsDrawer(tk.Frame):
         self._inner = tk.Frame(self._canvas, bg=theme.RAISED)
         self._inner_win = self._canvas.create_window(
             0, 0, anchor="nw", window=self._inner, width=self.WIDTH)
-        self._inner.bind(
-            "<Configure>",
-            lambda e: self._canvas.configure(
-                scrollregion=self._canvas.bbox("all") or (0, 0, 0, 0)),
-            add=True)
+        # THE MARK THAT SAYS THERE IS MORE. MEASURED 2026-09-06: 3718 px of
+        # drawer in a 1329-px viewport at 920x1440 (36% visible; Privacy,
+        # Knightfall and Restart all below the fold) and 1649 at his own
+        # 1040x1760 -- scrolled by mouse wheel only, with nothing on screen
+        # saying it scrolled. The same 2-px CYAN_DIM strip the pages use,
+        # on the canvas' right edge, lifted above the inner window (the
+        # 09-05 stacking bug on the setup sheet). HOLO ONLY at paint time:
+        # classic's drawer crop is pixel-frozen (tests/test_ui_classic_frozen).
+        self._thumb = tk.Frame(self._canvas, bg=theme.CYAN_DIM,
+                               width=max(2, px(2)))
+        self._inner.bind("<Configure>", lambda e: self._sync_view(), add=True)
+        self._canvas.bind("<Configure>", lambda e: self._sync_thumb(),
+                          add=True)
         self._canvas.bind("<Enter>", self._grab_wheel, add=True)
         self._canvas.bind("<Leave>", self._drop_wheel, add=True)
         self.bind("<Escape>", lambda e: self.close(), add=True)
+        # KEYBOARD, in both looks (behaviour, not pixels): the drawer takes
+        # focus when it opens, so the keys land here unless he has clicked
+        # into a box, in which case they are that box's.
+        for seq, what in (("<Down>", "down"), ("<Up>", "up"),
+                          ("<Next>", "page_down"), ("<Prior>", "page_up"),
+                          ("<Home>", "home"), ("<End>", "end")):
+            self.bind(seq, lambda e, w=what: self._key_scroll(w), add=True)
 
         self._build_sections()
         if theme.LOOK == "holo":
@@ -2241,14 +2262,82 @@ class SettingsDrawer(tk.Frame):
         tick()
 
     def _grab_wheel(self, _e):
-        self._canvas.bind_all("<Button-4>",
-                              lambda e: self._canvas.yview_scroll(-2, "units"))
+        self._canvas.bind_all("<Button-4>", lambda e: self._key_scroll("up"))
         self._canvas.bind_all("<Button-5>",
-                              lambda e: self._canvas.yview_scroll(2, "units"))
+                              lambda e: self._key_scroll("down"))
 
     def _drop_wheel(self, _e):
         for seq in ("<Button-4>", "<Button-5>"):
             self._canvas.unbind_all(seq)
+
+    # ------------------------------------------------------ the scroll
+    def _key_scroll(self, what: str) -> str:
+        """Up/Down a step, Page Up/Down a page, Home/End the lot -- the
+        wheel goes through here too, so the thumb follows every move."""
+        try:
+            if what == "down":
+                self._canvas.yview_scroll(2, "units")
+            elif what == "up":
+                self._canvas.yview_scroll(-2, "units")
+            elif what == "page_down":
+                self._canvas.yview_scroll(1, "pages")
+            elif what == "page_up":
+                self._canvas.yview_scroll(-1, "pages")
+            elif what == "home":
+                self._canvas.yview_moveto(0.0)
+            elif what == "end":
+                self._canvas.yview_moveto(1.0)
+        except Exception:                      # noqa: BLE001 - torn down
+            log.debug("drawer: scroll failed", exc_info=True)
+        self._sync_thumb()
+        return "break"
+
+    def _sync_view(self) -> None:
+        try:
+            self._canvas.configure(
+                scrollregion=self._canvas.bbox("all") or (0, 0, 0, 0))
+        except Exception:                      # noqa: BLE001 - torn down
+            return
+        self._sync_thumb()
+
+    def overflow_px(self) -> int:
+        """How much of the drawer is below the fold (0 = it all fits)."""
+        try:
+            return max(0, self._inner.winfo_reqheight()
+                       - max(1, self._canvas.winfo_height()))
+        except Exception:                      # noqa: BLE001 - torn down
+            return 0
+
+    def _sync_thumb(self) -> None:
+        over = self.overflow_px()
+        try:
+            if over <= 0 or theme.LOOK != "holo":
+                self._thumb.place_forget()
+                return
+            height = max(1, self._canvas.winfo_height())
+            span = max(px(20), int(height * height / (height + over)))
+            top = self._canvas.canvasy(0)
+            frac = max(0.0, min(1.0, top / float(over)))
+            self._thumb.place(relx=1.0, x=-px(3), anchor="nw",
+                              y=int(frac * (height - span)), height=span)
+            self._thumb.lift()
+        except Exception:                      # noqa: BLE001 - torn down
+            log.debug("drawer: the thumb could not be placed", exc_info=True)
+
+    def _open_tab(self, key: str) -> None:
+        """Close the drawer and light a tab, through the console's seam."""
+        self.close()
+        fn = self.on_open_tab
+        if not callable(fn):
+            if self.toast:
+                self.toast.show("That tab is not wired to this console",
+                                kind="warn")
+            log.warning("drawer: on_open_tab not wired (%s)", key)
+            return
+        try:
+            fn(key)
+        except Exception:                      # noqa: BLE001 - a callback
+            log.exception("drawer: on_open_tab(%s) failed", key)
 
     # ---------------------------------------------------- config binding
     def bind_config(self, var_name: str, widget,
@@ -2606,7 +2695,17 @@ class SettingsDrawer(tk.Frame):
         # to undo it -- one click deep, next to a slider. Enrolling a voice
         # is on the USERS tab now, where it is judged before anything is
         # written and asks for the override code first.
-        self._info_row(box, "Enrol your voice on the Users tab")
+        #
+        # IN HOLO THAT IS A BUTTON. Settings is where he looks first for
+        # "add a user" (2026-09-06), and the only pointer was this caption.
+        # The button closes the drawer and lights the tab through the
+        # console's own seam. Classic keeps the caption: its drawer crop is
+        # pixel-frozen. Read at CALL time.
+        if theme.LOOK == "holo":
+            self._button_row(box, "Open the Users tab",
+                             lambda: self._open_tab("users"))
+        else:
+            self._info_row(box, "Enrol your voice on the Users tab")
         self._button_row(box, "Train wake word", self._service("train_wakeword"))
 
         # Speech
@@ -2661,6 +2760,11 @@ class SettingsDrawer(tk.Frame):
                             "left or right. Needs the camera preview on.")
         self._info_row(box, "The microphone stays on while offline — say "
                             "“come back online” to switch sensing back on.")
+        # The radar rooms are the Sensors tab's; same seam, same reason as
+        # the Users button above (holo only).
+        if theme.LOOK == "holo":
+            self._button_row(box, "Open the Sensors tab",
+                             lambda: self._open_tab("sensors"))
         # Knightfall (2026-09-04): the TYPED way back in when the spoken
         # passphrase cannot work either. In Privacy because it is a way
         # past the owner gate, which is what the rows above are about.

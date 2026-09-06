@@ -665,11 +665,12 @@ def empty_state_line(get_option: Optional[Callable]) -> str:
                       exc_info=True)
     # WHERE THE FIX IS depends on the look, because the button only exists
     # in one of them. Until 2026-09-05 the only answer was a hand edit and a
-    # restart; holo now has SETUP, which does both keys and the profile, so
+    # restart; holo has ADD A SENSOR (it was SETUP until 2026-09-06 -- a bare
+    # word that never said "add"), which does both keys and the profile, so
     # pointing him at the file would be pointing him at the harder half of
     # a job the page can do. Classic is frozen (``restyled``) and keeps the
     # old sentence word for word.
-    where = (" — press SETUP to add one"
+    where = (" — press ADD A SENSOR"
              if restyled() else
              " — edit ~/.config/jarvis/assistant.json and restart Jarvis")
     if not enabled:
@@ -2394,17 +2395,30 @@ class SensorsPage(tk.Frame):
         # the first place.
         act = tk.Frame(foot, bg=bg)
         act.pack(fill="x")
-        # SETUP, then SAVE. It is NOT in each room block's header: that row
-        # already packs name(w=12) + presence + distance(w=8) + rtt(w=8) at
-        # fixed widths and the measured body budget is 690 px into a 719-px
-        # viewport at 920x1440 -- 29 px spare. A fifth control there is the
-        # exact class of change that overflowed his real window this morning.
-        # The foot row is SAVE-left / age-right and has slack.
+        # ADD A SENSOR, then SAVE. It is NOT in each room block's header: that
+        # row already packs name(w=12) + presence + distance(w=8) + rtt(w=8)
+        # at fixed widths and the measured body budget is 690 px into a
+        # 719-px viewport at 920x1440 -- 29 px spare. A fifth control there
+        # is the exact class of change that overflowed his real window this
+        # morning. The foot row is button-left / toggle-right and has slack:
+        # MEASURED 2026-09-06 at 920, ADD A SENSOR (235) + SAVE (123) on the
+        # left and the toggle, its caption and their pads (360) on the right
+        # is 730 of the 856 px the row has.
+        #
+        # IT SAYS "ADD" AND IT IS OUTLINED. Hunter, 2026-09-06: "make them
+        # easy to use for me too add things". The word here was SETUP, kind
+        # ghost -- no outline in holo, so a bare word beside a ringed SAVE --
+        # and the only way to a new room was SETUP -> "+ NEW", another bare
+        # word among the room chips. Nothing on the page said "add a
+        # sensor". The accent kind is the ONE primary action on the page.
+        # SETUP is gone from the row (three words do not fit at 920: ADD A
+        # SENSOR + SETUP + SAVE is 878 px); editing a room is the same sheet,
+        # through its chips. The attribute keeps its name for the tests.
         # HOLO ONLY (``restyled``): this is inside _build, which _build_v3
         # never reaches, so classic gains nothing and loses nothing.
-        self.setup_btn = RoundButton(act, text="SETUP", kind="ghost",
+        self.setup_btn = RoundButton(act, text="ADD A SENSOR", kind="accent",
                                      size=theme.SIZE_CAPTION, bg=bg,
-                                     pad_y=5, command=self.open_setup)
+                                     pad_y=5, command=self.add_sensor)
         self.setup_btn.pack(side="left", padx=(0, px(6)))
         self._save_btn = RoundButton(act, text="SAVE", kind="default",
                                      size=theme.SIZE_CAPTION, bg=bg,
@@ -2441,6 +2455,13 @@ class SensorsPage(tk.Frame):
                               fg=theme.FAINT, bg=bg, anchor="w",
                               justify="left", bd=0, padx=0, pady=0)
         self._note.pack(side="left", fill="x", expand=True)
+        # It shares its row with the age readout, so it wraps to its OWN
+        # slot: wrapped to the page width it claimed 976 px of a 951-px
+        # slot at 1040 (MEASURED 2026-09-06) -- harmless for the standing
+        # caption, which is shorter, and a clipped word per line for the
+        # refusal message a bad band edit puts here.
+        self._note.bind("<Configure>", lambda e: self._note.configure(
+            wraplength=max(px(160), int(e.width))), add=True)
         self._notes = tk.Label(foot, font=ui_display(theme.SIZE_CAPTION),
                                fg=theme.WARN, bg=bg, anchor="w",
                                justify="left", bd=0, padx=0, pady=0)
@@ -2517,9 +2538,8 @@ class SensorsPage(tk.Frame):
             self._rooms_bands.append(rows)
         self._resync_spans()
 
-        self.bind("<Configure>", lambda e: [
-            w.configure(wraplength=max(px(160), int(e.width) - 2 * theme.PAD))
-            for w in (self._notes, self._note)], add=True)
+        self.bind("<Configure>", lambda e: self._notes.configure(
+            wraplength=max(px(160), int(e.width) - 2 * theme.PAD)), add=True)
         self._show_notes()
 
     # ------------------------------------------------- the frozen classic
@@ -2808,8 +2828,16 @@ class SensorsPage(tk.Frame):
         return e
 
     # -------------------------------------------------------- sensor setup
-    def open_setup(self) -> None:
+    def add_sensor(self) -> None:
+        """ADD A SENSOR: the sheet, on its blank NEW-ROOM form, with the
+        cursor in the room box. Editing a room is the same sheet through
+        its chips."""
+        self.open_setup(new=True)
+
+    def open_setup(self, new: bool = False) -> None:
         """Open the setup sheet over this page, building it on first press.
+        ``new`` lands on the + NEW form with the room box focused rather
+        than on whichever room was last shown.
 
         The sheet is a child of the HOST, not of this page: ``reload()``
         destroys and rebuilds this page's children, and a sheet parented
@@ -2828,6 +2856,8 @@ class SensorsPage(tk.Frame):
                                           "opened", fg=theme.ERR)
                 return
         self.setup.show()
+        if new:
+            self.setup.select("")
 
     def _setup_saved(self, room: str) -> None:
         """A room was added or changed: re-read the config and rebuild.

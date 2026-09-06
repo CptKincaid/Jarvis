@@ -121,9 +121,9 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       confirmation open on a guest: what is removed, what
                       SURVIVES (the face gallery), the command that removes
                       that, and the label typed to confirm
-  32  users-add       the add form, with the consent paragraph named for
-                      the person being added -- the words that say a row
-                      stores no measurement of anybody
+  32  users-add       the add form, step 1 of 2 (WHO): name, label, face
+                      label and role, every box on screen with a person
+                      already on the page
   33  users-phrase    the passphrase panel on the owner's row: two MASKED
                       boxes, empty, and the sentences saying why this one
                       secret may be typed here when the override code may
@@ -131,6 +131,11 @@ tests/test_ui_shots.py pins ``STATES`` to it.
   34  users-purge     the gallery purge armed on a guest: what is destroyed,
                       what SURVIVES, that it may refuse rather than lie, and
                       the label typed to confirm. Arming destroys nothing
+  35  users-agree     the add form, step 2 of 2 (THEIR AGREEMENT): the
+                      consent paragraph named for the person being added --
+                      the words that say a row stores no measurement of
+                      anybody -- whole, above the box they type their own
+                      label into, on one screen
 """
 from __future__ import annotations
 
@@ -192,6 +197,7 @@ STATES = (
     ("32", "users-add", None),
     ("33", "users-phrase", None),
     ("34", "users-purge", None),
+    ("35", "users-agree", None),
 )
 
 
@@ -1456,10 +1462,23 @@ class Rig:
 
         S(lambda: (self.begin("32", "users-add"), users_add()), 700)
         S(lambda: self.capture("32", "users-add", note=(
-            "the add form with the consent paragraph named for the person: a "
+            "the add form, step 1 of 2: who. Name, label, face label and "
+            "role, every box on screen with three people on the page; the "
+            "agreement is step 2 (state 35)")), 0)
+
+        # 35 sits here in TIME (it is step 2 of the form 32 opened) and is
+        # numbered last so the numbered list stays in order.
+        def users_agree():
+            win.users._next_pressed()
+
+        S(lambda: (self.begin("35", "users-agree"), users_agree()), 700)
+        S(lambda: self.capture("35", "users-agree", note=(
+            "the add form, step 2 of 2: the consent paragraph named for the "
+            "person, whole, above the box they type their own label into. A "
             "row stores a name, a role and a face LABEL and no measurement "
             "of anybody, so these are not the words the camera ceremony "
-            "shows. They type their own label to agree")), 0)
+            "shows")), 0)
+
         def users_phrase():
             page = win.users
             page._cancel()

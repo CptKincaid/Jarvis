@@ -1305,15 +1305,15 @@ def test_the_empty_page_says_where_the_fix_IS_in_the_look_it_is_in():
     """Telling him the key without telling him where it lives is half an
     answer -- and WHERE it lives changed on 2026-09-05.
 
-    Until then the only answer was a hand edit and a restart. Holo now has a
-    SETUP button that writes the profile AND both keys, so pointing him at
-    the file would be pointing him at the harder half of a job the page can
-    do. Classic is pixel-frozen and has no such button, so it keeps the old
+    Until then the only answer was a hand edit and a restart. Holo now has an
+    ADD A SENSOR button (SETUP until 2026-09-06) that writes the profile AND
+    both keys, so pointing him at the file would be pointing him at the
+    harder half of a job the page can do. Classic is pixel-frozen and has no such button, so it keeps the old
     sentence word for word. Read at CALL time, never captured.
     """
     from jarvis.ui import theme
     try:
-        for look, wanted in (("holo", "press SETUP"),
+        for look, wanted in (("holo", "press ADD A SENSOR"),
                              ("classic", "assistant.json")):
             theme.select_look(look)
             for enabled in (True, False):

@@ -679,8 +679,13 @@ class SetupSheet(tk.Frame):
             top, text="SAVE PROFILE", kind="default", size=theme.SIZE_CAPTION,
             bg=bg, pad_y=5, command=self.save)
         self._buttons["save"].pack(side="left")
+        # EVERY BUTTON ON THIS SHEET IS OUTLINED (kind "default"): 8 of its
+        # 11 were bare words on 2026-09-06 -- CLOSE, CHECK, TUNE, COPY FLASH
+        # COMMAND, BOARD & WIRING and every room chip but the chosen one --
+        # and to him a bare word is not a button. The sheet is holo's, so
+        # classic's frozen ink is untouched.
         self._buttons["close"] = RoundButton(
-            top, text="CLOSE", kind="ghost", size=theme.SIZE_CAPTION, bg=bg,
+            top, text="CLOSE", kind="default", size=theme.SIZE_CAPTION, bg=bg,
             pad_y=5, command=self.hide)
         self._buttons["close"].pack(side="right")
         # A SECOND ROW for the device buttons. One row of five was measured
@@ -694,8 +699,8 @@ class SetupSheet(tk.Frame):
                                     ("copy", "COPY FLASH COMMAND",
                                      self.copy_command)):
             self._buttons[key] = RoundButton(
-                mid, text=label, kind="ghost", size=theme.SIZE_CAPTION, bg=bg,
-                pad_y=5, command=command)
+                mid, text=label, kind="default", size=theme.SIZE_CAPTION,
+                bg=bg, pad_y=5, command=command)
             self._buttons[key].pack(side="left", padx=(0, px(6)))
         self._result = tk.Label(foot, text=NOT_LIVE,
                                 font=ui_display(theme.SIZE_CAPTION),
@@ -738,9 +743,61 @@ class SetupSheet(tk.Frame):
                                    padx=0, pady=0)
         self._room_note.pack(side="left", padx=(px(8), 0))
 
+        # IN THE ORDER A NEW SENSOR NEEDS THEM. MEASURED 2026-09-06 at
+        # 920x1440 on the + NEW form: the address, gateway/mask, mac, wi-fi,
+        # password and ota code -- everything a new device actually needs
+        # -- sat below the 572-px fold, under a 128-px mount paragraph and
+        # the gates line; at his 1040 the ota box was hidden. Address and
+        # network come first now; where the thing sits and how far it
+        # watches come after, because those have defaults and a network
+        # password does not.
+        row = self._row(body, "address")
+        self._field["ip"] = self._entry(row, width=ENTRY_W)
+        self._field["ip"].pack(side="left")
+        self._dhcp = Toggle(row, value=False, bg=bg)
+        self._dhcp.pack(side="right")
+        tk.Label(row, text="router reserves it",
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED, bg=bg,
+                 bd=0, padx=0, pady=0).pack(side="right", padx=(0, px(6)))
+        self._dhcp.command = self._on_dhcp
+        self._static = self._row(body, "gateway")
+        self._field["gateway"] = self._entry(self._static, width=ENTRY_W)
+        self._field["gateway"].pack(side="left")
+        tk.Label(self._static, text="mask", font=ui_display(theme.SIZE_CAPTION),
+                 fg=theme.FAINT, bg=bg, bd=0, padx=0,
+                 pady=0).pack(side="left", padx=px(6))
+        self._field["subnet"] = self._entry(self._static, width=ENTRY_W)
+        self._field["subnet"].pack(side="left")
+        row = self._row(body, "mac")
+        self._field["mac"] = self._entry(row, width=ENTRY_W)
+        self._field["mac"].pack(side="left")
+        tk.Label(row, text="only for a DHCP reservation",
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
+                 bd=0, padx=0, pady=0).pack(side="left", padx=(px(6), 0))
+        self._addr = tk.Label(body, font=ui_mono(theme.SIZE_CAPTION),
+                              fg=theme.CYAN_DIM, bg=bg, anchor="w",
+                              justify="left", bd=0, padx=0, pady=0)
+        self._addr.pack(fill="x", padx=pad, pady=(px(2), px(6)))
+        self._wrapped.append(self._addr)
+
+        row = self._row(body, "wi-fi")
+        self._field["ssid"] = self._entry(row, width=ENTRY_W)
+        self._field["ssid"].pack(side="left")
+        # SHORT ENOUGH FOR ITS SLOT. The caption read "network name (not a
+        # secret; the router shouts it)": 531 px in the 449-px slot beside
+        # the box at 920x1440, cut at "the ro" (MEASURED 2026-09-06). On a
+        # line of its own it fitted but cost 34 px, which put the ota box
+        # 22 px under the fold on the + NEW form at 920; the shorter
+        # caption keeps the row and the fold (ota box 517-554 in 566).
+        tk.Label(row, text="network name (not a secret)",
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
+                 bd=0, padx=0, pady=0).pack(side="left", padx=(px(6), 0))
+        self._secret_row(body, "password", "password")
+        self._secret_row(body, "ota_password", "ota code")
+
         row = self._row(body, "mount")
         for key in sorted(sp.PRESETS):
-            btn = RoundButton(row, text=key.upper(), kind="ghost",
+            btn = RoundButton(row, text=key.upper(), kind="default",
                               size=theme.SIZE_CAPTION, bg=bg, pad_x=8,
                               pad_y=4,
                               command=lambda k=key: self.pick_preset(k))
@@ -782,44 +839,6 @@ class SetupSheet(tk.Frame):
         self._gates.pack(fill="x", padx=pad, pady=(px(2), px(6)))
         self._wrapped.append(self._gates)
 
-        row = self._row(body, "address")
-        self._field["ip"] = self._entry(row, width=ENTRY_W)
-        self._field["ip"].pack(side="left")
-        self._dhcp = Toggle(row, value=False, bg=bg)
-        self._dhcp.pack(side="right")
-        tk.Label(row, text="router reserves it",
-                 font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED, bg=bg,
-                 bd=0, padx=0, pady=0).pack(side="right", padx=(0, px(6)))
-        self._dhcp.command = self._on_dhcp
-        self._static = self._row(body, "gateway")
-        self._field["gateway"] = self._entry(self._static, width=ENTRY_W)
-        self._field["gateway"].pack(side="left")
-        tk.Label(self._static, text="mask", font=ui_display(theme.SIZE_CAPTION),
-                 fg=theme.FAINT, bg=bg, bd=0, padx=0,
-                 pady=0).pack(side="left", padx=px(6))
-        self._field["subnet"] = self._entry(self._static, width=ENTRY_W)
-        self._field["subnet"].pack(side="left")
-        row = self._row(body, "mac")
-        self._field["mac"] = self._entry(row, width=ENTRY_W)
-        self._field["mac"].pack(side="left")
-        tk.Label(row, text="only for a DHCP reservation",
-                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
-                 bd=0, padx=0, pady=0).pack(side="left", padx=(px(6), 0))
-        self._addr = tk.Label(body, font=ui_mono(theme.SIZE_CAPTION),
-                              fg=theme.CYAN_DIM, bg=bg, anchor="w",
-                              justify="left", bd=0, padx=0, pady=0)
-        self._addr.pack(fill="x", padx=pad, pady=(px(2), px(6)))
-        self._wrapped.append(self._addr)
-
-        row = self._row(body, "wi-fi")
-        self._field["ssid"] = self._entry(row, width=ENTRY_W)
-        self._field["ssid"].pack(side="left")
-        tk.Label(row, text="network name (not a secret; the router shouts it)",
-                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
-                 bd=0, padx=0, pady=0).pack(side="left", padx=(px(6), 0))
-        self._secret_row(body, "password", "password")
-        self._secret_row(body, "ota_password", "ota code")
-
         # ---- THE BOARD IS FOLDED AWAY. Pins, board id and USB port are set
         # once, at the bench, and never again; the rows he actually uses are
         # above them and this sheet already scrolls (measured 2026-09-05 on
@@ -831,7 +850,7 @@ class SetupSheet(tk.Frame):
         # every one of its controls is on screen without scrolling. This chip
         # is a body control and scrolls with the rows it folds.
         self._board_btn = RoundButton(
-            fold, text="BOARD & WIRING", kind="ghost",
+            fold, text="BOARD & WIRING", kind="default",
             size=theme.SIZE_CAPTION, bg=bg, pad_x=8, pad_y=4,
             command=self.toggle_board)
         self._board_btn.pack(side="left")
@@ -954,13 +973,15 @@ class SetupSheet(tk.Frame):
             if index and index % 4 == 0:
                 row = tk.Frame(self._picker, bg=bg)
                 row.pack(fill="x", pady=(px(3), 0))
+            # Every chip is a button (outlined); the chosen one is accent.
             RoundButton(row, text=state.room.upper(),
-                        kind="accent" if state.room == self._room else "ghost",
+                        kind="accent" if state.room == self._room
+                        else "default",
                         size=theme.SIZE_CAPTION, bg=bg, pad_x=8, pad_y=4,
                         command=lambda r=state.room: self.select(r)
                         ).pack(side="left", padx=(0, px(4)))
         RoundButton(row, text="+ NEW",
-                    kind="accent" if not self._room else "ghost",
+                    kind="accent" if not self._room else "default",
                     size=theme.SIZE_CAPTION, bg=bg, pad_x=8, pad_y=4,
                     command=lambda: self.select("")).pack(side="left")
         # ONE ROOM PER LINE. Joined with the same "·" the facts inside a
@@ -994,6 +1015,14 @@ class SetupSheet(tk.Frame):
         else:
             self._room_note.configure(text="lower-case letters, digits, "
                                            "hyphens")
+            # A NEW room starts with the cursor in its name: ADD A SENSOR
+            # lands here, and the first thing it asks for is the one box
+            # that has no default.
+            try:
+                self._field["room"].focus_set()
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("sensor setup: the room box could not take focus",
+                          exc_info=True)
         for key in ("password", "ota_password"):
             self._secret[key].delete(0, "end")
         self._still.set(bool(form.get("still", True)), animate=False)
@@ -1047,7 +1076,7 @@ class SetupSheet(tk.Frame):
     def _recompute(self) -> None:
         """Repaint the consequence lines from what is typed right now."""
         for key, btn in self._preset_btn.items():
-            btn.set_kind("accent" if key == self._preset else "ghost")
+            btn.set_kind("accent" if key == self._preset else "default")
         if self._dhcp.get():
             self._static.pack_forget()
         else:
