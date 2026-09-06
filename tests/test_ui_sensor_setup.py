@@ -1034,12 +1034,16 @@ def test_a_room_added_from_the_sheet_appears_on_the_page_without_a_restart(
 def test_the_empty_page_points_at_setup_in_holo_and_at_the_file_in_classic():
     """A page that says "edit assistant.json and restart" is the answer this
     lane exists to replace -- in the look that HAS the button. Classic is
-    frozen, so it keeps the old sentence word for word."""
+    frozen, so it keeps the old sentence word for word. The button was
+    SETUP until 2026-09-06; it says ADD A SENSOR now, because it is the
+    only way to add one and the old word never said so."""
     from jarvis.ui import sensors_page as page_mod
     from jarvis.ui import theme
     try:
-        for look, wanted, unwanted in (("holo", "SETUP", "assistant.json"),
-                                       ("classic", "assistant.json", "SETUP")):
+        for look, wanted, unwanted in (("holo", "ADD A SENSOR",
+                                        "assistant.json"),
+                                       ("classic", "assistant.json",
+                                        "ADD A SENSOR")):
             theme.select_look(look)
             for enabled in (True, False):
                 line = page_mod.empty_state_line(

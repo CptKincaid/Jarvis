@@ -326,8 +326,11 @@ def test_the_purge_panel_fits_and_its_confirm_is_reachable(root, geometry):
 @pytest.mark.parametrize("geometry", BOTH)
 def test_the_pinned_foot_and_its_note_are_on_screen_with_the_new_sentences(
         root, geometry):
-    """The note grew and it is PINNED, so it must still fit under the body
-    rather than pushing the Add button off the bottom."""
+    """The foot is PINNED, so it must fit under the body rather than
+    pushing the Add button off the bottom. Since 2026-09-06 the note is
+    not IN the foot -- the sentences are one press away, behind READ and
+    its opener caption, which must be on screen too (the sheet renders
+    ``foot_lines`` verbatim; tests/test_ui_easy_to_add.py reads it)."""
     page, _svc, host = _page(root, geometry)
     root.update_idletasks()
     foot = page._foot
@@ -337,6 +340,9 @@ def test_the_pinned_foot_and_its_note_are_on_screen_with_the_new_sentences(
         "the foot ends %d px into a %d px page at %r"
         % (bottom, page.winfo_height(), geometry))
     assert page._add_btn.winfo_ismapped()
+    assert page._read_btn.winfo_ismapped()
+    assert page._opener_lbl.winfo_ismapped()
+    assert page._read_btn.master is page._add_btn.master
 
 
 @pytest.mark.parametrize("geometry", BOTH)

@@ -293,8 +293,10 @@ class TabStrip(tk.Frame):
         strip.add("sensors", "SENSORS", select=page.show, leave=page.hide)
 
     ``select(key)`` is idempotent -- selecting the tab that is already
-    selected does nothing at all -- so a page whose own close path syncs
-    the strip back cannot recurse through it.
+    selected does nothing at all -- and a ``select()`` issued from INSIDE a
+    leave/select callback is refused, so a page whose own close path syncs
+    the strip back to CHAT cannot clobber a switch that is half-way through
+    (the SENSORS -> USERS defect of 2026-09-06).
     """
 
     def __init__(self, parent, bg=None, on_change: Optional[Callable] = None):
@@ -306,6 +308,14 @@ class TabStrip(tk.Frame):
         self._widgets: dict = {}
         self._order: list = []
         self._selected = ""
+        # True while select() is inside its leave/select callbacks. A page's
+        # own close hook calls select("chat") from INSIDE leave(), and that
+        # is not the idempotent no-op it looks like: by then _selected is
+        # already the NEW key, so the nested call clobbered it and SENSORS ->
+        # USERS lit CHAT with the Users page open (measured 2026-09-06,
+        # both looks, both directions). A select() issued mid-switch is
+        # refused; the outer switch finishes what it started.
+        self._switching = False
         self._row = tk.Frame(self, bg=bg)
         self._row.pack(fill="x", padx=theme.PAD, pady=px(STRIP_PAD_Y))
         # The hairline the stage hangs off, so the row reads as a shelf
@@ -356,18 +366,26 @@ class TabStrip(tk.Frame):
         key = str(key)
         if key not in self._specs or key == self._selected:
             return False
+        if self._switching:
+            log.debug("tab strip: select(%r) refused mid-switch (%r -> %r)",
+                      key, self._selected, key)
+            return False
         was, self._selected = self._selected, key
         for k, tab in self._widgets.items():
             tab.set_selected(k == key)
         if not run:
             return True
-        self._call(self._specs.get(was), "leave")
-        self._call(self._specs.get(key), "select")
-        if callable(self._on_change):
-            try:
-                self._on_change(key)
-            except Exception:                 # noqa: BLE001 - a callback
-                log.exception("tab strip: on_change failed")
+        self._switching = True
+        try:
+            self._call(self._specs.get(was), "leave")
+            self._call(self._specs.get(key), "select")
+            if callable(self._on_change):
+                try:
+                    self._on_change(key)
+                except Exception:             # noqa: BLE001 - a callback
+                    log.exception("tab strip: on_change failed")
+        finally:
+            self._switching = False
         return True
 
     def focus_selected(self) -> None:
