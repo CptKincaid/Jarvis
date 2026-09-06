@@ -26,14 +26,20 @@ disk -- worse than no record, because somebody reading it later would
 believe a terminal ceremony happened. The console taker returns "console".
 It costs nothing and keeps the record true.
 
-TWO TEXTS, BECAUSE THEY STORE DIFFERENT THINGS. This is a finding rather
+THREE TEXTS, BECAUSE THEY STORE DIFFERENT THINGS. This is a finding rather
 than a preference. ``CONSENT_LINES`` (the face text, moved here verbatim
 from face_enrol so its sentences are unchanged) describes storing 128
 numbers of somebody's face. ``jarvis_people.py add`` stores NO face data:
 it writes a registry row holding a name, a role and a face LABEL. Using the
 face words there over-claims, so ``WHAT_ROW`` has its own text saying what
 a row actually is and pointing at the separate ceremony the lens needs.
-There is still one place and one rule; neither text lies.
+``WHAT_VOICE`` arrived the same way and for the same reason: it moved
+here verbatim from ``scripts/voice_enrol.py`` the moment a SECOND caller
+existed (the in-app run, jarvis/voicerun.py), before it could drift. It
+describes 192 numbers per take and says the thing the face text cannot:
+NO RECORDING IS KEPT -- the audio becomes those numbers and is thrown
+away, and the numbers cannot be turned back into speech. There is still
+one place and one rule; no text lies.
 
 NOTHING HERE OPENS A DEVICE and nothing here writes a file. It formats
 sentences and compares a typed string with a label.
@@ -47,6 +53,7 @@ from typing import Callable, Optional, Sequence, Tuple
 # otherwise arrive as "the other one".
 WHAT_FACE = "face"      # 128 numbers per take, in the gallery
 WHAT_ROW = "row"        # a registry row: a name, a role, a face LABEL
+WHAT_VOICE = "voice"    # 192 numbers per take, in the voice gallery
 
 # The provenance strings. NEVER interchangeable -- see the docstring.
 HOW_TERMINAL = "typed"
@@ -104,7 +111,38 @@ ROW_LINES = (
     "%(who)s must type their own name below. Nobody may type it for them.",
 )
 
-_TEXTS = {WHAT_FACE: CONSENT_LINES, WHAT_ROW: ROW_LINES}
+VOICE_LINES = (
+    "CONSENT -- this is %(who)s's data, not yours.",
+    "",
+    "Enrolling %(who)s stores a measurement of %(who)s's VOICE: 192 numbers",
+    "per take, in %(root)s, at 0600 in a 0700",
+    "directory. NO RECORDING IS KEPT. The audio is turned into those numbers",
+    "and thrown away; there is no file anywhere that can be played back. The",
+    "numbers cannot be turned back into speech, and nothing leaves this",
+    "machine -- no cloud, no API, no upload, ever.",
+    "",
+    "What it is FOR: Jarvis can tell %(who)s apart from the other people he",
+    "knows, greet %(who)s by name, and keep something private when somebody",
+    "else is in the room.",
+    "",
+    "WHAT IT IS NOT: it is not a password and not a lock. A recording of",
+    "%(who)s's voice would defeat it, and it is not meant to withstand",
+    "somebody determined. Being recognised here does NOT let %(who)s change",
+    "settings, read the owner's mail or calendar, or send anything off this",
+    "machine.",
+    "",
+    "Deleting it, at any time, and it takes about a second:",
+    "    %(python)s %(script)s --delete --label %(who)s",
+    "which destroys every generation that holds %(who)s -- including the old",
+    "ones -- and leaves everybody else's alone.",
+    "",
+    "%(who)s must type their own name below. Nobody may type it for them,",
+    "and --yes cannot do it either: that is the owner's flag, and this is",
+    "not the owner's consent to give.",
+)
+
+_TEXTS = {WHAT_FACE: CONSENT_LINES, WHAT_ROW: ROW_LINES,
+          WHAT_VOICE: VOICE_LINES}
 
 PROMPT = 'Type "%s" to agree: '
 PIPE_REFUSAL = ("consent for %r cannot be taken through a pipe: the person "

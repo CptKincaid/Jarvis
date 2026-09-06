@@ -57,7 +57,19 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from jarvis import voicegallery as vg               # noqa: E402
+# THE BARS LIVE IN THE PACKAGE, not here, since the in-app run
+# (jarvis/voicerun.py) needed the same numbers. They MOVED unchanged and
+# are re-exported under their old names so this script's own tests, its
+# printing and its refusals are exactly what they were -- and so there is
+# only ever ONE loudness floor, ONE cohesion bar and ONE separation bar
+# in the tree. See jarvis/voiceenrol.py's header for why a second copy is
+# the failure being avoided.
+from jarvis.voiceenrol import (MIN_RMS, PROMPTS,   # noqa: E402,F401
+                               SECONDS, TAKES, pool_ok,
+                               separation_margins, take_ok,
+                               voiceprint_vectors)
 from jarvis.config import CONFIG, PATHS             # noqa: E402
+from jarvis import consent as cs                    # noqa: E402
 from jarvis.identity import owner_label             # noqa: E402
 
 JARVIS_PID = Path("/tmp/vss_voice/jarvis.pid")
@@ -70,63 +82,11 @@ JARVIS_PID = Path("/tmp/vss_voice/jarvis.pid")
 # centroid is at cos 0.975 of its converged position by 8 takes, 0.987 by 10,
 # and flat past 8), ``takes_ok`` refuses fewer, and the two numbers cannot
 # drift apart because there is only one.
-TAKES = vg.MIN_TAKES_TO_NAME
-SECONDS = 8.0
-MIN_RMS = 0.004         # below this the take is effectively silence
-
-# Varied prompts beat one long monotone take: identify() compares against the
-# centroid of a person's takes, so a spread of natural phrasing and distance
-# generalises better than eight readings of one sentence. Copied in spirit
-# from scripts/enroll_voice.py and reworded for somebody who is not the owner.
-PROMPTS = [
-    ("Speak normally, from where you are sitting.",
-     "Hello Jarvis, my name is {name} and this is my normal speaking voice."),
-    ("Same spot, same voice.",
-     "What time is it, and what is the weather doing this afternoon?"),
-    ("A little quieter, as if it were late.",
-     "Could you turn the music down a bit please."),
-    ("Lean back, or sit a little further away.",
-     "Jarvis, can you tell me what is on the calendar for tomorrow."),
-    ("Normal again, but a bit faster.",
-     "I'm just passing through, no need to do anything."),
-    ("Relaxed and conversational.",
-     "That's interesting -- go on, tell me a little more about that."),
-    ("Normal distance, normal voice.",
-     "Thank you, that is all I needed for now."),
-    ("Last one. Say anything you like, about eight seconds' worth.",
-     "(anything at all -- your own words are better than mine)"),
-]
-
-CONSENT_LINES = (
-    "CONSENT -- this is %(who)s's data, not yours.",
-    "",
-    "Enrolling %(who)s stores a measurement of %(who)s's VOICE: 192 numbers",
-    "per take, in %(root)s, at 0600 in a 0700",
-    "directory. NO RECORDING IS KEPT. The audio is turned into those numbers",
-    "and thrown away; there is no file anywhere that can be played back. The",
-    "numbers cannot be turned back into speech, and nothing leaves this",
-    "machine -- no cloud, no API, no upload, ever.",
-    "",
-    "What it is FOR: Jarvis can tell %(who)s apart from the other people he",
-    "knows, greet %(who)s by name, and keep something private when somebody",
-    "else is in the room.",
-    "",
-    "WHAT IT IS NOT: it is not a password and not a lock. A recording of",
-    "%(who)s's voice would defeat it, and it is not meant to withstand",
-    "somebody determined. Being recognised here does NOT let %(who)s change",
-    "settings, read the owner's mail or calendar, or send anything off this",
-    "machine.",
-    "",
-    "Deleting it, at any time, and it takes about a second:",
-    "    %(python)s %(script)s --delete --label %(who)s",
-    "which destroys every generation that holds %(who)s -- including the old",
-    "ones -- and leaves everybody else's alone.",
-    "",
-    "%(who)s must type their own name below. Nobody may type it for them,",
-    "and --yes cannot do it either: that is the owner's flag, and this is",
-    "not the owner's consent to give.",
-)
-
+# THE VOICE CONSENT WORDS MOVED to jarvis/consent.py as
+# ``consent.WHAT_VOICE``, unchanged, because a second caller now
+# exists (the in-app run) and two copies of a consent paragraph
+# is how one of them quietly stops describing what is stored.
+CONSENT_LINES = cs.VOICE_LINES
 
 def face_enrol():
     """``scripts/face_enrol.py`` as a module, loaded by PATH.
@@ -258,73 +218,6 @@ def migrate_label_ok(label, owner):
         % (owner, label, label, label, sys.executable, __file__, label))
 
 
-def take_ok(rms, min_rms=MIN_RMS):
-    """``(ok, why not)`` for one take's loudness. Pure, so it is tested."""
-    try:
-        value = float(rms)
-    except (TypeError, ValueError):
-        return False, "the take's loudness could not be measured"
-    if not np.isfinite(value):
-        return False, "the take's loudness is not a number"
-    if value < float(min_rms):
-        return False, ("too quiet (rms %.4f, floor %.4f) -- muted mic or the "
-                       "wrong device?" % (value, float(min_rms)))
-    return True, ""
-
-
-def separation_margins(mine, theirs):
-    """The margins ``identify`` would actually see between two pools:
-    ``(median margin for mine, median margin for theirs)``.
-
-    THE SAME QUANTITY THE MARGIN BAR IS APPLIED TO, and not a proxy for it.
-    ``identify`` names somebody when ``cos(probe, own centroid) - cos(probe,
-    other centroid) >= vg.MARGIN``. So each take here is scored leave-one-out
-    against its own pool's centroid and against the other pool's, exactly as a
-    fresh utterance would be, and the median over the takes is what more than
-    half of that person's verdicts will look like.
-
-    The first version of ``pool_ok`` compared the two CENTROIDS to each other
-    and refused above cosine 0.80. Measured 2026-09-04 on synthetic pools at
-    his within-person spread: at a centroid cosine of 0.71 that check passed
-    and 91-97% of verdicts for BOTH people then failed the 0.20 margin. It
-    fired only past 0.80, where every verdict had already been failing since
-    about 0.60 -- the wrong quantity, never firing in the regime it existed
-    for. Leave-one-out medians track fresh-probe medians within 0.01 on the
-    same data, so this is the number, not an estimate of it.
-    """
-    def _loo(pool, other_c):
-        out = []
-        for i, e in enumerate(pool):
-            rest = [x for j, x in enumerate(pool) if j != i]
-            out.append(vg.cosine(e, vg.centroid(rest)) - vg.cosine(e, other_c))
-        return float(np.median(out))
-    return _loo(mine, vg.centroid(theirs)), _loo(theirs, vg.centroid(mine))
-
-
-def voiceprint_vectors(path):
-    """The owner's stored embeddings, as a list, or [] when there is nothing
-    this script may anchor to.
-
-    NUMBERS ONLY, AND NOTHING IS WRITTEN. Format 1 returns [] for
-    ``migrate_voiceprint``'s reason: those vectors were pooled before silence
-    trimming and score low against trimmed probes, so anchoring to them would
-    refuse HIM. [] means "no anchor", and every check below stands down.
-    """
-    try:
-        path = Path(path)
-        if not path.exists():
-            return []
-        data = np.load(path)
-        names = list(data.files)
-        fmt = int(data["_format"][0]) if "_format" in names else 1
-        if fmt != 2:
-            return []
-        return [np.asarray(data[k], dtype=np.float32).ravel()
-                for k in sorted(n for n in names if n.startswith("emb_"))]
-    except Exception:  # noqa: BLE001 - an unreadable voiceprint is no anchor
-        return []
-
-
 def his_labels(gallery, vectors=None):
     """Every gallery label that IS the owner's pool, by the two routes the
     runtime uses -- ``speaker._owner_pools``' question, asked here so the
@@ -448,114 +341,6 @@ def delete_warning(gallery, label, vectors=None):
         "will enrol. Put it back when you are\ndone, no microphone needed:"
         "\n    %s %s --migrate"
         % (label, ", ".join(others), sys.executable, __file__))
-
-
-def pool_ok(gallery, label, vectors, owner="", owner_vectors=None):
-    """``(ok, why not)`` for a FINISHED pool, before it is saved.
-
-    Four refusals, and each one prints its number, because "that did not work"
-    is not something anybody can act on at eleven at night.
-
-    1. COHESION. A median pairwise cosine above 0.90 is one take recorded
-       several times. His own fourteen-take pool measures 0.485.
-    2. THE SAME NAME IS THE SAME PERSON. Topping up a label compares the new
-       takes against THE ONES ALREADY UNDER IT -- the comparison this loop
-       used to skip outright (``if other == label: continue``), which is how
-       a stranger's takes could be recorded under anybody's name and never
-       measured against the person whose name it was. Same quantity as
-       refusal 3, opposite sense: if the two pools ARE separable by the margin
-       bar they are two people, and one name cannot hold both.
-    3. SEPARATION. If the MARGIN this pool's takes would clear against
-       somebody already enrolled -- or theirs against this pool -- has a
-       median under ``vg.MARGIN``, ``identify`` would fail to name that
-       person more often than not: every such verdict comes back UNKNOWN on
-       the margin, which looks exactly like the feature being broken. Better
-       to say so now, with the number, than to store it and let them both
-       quietly stop working. See ``separation_margins`` for why this is the
-       margin itself and not the centroids' cosine.
-    4. THE OWNER'S ANCHOR. Under HIS label, the pool that would be stored is
-       measured against ``voiceprint.npz`` itself on
-       ``vg.OWNER_POOL_COSINE`` -- THE SAME NUMBER speaker._owner_pools
-       applies at runtime, so this script can never write a pool the runtime
-       would refuse to read as his. It is what makes refusal 2 hold at the
-       separations where the margin bar cannot: measured 2026-09-05, her ten
-       takes added to his migrated fourteen leave the label's centroid at
-       0.809-0.972 against the 0.98 line and are refused at every separation,
-       including the ones where she is too confusable for a margin to notice.
-    """
-    if len(vectors) < 2:
-        return False, "a pool needs at least two takes"
-    med = vg.median_pairwise(vectors)
-    if med is not None and med > vg.COLLAPSED_MEDIAN_COSINE:
-        return False, ("these %d takes have a median pairwise cosine of %.3f, "
-                       "above %.2f -- that is one take recorded several times, "
-                       "not several takes. A real pool measures around 0.485."
-                       % (len(vectors), med, vg.COLLAPSED_MEDIAN_COSINE))
-
-    # 2. the same name is the same person
-    already = gallery.embeddings(label)
-    if len(already) >= 2:
-        m_new, m_old = separation_margins(vectors, already)
-        if min(m_new, m_old) >= vg.MARGIN:
-            return False, (
-                "%r already holds %d take(s), and these %d are a DIFFERENT "
-                "voice: they clear that pool by a median margin of %.3f and "
-                "it clears them by %.3f, where anything at or above %.2f is "
-                "two people Jarvis can tell apart. One name cannot hold two "
-                "people -- Jarvis would answer whoever it heard as %r. Use "
-                "--label for the person actually at the microphone."
-                % (label, len(already), len(vectors), m_new, m_old,
-                   vg.MARGIN, label))
-
-    # 4. the owner's anchor -- the same number the runtime applies
-    if owner and label == owner and owner_vectors is not None \
-            and len(owner_vectors) >= 1:
-        mine = vg.centroid(list(owner_vectors))
-        would_be = vg.centroid(list(already) + list(vectors))
-        if mine is not None and would_be is not None:
-            sim = vg.cosine(would_be, mine)
-            if sim < vg.OWNER_POOL_COSINE:
-                if not already:
-                    return False, (
-                        "%r would be a NEW pool under the owner's name that "
-                        "does not match voiceprint.npz (cosine %.3f, needs "
-                        "%.2f), so Jarvis would not read it as him anyway. "
-                        "Carry his existing voiceprint in first -- no "
-                        "microphone needed:\n    %s %s --migrate\n"
-                        "If somebody else is at the microphone, enrol them "
-                        "under their own name with --label."
-                        % (label, sim, vg.OWNER_POOL_COSINE,
-                           sys.executable, __file__))
-                return False, (
-                    "these %d takes would pull %r away from voiceprint.npz "
-                    "(the pool would sit at cosine %.3f, and %.2f is where "
-                    "Jarvis stops reading it as the owner). Either they are "
-                    "not his voice, or they were recorded somewhere his "
-                    "voiceprint would not recognise. Nothing was written.\n"
-                    "If his pool has ALREADY come apart from voiceprint.npz, "
-                    "more takes cannot close it and this refusal is the "
-                    "dead end that used to follow: re-anchor the two instead, "
-                    "no microphone needed:\n    %s %s --reanchor"
-                    % (len(vectors), label, sim, vg.OWNER_POOL_COSINE,
-                       sys.executable, __file__))
-
-    for other in sorted(gallery.labels()):
-        if other == label:
-            continue                # refusal 2 above is this label's own test
-        theirs = gallery.embeddings(other)
-        if len(theirs) < 2:
-            continue
-        m_mine, m_theirs = separation_margins(vectors, theirs)
-        if min(m_mine, m_theirs) < vg.MARGIN:
-            return False, (
-                "%s's takes clear %s's by a median margin of %.3f, and %s's "
-                "clear %s's by %.3f; the bar is %.2f. Jarvis could not tell "
-                "the two of you apart: more than half the verdicts for %s "
-                "would come back \"I can't tell which of you\". Re-record in "
-                "a different spot, or use a different microphone."
-                % (label, other, m_mine, other, label, m_theirs, vg.MARGIN,
-                   label if m_mine < m_theirs else other))
-    return True, ""
 
 
 def separation_report(gallery):
