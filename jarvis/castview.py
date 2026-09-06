@@ -63,6 +63,20 @@ and it is the cheapest true one available:
   the relay as a ``stop`` -- so a helper that was merely slow puts the
   window away rather than leaving one up that Jarvis has already said it
   did not open -- the deck is released, and the cast HOLDS out loud.
+  ...AND A RECEIPT IS STILL NOT A DESKTOP, WHICH IS THE ROUND-4 FINDING
+  AND THE ONE WITH LIVE EXPOSURE. The gesture ships ``enabled: False``;
+  the spoken cast does not, so this is the direction he can hit today. A
+  RustDesk viewer sitting on an accept-or-password prompt survives the
+  script's own 700 ms settle perfectly well, and this sink said "The
+  Spark's screen is on HPCOMPUTER, sir." over it with nothing on any
+  monitor -- and nothing revisited it, so the deck stayed held and the
+  next genuine cast was refused as busy (MEASURED, round-3 attack). So
+  this direction takes the same tri-state ``connected`` probe, the same
+  second look and the same spoken retraction as the Spark's. Its
+  evidence is the MIRROR of the Spark's, because the viewer is on his
+  machine and there is no pid here: jarvis/app.py reads an ESTABLISHED
+  socket INBOUND from HPCOMPUTER on ``RUSTDESK_PORTS`` and bytes leaving
+  over it.
 * The Spark: the viewer is still running ``VIEWER_SETTLE_S`` after launch
   AND it is actually receiving something. Round 2 stopped at the first
   half, and the module's own docstring had already predicted what that
@@ -73,8 +87,11 @@ and it is the cheapest true one available:
   with nothing cast. So there is a second, injected probe -- ``connected``
   -- and it is a TRI-STATE: True, False, or None for cannot tell, which
   becomes an honest "I can't say it landed" rather than a landing. With no
-  such probe wired the sink reports itself UNAVAILABLE, on exactly the
-  rule the launcher is already held to. jarvis/app.py implements it out
+  such probe wired EITHER SINK reports itself UNAVAILABLE, on exactly the
+  rule the launcher is already held to -- and round 4 moved that rule, the
+  probe, the settle, the second look and the retraction onto the shared
+  ``_ViewSink`` base, because two copies of it is how round 3 came to ship
+  one honest direction and one that lied. jarvis/app.py implements it out
   of /proc: an ESTABLISHED socket the viewer itself owns to that host,
   and bytes arriving over it. It opens no window and no capture device.
   And it is ASKED AGAIN at ``VIEWER_CONFIRM_S``, because a viewer alive
@@ -181,7 +198,26 @@ ACK_WAIT_ROUNDS = 8
 # exactly the reason the verbs are one: a free-text Windows error would put
 # a path, a window title or a process name on the wire, and this lane has
 # always sent nothing but an index and a layout.
-HELPER_FAILS = ("no-viewer", "launch-failed", "viewer-exited")
+HELPER_FAILS = ("no-viewer", "launch-failed", "viewer-exited",
+                "stop-failed")
+# ROUND 4 ADDED ``stop-failed``. ``Stop-Cast`` swallowed a failed
+# ``Stop-Process`` in an empty catch and returned 0 unconditionally, so a
+# viewer the script could NOT kill was orphaned on his middle monitor
+# while the receipt told Jarvis the stop had happened -- and a following
+# show-spark would stack a second viewer on top of it. A stop that did
+# not happen is now a code like any other.
+# THE PORTS THE SPARK IS VIEWED ON, and the reason this constant exists at
+# all. The Spark -> HPCOMPUTER cast has no viewer process on this box: the
+# viewer runs on HIS Windows machine and the Spark is the end being VIEWED.
+# So the local evidence is an INBOUND connection from HPCOMPUTER -- and
+# "is there a connection to HPCOMPUTER" is TRUE ALMOST ALWAYS, because the
+# Windows helper's own long poll is one, held open 25 s at a time about
+# 2.4 times a minute. A probe that is true whatever happens is a rubber
+# stamp on a sentence, so the probe is scoped to these ports and the poll
+# port (jarvis/webapp.py's 8765) is deliberately not among them. 21118 is
+# the direct-IP path measured open in both directions on 2026-09-04; the
+# others are RustDesk's own defaults and are GUESSED to be worth watching.
+RUSTDESK_PORTS = (21115, 21116, 21117, 21118, 21119)
 # A second cast is refused for this long after one starts or stops. The
 # gesture's own cooldown is 8 frames, about 1.1 s at 7.5 fps, which is not
 # enough to stop a double fling opening two viewers.
@@ -198,6 +234,14 @@ SHOWN_LINE = "{What} is on {target}, sir."
 NO_HELPER_LINE = ("HPCOMPUTER isn't listening for me, sir — its startup "
                   "script isn't running. I've not cast anything.")
 NO_VIEWER_LINE = "I've no viewer to open here, sir; I've not cast anything."
+# ...and this is what an unavailable sink says when what is MISSING is the
+# EVIDENCE rather than the machinery. Round 3 spoke NO_VIEWER_LINE and
+# NO_HELPER_LINE for both cases alike, so a sink with no connection probe
+# told him HPCOMPUTER's startup script was not running -- which was a
+# second untrue sentence sitting behind the first. The reason a cast did
+# not happen has to be the real one.
+NO_EVIDENCE_LINE = ("I've no way to check that would actually land, sir, so "
+                    "I'll not say it did. Nothing's cast.")
 VIEWER_FAILED_LINE = "The viewer wouldn't open, sir."
 VIEWER_DIED_LINE = ("The viewer opened and closed again, sir. Nothing's "
                     "cast.")
@@ -212,7 +256,18 @@ HELPER_FAIL_LINES = {
     "no-viewer": LAUNCH_FAILED_LINE + " — RustDesk isn't where it expects it.",
     "launch-failed": LAUNCH_FAILED_LINE + " — it wouldn't start.",
     "viewer-exited": LAUNCH_FAILED_LINE + " — it closed straight away.",
+    "stop-failed": ("There's a viewer still up on HPCOMPUTER that I "
+                    "couldn't close, sir. I've not opened another."),
 }
+# What the SPARK -> HPCOMPUTER direction says when the thing it started is
+# not there any more. Two different facts, two different sentences: the
+# machine stopped answering, or the viewer it started never carried a
+# picture.
+HELPER_GONE_LINE = ("HPCOMPUTER stopped answering me, sir. I've not left "
+                    "anything cast.")
+HP_NOT_CONNECTED_LINE = ("HPCOMPUTER opened the viewer but nothing's coming "
+                         "through, sir — it never connected back to the "
+                         "Spark. Nothing's cast.")
 NO_RECEIPT_LINE = ("HPCOMPUTER didn't come back for it, sir. I've taken it "
                    "back rather than leave it queued — nothing's cast.")
 BUSY_LINE = "There's a cast up already, sir"
@@ -552,6 +607,19 @@ class _ViewSink:
     smaller version of a desktop on a monitor; it is a different thing, and
     quietly substituting one for the other would teach him the gesture had
     worked.
+
+    ROUND 4 PUT THE HONESTY HERE RATHER THAN IN ONE SINK. Round 3 gave
+    ``SparkViewSink`` a tri-state connection probe, a second look and a
+    spoken retraction, and left ``HpViewSink`` claiming a landing off a
+    receipt -- and the receipt only ever meant "the Windows script acted",
+    never "a desktop arrived". Two copies of "probe, give the deck back,
+    retract" is two places for the directions to drift apart, and they had
+    already drifted once. So the probe, the tri-state, the settle, the
+    second look, the retraction and the give-back are all on this base and
+    neither subclass owns a copy. What legitimately differs is exactly two
+    things, and each is one overridden hook: what STARTS the cast, and what
+    "still there" means -- a process this app owns, versus a machine that
+    polls us.
     """
 
     name = "view"
@@ -559,17 +627,62 @@ class _ViewSink:
     reversible = False
     needs_identity = True
     wants_bytes = False
+    # What this direction says when the thing it started is gone. One line
+    # each, because "the viewer died" and "HPCOMPUTER stopped answering"
+    # are different facts and he should be told which one happened.
+    gone_line = VIEWER_DIED_LINE
+    gone_reason = VIEWER_DIED_REASON
+    not_connected_line = VIEWER_NOT_CONNECTED_LINE
 
     def __init__(self, *, state: Optional[ViewState] = None,
-                 now: Callable[[], float] = time.monotonic) -> None:
+                 now: Callable[[], float] = time.monotonic,
+                 connected: Optional[Callable[[], Optional[bool]]] = None,
+                 settle: Optional[Callable[[float], object]] = None,
+                 later: Optional[Callable[[float, Callable], object]] = None,
+                 retract: Optional[Callable[[str], object]] = None,
+                 settle_s: float = VIEWER_SETTLE_S,
+                 confirm_s: float = VIEWER_CONFIRM_S) -> None:
         self._now = now
         self.state = state if state is not None else ViewState(now=now)
+        # THE TRI-STATE: True, False, or None for CANNOT TELL. It is
+        # injected because this module owns no transport and reads no
+        # /proc; jarvis/app.py implements one per direction.
+        self._connected = connected if callable(connected) else None
+        self._settle = settle if callable(settle) else time.sleep
+        # How the SECOND look is scheduled. Injected so the suite neither
+        # sleeps nor spawns; the default is a daemon timer.
+        self._later = later if callable(later) else _default_later
+        self._retract = retract if callable(retract) else None
+        self.settle_s = float(settle_s)
+        self.confirm_s = float(confirm_s)
+        self._watch = None
 
     def needs_readback(self, subject: Optional[CastSubject] = None) -> bool:
         return False
 
     def available(self) -> tuple:
+        """THE RULE BOTH DIRECTIONS ARE NOW HELD TO. With no honest local
+        evidence that the cast ARRIVED, this sink cannot know whether it
+        landed -- so it reports itself unavailable rather than saying a
+        sentence it cannot support. Subclasses check their own wiring
+        first and then call this."""
+        if self._connected is None:
+            return False, NO_CONNECTION_PROBE_REASON
         return True, ""
+
+    # What this direction says when it is not wired up at all. The
+    # EVIDENCE case is separate and shared, because "I have no viewer" and
+    # "I have no way to tell" are different sentences and only one of them
+    # is true at a time.
+    unavailable_line = NO_VIEWER_LINE
+
+    def _unavailable(self, why: str):
+        """Hold, and say the true reason. A missing PROBE is not a missing
+        helper and not a missing viewer."""
+        line = (NO_EVIDENCE_LINE
+                if why in (NO_PROBE_REASON, NO_CONNECTION_PROBE_REASON)
+                else self.unavailable_line)
+        return held_result(line, sink=self.name, detail=why)
 
     def _busy(self) -> Optional[object]:
         ok, why = self.state.take(self.name)
@@ -585,7 +698,99 @@ class _ViewSink:
         self.state.release()
         return True
 
-    def _stop(self) -> None:                        # pragma: no cover - base
+    # -- the evidence ---------------------------------------------------
+    def _settle_and_confirm(self) -> Optional[object]:
+        """Wait, look, and refuse to claim anything that is not there.
+
+        Returns None when the cast landed -- and only then is the second
+        look armed. Anything else is a ``held_result`` with the deck
+        already given back, because a cast that cannot be shown to have
+        arrived must not hold the deck against the next one.
+        """
+        try:
+            self._settle(self.settle_s)
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the settle wait raised", exc_info=True)
+        if not self._still_there():
+            log.warning("castview: %s was gone %.1fs after it started",
+                        self.name, self.settle_s)
+            return self._give_back(self.gone_line, self.gone_reason)
+        linked = self._is_connected()
+        if linked is False:
+            return self._give_back(self.not_connected_line,
+                                   NOT_CONNECTED_REASON)
+        if linked is None:
+            return self._give_back(CANNOT_TELL_LINE, CANNOT_TELL_REASON)
+        self._arm_confirm()
+        return None
+
+    def _give_back(self, line: str, why: str):
+        self._stop()
+        self.state.release()
+        return held_result(line, sink=self.name, detail=why)
+
+    def _is_connected(self) -> Optional[bool]:
+        """True, False, or None for CANNOT TELL. A probe that raises has
+        no opinion; it is never a yes."""
+        if self._connected is None:
+            return None
+        try:
+            got = self._connected()
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the connection probe raised", exc_info=True)
+            return None
+        return None if got is None else bool(got)
+
+    def _still_there(self) -> bool:
+        """Is the thing this sink started still up? Overridden per
+        direction; the base has nothing of its own to look at."""
+        return True
+
+    def _arm_confirm(self) -> None:
+        """The SECOND LOOK. A cast alive at the settle and gone at three
+        seconds was claimed and never revisited, so the deck stayed held
+        by something that was not there and the next genuine cast was
+        refused as busy. This gives the deck back and takes the sentence
+        back."""
+        try:
+            self._watch = self._later(self.confirm_s, self._confirm)
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the confirm timer would not arm",
+                      exc_info=True)
+            self._watch = None
+
+    def _confirm(self) -> None:
+        self._watch = None
+        if self.state.live != self.name:
+            return                                  # already stopped
+        if self._still_there() and self._is_connected() is True:
+            return
+        log.warning("castview: the cast was gone %.1fs after it was claimed",
+                    self.confirm_s)
+        self._stop()
+        self.state.release()
+        if self._retract is not None:
+            try:
+                self._retract(CAST_GONE_LINE)
+            except Exception:                       # noqa: BLE001 - the seam
+                log.debug("castview: the retraction raised", exc_info=True)
+
+    # -- stopping -------------------------------------------------------
+    def _stop(self) -> None:
+        watch, self._watch = self._watch, None
+        cancel = getattr(watch, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:                       # noqa: BLE001 - the seam
+                log.debug("castview: the confirm timer would not cancel",
+                          exc_info=True)
+        try:
+            self._stop_here()
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: stopping the cast raised", exc_info=True)
+
+    def _stop_here(self) -> None:                   # pragma: no cover - base
         pass
 
 
@@ -620,7 +825,9 @@ class SparkViewSink(_ViewSink):
                  host: str = HPCOMPUTER_HOST,
                  state: Optional[ViewState] = None,
                  now: Callable[[], float] = time.monotonic) -> None:
-        super().__init__(state=state, now=now)
+        super().__init__(state=state, now=now, connected=connected,
+                         settle=settle, later=later, retract=retract,
+                         settle_s=settle_s, confirm_s=confirm_s)
         self._launch = launch if callable(launch) else None
         self._stop_fn = stop if callable(stop) else None
         # ``alive`` answers one question a moment after the launch: is the
@@ -631,23 +838,14 @@ class SparkViewSink(_ViewSink):
         # this sink. Without direct-IP access and an unattended password
         # on HPCOMPUTER a direct-IP connect waits for someone to accept it
         # on the Windows side, and a viewer sitting on that prompt is a
-        # live process: ``Popen.poll() is None`` says yes and round 2 said
+        # live process: ``Popen.poll() is None`` said yes and round 2 said
         # "HPCOMPUTER's screen is on the Spark, sir." with nothing cast.
-        # ``connected`` is a TRI-STATE -- True, False, or None for cannot
-        # tell -- and jarvis/app.py implements it by reading /proc: an
+        # The tri-state ``connected`` probe is on ``_ViewSink`` now, and
+        # jarvis/app.py implements this direction's out of /proc: an
         # ESTABLISHED socket the viewer itself owns to that host, and
         # sustained bytes coming in over it. It never opens a window, a
         # capture device or the picture.
-        self._connected = connected if callable(connected) else None
-        self._settle = settle if callable(settle) else time.sleep
-        # How the SECOND look is scheduled. Injected so the suite neither
-        # sleeps nor spawns; the default is a daemon timer.
-        self._later = later if callable(later) else _default_later
-        self._retract = retract if callable(retract) else None
-        self.settle_s = float(settle_s)
-        self.confirm_s = float(confirm_s)
         self.host = str(host)
-        self._watch = None
 
     def available(self) -> tuple:
         if self._launch is None:
@@ -657,19 +855,14 @@ class SparkViewSink(_ViewSink):
             # cannot be read is a viewer whose landing cannot be claimed,
             # and this sink may not claim one.
             return False, NO_PROBE_REASON
-        if self._connected is None:
-            # AND THE SAME RULE AGAIN, one level up. If there is no honest
-            # local evidence that the viewer CONNECTED then this sink
-            # cannot know whether a cast landed, and an honest "I cannot
-            # tell" is the correct outcome -- better than a confident
-            # wrong sentence.
-            return False, NO_CONNECTION_PROBE_REASON
-        return True, ""
+        # ...and the connection probe, which the base owns because BOTH
+        # directions are held to it now.
+        return super().available()
 
     def deliver(self, subject: CastSubject):
         ok, why = self.available()
         if not ok:
-            return held_result(NO_VIEWER_LINE, sink=self.name, detail=why)
+            return self._unavailable(why)
         busy = self._busy()
         if busy is not None:
             return busy
@@ -680,34 +873,14 @@ class SparkViewSink(_ViewSink):
             self.state.release()
             return held_result(VIEWER_FAILED_LINE, sink=self.name,
                                detail=str(exc))
-        try:
-            self._settle(self.settle_s)
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: the settle wait raised", exc_info=True)
-        if not self._still_up():
-            # It started and went. Clean up whatever is left of it, give
-            # the deck back and say so: a window that is not there is not
-            # a cast, however cleanly the process was spawned.
-            log.warning("castview: the viewer was gone %.1fs after launch",
-                        self.settle_s)
-            return self._give_back(VIEWER_DIED_LINE, VIEWER_DIED_REASON)
-        linked = self._is_connected()
-        if linked is False:
-            return self._give_back(VIEWER_NOT_CONNECTED_LINE,
-                                   NOT_CONNECTED_REASON)
-        if linked is None:
-            return self._give_back(CANNOT_TELL_LINE, CANNOT_TELL_REASON)
-        self._arm_confirm()
+        held = self._settle_and_confirm()
+        if held is not None:
+            return held
         return landed_result(
             SHOWN_LINE.format(What=_cap(VIEW_SCREENS[HPCOMPUTER]),
                               target=self.label), sink=self.name)
 
-    def _give_back(self, line: str, why: str):
-        self._stop()
-        self.state.release()
-        return held_result(line, sink=self.name, detail=why)
-
-    def _still_up(self) -> bool:
+    def _still_there(self) -> bool:
         """Ask whether the process is there. A probe that raises is not a
         yes."""
         try:
@@ -716,61 +889,10 @@ class SparkViewSink(_ViewSink):
             log.debug("castview: the viewer probe raised", exc_info=True)
             return False
 
-    def _is_connected(self) -> Optional[bool]:
-        """True, False, or None for CANNOT TELL. A probe that raises has
-        no opinion; it is never a yes."""
-        if self._connected is None:
-            return None
-        try:
-            got = self._connected()
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: the connection probe raised", exc_info=True)
-            return None
-        return None if got is None else bool(got)
-
-    def _arm_confirm(self) -> None:
-        """The SECOND LOOK. A viewer alive at 0.7 s and gone at 3 s was
-        claimed landed and never revisited, so the deck stayed held by a
-        cast that was not there and the next genuine cast was refused as
-        busy. This gives the deck back and takes the sentence back."""
-        try:
-            self._watch = self._later(self.confirm_s, self._confirm)
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: the confirm timer would not arm",
-                      exc_info=True)
-            self._watch = None
-
-    def _confirm(self) -> None:
-        self._watch = None
-        if self.state.live != self.name:
-            return                                  # already stopped
-        if self._still_up() and self._is_connected() is True:
-            return
-        log.warning("castview: the cast was gone %.1fs after it was claimed",
-                    self.confirm_s)
-        self._stop()
-        self.state.release()
-        if self._retract is not None:
-            try:
-                self._retract(CAST_GONE_LINE)
-            except Exception:                       # noqa: BLE001 - the seam
-                log.debug("castview: the retraction raised", exc_info=True)
-
-    def _stop(self) -> None:
-        watch, self._watch = self._watch, None
-        cancel = getattr(watch, "cancel", None)
-        if callable(cancel):
-            try:
-                cancel()
-            except Exception:                       # noqa: BLE001 - the seam
-                log.debug("castview: the confirm timer would not cancel",
-                          exc_info=True)
+    def _stop_here(self) -> None:
         if self._stop_fn is None:
             return
-        try:
-            self._stop_fn()
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: stopping the viewer raised", exc_info=True)
+        self._stop_fn()
 
 
 class HpViewSink(_ViewSink):
@@ -780,17 +902,54 @@ class HpViewSink(_ViewSink):
     says why. That is the honest degradation: nothing is queued for a
     machine that is not listening, so a startup script installed an hour
     later does not suddenly execute an hour-old intention.
+
+    ROUND 4: A RECEIPT IS NOT A DESKTOP, AND THIS IS THE DIRECTION HE CAN
+    ACTUALLY HIT TODAY -- the gesture ships off, the spoken cast does not.
+    Round 3 made the receipt honest about the LAUNCH: the Windows script
+    now moves its sequence only after a viewer it watched survive 700 ms.
+    That is the strongest thing the script can say and it is still not a
+    landing. A RustDesk viewer sitting on an accept-or-password prompt
+    survives 700 ms perfectly well, and MEASURED against the real relay
+    and the real sink it gave landed=True, held=False and "The Spark's
+    screen is on HPCOMPUTER, sir." with nothing on any monitor -- and
+    nothing re-checked it, so ``state.live`` stayed held by a cast that
+    was not there and the next genuine cast was refused as busy.
+
+    So this direction now needs what the other one needed: a tri-state
+    connection probe (see ``_ViewSink``), a second look, and a spoken
+    retraction. THE EVIDENCE IS THE MIRROR IMAGE of the Spark's, because
+    the viewer is on HIS machine and there is no pid here to ask about:
+    the Spark is the end being VIEWED, so what jarvis/app.py reads is an
+    ESTABLISHED socket INBOUND from HPCOMPUTER on the screen-sharing port
+    and bytes leaving over it. It opens nothing.
+
+    AND WHAT IT STILL CANNOT SAY, unchanged and not quietly widened: that
+    proves a live connection carrying a stream. It does not prove a
+    window is visible, or on the middle monitor, or in front of what he
+    was reading. That last step has no local evidence and is his.
     """
 
     name = "hp-view"
     label = VIEW_LABELS[HPCOMPUTER]
+    unavailable_line = NO_HELPER_LINE
+    gone_line = HELPER_GONE_LINE
+    gone_reason = NO_HELPER_REASON
+    not_connected_line = HP_NOT_CONNECTED_LINE
 
     def __init__(self, *, relay: Optional[CastRelay] = None,
                  state: Optional[ViewState] = None,
                  ack_s: float = HELPER_ACK_S,
                  wait: Optional[Callable[[float], object]] = None,
+                 connected: Optional[Callable[[], Optional[bool]]] = None,
+                 settle: Optional[Callable[[float], object]] = None,
+                 later: Optional[Callable[[float, Callable], object]] = None,
+                 retract: Optional[Callable[[str], object]] = None,
+                 settle_s: float = VIEWER_SETTLE_S,
+                 confirm_s: float = VIEWER_CONFIRM_S,
                  now: Callable[[], float] = time.monotonic) -> None:
-        super().__init__(state=state, now=now)
+        super().__init__(state=state, now=now, connected=connected,
+                         settle=settle, later=later, retract=retract,
+                         settle_s=settle_s, confirm_s=confirm_s)
         self.relay = relay
         self.ack_s = float(ack_s)
         # How the receipt is waited for. None is the real one -- the
@@ -800,19 +959,19 @@ class HpViewSink(_ViewSink):
     def available(self) -> tuple:
         if self.relay is None or not self.relay.alive():
             return False, NO_HELPER_REASON
-        return True, ""
+        return super().available()
 
     def deliver(self, subject: CastSubject, *,
                 wait: Optional[Callable[[float], object]] = None):
-        """PARKED IS NOT RECEIVED, and that distinction is the whole of
-        this method.
+        """PARKED IS NOT RECEIVED, AND RECEIVED IS NOT SHOWN. Those are two
+        separate steps and this method is both of them.
 
         ``alive()`` only says the helper polled within the last minute; it
         may last have polled 59 seconds ago, and a verb sitting on the
         relay for a machine that is not at the door is not a screen on a
         monitor. So the verb goes on, and then this waits for the helper's
         NEXT poll to quote that sequence back -- which is the Windows
-        script saying it has acted on it. Only that is a landing.
+        script saying it has acted on it.
 
         With no receipt the verb is TAKEN BACK OFF THE RELAY (as a stop,
         the closed set's own word for it, so that a helper which did get it
@@ -820,10 +979,17 @@ class HpViewSink(_ViewSink):
         deck is released. Nothing is left queued for a machine that did not
         answer -- the same rule this sink already held for a helper that
         was never running at all.
+
+        AND THEN THE SAME AGAIN FOR THE PICTURE. The receipt means the
+        script launched something and watched it survive its own 700 ms;
+        it does not mean a desktop arrived, and a viewer on a password
+        prompt satisfies it exactly. So the connection is probed, and a
+        cast that cannot be shown to be carrying a stream gives the deck
+        back and says so rather than claiming a landing.
         """
         ok, why = self.available()
         if not ok:
-            return held_result(NO_HELPER_LINE, sink=self.name, detail=why)
+            return self._unavailable(why)
         busy = self._busy()
         if busy is not None:
             return busy
@@ -849,17 +1015,23 @@ class HpViewSink(_ViewSink):
             self.state.release()
             return held_result(line, sink=self.name,
                                detail=why or NO_RECEIPT_REASON)
+        held = self._settle_and_confirm()
+        if held is not None:
+            return held
         return landed_result(
             SHOWN_LINE.format(What=_cap(VIEW_SCREENS[SPARK]),
                               target=self.label), sink=self.name)
 
-    def _stop(self) -> None:
+    def _still_there(self) -> bool:
+        """A machine that has stopped answering is a machine that is gone,
+        whatever a socket says. This is the slow half of the evidence and
+        the connection probe is the fast half."""
+        return self.relay is not None and bool(self.relay.alive())
+
+    def _stop_here(self) -> None:
         if self.relay is None:
             return
-        try:
-            self.relay.set_verb(VERB_STOP)
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: stopping the cast raised", exc_info=True)
+        self.relay.set_verb(VERB_STOP)
 
 
 def _default_later(delay_s: float, fn: Callable[[], object]):
@@ -890,12 +1062,14 @@ __all__ = [
     "ACK_WAIT_ROUNDS", "CANNOT_TELL_LINE", "CANNOT_TELL_REASON",
     "CAST_GONE_LINE", "CAST_GONE_REASON", "HELPER_FAILS",
     "HELPER_FAIL_LINES", "LAUNCH_FAILED_LINE",
+    "HELPER_GONE_LINE", "HP_NOT_CONNECTED_LINE", "RUSTDESK_PORTS",
     "NOT_CONNECTED_REASON", "NO_CONNECTION_PROBE_REASON",
     "VIEWER_CONFIRM_S", "VIEWER_NOT_CONNECTED_LINE", "VIEWER_STREAM_BPS",
     "BUSY_FULL_LINE", "BUSY_LINE", "CAST_SUPPRESS_S", "CastRelay",
     "HELPER_ACK_S", "HELPER_ALIVE_S", "HPCOMPUTER_HOST", "HpViewSink",
     "MAX_LAYOUT_CHARS",
-    "NOTHING_UP_LINE", "NO_HELPER_LINE", "NO_HELPER_REASON",
+    "NOTHING_UP_LINE", "NO_EVIDENCE_LINE", "NO_HELPER_LINE",
+    "NO_HELPER_REASON",
     "NO_PROBE_REASON", "NO_RECEIPT_LINE", "NO_RECEIPT_REASON",
     "NO_VIEWER_LINE", "NO_VIEWER_REASON", "SHOWN_LINE", "SPARK_HOST",
     "STOPPED_LINE", "SparkViewSink", "VERBS", "VERB_NONE", "VERB_SHOW",

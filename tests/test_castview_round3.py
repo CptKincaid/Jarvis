@@ -179,7 +179,12 @@ def test_the_helper_can_report_that_the_launch_failed():
         relay.note(mon=1, layout="0,1920", at=clk.t,
                    fail="no-viewer", failseq=relay.seq)
         return True
-    sink = cv.HpViewSink(relay=relay, ack_s=2.0, wait=wait, now=clk)
+    # ROUND 4 wires a connection probe here: this direction is held to
+    # the same rule now, and a sink with none is unavailable rather than
+    # claiming a landing. It never gets that far in this test.
+    sink = cv.HpViewSink(relay=relay, ack_s=2.0, wait=wait,
+                         connected=lambda: True, settle=lambda s: None,
+                         later=lambda d, fn: None, now=clk)
     res = sink.deliver(hp_subj())
     print("\n  helper reported %r -> %r" % (relay.fail, res.spoken))
     assert not res.landed and res.held
@@ -270,6 +275,8 @@ def test_a_launch_that_works_still_becomes_a_receipt():
     helper.poll_once(at=clk.t)
     sink = cv.HpViewSink(relay=relay, ack_s=2.0,
                          wait=lambda s: (helper.round_trip(at=clk.t), True)[1],
+                         connected=lambda: bool(helper.windows_up),
+                         settle=lambda s: None, later=lambda d, fn: None,
                          now=clk)
     res = sink.deliver(hp_subj())
     print("\n  launch works -> %r (windows up %d)"

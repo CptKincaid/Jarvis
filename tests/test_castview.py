@@ -49,7 +49,7 @@ def subject(kind: str = "screen", spoken: str = "the Spark's screen"):
 
 
 def deck(clock=None, *, launch=True, helper_at=None, answers=True,
-         viewer_up=True):
+         viewer_up=True, served=True):
     """Both sinks and the shared live-cast state, with recorders behind
     every outward edge.
 
@@ -57,8 +57,10 @@ def deck(clock=None, *, launch=True, helper_at=None, answers=True,
     now supplies both confirmations. ``answers`` plays the Windows script's
     half of the round trip -- wake on the parked long poll, take the verb,
     act, poll again quoting the sequence it acted on, which is the receipt.
-    ``viewer_up`` is the Spark viewer's aliveness a moment after launch.
-    Set either False for a cast that goes out and is never confirmed.
+    ``viewer_up`` is the Spark viewer's aliveness a moment after launch,
+    and ``served`` (ROUND 4) is whether HPCOMPUTER is actually pulling the
+    Spark's screen once its helper has acknowledged the verb. Set any of
+    them False for a cast that goes out and is never confirmed.
     """
     clock = clock or Clock()
     rec = {"launched": [], "stopped": [], "verbs": [], "naps": [],
@@ -89,7 +91,15 @@ def deck(clock=None, *, launch=True, helper_at=None, answers=True,
         settle=rec["naps"].append,
         later=lambda d, fn: rec["later"].append((d, fn)),
         state=state, now=clock)
-    hp = cv.HpViewSink(relay=relay, state=state, now=clock, wait=helper)
+    # ROUND 4: HpViewSink is held to the same rule. A receipt says the
+    # Windows script ACTED; it never said a desktop arrived, and a viewer
+    # on an accept-or-password prompt satisfies it exactly. ``served`` is
+    # the connection probe for that direction and it is an injected
+    # recorder here; nothing opens a socket.
+    hp = cv.HpViewSink(relay=relay, state=state, now=clock, wait=helper,
+                       connected=lambda: served,
+                       settle=rec["naps"].append,
+                       later=lambda d, fn: rec["later"].append((d, fn)))
     return spark, hp, relay, state, rec, clock
 
 

@@ -115,7 +115,7 @@ FROM_HP_LEFT = screen_gesture(MIDDLE_X, 300.0)          # nothing that way
 
 
 def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None,
-        answers=True, viewer_up=True, **kw):
+        answers=True, viewer_up=True, served=True, **kw):
     """The courier with the screen cast wired to recorders.
 
     ``on`` is the config switch, ``learned`` whether a map is stored,
@@ -127,7 +127,9 @@ def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None,
     plays the Windows script coming back for the verb and quoting the
     sequence it acted on, and ``viewer_up`` is the Spark viewer still
     being there a moment after launch. Set either False and the cast HOLDS
-    -- which is the honest state, not a failure of the fixture.
+    -- which is the honest state, not a failure of the fixture. ROUND 4
+    added ``served``: whether HPCOMPUTER's viewer is actually pulling the
+    Spark's screen, which a receipt never said.
     """
     from tests.test_gesturecast import Options
     opts = Options()
@@ -166,6 +168,11 @@ def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None,
                 view_stop=lambda: stopped.append(1),
                 view_alive=lambda: viewer_up,
                 view_connected=lambda: viewer_up,
+                # ROUND 4: the same rule in the OTHER direction. A receipt
+                # from the Windows helper means "the script acted"; it
+                # never meant "a desktop arrived". ``view_served`` is what
+                # HPCOMPUTER is actually pulling off this box.
+                view_served=lambda: served,
                 view_later=lambda _d, _fn: None,
                 view_ack_wait=windows_helper,
                 view_settle=lambda _s: None, **kw)

@@ -15,6 +15,10 @@
 # not act. No cursor coordinate, no window handle, no title, no process
 # name, no path and no Windows error string leaves this machine.
 #
+# ROUND 4: AND A STOP THAT DID NOT HAPPEN IS NOW ONE OF THOSE CODES. See
+# Stop-Cast below -- an empty catch there meant a viewer this script could
+# not kill was left up while the receipt said it had been closed.
+#
 # THE RECEIPT IS THE POINT OF THIS FILE, AND IT WAS WRONG. Jarvis reads
 # $seq back as proof that the cast landed. Round 2 committed it BEFORE
 # Start-Process, under $ErrorActionPreference = 'SilentlyContinue', so
@@ -56,12 +60,40 @@ function Get-Layout {
     ForEach-Object { "$($_.Bounds.X),$($_.Bounds.Width)" }) -join ',')
 }
 
+# Stop the viewer THIS script started, and say so if it would not die.
+# Returns 0 when nothing of ours is running any more, and the pid back when
+# one still is -- with $script:fail set to 'stop-failed'.
+#
+# ROUND 3 PUT $ErrorActionPreference = 'Stop' AT THE TOP AND LEFT THIS
+# EMPTY CATCH BEHIND, and it is the one that reaches the sentence Jarvis
+# says. `return 0` was unconditional, so a viewer that would not close --
+# a hung RustDesk, a process this session may not touch -- was orphaned on
+# his middle monitor while $castPid was cleared, $ok stayed true and the
+# receipt told Jarvis the stop had happened. The same swallow let the next
+# show-spark stack a SECOND viewer on top of the one still up.
+#
+# A process that has ALREADY EXITED is not a failure: there is nothing
+# running and nothing to report, which is exactly the state the caller
+# wanted. Only a kill that was attempted and did not take is reported.
 function Stop-Cast {
   param([int]$ProcId)
-  if ($ProcId -ne 0) {
-    try { Stop-Process -Id $ProcId -Force -ErrorAction Stop } catch { }
+  if ($ProcId -eq 0) { return 0 }
+  try { $null = Get-Process -Id $ProcId -ErrorAction Stop }
+  catch { return 0 }                       # already gone: nothing to do
+  try { Stop-Process -Id $ProcId -Force -ErrorAction Stop }
+  catch {
+    $script:fail = 'stop-failed'
+    return $ProcId
   }
-  return 0
+  # ...and CHECK, because Stop-Process returning is not the process being
+  # gone. The wait is bounded; nothing here loops.
+  for ($i = 0; $i -lt 20; $i++) {
+    try { $null = Get-Process -Id $ProcId -ErrorAction Stop }
+    catch { return 0 }
+    Start-Sleep -Milliseconds 50
+  }
+  $script:fail = 'stop-failed'
+  return $ProcId
 }
 
 # Start the viewer and WATCH IT. Returns the pid, or 0 with $script:fail
@@ -121,11 +153,22 @@ while ($true) {
       $ok = $true
       if ($verb -eq 'show-spark') {
         $castPid = Stop-Cast -ProcId $castPid
-        $castPid = Start-Viewer
-        $ok = ($castPid -ne 0)
+        if ($castPid -ne 0) {
+          # The old viewer would not close. Do NOT stack a second one on
+          # top of it: two RustDesk windows on his middle monitor is worse
+          # than none, and $script:fail already says why.
+          $ok = $false
+        }
+        else {
+          $castPid = Start-Viewer
+          $ok = ($castPid -ne 0)
+        }
       }
       elseif ($verb -eq 'stop') {
         $castPid = Stop-Cast -ProcId $castPid
+        # A RECEIPT FOR A STOP MEANS THE VIEWER IS GONE. It used to mean
+        # "Stop-Cast returned", which it always did.
+        $ok = ($castPid -eq 0)
       }
       # anything else: do nothing, deliberately. No else branch acts.
       if ($ok) {

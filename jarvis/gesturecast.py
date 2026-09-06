@@ -187,6 +187,7 @@ class GestureCast:
                  view_stop: Optional[Callable[[], object]] = None,
                  view_alive: Optional[Callable[[], bool]] = None,
                  view_connected: Optional[Callable[[], Optional[bool]]] = None,
+                 view_served: Optional[Callable[[], Optional[bool]]] = None,
                  view_later: Optional[Callable[[float, Callable],
                                                object]] = None,
                  view_ack_wait: Optional[Callable[[float], object]] = None,
@@ -275,9 +276,24 @@ class GestureCast:
             # event, set when the poll route answers the Windows script. A
             # test injects the helper's half of the round trip here rather
             # than reaching inside the sink.
+            #
+            # ROUND 4: AND ``view_served``, WHICH IS THE SAME RULE AGAIN IN
+            # THE DIRECTION HE CAN ACTUALLY HIT. The gesture ships off; the
+            # spoken cast does not. Round 3 made the RECEIPT honest -- the
+            # Windows script moves its sequence only after a launch it
+            # watched survive 700 ms -- and a receipt still is not a
+            # desktop: a viewer on an accept-or-password prompt survives
+            # 700 ms perfectly well, and this sink said "The Spark's screen
+            # is on HPCOMPUTER, sir." over it (MEASURED). Without a
+            # connection probe the sink is UNAVAILABLE here too, and the
+            # second look retracts the sentence out loud when the cast goes.
             "hp-view": view_mod.HpViewSink(relay=self.relay,
                                            state=self.view_state,
-                                           wait=view_ack_wait, now=now),
+                                           wait=view_ack_wait,
+                                           connected=view_served,
+                                           later=view_later,
+                                           retract=self._speak,
+                                           settle=view_settle, now=now),
         }
         self.views = view_mod.registry(self.registry["spark-view"],
                                        self.registry["hp-view"])

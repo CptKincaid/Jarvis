@@ -31,6 +31,7 @@ import uuid
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 from jarvis import gateledger
 from jarvis.config import CONFIG, MACHINE, PATHS
@@ -1569,6 +1570,7 @@ class JarvisApp:
                 view_stop=self._rustdesk_close,
                 view_alive=self._rustdesk_alive,
                 view_connected=self._rustdesk_connected,
+                view_served=self._hpcomputer_watching,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
@@ -1671,6 +1673,77 @@ class JarvisApp:
             return None
         rate = (second - first) / self._STREAM_SAMPLE_S
         log.info("cast: viewer pid %d is pulling %.0f B/s", pid, rate)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
+
+    # How long the byte counter is sampled over on the SERVING side. The
+    # same idea as _STREAM_SAMPLE_S and the same GUESS.
+    _SERVE_SAMPLE_S = 0.35
+
+    def _hpcomputer_watching(self) -> Optional[bool]:
+        """Is HPCOMPUTER actually PULLING the Spark's screen?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. This is the Spark -> HPCOMPUTER direction
+        and it is NOT the mirror of ``_rustdesk_connected``: there is no
+        viewer process on this box to ask about. The viewer runs in HIS
+        Windows session; the Spark is the end being VIEWED. So the
+        evidence is what arrives here:
+
+          * an ESTABLISHED TCP socket INBOUND from castview.HPCOMPUTER_HOST
+            on one of ``castview.RUSTDESK_PORTS``. THE PORT SCOPING IS THE
+            WHOLE POINT: the Windows helper's own long poll is also an
+            established socket to that host, held open 25 s at a time
+            about 2.4 times a minute, so "is there a connection to
+            HPCOMPUTER" is true almost always and is worth nothing. The
+            poll's own port (webapp's 8765) is deliberately not in that
+            tuple.
+          * bytes actually leaving over it. The socket alone is not
+            enough for the same reason it was not enough in the other
+            direction -- a viewer negotiating a password holds one open --
+            so the inode is traced back to the process serving it and its
+            ``wchar`` is sampled. ``castview.VIEWER_STREAM_BPS`` is the
+            floor and it is GUESSED.
+
+        THE HONEST WEAKNESS, stated rather than buried: ``wchar`` is that
+        process's WHOLE output, not this socket's. If his RustDesk were
+        serving a second viewer at the same moment, this would read that
+        traffic too and could say yes to a cast that is not carrying. It
+        cannot say yes to a machine that is not connected at all, which is
+        the failure this exists to catch, and per-socket byte counters are
+        not in /proc -- reading them means opening a netlink socket, which
+        this lane does not do.
+
+        NOTHING HERE OPENS A WINDOW, A SOCKET, A CAPTURE DEVICE OR THE
+        PICTURE, and nothing leaves this box. It proves a live connection
+        carrying a stream. It does NOT prove a window is visible or on his
+        middle monitor. That last step is his.
+        """
+        try:
+            inodes = procnet.established_to(castview_mod.HPCOMPUTER_HOST,
+                                            castview_mod.RUSTDESK_PORTS)
+            if not inodes:
+                return False
+            pid = None
+            for inode in sorted(inodes):
+                pid = procnet.pid_for_inode(inode)
+                if pid is not None:
+                    break
+            if pid is None:
+                return None                # not ours to look into
+            first = procnet.wchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._SERVE_SAMPLE_S)
+            second = procnet.wchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._SERVE_SAMPLE_S
+        log.info("cast: HPCOMPUTER is pulling %.0f B/s from pid %d",
+                 rate, pid)
         return rate >= castview_mod.VIEWER_STREAM_BPS
 
     def _rustdesk_close(self) -> None:
