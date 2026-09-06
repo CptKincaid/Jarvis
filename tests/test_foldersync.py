@@ -1134,16 +1134,26 @@ def test_the_landing_takes_the_atomic_link_and_never_a_check(home):
     def watch_open(path, flags, *a, **k):
         if flags & os.O_EXCL:
             used.append("o_excl")
+            where.append(Path(path))
         return real_open(path, flags, *a, **k)
 
+    where = []
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(os, "link", watch_link)
         mp.setattr(os, "open", watch_open)
-        syncer(home, t).pull_once()
-    # The O_EXCL is the PART FILE being claimed before a byte moves (row 5);
-    # the landing itself is still the atomic link, which is what this test
-    # exists to hold, and it must not quietly degrade to the fallback.
-    assert used == ["o_excl", "link"]
+        s = syncer(home, t)
+        s.pull_once()
+    # The FIRST O_EXCL is the PART FILE being claimed before a byte moves
+    # (row 5); the landing itself is still the atomic link, which is what
+    # this test exists to hold, and it must not quietly degrade to the
+    # fallback.  The LAST is round 10: the ledger's temp being claimed
+    # inside _replace_ours after the landing is recorded -- in the state
+    # dir, ours, never a name in his Inbox.
+    assert used == ["o_excl", "link", "o_excl"]
+    assert where[0].name.startswith(fs.PART_PREFIX), where
+    assert where[1].parent == s.ledger.path.parent, where
+    assert not [p for p in where if p.parent == home / "Inbox"
+                and not p.name.startswith(fs.PART_PREFIX)], where
     assert (home / "Inbox" / "notes.txt").exists()
 
 
