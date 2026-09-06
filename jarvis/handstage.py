@@ -127,6 +127,22 @@ FACE_JUMP_FRAC = 0.20
 # against the median of three 14 of 14, and the lean stays refused 6/6
 # either way.
 FACE_JUMP_SAMPLES = 3
+# ROUND 3, THE SECOND SIGNAL. A throw now also needs his head to have been
+# pointed where it was pointed BEFORE the reach began -- see
+# gesture.CastThresholds.yaw_hold_deg for why one scalar could not do it
+# alone. The reference angle is taken while the machine is still IDLE, for
+# the same reason gesturecast.py reads yaw from before the fist closes:
+# the reaching arm crosses the face at exactly the moment the gesture
+# matters, so an angle sampled at the grab is an angle sampled through a
+# forearm.
+#
+# YAW_STALE_S is how old the newest clean face row may be and still count.
+# GUESSED, and bounded by arithmetic: a reach, a close, a three-frame
+# dwell and a swing is about 1.5 s at 7.5 fps, so a window shorter than
+# that would answer "no opinion" on every throw by construction. Longer
+# than this and the angle is not evidence about the swing at all.
+YAW_STALE_S = 2.0
+YAW_ROWS = 24                 # ~3-4 s of face rows at 6-7.5 fps
 
 # Why the stage did not look this frame. "" when it did.
 REASON_OFF = "off"
@@ -154,6 +170,7 @@ class HandShot:
     toward: str = ""           # the measured sector of a carry end
     armed: bool = False        # the tracker ran this frame
     reason: str = ""           # why it did not, else ""
+    looking: str = ""          # "yes" | "no" | "" for no clean face row
     hand_ms: float = 0.0       # the stage's cost this frame
 
     def as_dict(self) -> dict:
@@ -163,7 +180,8 @@ class HandShot:
                 "closed": round(self.closed, 3), "reach": round(self.reach, 3),
                 "state": self.state, "held": self.held, "event": self.event,
                 "toward": self.toward, "armed": self.armed,
-                "reason": self.reason, "hand_ms": round(self.hand_ms, 2)}
+                "reason": self.reason, "looking": self.looking,
+                "hand_ms": round(self.hand_ms, 2)}
 
 
 # ------------------------------------------------------------- the config
@@ -256,6 +274,7 @@ class HandStage:
                  get_option: Optional[Callable] = None,
                  make_tracker: Optional[Callable[[], Any]] = None,
                  hold_off: Optional[Callable[[], bool]] = None,
+                 watch: Optional[Callable[[dict], None]] = None,
                  now: Callable[[], float] = time.monotonic,
                  attend_latch_s: Optional[float] = None,
                  face_window_s: Optional[float] = None,
@@ -264,6 +283,15 @@ class HandStage:
         self._get = get_option
         self._make = make_tracker or default_tracker_factory(get_option)
         self._hold_off = hold_off
+        # WHERE THE SCREEN-CAST SOURCE COMES FROM. ``watch(row)`` is handed
+        # the same scalars this stage already reports, on EVERY frame it
+        # looked at, BEFORE the machine's event fires -- so a courier that
+        # wants to know where his hand was when the fist closed has the
+        # number already, and ``gesture.CastEvent`` needs no new field. It
+        # is a dict of floats and bools; nothing of the frame is in it and
+        # nothing of the frame could be. Off by default (None), and the
+        # ``enabled`` gate above it means OFF really means never called.
+        self._watch = watch
         self._now = now
         self.attend_latch_s = float(
             attend_latch_s if attend_latch_s is not None
@@ -291,6 +319,14 @@ class HandStage:
         self.looked = 0
         self.events = 0
         self.last: Optional[HandShot] = None
+        self._face = (0.0, False)
+        self._yaws: deque = deque(maxlen=YAW_ROWS)
+        self._yaw_ref: Optional[float] = None
+        # Instruments, not decisions: how often the head could be read at
+        # all, so the abstain RATE is visible in his own room rather than
+        # guessed here.
+        self.look_reads = 0
+        self.look_misses = 0
 
     # ------------------------------------------------------------ reads
     @property
@@ -311,6 +347,10 @@ class HandStage:
                 "tracker": self._tracker is not None,
                 "tracker_reason": self._tracker_reason,
                 "baseline_samples": len(self._eyes),
+                "look_reads": int(self.look_reads),
+                "look_misses": int(self.look_misses),
+                "look_miss_pct": (round(100.0 * self.look_misses
+                                        / max(self.look_reads, 1), 1)),
                 "machine": self.gesture.status(), "last": last}
 
     # ------------------------------------------------------------ guts
@@ -362,6 +402,48 @@ class HandStage:
             return 0.0
         return median
 
+    def _face_yaw(self, faces) -> tuple:
+        """``(yaw_deg, ok)`` for the ONE face rule this stage already
+        follows. Two faces is not this gesture, and a face whose landmarks
+        failed has no angle -- ``ok`` False is NO OPINION, never zero
+        degrees, which would read as looking straight at the lens."""
+        if len(faces) != 1:
+            return 0.0, False
+        f = faces[0]
+        if not bool(getattr(f, "landmarks_ok", True)):
+            return 0.0, False
+        try:
+            return float(getattr(f, "yaw_deg", 0.0) or 0.0), True
+        except (TypeError, ValueError):
+            return 0.0, False
+
+    def _looking(self, t: float) -> Optional[bool]:
+        """Was his head still pointed where it was before the reach?
+
+        Tri-state, and None is NO OPINION, never a yes. The reference is
+        latched while the machine is IDLE and frozen for the life of a
+        reach or a carry, so it is an angle read before the arm came up.
+        """
+        self.look_reads += 1
+        if self.gesture.state is CastState.IDLE:
+            # Still resting: keep the reference fresh, and have no opinion
+            # about a swing that has not begun.
+            yaw, ok = self._face
+            if ok:
+                self._yaw_ref = float(yaw)
+            self.look_misses += 0 if ok else 1
+            return True if ok else None
+        ref = self._yaw_ref
+        if ref is None:
+            self.look_misses += 1
+            return None
+        for at, yaw in reversed(self._yaws):
+            if (t - at) <= YAW_STALE_S:
+                return abs(float(yaw) - ref) <= float(self.gesture.t.yaw_hold_deg)
+            break
+        self.look_misses += 1
+        return None
+
     def _arm(self, faces, t: float) -> bool:
         if len(faces) == 1 and bool(getattr(faces[0], "attending", False)):
             self._attended_at = t
@@ -396,7 +478,8 @@ class HandStage:
             g.frame_w, g.frame_h = fw, fh
 
     def _shot(self, obs, ev, armed: bool, reason: str, t0: float,
-              eye_px: float) -> HandShot:
+              eye_px: float,
+              looking: Optional[bool] = None) -> HandShot:
         g = self.gesture
         best = obs[0] if obs else None
         shot = HandShot(
@@ -411,11 +494,36 @@ class HandStage:
             event=ev.kind if ev is not None else "",
             toward=ev.toward if ev is not None else "",
             armed=armed, reason=reason,
+            looking=("" if looking is None else ("yes" if looking else "no")),
             hand_ms=(self._now() - t0) * 1000.0)
         if ev is not None:
             self.events += 1
         self.last = shot
+        self._tell(shot, t0)
         return shot
+
+    def _tell(self, shot: HandShot, t: float) -> None:
+        """One numbers-only row to the watcher, on every frame we looked.
+
+        It carries the frame WIDTH because the lateral position that names
+        a screen is measured from the frame centre, and the stage is the
+        only thing that knows both. A watcher that raises must not kill the
+        capture thread: a dropped row costs one sample."""
+        watch = self._watch
+        if watch is None:
+            return
+        yaw_deg, face_ok = self._face
+        try:
+            watch({"at": float(t), "present": bool(shot.present),
+                   "cx": float(shot.cx), "cy": float(shot.cy),
+                   "palm_diag": float(shot.palm_diag),
+                   "frame_w": float(self.gesture.frame_w),
+                   "frame_h": float(self.gesture.frame_h),
+                   "yaw_deg": float(yaw_deg), "face_ok": bool(face_ok),
+                   "looking": shot.looking,
+                   "armed": bool(shot.armed), "state": shot.state})
+        except Exception:                            # noqa: BLE001 - a watcher
+            log.debug("gesture: the frame watcher raised", exc_info=True)
 
     # ---------------------------------------------------------- the call
     def observe(self, frame, faces, frame_w: int, frame_h: int,
@@ -436,6 +544,10 @@ class HandStage:
         self._fit(frame_w, frame_h)
         self._tick_fps(t0)
         eye_px = self._baseline(faces, t0)
+        self._face = self._face_yaw(faces)
+        if self._face[1]:
+            self._yaws.append((t0, float(self._face[0])))
+        looking = self._looking(t0)
         armed = self._arm(faces, t0)
         if self._hold_off is not None:
             try:
@@ -445,13 +557,15 @@ class HandStage:
             if busy:
                 if g.state is CastState.CARRYING:
                     g.cancel("a question is on the floor")
-                ev = g.update((), eye_px, seq)
-                return self._shot((), ev, False, REASON_QUESTION, t0, eye_px)
+                ev = g.update((), eye_px, seq, looking=looking)
+                return self._shot((), ev, False, REASON_QUESTION, t0, eye_px,
+                                  looking)
         if not armed:
             # A miss, not a skipped call: the machine's clock keeps
             # running, so a carry that loses attention still times out.
-            ev = g.update((), eye_px, seq)
-            return self._shot((), ev, False, REASON_UNARMED, t0, eye_px)
+            ev = g.update((), eye_px, seq, looking=looking)
+            return self._shot((), ev, False, REASON_UNARMED, t0, eye_px,
+                              looking)
         tracker = self._tracker_or_none(t0)
         if tracker is None:
             return None
@@ -468,8 +582,8 @@ class HandStage:
             except (ValueError, AttributeError, TypeError):
                 continue
         rows = None                                  # nothing of the frame survives
-        ev = g.update(obs, eye_px, seq)
-        return self._shot(obs, ev, True, "", t0, eye_px)
+        ev = g.update(obs, eye_px, seq, looking=looking)
+        return self._shot(obs, ev, True, "", t0, eye_px, looking)
 
     def cancel(self, why: str = "cancelled"):
         """The spoken "drop it", the chip click, shutdown: any thread."""
@@ -479,6 +593,7 @@ class HandStage:
 __all__ = [
     "ATTEND_LATCH_S", "DEFAULT_THREADS", "FACE_JUMP_FRAC",
     "FACE_JUMP_SAMPLES", "FACE_MIN_SAMPLES", "FACE_WINDOW_S", "STALL_FLOOR_S",
+    "YAW_ROWS", "YAW_STALE_S",
     "HandShot", "HandStage", "OPTION_ENABLED", "OPTION_PREFIX",
     "REASON_NO_MODELS", "REASON_OFF", "REASON_QUESTION", "REASON_UNARMED",
     "default_tracker_factory", "gesture_enabled", "thresholds_from_options",

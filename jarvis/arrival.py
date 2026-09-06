@@ -79,6 +79,21 @@ ARRIVAL_EARCON = "arrival"
 DEFAULT_CONFIRM_MIN = 5
 DEFAULT_MIC_SILENCE_MIN = 10
 
+# One arrival cue per return, shared by the phone, door and desk probes.
+# Lives HERE rather than in app.py because it is part of the choreography
+# this module owns and because ``greet_refusal`` below has to name it; the
+# app keeps its own ``GREET_DAMPER_S`` as an alias so the two can never
+# drift apart.
+GREET_DAMPER_S = 600.0
+
+# EVERY GATE ON THE ARRIVAL PATH HAS A NAME, and the set is closed so that
+# nothing can refuse anonymously. On 2026-09-05 he walked in at 20:43:13,
+# the fabric published the kitchen, and he got silence: no arrival line, no
+# greeting, and nothing at all in the log saying which gate had declined.
+# The silence was the defect, not the refusal -- a refusal is often right,
+# but it must always be legible.
+DOOR_GATES = ("no-room", "wrong-room", "not-away", "already-greeted", "damper")
+
 
 def arrival_plan(*, returned: bool = False, home: bool = True,
                  quiet_reason: str = "", cue: bool = True,
@@ -226,6 +241,51 @@ def door_arrival(*, room, door: str = DEFAULT_DOOR_ROOM,
     return bool(away) and bool(key) and key == _room_key(door)
 
 
+def door_refusal(*, room, door: str = DEFAULT_DOOR_ROOM,
+                 state: str = "") -> str:
+    """Why this room change is NOT a door opening. "" means it would fire.
+
+    The mirror of ``door_arrival``, and the reason it exists separately is
+    that the boolean threw away the interesting half. Tonight the gate that
+    said no was ``not-away`` -- the sentinel had never once said "away",
+    because a latched office pinned the house occupied -- and the boolean
+    could not say so. Now it can, in a sentence he can read in jarvis.log.
+
+    ``state`` is the sentinel's own verdict word, not a bool, because
+    "home" and "unknown" fail identically here and telling them apart is
+    the whole point at boot: a fresh start while he sits in the office is
+    "unknown", and that must be distinguishable from a house that has
+    positively decided he is in.
+    """
+    key = _room_key(room)
+    if not key:
+        return ("no room: the fabric has no active room, so there is no "
+                "door to open")
+    want = _room_key(door)
+    if key != want:
+        return ("wrong room: %s became occupied but the door room is %s"
+                % (key, want or "unset"))
+    verdict = str(state or "").strip().lower() or "unknown"
+    if verdict != "away":
+        return ('not away: the house reads "%s", and the door needs away '
+                "and only away" % verdict)
+    return ""
+
+
+def greet_refusal(*, source: str = "", since_s: float = 0.0,
+                  damper_s: float = GREET_DAMPER_S) -> str:
+    """Why a greeting was swallowed by the damper. "" means it may speak."""
+    try:
+        since, damper = float(since_s), float(damper_s)
+    except (TypeError, ValueError):
+        return ""
+    if since >= damper:
+        return ""
+    return ("damper: the %s probe reached the door %ds after the last "
+            "greeting and the damper is %ds, so this is the same return"
+            % (source or "presence", int(since), int(damper)))
+
+
 class DoorWatch:
     """The rising edge of ``door_arrival``, and nothing else.
 
@@ -244,17 +304,38 @@ class DoorWatch:
     def __init__(self, door: str = DEFAULT_DOOR_ROOM):
         self.door = door
         self._fired = False
+        # The gate that last said no, in words. "" while it would fire.
+        self.last_refusal = ""
+        self._said = ""
 
     def left(self) -> None:
         """He went out. The next door opening is a new arrival."""
         self._fired = False
 
-    def observe(self, *, room, away: bool = False) -> bool:
-        """One RoomChanged. True exactly once per return."""
-        if not door_arrival(room=room, door=self.door, away=away):
+    def observe(self, *, room, away: bool = False, state: str = "") -> bool:
+        """One RoomChanged. True exactly once per return.
+
+        ``state`` is the sentinel's verdict word when the caller has it, so
+        the refusal can say "unknown" rather than merely "not away".
+
+        THE REFUSAL IS ALWAYS WRITTEN AT INFO, and there is deliberately no
+        flag to suppress it: tonight's defect was silence, and a quiet
+        option is how silence comes back. It is said ONCE PER REASON rather
+        than once per poll -- the fabric ticks every 2 s, and a line every
+        two seconds is how a real answer gets filtered out of a log.
+        """
+        verdict = str(state or "").strip().lower() or ("away" if away else "home")
+        why = door_refusal(room=room, door=self.door, state=verdict)
+        if not why and self._fired:
+            why = ("already greeted: this return has already opened the "
+                   "door once, and one homecoming is one arrival")
+        self.last_refusal = why
+        if why:
+            if self._said != why:
+                self._said = why
+                log.info("arrival: no greeting -- %s", why)
             return False
-        if self._fired:
-            return False
+        self._said = ""
         self._fired = True
         return True
 

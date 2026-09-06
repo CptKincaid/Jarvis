@@ -871,7 +871,14 @@ class TestTheConfig:
         exists: no probe, no thread, no device, nothing spoken."""
         courier = GestureCast()
         assert courier.machine.state is CastState.IDLE
-        assert set(courier.registry) == {"board", "hpcomputer", "handoff"}
+        # The two screen-view sinks joined the registry with the screen
+        # cast; both ship with their launchers unwired (None), so building
+        # the courier still opens nothing at all.
+        assert set(courier.registry) == {"board", "hpcomputer", "handoff",
+                                         "spark-view", "hp-view"}
+        assert not courier.screen_cast_on          # OFF by default
+        assert courier.screens is None             # and nothing learned
+        assert courier.cast_live == ""
         assert courier.holding_line() == NOTHING_LINE
         assert courier.recent() is None
         assert_numbers_only(courier.status())
