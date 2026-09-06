@@ -118,7 +118,7 @@ def _answerable_app(result, monkeypatch):
     app._turn_timer = app._turn_watchdog = None
     app._thinking_delay_s, app._turn_timeout_s = 60.0, 120.0   # never fire here
     app._emit_result = lambda r: r
-    app.commander = SimpleNamespace(resolve_uncertain=lambda text, yes: result)
+    app.commander = SimpleNamespace(resolve_uncertain=lambda text, yes, **kw: result)
     # via monkeypatch: a bare assignment here silenced the event bus for every
     # test that ran after this file (timekeeper, speak queue) -- it did.
     monkeypatch.setattr(app_mod.bus, "publish", lambda ev: None)
@@ -170,7 +170,7 @@ def test_a_yes_whose_lookup_closes_the_turn_synchronously_is_not_reopened(monkey
     monkeypatch.setattr(CONFIG, "talkback", True)
     app = _answerable_app(SimpleNamespace(handled=True, status="Thinking", done=False,
                                           reply=None, speak=False), monkeypatch)
-    def resolve(text, yes):
+    def resolve(text, yes, **kw):
         app._turn_finished()                      # the brain answered inline
         return SimpleNamespace(handled=True, status="Thinking", done=False,
                                reply=None, speak=False)

@@ -27,6 +27,18 @@ NOTHING HERE OPENS A DEVICE, and there is no import in this file that could.
 No cv2, no jarvis.camera, no frame, no crop. It reads the gallery -- which is
 128 floats and a string per take -- and formats sentences.
 
+AND SINCE 2026-09-05 THAT CLAIM IS TRUE AT IMPORT TIME AS WELL, which it was
+not. ``jarvis.faceenrol`` and ``jarvis.facegallery`` were imported at module
+scope, and faceenrol imports ``jarvis.facedetect`` and ``jarvis.visionrig`` --
+so merely importing THIS file pulled the whole vision stack in. That was found
+by the USERS page (jarvis/ui/users_page.py), which asks this module for one
+STRING -- the command that deletes somebody's face measurements -- and had the
+photo rig's lens blocker refuse the import outright. A page for managing names
+has no business loading a face detector, so the two heavy imports moved inside
+the four functions that actually need a gallery. ``command_line`` and
+``to_clipboard`` -- the pure string builder and the clipboard seam -- now need
+neither, which is what the users tab uses.
+
 DELETING IS HANDED OVER TOO, AND THAT IS NOT TIMIDITY. "Forget Heather's
 face" arrives as a speech-recognition result. Destroying biometric data on a
 word that might have been misheard is not a risk worth taking for the sake of
@@ -48,8 +60,6 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from jarvis import faceenrol as fe
-from jarvis.facegallery import clean_note, label_ok
 from jarvis.logs import get_logger
 
 log = get_logger("enrolentry")
@@ -107,6 +117,7 @@ def command_line(label: str, owner: str = "hunter",
     if plan and not delete:
         out += ["--plan", shlex.quote(str(plan))]
     for pose in poses:
+        from jarvis.facegallery import clean_note   # noqa: PLC0415 - lazy
         note = clean_note(pose)
         if note:
             out += ["--pose", shlex.quote(note)]
@@ -261,6 +272,8 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
     worth knowing before he starts: with recorded coverage it is the gap, and
     with none it is the five stations. No device is opened to work that out.
     """
+    from jarvis import faceenrol as fe               # noqa: PLC0415 - lazy
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     label = str(label or owner).strip().lower()
     if not label_ok(label):
         return {"reply": "That isn't a name I can store, sir - lowercase "
@@ -356,6 +369,7 @@ def forget_answer(gallery, label: str, owner: str = "hunter",
 
     A misheard word may not destroy biometric data. What this does is name
     what would go, and hand over the command that asks for it in writing."""
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     label = str(label or "").strip().lower()
     if not label_ok(label):
         return {"reply": "That isn't a name I can look up, sir.",
@@ -392,6 +406,7 @@ def gallery_answer(gallery, owner: str = "hunter") -> dict:
     This is the half of the feature that DOES belong in the window: the
     notes were added so a bad match has an answer, and the answer is a
     sentence, not a report."""
+    from jarvis import faceenrol as fe               # noqa: PLC0415 - lazy
     try:
         loaded = bool(gallery.load())
     except Exception:  # noqa: BLE001
@@ -487,6 +502,7 @@ def spoken_label(text: str, owner: str = "hunter") -> str:
     valid tokens and neither is a person; storing one produces a real,
     gallery-shaped, permanent label in the one store whose entire point is
     knowing whose face it holds."""
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     word = str(text or "").strip().lower()
     word = word.replace("'s", "").replace("\u2019s", "").strip()
     if not word or word in _MINE:
@@ -510,4 +526,122 @@ def spoken_pose(text: str) -> str:
     answer better than an index. ``clean_note`` caps it and strips the
     non-printables, and ``command_line`` shlex-quotes it before it goes
     anywhere near his clipboard, so a spoken pose cannot become shell."""
+    from jarvis.facegallery import clean_note        # noqa: PLC0415 - lazy
     return clean_note(str(text or "").strip())
+
+
+# ---------------------------------------------------------- what a purge did
+# THE ONE THING A SURFACE MAY NOT DO WITH A PURGE IS ROUND IT UP. Both
+# galleries' ``purge_label`` return NUMBERS rather than a boolean, precisely so
+# a caller cannot claim a delete happened because a call did not raise: the
+# invariant is that no file is destroyed until the embeddings it held, minus
+# theirs, have been read back off disk from the new generation by name AND by
+# sample count, and anything that fails any step is counted, named and left
+# alone. Three separate bugs moved through that room. So this builds the
+# sentence FROM those numbers, and when ``complete`` is False it says they are
+# still there and names the command that finishes the job.
+PURGE_FOLLOW_UP = ("Run the enrolment script with --status to see what is "
+                   "left, then --delete with no label to destroy everything.")
+
+
+def purge_line(report, *, kind: str = "face") -> str:
+    """One honest sentence about what a purge actually did.
+
+    ``kind`` is "face" or "voice", and the line always names the OTHER one --
+    a face purge that quietly left a voice pool behind would be the same
+    half-truth as a forget that left a gallery behind, which is the defect
+    this whole surface is correcting.
+    """
+    rep = dict(report or {})
+    who = str(rep.get("label") or "somebody")
+    other = "voice" if kind == "face" else "face"
+    held = list(rep.get("generations_with") or ())
+    removed = int(rep.get("removed") or 0)
+    complete = bool(rep.get("complete"))
+    tail = "This does not touch %s's %s." % (who, other)
+
+    if not held and complete:
+        return ("Nothing to remove: no %s generation held %s. %s"
+                % (kind, who, tail))
+
+    if complete:
+        return ("Removed. %d %s generation(s) held %s; %d file(s) were "
+                "overwritten, and everybody else was read back from the new "
+                "generation at full count. %s"
+                % (len(held), kind, who, removed, tail))
+
+    # NOT COMPLETE. Say which generations still hold them and WHY each one
+    # could not be finished, because "some of it worked" is not something
+    # anybody can act on.
+    bits = []
+    still = list(rep.get("still_holding") or ())
+    if still:
+        bits.append("generation(s) %s still hold %s"
+                    % (", ".join(str(g) for g in still), who))
+    unreadable = list(rep.get("unreadable") or ())
+    if unreadable:
+        bits.append("%s could not be read, so %s was left alone"
+                    % (_gens(unreadable), _they(unreadable)))
+    foreign = list(rep.get("foreign") or ())
+    if foreign:
+        models = ", ".join(str(m) for m in (rep.get("foreign_models") or ())
+                           if m)
+        bits.append("%s %s written by another model (%s) this build cannot "
+                    "rewrite" % (_gens(foreign), _were(foreign),
+                                 models or "unknown"))
+    not_carried = list(rep.get("not_carried") or ())
+    if not_carried:
+        bits.append("%s hold somebody else who could not be carried forward, "
+                    "so destroying %s would cost them their enrolment"
+                    % (_gens(not_carried), _they(not_carried)))
+    why = "; ".join(bits) or "the read-back could not be completed"
+    return ("Not finished, and nothing here may claim otherwise: %s. %d "
+            "file(s) were overwritten. %s %s"
+            % (why, removed, PURGE_FOLLOW_UP, tail))
+
+
+def _gens(gens) -> str:
+    return "generation%s %s" % ("" if len(gens) == 1 else "s",
+                                ", ".join(str(g) for g in gens))
+
+
+def _were(gens) -> str:
+    return "was" if len(gens) == 1 else "were"
+
+
+def _they(gens) -> str:
+    return "it" if len(gens) == 1 else "they"
+
+
+VOICE_SCRIPT = "scripts/voice_enrol.py"
+
+
+def voice_script_path() -> str:
+    """Where scripts/voice_enrol.py is, derived the same way and for the same
+    reason: a hard-coded ~/Jarvis is wrong in every worktree."""
+    return str((Path(__file__).resolve().parent.parent / VOICE_SCRIPT))
+
+
+def voice_command_line(label: str, name: str = "", delete: bool = False,
+                       python: Optional[str] = None,
+                       script: Optional[str] = None) -> str:
+    """The hand-over for somebody ELSE's voice, quoted.
+
+    THE VOICE HALF OF THE SAME REFUSAL. A window cannot take a third party's
+    consent -- ``consent.take_at_terminal``'s precondition is two real ttys
+    and its whole point is that nobody may type it for them, which a dialog
+    driven by whoever is already logged in cannot reproduce. So a guest's
+    voice stays at the terminal and this is the command, ready to run.
+
+    IMPORT-LIGHT, like ``command_line`` beside it: no gallery, no model, no
+    recorder is reached to build a string. That property is tested, because
+    importing this module used to pull the whole vision stack in.
+    """
+    out = [shlex.quote(python or sys.executable),
+           shlex.quote(script or voice_script_path())]
+    if delete:
+        out.append("--delete")
+    out += ["--label", shlex.quote(str(label or ""))]
+    if name:
+        out += ["--name", shlex.quote(str(name))]
+    return " ".join(out)

@@ -205,7 +205,7 @@ def test_a_save_failure_after_a_sent_mail_leaves_the_old_code_working(
     not, so the old hash is put back in memory (disk never changed) and
     the line says the one in the inbox is dead."""
     a = _app(tmp_path)
-    monkeypatch.setattr(a.gate.registry, "save", lambda: False)
+    monkeypatch.setattr(Registry, "save", lambda self: False)
     with caplog.at_level(logging.DEBUG):
         line = a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
     new, _, _ = _mailed_code()
@@ -355,10 +355,14 @@ def test_a_save_that_raises_is_a_line_not_an_exception(tmp_path, caplog,
     """R7: Registry.save only catches OSError, so anything else came out
     of a method documented `-> str` -- into the drawer thread, which has
     no way to say what happened. Every failure ends in a line."""
-    def boom():
+    def boom(self):
         raise RuntimeError("the registry file is a directory")
     a = _app(tmp_path)
-    monkeypatch.setattr(a.gate.registry, "save", boom)
+    # ON THE CLASS, not the instance: _knightfall_rotate re-reads the people
+    # book before writing it (a boot-time copy was overwriting people
+    # enrolled since boot -- tests/test_knightfall_stale_registry.py), so an
+    # instance patch on the pre-read object never runs. Same meaning.
+    monkeypatch.setattr(Registry, "save", boom)
     with caplog.at_level(logging.DEBUG):
         line = a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
     new, _, _ = _mailed_code()
@@ -374,7 +378,8 @@ def test_a_set_secret_that_raises_is_a_line_too(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("no")
     a = _app(tmp_path)
-    monkeypatch.setattr(a.gate.registry, "set_secret", boom)
+    # ON THE CLASS -- see the note above; the rotation re-reads first.
+    monkeypatch.setattr(Registry, "set_secret", boom)
     line = a.knightfall_code(FAKE_CODE, smtp=FakeSMTP)
     assert line.startswith("Knightfall accepted, sir; the new code could "
                            "not be stored")

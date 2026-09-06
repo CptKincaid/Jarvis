@@ -273,7 +273,9 @@ class TestWhatIsActuallyDelivered:
         a = _app(monkeypatch, tmp_path)
         _clock(monkeypatch, 14, 29)
         assert a._deliver_first_wake_briefing() is True
-        assert a.chats == [("my afternoon briefing", {"force_tool": "get_briefing"})]
+        assert a.chats == [("my afternoon briefing",
+                            {"force_tool": "get_briefing",
+                             "addressee": ("", "sir")})]
         assert a.said == ["Your briefing for today, sir."]
 
     def test_the_day_review_telemetry_is_not_read_out_unprompted(self, monkeypatch, tmp_path):

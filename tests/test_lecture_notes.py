@@ -331,7 +331,7 @@ def test_a_noted_line_reopens_the_mic_with_the_lecture_window(monkeypatch, tmp_p
     a = _app(monkeypatch, tmp_path)
     res = SimpleNamespace(reply="a line", speak=False, done=True, ack=False,
                           status="Noting: biosensors (1)", handled=True)
-    a.commander.handle = lambda text, source: res
+    a.commander.handle = lambda text, source, **kw: res
     a._dispatch("a line", "voice")
     time.sleep(0.4)
     assert a.starts == [(True, {"window": 20.0})], a.starts
@@ -346,7 +346,7 @@ def test_the_mic_waits_for_speech_to_finish_first(monkeypatch, tmp_path):
     a.tts.is_speaking = True
     res = SimpleNamespace(reply="a line", speak=False, done=True, ack=False,
                           status="Noting: biosensors (1)", handled=True)
-    a.commander.handle = lambda text, source: res
+    a.commander.handle = lambda text, source, **kw: res
     a._dispatch("a line", "voice")
     time.sleep(0.3)
     assert a.starts == [] and a._followup_after_speech
@@ -356,7 +356,7 @@ def test_a_typed_note_does_not_touch_the_mic(monkeypatch, tmp_path):
     a = _app(monkeypatch, tmp_path)
     res = SimpleNamespace(reply="a line", speak=False, done=True, ack=False,
                           status="Noting: biosensors (1)", handled=True)
-    a.commander.handle = lambda text, source: res
+    a.commander.handle = lambda text, source, **kw: res
     a._dispatch("a line", "typed")
     time.sleep(0.3)
     assert a.starts == [] and not a._reopen_mic
