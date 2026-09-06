@@ -37,9 +37,22 @@ THE VERBS, spoken over ssh by jarvis/knightfall_weekly.py on the Spark and
 allowed one-by-one by the forced-command key in jarvis-override-gate.sh:
 
   put             JSON on stdin -> spool/pending.json, atomically, 0600
-  receipt         print spool/receipt.json and delete it
+  receipt         PRINT spool/receipt.json, deleting nothing
+  receipt --ack <id>
+                  delete spool/receipt.json, and only if it is that
+                  push's. This is the one thing that removes a receipt.
   revoke <id>     delete spool/pending.json if it is that push's
   ping            "is the gate alive and is the spool directory there"
+
+WHY THE READ AND THE DELETE ARE TWO VERBS (2026-09-06). ``receipt`` used
+to print AND delete in one step, which made a receipt a one-shot message:
+a Spark that fetched it and then failed to write its own registry had lost
+the only record that the email went out, and its Wednesday deadline then
+dropped a code that had actually been sent. The Spark now reads, writes
+people.json, and only then acks -- so every failure in between leaves the
+receipt exactly where it was. An ack for an id this box does not hold is
+answered ``{"ok": true, "acked": false}`` and changes nothing, so the
+Spark may retry it as often as it likes.
 
 And two REHEARSALS that change nothing, for a human at a keyboard:
 
@@ -306,7 +319,24 @@ def main(argv=None) -> int:
             return 0
         if verb == "receipt":
             data, why = _read_json(RECEIPT)
-            _delete(RECEIPT)
+            if len(argv) > 1:
+                # receipt --ack <id>: the ONLY thing that deletes a
+                # receipt, and only the one the Spark has written down.
+                # Anything else in this position is not a verb.
+                code_id = argv[2] if len(argv) == 3 else ""
+                if argv[1] != "--ack" or not _is_id(code_id):
+                    print(json.dumps({"ok": False,
+                                      "why": "not a verb this gate allows"}))
+                    return 2
+                # A receipt that will not parse is acked away too: junk
+                # that could never be read must not wedge the lane.
+                hit = bool(why) or str(data.get("id") or "") == code_id
+                if hit and RECEIPT.exists():
+                    _delete(RECEIPT)
+                else:
+                    hit = False
+                print(json.dumps({"ok": True, "acked": bool(hit)}))
+                return 0
             print(json.dumps(data if not why else {"status": "none"}))
             return 0
         if verb == "revoke":
