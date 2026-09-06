@@ -194,7 +194,7 @@ def answer_minutes(text: str) -> Optional[int]:
     """A duration ANSWER, or None. Fillers and trailing courtesies come
     off; what is left must be short and must parse, so a command that
     merely contains minutes never counts as an answer."""
-    s = " ".join(str(text or "").split()).lower().strip(" .!?,")
+    s = " ".join(str(text or "").split()).lower().strip(" .!?,…")
     s = s.replace("quarter of an hour", "15 minutes").replace(
         "quarter an hour", "15 minutes").replace("half an hour", "30 minutes")
     changed = True
@@ -205,7 +205,7 @@ def answer_minutes(text: str) -> Optional[int]:
                 s, changed = s[len(word) + 1:].strip(), True
         for tail in _ANSWER_TAIL:
             if s.endswith(" " + tail):
-                s, changed = s[:-len(tail) - 1].strip(" .,"), True
+                s, changed = s[:-len(tail) - 1].strip(" .,…"), True
     if not s or len(s.split()) > ANSWER_MAX_WORDS:
         return None
     return parse_minutes(s)

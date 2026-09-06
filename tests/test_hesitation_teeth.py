@@ -32,15 +32,25 @@ until he answers, skips or stops; a hesitated "quiz me on X" drops the
 open card and routes on (the registry still sees the unstripped words --
 the 5caf86c ruling -- so it may cost him a repeat, never a card).
 
-TWO THINGS ARE LEFT STANDING and pinned in section 5 rather than fixed,
-because neither was in the four items and each would be a fifth default
-taken for him: the send-ask question ("Which Heather, sir?") still reads
-a bare filled pause as an answer and spends its one re-ask, 117/117,
-where the flashcard was given the opposite rule this round; and a RISING
-hesitated stop over a ringing alarm ("Uh, stop?") leaves it ringing,
-26/26, which is the "?" bar and the "stop is the safe direction" rule
-pulling in opposite directions. Neither is a regression -- mainline
-13162d2 lost both -- and both wait on him.
+TWO THINGS WERE LEFT STANDING in round 3 and pinned in section 5. Round
+4 DECIDED both, and section 5's pins are inverted in place rather than
+deleted, so the change reads as a diff:
+
+  a. A rising hesitated stop over a ringing alarm now SILENCES it,
+     26/26. Round 3 read this as the "?" bar and "stop is the safe
+     direction" pulling apart; round 4's adversary showed it was one
+     defect at fourteen anchors, of which the alarm was the only rung
+     the fixer had looked at -- 676 flashcards marked wrong, a camera
+     run that would not stop, an undo lane REGRESSED against mainline.
+     THE CARRY IN strip_fillers IS UNCHANGED and section 1 is unmoved:
+     the fix is each stop grammar's own terminal class.
+  b. The send-ask question now STANDS on a bare filled pause, 0/117
+     spent and 0/117 dropped, which is the rule the flashcard was given
+     in round 3 and its twin was not.
+
+tests/test_stop_is_the_safe_direction.py holds (a)'s other four twins
+and the STOP/CONSENT mirror rule; tests/test_answer_census.py pins that
+rule over every site the census derives.
 """
 from __future__ import annotations
 
@@ -554,22 +564,40 @@ class TestTheWordCountsCountWordsHeSaid:
 
 
 # ===================================================================
-# 5. WHAT ROUND 3 DID NOT CHANGE -- pinned as it stands, so the two open
-#    questions are numbers in the tree and not only in a report
+# 5. THE TWO THINGS ROUND 3 LEFT STANDING -- both DECIDED in round 4,
+#    and both pins inverted here rather than deleted, so the change is
+#    a diff somebody can read and reverse
 # ===================================================================
-class TestTheTwoThingsLeftStanding:
-    """Neither is a regression -- both behave exactly as mainline 13162d2
-    did -- and neither is in the four items this round was asked to fix.
-    They are pinned so that changing either is a DECISION somebody makes,
-    not a drift. Both wait on him."""
+class TestTheTwoThingsRound4Decided:
+    """Round 3 pinned these two as they stood and said both waited on
+    him. Round 4's adversary showed the first was not one open question
+    but the visible corner of a defect at 14 anchors -- 676 flashcards
+    marked wrong, a camera run that would not stop, an undo lane that
+    REGRESSED against mainline -- so the ruling was taken and flagged
+    rather than deferred:
 
-    def test_the_send_ask_question_still_spends_its_re_ask_on_a_bare_pause(self, cmdr):
-        """OPEN. "Which Heather, sir?" -- a bare "Hmm." is taken as an
-        answer, spends the one re-ask, and the second hesitation drops the
-        question out loud. The flashcard was given the opposite rule this
-        round (the card STANDS); this rung was not, because it was not in
-        the four items. Measured: 117/117 spend it, 117/117 drop it once
-        spent. The adversary called it minor; it is his call, not mine."""
+      a. A STOP WORD WITH A "?" OR AN "…" HUNG ON IT STOPS. The "?" bar
+         stays where acting is irreversible; ``_YES_RX`` / ``_NO_RX`` /
+         ``_SEND_YES_BAR_RX`` / ``_OPEN_IT_RX`` / ``_ENROL_CONFIRM_RX``
+         are untouched, and sections 1-4 above are unmoved.
+      b. The send-ask question STANDS on a bare filled pause, which is
+         the rule the flashcard was given in round 3. Its twin was
+         never given it.
+
+    tests/test_stop_is_the_safe_direction.py holds (a)'s five twins and
+    the STOP/CONSENT mirror rule that keeps the next canonical change
+    from repeating this."""
+
+    def test_the_send_ask_question_now_stands_on_a_bare_pause(self, cmdr):
+        """DECIDED (b). "Which Heather, sir?" answered with "Hmm." used
+        to be an ATTEMPT: it spent the one re-ask 117/117, and a second
+        hesitation dropped the question out loud 117/117. Both are now
+        0/117 -- the question stands, exactly as the flashcard does, and
+        ages out on its own stale() clock instead. A man thinking about
+        which Heather has neither answered nor changed the subject.
+
+        The controls below prove the rung did not go deaf: a real name
+        still spends the re-ask and "never mind" still drops it."""
         spent, dropped, n = 0, 0, 0
         for w in FILLERS:
             for said in _pauses(w):
@@ -589,24 +617,38 @@ class TestTheTwoThingsLeftStanding:
                 _through(cmdr, said)
                 if cmdr._pending_sendask is None:
                     dropped += 1
-        assert (n, spent, dropped) == (117, 117, 117)
+        assert (n, spent, dropped) == (117, 0, 0)
+        # ...and the rung still hears a real answer and a real refusal
+        ask = SendAsk(kind="person", said_file="lab report", who="Heather",
+                      hint="", source="voice", made_at=_t.monotonic(),
+                      candidates=["Heather Smith", "Heather Jones"])
+        cmdr._pending_sendask = ask
+        _through(cmdr, "the second one")
+        assert cmdr._pending_sendask is None or ask.reasked
+        ask2 = SendAsk(kind="person", said_file="lab report", who="Heather",
+                       hint="", source="voice", made_at=_t.monotonic(),
+                       candidates=["Heather Smith", "Heather Jones"])
+        cmdr._pending_sendask = ask2
+        _through(cmdr, "never mind")
+        assert cmdr._pending_sendask is None
 
-    def test_a_RISING_hesitated_stop_leaves_the_alarm_ringing(self, cmdr):
-        """OPEN, and the one place the two defaults pull apart. The "?"
-        bar says a rising hesitated yes never acts; the alarm rung says
-        stop is the safe direction. "Uh, stop?" now strips to "stop?",
-        the ring grammars rstrip only ".!", and the alarm goes on
-        ringing: 26/26. Mainline lost these forms too, so nothing was
-        taken away -- but a man woken at six who says "uh, stop?" is not
-        asking a question, and one character in _try_ringing's rstrip
-        would change it."""
+    def test_a_RISING_hesitated_stop_SILENCES_the_alarm(self, cmdr):
+        """DECIDED (a), and the pin is inverted rather than deleted:
+        26/26 SILENCED where round 3 pinned 26/26 ringing.
+
+        The two defaults only looked as though they pulled apart. The
+        "?" bar is about IRREVERSIBLE acts; a dismissed alarm is not one,
+        and ``_try_ringing``'s own rule is that stop is the safe
+        direction. The fix is at ``_RING_STOP_RX``'s terminal class, not
+        in strip_fillers: THE CARRY IS UNCHANGED, and the line below
+        still pins it, because the bar on the send lane depends on it."""
         lost, n = [], 0
         for w in FILLERS:
             for said in (f"{w.capitalize()}, stop?", f"stop, {w}?"):
                 n += 1
                 calls = _ring(cmdr)
                 _through(cmdr, said)
-                if calls == []:
+                if calls != [("stop", "dismiss")]:
                     lost.append(said)
-        assert n == 26 and len(lost) == 26
-        assert strip_fillers("stop, uh?") == "stop?"
+        assert n == 26 and lost == [], f"{len(lost)}/{n} kept ringing: {lost[:8]}"
+        assert strip_fillers("stop, uh?") == "stop?"   # the carry stands

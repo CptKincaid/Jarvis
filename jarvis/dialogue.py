@@ -68,7 +68,7 @@ _ENOUGH_RX = re.compile(
     r"enough(?: for now| for today)?|"
     r"we(?:'re| are)?\s+done(?: for now)?|"
     r"leave it (?:there|at that))"
-    r"(?:[,]?\s*(?:please|sir|jarvis|thanks|thank you))*[.!\s]*$", re.I)
+    r"(?:[,]?\s*(?:please|sir|jarvis|thanks|thank you))*[?.!…\s]*$", re.I)
 
 
 def enough_kind(text: str) -> bool:
@@ -197,7 +197,7 @@ _YES_RX = re.compile(
 _SKIP_RX = re.compile(
     r"^(?:no|nope|nah|skip(?: (?:it|that|this one))?|leave (?:it|that)|"
     r"drop (?:it|that)|not (?:that|this week)|pass)"
-    r"(?:[,]?\s*(?:please|sir|jarvis))?[.!\s]*$", re.I)
+    r"(?:[,]?\s*(?:please|sir|jarvis))?[?.!\u2026\s]*$", re.I)
 _MOVE_RX = re.compile(
     r"\b(?:move|push|shift|make|put)\b.*", re.I)
 

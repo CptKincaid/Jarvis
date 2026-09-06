@@ -1463,7 +1463,7 @@ _QUIET_RX = re.compile(
     r"^" + _JV + r"(?:stop(?: it| now| there| talking| speaking| reading)?|"
     r"be quiet|quiet|hush|shush|shh+|shut up|shut it|silence|that's enough|"
     r"that'll do|enough|never ?mind|cancel that|stop that|zip it|pipe down)"
-    r"(?:[,]?\s*jarvis)?[.!\s]*$", re.I)
+    r"(?:[,]?\s*jarvis)?[?.!…\s]*$", re.I)
 _REPEAT_RX = re.compile(
     r"^" + _JV + r"(?:say (?:that |it )?again|repeat (?:that|it)|come again|"
     r"pardon(?: me)?|what was that|sorry,? what|once more|repeat)"
@@ -1523,7 +1523,7 @@ def continue_kind(text: str) -> bool:
 _CANCEL_TASK_RX = re.compile(
     r"^" + _JV + r"(?:cancel(?: that| it| this| the task| the job| claude|"
     r" everything)?|abort(?: that| it| the task)?|stop (?:that|the task|the job|"
-    r"claude|working|the claude task))(?:[,]?\s*jarvis)?[.!\s]*$", re.I)
+    r"claude|working|the claude task))(?:[,]?\s*jarvis)?[?.!…\s]*$", re.I)
 
 
 def cancel_kind(text: str) -> bool:
@@ -1897,7 +1897,7 @@ _READ_CTL_RX = re.compile(
     r"one (?:sec|second|moment|minute))"
     r"|(?P<resume>go on|carry on|continue(?:\s+reading)?|resume(?:\s+reading)?|"
     r"keep going|unpause|where were we|as you were)"
-    r")(?:[,]?\s*jarvis)?[?.!\s]*$", re.I)
+    r")(?:[,]?\s*jarvis)?[?.!\u2026\s]*$", re.I)
 
 
 def read_control_kind(text: str) -> Optional[str]:
@@ -3102,7 +3102,9 @@ BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment.
 # meaning no to a destructive read-back, and "okay" -- absent from
 # _YES_WORDS, so "okay" used to answer this question with total silence --
 # must not start meaning yes to one.
-_BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$"
+# Only _BRIEFING_NO_RX reads this (the YES half has an inline tail of
+# its own): the "…" here widens the DECLINE and nothing else.
+_BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!\u2026]*$"
 # An affirmative is a CHAIN: "Yes, go ahead." / "Yeah, sure." / "Okay, do
 # it." are how he actually answers, and a grammar that took one yes-word
 # plus a courtesy refused 26 of 37 natural answers (measured, 09-03, F36)
@@ -3210,23 +3212,23 @@ _ENROL_STOP_RX = re.compile(
     r"that'?s enough|enough)"
     r"(?:\s+(?:the\s+)?(?:enrol(?:ment|ling)?|enroll(?:ment|ing)?|"
     r"capture|that))?"
-    r"(?:[, ]+(?:jarvis|please|thanks))*[.!]*$", re.I)
+    r"(?:[, ]+(?:jarvis|please|thanks))*[?.!…]*$", re.I)
 _ENROL_READY_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:ready|next|go|go on|i'?m ready|i am ready|"
-    r"carry on)(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
+    r"carry on)(?:[, ]+(?:jarvis|please))*[?.!…]*$", re.I)
 _ENROL_WAIT_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:wait|hold on|hold|not yet|one moment|"
     r"just a moment|hang on|give me a second|give me a sec)"
-    r"(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
+    r"(?:[, ]+(?:jarvis|please))*[?.!…]*$", re.I)
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
     r"turn it off|alright|all right|got it|thank you|thanks|quiet|silence|"
-    r"stop it|that'?s enough|cancel|off)(?:[, ]+(?:jarvis|thanks|please))*[.!]*$", re.I)
+    r"stop it|that'?s enough|cancel|off)(?:[, ]+(?:jarvis|thanks|please))*[?.!…]*$", re.I)
 _SNOOZE_RX = re.compile(
     r"^(?:snooze|(?:five|ten|\d+) more minutes|(?:a )?(?:bit|few minutes) more)"
     r"(?:\s+(?:for\s+)?(?:(?P<n>" + _NUM_ALT + r")\s*(?:minutes?|mins?)?))?"
-    r"(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
+    r"(?:[, ]+(?:jarvis|please))*[?.!…]*$", re.I)
 # Pending permission question (spec 5.2 b).
 _YES_RX = re.compile(
     r"^(?:yes|yeah|yep|yup|aye|allow(?: it| that)?|approve(?:d| it)?|go ahead|"
@@ -4028,7 +4030,7 @@ _LECTURE_RX = re.compile(
     r"\s+(?:for|on|in)\s+(?P<course>.+?)[.!]*$", re.I)
 _LECTURE_END_RX = re.compile(
     r"^(?:(?:end|stop|close|finish|save)\s+(?:the\s+|my\s+)?(?:lecture\s+|class\s+)?notes"
-    r"|(?:end|stop)\s+(?:the\s+)?note[- ]taking)(?:[, ]+(?:please|now|jarvis))*[.!?]*$", re.I)
+    r"|(?:end|stop)\s+(?:the\s+)?note[- ]taking)(?:[, ]+(?:please|now|jarvis))*[.!?…]*$", re.I)
 # A deliberate note from a source the mode does not listen to: `jarvis
 # "note: the demo is on friday"` while the lecture runs on the microphone.
 _NOTE_PREFIX_RX = re.compile(r"^note\s*[:\-]\s*(?P<body>\S.*)$", re.I)
@@ -5828,11 +5830,17 @@ _SEND_YES_HEAD = (
 # plain one.
 # "go" / "send" alone in the tail are the truncated heads ("yes go", "yes
 # send"): an early endpoint took the rest.
-_SEND_YES_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|"
-                  r"then|and|go|send|" + _SEND_YES_HEAD + r"|" + _SEND_TO_REF + r"|"
-                  + _SEND_FROM_SAME + r"|" + _SEND_REF_TAIL + r"|"
-                  + _SEND_APPROVAL + r"|" + _SEND_REASSURE +
-                  r"))*[?.!]*$")
+# What may follow the answer word and still be part of it. The two
+# halves of the send lane share this BODY and differ only in the terminal
+# class they end on (_SEND_YES_TAIL / _SEND_NO_TAIL below): the yes must
+# not take an "…", the no must. Written as one body rather than a slice
+# off the other, so editing the shared part cannot silently mis-build the
+# half that is not in front of you.
+_SEND_TAIL_BODY = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|"
+                   r"then|and|go|send|" + _SEND_YES_HEAD + r"|" + _SEND_TO_REF + r"|"
+                   + _SEND_FROM_SAME + r"|" + _SEND_REF_TAIL + r"|"
+                   + _SEND_APPROVAL + r"|" + _SEND_REASSURE + r"))*")
+_SEND_YES_TAIL = _SEND_TAIL_BODY + r"[?.!]*$"
 _SEND_YES_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?" + _SEND_YES_HEAD + _SEND_YES_TAIL,
     re.I)
@@ -6028,12 +6036,20 @@ def _send_clean(text: str) -> str:
 # over" are contradictory sentences, and the safe reading of each is the
 # one where nothing leaves the machine -- a no followed by any yes-shaped
 # thing is a no.
+# The DECLINE's tail: the same body, one character wider. Both halves
+# read _SEND_YES_TAIL until round 4, and widening THAT would have let
+# "yes, uh…" SEND -- _SEND_YES_BAR_RX bars a "?" anywhere and says
+# nothing about an ellipsis. Refusing a cancel leaves a draft armed for
+# its 90 s and the next yes-shaped utterance spends it, so the two
+# halves need different terminal classes. That is the whole STOP/CONSENT
+# mirror in one pair of constants (tests/test_stop_consent_mirror.py).
+_SEND_NO_TAIL = _SEND_TAIL_BODY + r"[?.!\u2026]*$"
 _SEND_NO_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?(?:no[,\s]+)?"
     r"(?:no|nope|nah|negative|don'?t|do not|stop|cancel|abort|"
     r"not now|not yet|not that one|wrong one|wrong file|wrong person|"
     r"hold on|hold off|hang on|wait|never ?mind|forget it|scratch that|leave it|"
-    r"no thanks|no thank you|that'?s wrong)" + _SEND_YES_TAIL, re.I)
+    r"no thanks|no thank you|that'?s wrong)" + _SEND_NO_TAIL, re.I)
 # A no said LATE, after the yes he started on: "send it to her, actually
 # no", "yes, hold on", "yes, send it, no wait", "send it to her. no." Each
 # was re-asked (safe, nothing sent) with the draft kept armed for the next
@@ -8440,17 +8456,17 @@ _REVIEW_RX = re.compile(
     r"run through|drill|study) (?:my |the |some |today's )?(?:flash ?cards|cards|"
     r"due cards|deck|flashcard deck)|(?:start |begin )?(?:a |the |my )?"
     r"(?:flash ?card review|flash ?cards|review session|card review))"
-    r"(?:\s+(?:please|now|again))?[.!?\s]*$", re.I)
+    r"(?:\s+(?:please|now|again))?[.!?…\s]*$", re.I)
 _QUIZ_STOP_RX = re.compile(
     r"^" + _JV + r"(?:(?:stop|end|quit|finish|pause|cancel|enough(?: of| with)?|"
     r"that's enough(?: of)?) (?:the |this |my )?(?:quiz|quizzing|flash ?cards|"
     r"review|questions|test|quizzes)(?: me)?|stop quizzing me|no more questions|"
-    r"that's enough questions)[.!?\s]*$", re.I)
+    r"that's enough questions)[.!?…\s]*$", re.I)
 _QUIZ_SKIP_RX = re.compile(
     r"^(?:skip(?: it| that| this one)?|pass|next(?: one| question)?|"
     r"i (?:don't|do not) know(?: that one| this one| it)?|no idea|not sure|"
     r"dunno|i give up|tell me(?: the answer)?|what's the answer|"
-    r"what is the answer)[.!?\s]*$", re.I)
+    r"what is the answer)[.!?…\s]*$", re.I)
 
 
 def quiz_kind(text: str) -> Optional[str]:
@@ -10372,7 +10388,8 @@ _UNDO_RX = re.compile(
     r"|^take that back"
     r"|^(?:on second thought[s]?|actually)[,.]?\s+(?:scratch|undo|cancel) that",
     re.I)
-_UNDO_TAIL_RX = re.compile(r"^[\s,.!]*(?:please|jarvis|sir|instead)?[\s,.!]*$", re.I)
+_UNDO_TAIL_RX = re.compile(
+    r"^[\s,.!?\u2026]*(?:please|jarvis|sir|instead)?[\s,.!?\u2026]*$", re.I)
 # Spoken fillers Whisper writes down: "BELAY THAT LAST Uhhh... ORDER" (live
 # 2026-09-01 21:10:23) was a perfect undo with a hesitation in it, and the
 # hesitation sent it to the intent classifier, which asked "Was that for
@@ -12492,6 +12509,25 @@ class Commander:
         if not self._same_room(ask.source, source):
             log.debug("send %s question: a %s turn is not its answer",
                       ask.kind, source)
+            return None
+        # NOTHING BUT A FILLED PAUSE: the question STANDS -- the rule the
+        # flashcard was given in round 3, now given to its twin. "Which
+        # Heather, sir?" answered with "Hmm." used to be an ATTEMPT: it
+        # spent the one re-ask (117/117 measured), and a second hesitation
+        # dropped the question out loud (117/117). A man thinking about
+        # which Heather has not answered and has not changed the subject.
+        # Nothing is spent, nothing is dropped, question_open() stays
+        # true, and the ask ages out on its own stale() clock as before.
+        if not strip_fillers(text or ""):
+            # ``_answered_pending`` here means "this turn does not SPEND
+            # the question", which is the flag's one job: without it the
+            # hesitation falls through to the intent gate, is called
+            # background chat, and _drop_unanswered spends the question it
+            # never talked over -- which is how the second pause dropped
+            # it 117/117 even after this rung stopped consuming the first.
+            self._answered_pending = True
+            log.debug("send %s question: %r is a hesitation; it stands",
+                      ask.kind, str(text or "")[:40])
             return None
         self._pending_sendask = None
         said = " ".join(str(text or "").split())
