@@ -459,18 +459,23 @@ def test_the_census_imports_nothing_from_jarvis():
 
 
 # ===================================================================
-# 5. THE ADVERSARY'S EIGHT PLANTS (round 2, 09-06): caught or BLIND
+# 5. THE PLANTED GRAMMARS: caught, or BLIND and said so
 # ===================================================================
-# Each plant is one rung in a package of its own. Six left the census
-# GREEN in round 2 (P2, P3, P4, P5, P6, P8); the census now catches P2,
-# P4, P5 and P6. P3 and P8 are BLIND, and stated so in the module's
-# docstring: the test below asserts the blindness too, so that a census
-# that learns to see one of them fails here and the docstring is moved.
+# Each plant is one rung in a package of its own. P1-P8 are the
+# adversary's eight (round 2, 09-06); six of them left the census GREEN
+# then (P2, P3, P4, P5, P6, P8) and it now catches P2, P4, P5 and P6.
+# N2 is a ninth, planted in round 3 past those eight. P3, P8 and N2 are
+# BLIND, and each is stated in answercensus.py's own blind-spot list: the
+# test below asserts the blindness too, so that a census which learns to
+# see one of them fails HERE and the docstring must be moved with it. A
+# census is only a pin over the shapes it can see, and this is the list
+# of the ones it cannot.
 _PLANT_HEAD = '''
 import re
 from fake.endpoint import strip_fillers
 
 _P_RX = re.compile(r"^(?:yes|yeah)[.!]*$", re.I)
+_RXS = {"yes": _P_RX}
 
 
 class Commander:
@@ -539,8 +544,57 @@ PLANTS = {
             t = strip_fillers(text)
         return "yes" if _P_RX.match(t) else None
 ''', None),
+    # N1, N3, N4, N5: four more of my own, and all four CAUGHT. They pin
+    # the widenings round 3 made, from the far side -- a MODE rung whose
+    # grammar is an in-tuple, an f-string launder, a grammar one call away
+    # from the rung, and an endswith over lecture_course.
+    "N1": (_PLANT_HEAD + '''
+    def _try_ring2(self, text: str):
+        if not self.services.timekeeper.ringing:
+            return None
+        return "stop" if text.strip().lower() in ("stop", "quiet") else None
+''', "rungs.py:Commander._try_ring2:in('stop','quiet')"),
+    "N3": (_PLANT_HEAD + '''
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        t = f"{text}".strip().lower()
+        return "yes" if _P_RX.match(t) else None
+''', "rungs.py:Commander._try_pending:_P_RX"),
+    "N4": (_PLANT_HEAD + '''
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        return _judge(text)
+
+
+def _judge(words):
+    return "yes" if _P_RX.match(words) else None
+''', "rungs.py:_judge:_P_RX"),
+    "N5": (_PLANT_HEAD + '''
+    def _try_notes(self, text: str):
+        if not self.lecture_course:
+            return None
+        return "end" if text.strip().lower().endswith("end notes") else None
+''', "rungs.py:Commander._try_notes:endswith('end notes')"),
+    # N2 is MINE, not the adversary's: round 3 (09-06) planted five more
+    # shapes past the eight and this one walked. The regex is held in a
+    # module-level dict and reached by subscript; the rung IS walked and
+    # the grammar is not a site, so the rung reports clean. jarvis/ has no
+    # such container today (grepped), so the derivation was not widened
+    # for it -- it is declared in answercensus.py's blind spots and
+    # asserted blind here, so a census that learns to see it fails and the
+    # docstring is moved. The four that were CAUGHT: an in-tuple grammar
+    # on a ringing-alarm rung, an f-string launder, a grammar in a helper
+    # the rung calls, and an endswith over lecture_course.
+    "N2": (_PLANT_HEAD + '''
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        return "yes" if _RXS["yes"].match(text) else None
+''', None),
 }
-BLIND = {"P3", "P8"}
+BLIND = {"P3", "P8", "N2"}
 
 
 @pytest.mark.parametrize("name", sorted(PLANTS))

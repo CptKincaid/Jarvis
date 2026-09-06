@@ -106,6 +106,15 @@ not -- the BLIND SPOTS, so nobody reads its green as a proof:
   * A dispatch table built by calls (``registry.add(rx, handler)``) rather
     than a module-level list is not read as a table; its handlers would
     count as rungs if they read answer state.
+  * A regex reached through a SUBSCRIPT of a container -- ``_RXS["yes"]``,
+    ``_RX_LIST[0]`` -- is not resolved: the rung is walked and the grammar
+    inside it is not a site, so the rung reports clean. ``self._RX``, a
+    local alias, an ``a if x else b`` and a ``for rx in (_A, _B)`` loop
+    ARE resolved; a subscript is not. Round 3 (09-06) planted this shape
+    (N2 in tests/test_answer_census.py) after the adversary's eight, and
+    it walked past. No such container exists in jarvis/ today -- the
+    derivation was not widened for a shape the code does not use -- so
+    this is a declared hole, pinned as blind, not a silent one.
 """
 from __future__ import annotations
 

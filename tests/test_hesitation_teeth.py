@@ -31,6 +31,16 @@ never sends, grants, opens or runs; a flashcard stands on a bare pause
 until he answers, skips or stops; a hesitated "quiz me on X" drops the
 open card and routes on (the registry still sees the unstripped words --
 the 5caf86c ruling -- so it may cost him a repeat, never a card).
+
+TWO THINGS ARE LEFT STANDING and pinned in section 5 rather than fixed,
+because neither was in the four items and each would be a fifth default
+taken for him: the send-ask question ("Which Heather, sir?") still reads
+a bare filled pause as an answer and spends its one re-ask, 117/117,
+where the flashcard was given the opposite rule this round; and a RISING
+hesitated stop over a ringing alarm ("Uh, stop?") leaves it ringing,
+26/26, which is the "?" bar and the "stop is the safe direction" rule
+pulling in opposite directions. Neither is a regression -- mainline
+13162d2 lost both -- and both wait on him.
 """
 from __future__ import annotations
 
@@ -541,3 +551,62 @@ class TestTheWordCountsCountWordsHeSaid:
         res = cmdr._try_destructive_confirm("uh, um, ah, I think so, yes", "voice")
         assert res is not None and res.status == "Confirm?"
         assert cmdr._pending_destructive is not None
+
+
+# ===================================================================
+# 5. WHAT ROUND 3 DID NOT CHANGE -- pinned as it stands, so the two open
+#    questions are numbers in the tree and not only in a report
+# ===================================================================
+class TestTheTwoThingsLeftStanding:
+    """Neither is a regression -- both behave exactly as mainline 13162d2
+    did -- and neither is in the four items this round was asked to fix.
+    They are pinned so that changing either is a DECISION somebody makes,
+    not a drift. Both wait on him."""
+
+    def test_the_send_ask_question_still_spends_its_re_ask_on_a_bare_pause(self, cmdr):
+        """OPEN. "Which Heather, sir?" -- a bare "Hmm." is taken as an
+        answer, spends the one re-ask, and the second hesitation drops the
+        question out loud. The flashcard was given the opposite rule this
+        round (the card STANDS); this rung was not, because it was not in
+        the four items. Measured: 117/117 spend it, 117/117 drop it once
+        spent. The adversary called it minor; it is his call, not mine."""
+        spent, dropped, n = 0, 0, 0
+        for w in FILLERS:
+            for said in _pauses(w):
+                n += 1
+                ask = SendAsk(kind="person", said_file="lab report", who="Heather",
+                              hint="", source="voice", made_at=_t.monotonic(),
+                              candidates=["Heather Smith", "Heather Jones"])
+                cmdr._pending_sendask = ask
+                _through(cmdr, said)
+                if getattr(ask, "reasked", False):
+                    spent += 1
+                ask2 = SendAsk(kind="person", said_file="lab report", who="Heather",
+                               hint="", source="voice", made_at=_t.monotonic(),
+                               candidates=["Heather Smith", "Heather Jones"])
+                ask2.reasked = True
+                cmdr._pending_sendask = ask2
+                _through(cmdr, said)
+                if cmdr._pending_sendask is None:
+                    dropped += 1
+        assert (n, spent, dropped) == (117, 117, 117)
+
+    def test_a_RISING_hesitated_stop_leaves_the_alarm_ringing(self, cmdr):
+        """OPEN, and the one place the two defaults pull apart. The "?"
+        bar says a rising hesitated yes never acts; the alarm rung says
+        stop is the safe direction. "Uh, stop?" now strips to "stop?",
+        the ring grammars rstrip only ".!", and the alarm goes on
+        ringing: 26/26. Mainline lost these forms too, so nothing was
+        taken away -- but a man woken at six who says "uh, stop?" is not
+        asking a question, and one character in _try_ringing's rstrip
+        would change it."""
+        lost, n = [], 0
+        for w in FILLERS:
+            for said in (f"{w.capitalize()}, stop?", f"stop, {w}?"):
+                n += 1
+                calls = _ring(cmdr)
+                _through(cmdr, said)
+                if calls == []:
+                    lost.append(said)
+        assert n == 26 and len(lost) == 26
+        assert strip_fillers("stop, uh?") == "stop?"
