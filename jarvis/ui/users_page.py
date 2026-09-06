@@ -2065,11 +2065,19 @@ class UsersPage(tk.Frame):
                             fg=theme.INK, bg=bg, anchor="w", bd=0, padx=0,
                             pady=0)
         name_lbl.pack(side="left")
-        label_lbl = tk.Label(head, text=row.label,
-                             font=ui_display(theme.SIZE_CAPTION),
-                             fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0,
-                             pady=0)
-        label_lbl.pack(side="left", padx=(theme.PAD_S, 0))
+        # THE LABEL CHIP IS DRAWN ONLY WHEN IT SAYS SOMETHING THE NAME DOES
+        # NOT: "Marchbanks  marchbanks  KNOWN" spent 150 px repeating the
+        # name in lower case, and at 920 that is what pushed the name into
+        # an ellipsis ("Marchba…", measured on the rig, 2026-09-06). Every
+        # panel that asks him to type the label prints it in full.
+        fixed = [forget, role]
+        if str(row.display).strip().lower() != str(row.label).strip().lower():
+            label_lbl = tk.Label(head, text=row.label,
+                                 font=ui_display(theme.SIZE_CAPTION),
+                                 fg=theme.FAINT, bg=bg, anchor="w", bd=0,
+                                 padx=0, pady=0)
+            label_lbl.pack(side="left", padx=(theme.PAD_S, 0))
+            fixed.append(label_lbl)
         role_lbl = tk.Label(head, text=ROLE_WORDS.get(row.role,
                                                        row.role.upper()),
                             font=ui_display(theme.SIZE_CAPTION, "semibold"),
@@ -2077,9 +2085,9 @@ class UsersPage(tk.Frame):
                             else theme.MUTED,
                             bg=bg, anchor="w", bd=0, padx=0, pady=0)
         role_lbl.pack(side="left", padx=(theme.PAD_S, 0))
+        fixed.append(role_lbl)
         head.bind("<Configure>",
-                  lambda e, h=head, n=name_lbl, d=row.display,
-                  o=(forget, role, label_lbl, role_lbl):
+                  lambda e, h=head, n=name_lbl, d=row.display, o=tuple(fixed):
                   self._fit_head(h, n, d, o), add=True)
         forget.set_enabled(row.can_forget)
         role.set_enabled(row.can_change_role)

@@ -768,7 +768,13 @@ class SetupSheet(tk.Frame):
                  pady=0).pack(side="left", padx=px(6))
         self._field["subnet"] = self._entry(self._static, width=ENTRY_W)
         self._field["subnet"].pack(side="left")
-        row = self._row(body, "mac")
+        # The MAC row is "only for a DHCP reservation", as its own caption
+        # says, so it is shown only while the DHCP switch is on -- and the
+        # gateway/mask rows only while it is off (_recompute). One of the
+        # two pairs is always noise, and MEASURED 2026-09-06 on the rig at
+        # 920x1440 with two rooms configured the 63-px row it saves is what
+        # keeps the ota box above the fold (it was 68% visible with both).
+        self._mac_row = row = self._row(body, "mac")
         self._field["mac"] = self._entry(row, width=ENTRY_W)
         self._field["mac"].pack(side="left")
         tk.Label(row, text="only for a DHCP reservation",
@@ -1077,11 +1083,15 @@ class SetupSheet(tk.Frame):
         """Repaint the consequence lines from what is typed right now."""
         for key, btn in self._preset_btn.items():
             btn.set_kind("accent" if key == self._preset else "default")
+        after = self._field["ip"].master
         if self._dhcp.get():
             self._static.pack_forget()
+            self._mac_row.pack(fill="x", padx=theme.PAD, pady=px(3),
+                               after=after)
         else:
+            self._mac_row.pack_forget()
             self._static.pack(fill="x", padx=theme.PAD, pady=px(3),
-                              after=self._field["ip"].master)
+                              after=after)
         self._mount.configure(text=sp.PRESETS[self._preset].mount
                               if self._preset in sp.PRESETS else "")
         values, why = sp.validate(self.form(),
