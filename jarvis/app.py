@@ -326,6 +326,40 @@ TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 # was locked out for 62 minutes because nothing bounded this at all.
 AUDIO_TIMEOUT_S = 90.0          # watchdog: a hung decode must not wedge the mic
 
+
+def _stuck_thread_stack(thread) -> list:
+    """The stack of ``thread`` as it stands NOW, one line per frame, innermost
+    last -- or one line saying why there is none. Pure and never raises: a
+    diagnostic that can itself fail inside a watchdog is worse than none.
+
+    ``sys._current_frames()`` is the whole trick: it needs no ptrace and no
+    root, only the thread's ident, so it works under the account that could
+    not run py-spy. The frame is a snapshot and may be a few instructions
+    stale by the time it is formatted; for "what is it waiting on" that is
+    more than enough.
+    """
+    import sys
+    import traceback
+    if thread is None:
+        return ["no decode thread recorded"]
+    try:
+        if not thread.is_alive():
+            return ["the decode thread has already exited (name=%s)"
+                    % getattr(thread, "name", "?")]
+        frame = sys._current_frames().get(thread.ident)
+        if frame is None:
+            return ["the decode thread is alive but has no frame (ident=%r)"
+                    % thread.ident]
+        lines = traceback.format_stack(frame)
+        out = ["decode thread %r is standing here (innermost last):"
+               % getattr(thread, "name", "?")]
+        for chunk in lines[-12:]:
+            out.extend(ln.rstrip() for ln in chunk.splitlines() if ln.strip())
+        return out
+    except Exception as exc:                   # noqa: BLE001 - diagnostic
+        return ["the decode thread's stack could not be read: %s"
+                % type(exc).__name__]
+
 # The sources that arrive from somewhere other than this desk: a shell /
 # SSH / cron client and a clip sent over the command socket
 # (jarvis/cmdsock.py, jarvis/intercom.py), and the phone client's page
@@ -5214,8 +5248,15 @@ class JarvisApp:
             self._nudge("no_audio")
             return
         self._audio_started()
-        threading.Thread(target=self._process_audio, args=(audio,),
-                         daemon=True).start()
+        t = threading.Thread(target=self._process_audio, args=(audio,),
+                             daemon=True, name="audio-decode")
+        # Remembered so the watchdog can print WHERE this thread is if it
+        # never comes back. On 2026-09-06 nobody could say where the decode
+        # hung -- py-spy needs a privilege this account does not have -- and
+        # the fix had to be a timeout over an unknown. Next time the log
+        # says which line it was standing on.
+        self._audio_thread = t
+        t.start()
 
     # ------------------------------------------------------- the owner gate
     def _face_running(self) -> bool:
@@ -5951,6 +5992,11 @@ class JarvisApp:
                   "finished decoding. Releasing the wake word -- it was "
                   "being dropped as 'still transcribing the previous clip'.",
                   float(getattr(self, "_audio_timeout_s", AUDIO_TIMEOUT_S)))
+        # THE INSTRUMENT. Where is the decode thread standing right now?
+        # This is the question nobody could answer on 2026-09-06, and it is
+        # answerable from inside the process with no privilege at all.
+        for line in _stuck_thread_stack(getattr(self, "_audio_thread", None)):
+            log.error("audio watchdog: %s", line)
         self._audio_busy.clear()
         try:
             bus.publish(Status(text="Sorry, sir -- I lost that one",
