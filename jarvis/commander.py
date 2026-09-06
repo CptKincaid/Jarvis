@@ -10014,6 +10014,36 @@ _DAY_ANCHOR_RX = re.compile(
     r"saturday|sunday)\b", re.I)
 
 
+_DAY_BEFORE_DATE_RX = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+$", re.I)
+
+
+def _shift_named_day(prev: str, today) -> Optional[str]:
+    """``prev`` with the day it names moved on by one; "" when it names a
+    QUESTION rather than a day (nothing to move until he answers it); None
+    when it names no specific day at all (a weekday word alone is the
+    caller's job).  The new day is written out in full -- "Wednesday the
+    9th", "Thursday the 1st of October" -- so every downstream reader lands
+    on exactly that day."""
+    from jarvis.tools.calendar import (as_date, date_span, date_words,
+                                       digit_ordinals, is_ask)
+
+    text = digit_ordinals(prev)
+    found = date_span(text, today)
+    if found is None:
+        return None
+    value, start, end = found
+    day = as_date(value)
+    if is_ask(value) or day is None:
+        return ""
+    # "on tuesday the 8th": the weekday is part of the same phrase and would
+    # contradict the new day if it stayed.
+    lead = _DAY_BEFORE_DATE_RX.search(text[:start])
+    if lead:
+        start = lead.start()
+    return text[:start] + date_words(day + timedelta(days=1), today) + text[end:]
+
+
 def day_shift_followup(prev_text: str, text: str,
                        today=None) -> Optional[str]:
     """His previous question re-asked one day later, or None.
@@ -10031,12 +10061,26 @@ def day_shift_followup(prev_text: str, text: str,
     prev = (prev_text or "").strip()
     if not prev:
         return None
+    today = today or date.today()
+    # A question that NAMED A DAY -- "tuesday the 8th", "the 12th",
+    # "september twelfth", "9/12", "the day after the 12th" -- moves that
+    # day, read by the one resolver both calendar doors use.  ROUND THREE
+    # 2026-09-05: this rewrite moved the WEEKDAY word alone, which worked
+    # only while coerce_range ignored the ordinal beside it.  Once "the 8th"
+    # was read, "tuesday the 8th" became "Wednesday the 8th", and the
+    # follow-up he had been using turned into a question about a weekday he
+    # never said ("The 8th of September is a Tuesday, sir, not a Wednesday
+    # ...").  A question is not a day to move: "" here means stop.
+    moved = _shift_named_day(prev, today)
+    if moved:
+        return moved
+    if moved == "":
+        return None
     hits = list(_DAY_ANCHOR_RX.finditer(prev))
     if not hits:
         return None
     m = hits[-1]                      # the day he ended on
     word = m.group(1).lower()
-    today = today or date.today()
     if word in ("today", "tonight"):
         base = today
     elif word == "tomorrow":

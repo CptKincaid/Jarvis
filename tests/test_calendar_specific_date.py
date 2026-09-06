@@ -517,7 +517,13 @@ def test_the_source_has_no_bare_return_today_on_an_unrecognised_path():
     src = inspect.getsource(calendar.coerce_range)
     assert src.count('return "today"') == 1
     body = src.split('return "today"')[0]
-    assert "_DATEISH_RX" in body, "the last line must be guarded by the date guard"
+    # ROUND THREE moved the guard into the ONE reader, so that the model
+    # door and the day-shift rewrite meet it too: coerce_range must reach
+    # sentence_date before its one "today", and sentence_date's reader must
+    # carry the date guard.
+    assert "sentence_date(" in body, "the last line must sit behind the one reader"
+    reader = inspect.getsource(calendar._read) + inspect.getsource(calendar._unreadable)
+    assert "_DATEISH_RX" in reader, "the one reader must carry the date guard"
 
 
 @pytest.mark.parametrize("said", [
@@ -718,8 +724,10 @@ def test_the_ordinal_phrasings_he_actually_used_still_read_as_dates():
     """The tail rule must not buy the table above with his own sentences."""
     for said, want in HIS_PHRASINGS:
         assert coerce_range(said, NOW) == want, said
+    # ("what's on the 12th and the 13th" left this table in round three: two
+    # days in one breath is a QUESTION now, never the first of them -- see
+    # tests/test_calendar_date_frame.py.)
     for said, want in [("anything on the 12th at 3", "2026-09-12"),
-                       ("what's on the 12th and the 13th", "2026-09-12"),
                        ("is there anything on the 12th please", "2026-09-12"),
                        ("what's on the 12th, sir", "2026-09-12"),
                        ("anything on the 12th this month", "2026-09-12")]:
@@ -795,14 +803,15 @@ def test_an_ordinal_said_as_a_word_reads_as_a_date(said, want):
 
 
 @pytest.mark.parametrize("said,want", [
-    ("what do i have on 9-12", "2026-09-12"),
-    ("what do i have on 9.12", "2026-09-12"),
     ("anything on 9-12-2027", "2027-09-12"),
-    ("what's on 12-9", "2026-12-09"),
+    ("what's on 12-9-2026", "2026-12-09"),
 ])
-def test_a_dash_separated_date_reads_as_a_date(said, want):
-    """MEASURED before the fix: "on 9-12" -> today.  A bare "9-12" really is
-    a time range more often than a date; one he put "on" in front of is not."""
+def test_a_dash_separated_triple_with_a_year_reads_as_a_date(said, want):
+    """MEASURED before round two: "on 9-12" -> today.  ROUND THREE then
+    reversed the PAIR by a default taken for him: "on 9-12" ASKS, because
+    "9-12" is a time range at least as often as a date and a question is
+    the safe direction (tests/test_calendar_date_frame.py).  A triple with a
+    year cannot be a clock and is still read as the day it names."""
     assert coerce_range(said, NOW) == want, said
 
 
@@ -844,7 +853,13 @@ def test_the_one_line_that_may_answer_today_is_still_the_only_one():
     src = inspect.getsource(calendar.coerce_range)
     assert src.count('return "today"') == 1
     body = src.split('return "today"')[0]
-    assert "_DATEISH_RX" in body, "the last line must be guarded by the date guard"
+    # ROUND THREE moved the guard into the ONE reader, so that the model
+    # door and the day-shift rewrite meet it too: coerce_range must reach
+    # sentence_date before its one "today", and sentence_date's reader must
+    # carry the date guard.
+    assert "sentence_date(" in body, "the last line must sit behind the one reader"
+    reader = inspect.getsource(calendar._read) + inspect.getsource(calendar._unreadable)
+    assert "_DATEISH_RX" in reader, "the one reader must carry the date guard"
 
 
 # ------------------------------ (4) the two doors must not disagree
@@ -861,7 +876,6 @@ DOOR_ROWS = HIS_PHRASINGS + [
     ("what did i have yesterday", "2026-09-04"),
     ("what's on the day after the 12th", "2026-09-13"),
     ("what do i have on september twelfth", "2026-09-12"),
-    ("what do i have on 9-12", "2026-09-12"),
     ("on 12 september 2027", "2027-09-12"),
     ("what did i have on the 3rd", "2026-09-03"),
 ]

@@ -417,9 +417,6 @@ _D_MD_RX = re.compile(
 _D_DM_RX = re.compile(
     rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d)(?P<ord>{_ORD})?\s+(?:of\s+)?"
     rf"{_MONTH}{_YEAR}", re.I)
-# Month-first, because he is in Texas.
-_D_NUM_RX = re.compile(
-    r"\b(?P<a>\d{1,2})\s*/\s*(?P<b>\d{1,2})(?:\s*/\s*(?P<y>\d{2,4}))?\b")
 # THE TAIL RULE, the fix for the biggest hole of the 2026-09-05 build.
 #
 # "the" in "on / for / the" is the ARTICLE as often as it is a date cue, so
@@ -457,27 +454,81 @@ _D_ORD_RX = re.compile(
 _D_REL_MONTH_RX = re.compile(
     rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d){_ORD}?\s+of\s+"
     r"(?P<rel>this|next|last|the)\s+month\b", re.I)
-# "on 9-12" was silently TODAY: the dash was left out on the grounds that
-# "9-12" is a time range more often than a date, which is true of a bare
-# "9-12" and not of one he put "on" in front of.  So: a dash- or dot-separated
-# pair is a date only after on / for, only when the same tail rule holds ("on
-# 3-4 hours" stays a duration), and when the sentence ALSO carries a clock
-# word the reading is genuinely ambiguous and Jarvis asks instead of guessing.
-_DASH_PAIR = (r"\b(?:on|for)\s+(?P<a>\d{1,2})\s*[-.]\s*(?P<b>\d{1,2})"
-              r"(?:\s*[-.]\s*(?P<y>\d{2,4}))?\b")
-_D_DASH_RX = re.compile(_DASH_PAIR + _TAIL_OK, re.I)
-# The same pair without the tail rule: a clock word can only follow ("on
-# 9-12 from nine"), so the ambiguity has to be looked for where the date
-# reading has already been ruled out.
-_D_DASH_ANY_RX = re.compile(_DASH_PAIR, re.I)
-_TIMEISH_RX = re.compile(
-    r"\b(?:from|between|till|until|thru|through|am|pm|a\.m|p\.m|o'?clock|"
-    r"noon|midnight)\b|\d\s*:\s*\d", re.I)
-# The guard on the LAST line of coerce_range: shapes that can only be a
-# date.  A bare ordinal is deliberately absent (see _D_ORD_RX).
+# THE FRAME RULE (round three, 2026-09-05).  A number is a date only when
+# the sentence is about WHEN: a preposition or a calendar word stands right
+# in front of it.  Round two's ``_D_NUM_RX`` took a bare N/N ANYWHERE, so
+# "i got 9/10 on the quiz" was September the 10th, "the score was 3/5" the
+# 5th of March, "is it open 24/7" a question about the 24th of July, and
+# "is my 9/10 quiz on my calendar" listed Thursday the 10th through BOTH
+# doors -- nine of the grid's non-date rows, every one a pair that nothing
+# framed.  A month name frames itself; a bare ordinal is framed by on / for
+# / the plus the tail rule; a slashed pair needs one of THESE in front of
+# it, and the tail rule still applies after it ("on 9/12 speed" is a rank).
+# "got" is deliberately absent ("i got 9/10"); "have" is present ("what do
+# i have 9/12").  Two strengths of frame: a PREPOSITION is strong enough
+# that a pair it fronts which cannot be read is a question ("on 13/5" ->
+# "did you mean the 13th of May?"); a calendar NOUN is weaker -- it reads a
+# clean date ("on my calendar 9/12") and nothing else, so "is my gym on my
+# calendar 24/7" is about opening hours, not the 24th of July.
+_PREP_FRAME = (r"on|for|about|of|from|until|till|through|thru|by|before|"
+               r"after|since|due")
+_NOUN_FRAME = (r"calendar|schedule|agenda|diary|have|doing|free|busy|booked|"
+               r"planned|happening|scheduled")
+_DATE_FRAME = _PREP_FRAME + "|" + _NOUN_FRAME
+# Month-first, because he is in Texas.
+_D_NUM_RX = re.compile(
+    rf"\b(?:{_DATE_FRAME})\s+(?:the\s+)?(?P<a>\d{{1,2}})\s*/\s*"
+    rf"(?P<b>\d{{1,2}})(?:\s*/\s*(?P<y>\d{{2,4}}))?\b{_TAIL_OK}", re.I)
+# DEFAULT TAKEN FOR HIM (round three): a dash- or dot-separated PAIR after
+# on / for / about / of is a QUESTION, not a date.  Round two read "on 9-12"
+# as the 12th of September; but "9-12" is a time range at least as often
+# as a date, and the safe direction is a question that offers the date
+# reading -- never a guess, and never the silent today it was before round
+# two.  Three parts with a year ("9-12-2027") cannot be a clock and stay a
+# date.  A clock word may follow ("on 9-12 from nine"), so the tail rule
+# here admits the clock words too; "on 3-4 hours of sleep" is still a
+# duration.  A bare pair with no frame ("i'm free 9-12") is left alone.
+_DASH_TAIL_OK = (rf"(?!\s+(?!(?:{_ORD_TAIL}|from|between|till|until|through|"
+                 rf"thru|am|pm|noon|midnight)\b)\w)")
+_D_DASH_RX = re.compile(
+    r"\b(?:on|for|about|of)\s+(?P<a>\d{1,2})\s*[-.]\s*(?P<b>\d{1,2})"
+    r"(?:\s*[-.]\s*(?P<y>\d{2,4}))?\b" + _DASH_TAIL_OK, re.I)
+# Date-shaped and UNREADABLE: the shapes that can only be a date and that
+# every rule above declined -- a month name beside a number, an ISO shape.
+# Applied in sentence_date, so BOTH doors and the day-shift rewrite meet
+# it; it used to live in coerce_range alone, and "in december 2026" was a
+# question through the forced door and TODAY through the model door.  A
+# bare N/N is deliberately absent now: nothing framed it, so under the
+# frame rule it is not date-shaped.  A bare ordinal is absent for the same
+# reason (see _D_ORD_RX).
 _DATEISH_RX = re.compile(
     rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*\d{{1,2}}{_ORD}?{_TAIL_OK}|"
-    rf"\b\d{{1,2}}\s*/\s*\d{{1,2}}\b|\b\d{{4}}-\d{{1,2}}-\d{{1,2}}\b", re.I)
+    rf"\b\d{{4}}-\d{{1,2}}-\d{{1,2}}\b", re.I)
+# A month with no day in it -- "in december", "for october", "in september
+# 2027" -- was a silent today.  It is about WHEN, it names no day the tool
+# can list, so it is a question: which day.
+_MONTH_ONLY_RX = re.compile(
+    rf"\b(?:in|for|during|of|about|on)\s+(?:this\s+|next\s+|last\s+)?{_MONTH}"
+    rf"{_YEAR}", re.I)
+_WD_ALT = "|".join(WEEKDAYS)
+# The WHOLE value, the way the model sends ``range`` -- "9/12", "12th", "the
+# 12th", "september 12", "saturday the 12th" -- has nothing in front of it
+# to frame it.  The value IS the frame: it is read as if he had said "on".
+_BARE_VALUE_RX = re.compile(
+    rf"^(?:(?:{_WD_ALT})\s+)?(?:the\s+)?(?:\d{{1,2}}{_ORD}?"
+    rf"|\d{{1,2}}\s*[/.-]\s*\d{{1,2}}(?:\s*[/.-]\s*\d{{2,4}})?"
+    rf"|(?:{_MONTH_ALT})(?:\.|\b)\s*(?:the\s+)?\d{{1,2}}{_ORD}?(?:,?\s+\d{{4}})?"
+    rf"|\d{{1,2}}{_ORD}?\s+(?:of\s+)?(?:{_MONTH_ALT})(?:\.|\b)(?:,?\s+\d{{4}})?)"
+    r"\s*$", re.I)
+# "the last friday of september", "the first monday of october", "the 2nd
+# tuesday of this month".  MEASURED 2026-09-05: "the last friday of
+# september" was "friday" -- the 11th, a fortnight short of the 25th he
+# named -- because the weekday loop won and the rest of the phrase was
+# never read.  Digit ordinals arrive already rewritten ("first" -> "1st").
+_NTH_WD_RX = re.compile(
+    rf"\b(?:the\s+)?(?P<n>[1-5](?:st|nd|rd|th)|last)\s+(?P<wd>{_WD_ALT})\s+"
+    rf"(?:of|in)\s+(?:{_MONTH}|(?P<rel>this|next|last|the)\s+month\b){_YEAR}",
+    re.I)
 # "what DID I have on the 3rd" is a different question from "what DO I
 # have on the 3rd" -- one looks back, one looks forward.
 _PAST_RX = re.compile(r"\b(?:did|was|were|had)\b", re.I)
@@ -538,6 +589,23 @@ _OFFSET_RX = re.compile(
     r"(?P<dir>after|before|following|preceding|prior\s+to|"
     r"later\s+than|earlier\s+than|ahead\s+of)\b\s*", re.I)
 _BACKWARD_DIRS = re.compile(r"before|preceding|prior|earlier", re.I)
+# "in two days", "three days ago", "a week on tuesday", "two days from now":
+# a count of days or weeks stepped from today or from a day he can name.
+# MEASURED 2026-09-05: "in two days" was a silent today, and "a week on
+# tuesday" the coming Tuesday -- the 8th, seven days short of the 15th.
+# The COUNT is required: "in the next few days" is not an offset and "in 20
+# minutes" is not a day.
+_COUNT_ALT = (r"a|an|one|two|three|four|five|six|seven|eight|nine|ten|"
+              r"couple(?:\s+of)?|few|\d{1,2}")
+_UNIT = r"(?P<unit>days?|weeks?|fortnights?)"
+_IN_RX = re.compile(
+    rf"\bin\s+(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}(?:'s|s')?(?:\s+time)?\b",
+    re.I)
+_AGO_RX = re.compile(rf"\b(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+ago\b", re.I)
+_FROM_RX = re.compile(
+    rf"\b(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+(?:from|on)\s+", re.I)
+_DAY_WORD_RX = re.compile(
+    rf"\b(?P<w>today|tonight|now|yesterday|{'|'.join(WEEKDAYS)})\b", re.I)
 
 
 def is_ask(range) -> bool:
@@ -656,15 +724,36 @@ def _dated(text: str, month, day: int, year, today: date, backward: bool) -> str
     return _weekday_disagrees(text, got) or got.isoformat()
 
 
-def _explicit_date(text: str, today: date, backward: bool = False) -> Optional[str]:
-    """An ISO date, or an ASK, for anything date-shaped in ``text``; None
-    when he named no date at all.  It NEVER returns "today"."""
+_FRAME_LEAD_RX = re.compile(rf"^(?:{_DATE_FRAME})\s+", re.I)
+_PREP_LEAD_RX = re.compile(rf"^(?:{_PREP_FRAME})\s+", re.I)
+_JOINER_RX = re.compile(
+    r"^\s*,?\s*(?:to|and|or|through|thru|till|until|&|-)\s+", re.I)
+SPAN_ASK = ("I can only look at one day at a time, sir — which of those "
+            "did you want?")
+
+
+def _span(match) -> tuple:
+    """(start, end) of the day-words inside a match.  The framing
+    preposition is not part of them, so a caller that rewrites the day
+    (commander.day_shift_followup) keeps his "on"."""
+    lead = _FRAME_LEAD_RX.match(match.group(0))
+    return match.start() + (lead.end() if lead else 0), match.end()
+
+
+def _find_date(text: str, today: date, backward: bool = False) -> Optional[tuple]:
+    """(value, start, end) for the first date-shaped thing in ``text`` that
+    the frame rule admits -- ``value`` an ISO date or an ask -- or None
+    when it names no date at all.  It NEVER yields "today"."""
     match = _D_ISO_RX.search(text)
     if match:
         got = _make_date(int(match.group("y")), int(match.group("m")),
                          int(match.group("d")))
-        return got.isoformat() if got is not None else \
+        value = got.isoformat() if got is not None else \
             _ask_impossible(int(match.group("m")), int(match.group("d")))
+        return value, match.start(), match.end()
+    match = _NTH_WD_RX.search(text)
+    if match:
+        return (_nth_weekday_date(match, today, backward), *_span(match))
     match = _D_MD_RX.search(text) or _D_DM_RX.search(text)
     # A month name beside a BARE number ("may 3", "march 3") is a date only
     # under the same tail rule as a bare ordinal: "may 3 people come" was
@@ -676,33 +765,39 @@ def _explicit_date(text: str, today: date, backward: bool = False) -> Optional[s
         match = None
     if match:
         year = int(match.group("y")) if match.group("y") else None
-        return _dated(text, _MONTHS[match.group("mon").rstrip(".").lower()],
-                      int(match.group("d")), year, today, backward)
+        value = _dated(text, _MONTHS[match.group("mon").rstrip(".").lower()],
+                       int(match.group("d")), year, today, backward)
+        return (value, *_span(match))
     match = _D_NUM_RX.search(text)
+    if match and not _PREP_LEAD_RX.match(match.group(0)) and not (
+            1 <= int(match.group("a")) <= 12
+            and _make_date(2000, int(match.group("a")), int(match.group("b")))):
+        match = None                        # a noun frame reads only a clean date
     if match:
-        return _separated(text, match, "/", today, backward)
+        return (_separated(text, match, "/", today, backward), *_span(match))
     match = _D_REL_MONTH_RX.search(text)
     if match:
         step = {"next": 1, "last": -1}.get(match.group("rel").lower(), 0)
         month = today.month + step
         year = today.year + (month - 1) // 12
         month = (month - 1) % 12 + 1
-        return _dated(text, month, int(match.group("d")), year, today, backward)
-    timeish = bool(_TIMEISH_RX.search(text))
+        value = _dated(text, month, int(match.group("d")), year, today, backward)
+        return (value, *_span(match))
     match = _D_DASH_RX.search(text)
-    if match and not timeish:
-        return _separated(text, match, _sep_of(match), today, backward)
-    match = _D_DASH_ANY_RX.search(text)
-    if match and timeish:
-        # "on 9-12 from nine" is a date and a clock at once. Guessing
-        # either is the failure he reported; say both and ask.
-        return _ask(f"I couldn't tell whether {match.group('a')}"
-                    f"{_sep_of(match)}{match.group('b')} was a date or a time "
-                    "there, sir — which day did you mean?")
+    if match:
+        return (_dashed(text, match, today, backward), *_span(match))
     match = _D_ORD_RX.search(text)
     if match:
-        return _dated(text, None, int(match.group("d")), None, today, backward)
+        value = _dated(text, None, int(match.group("d")), None, today, backward)
+        return (value, *_span(match))
     return None
+
+
+def _explicit_date(text: str, today: date, backward: bool = False) -> Optional[str]:
+    """An ISO date, or an ASK, for anything date-shaped in ``text``; None
+    when he named no date at all.  It NEVER returns "today"."""
+    found = _find_date(text, today, backward)
+    return found[0] if found else None
 
 
 def _sep_of(match) -> str:
@@ -711,7 +806,7 @@ def _sep_of(match) -> str:
 
 
 def _separated(text: str, match, sep: str, today: date, backward: bool) -> str:
-    """A 9/12, 9-12 or 9.12 pair, read month-first."""
+    """A 9/12 pair (or a 9-12-2027 triple), read month-first."""
     a, b = int(match.group("a")), int(match.group("b"))
     raw_year = match.group("y")
     year = None
@@ -733,49 +828,231 @@ def _separated(text: str, match, sep: str, today: date, backward: bool) -> str:
     return _dated(text, a, b, year, today, backward)
 
 
-def _base_day(text: str, today: date, backward: bool) -> Optional[str]:
-    """The day an OFFSET is measured from: an explicit date, "today",
-    "tomorrow", "yesterday" or a weekday.  None when it names none."""
-    got = _explicit_date(text, today, backward)
-    if got:
-        return got                          # an ISO date, or an ask
-    if _TOMORROW_RX.search(text):
-        return (today + timedelta(days=1)).isoformat()
-    if _YESTERDAY_RX.search(text):
-        return (today - timedelta(days=1)).isoformat()
-    if re.search(r"\btoday\b|\btonight\b", text):
-        return today.isoformat()
-    for i, word in enumerate(WEEKDAYS):
-        if re.search(rf"\b{word}\b", text):
-            return (today + timedelta(days=(i - today.weekday()) % 7)).isoformat()
+def _dashed(text: str, match, today: date, backward: bool) -> str:
+    """A 9-12 or 9.12 pair: with a year it is a date (a clock has no year);
+    without one it is a QUESTION that offers the date reading."""
+    sep = _sep_of(match)
+    if match.group("y"):
+        return _separated(text, match, sep, today, backward)
+    a, b = int(match.group("a")), int(match.group("b"))
+    if 1 <= a <= 12 and _make_date(2000, a, b) is not None:
+        return _ask(f"Was {a}{sep}{b} the {b}{_suffix(b)} of {_month_name(a)}, "
+                    "sir, or a time?")
+    return _ask(f"I couldn't read {a}{sep}{b} as a date, sir — which day did "
+                "you mean?")
+
+
+def _nth_weekday(year: int, month: int, weekday: int, nth) -> Optional[date]:
+    """The nth (1..5) or "last" such weekday of the month; None when the
+    month has no such day (a 5th Friday, most months)."""
+    if nth == "last":
+        last = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+        return last - timedelta(days=(last.weekday() - weekday) % 7)
+    first = date(year, month, 1)
+    got = first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (nth - 1))
+    return got if got.month == month else None
+
+
+def _nth_weekday_date(match, today: date, backward: bool) -> str:
+    raw_n = match.group("n").lower()
+    nth = "last" if raw_n == "last" else int(raw_n[:-2])
+    weekday = WEEKDAYS.index(match.group("wd").lower())
+    rel = match.group("rel")
+    if rel:
+        # "of this month" is explicit: no forward/backward search.
+        step = {"next": 1, "last": -1}.get(rel.lower(), 0)
+        month = today.month + step
+        years = [today.year + (month - 1) // 12]
+        month = (month - 1) % 12 + 1
+    else:
+        month = _MONTHS[match.group("mon").rstrip(".").lower()]
+        if match.group("y"):
+            years = [int(match.group("y"))]
+        else:
+            # THE YEAR RULE (see _resolve_day): the next such day at or
+            # after today, or the most recent at or before it.
+            step = -1 if backward else 1
+            years = [today.year + step * i for i in range(_YEAR_SCAN)]
+    fixed = bool(rel or match.group("y"))
+    for year in years:
+        got = _nth_weekday(year, month, weekday, nth)
+        if got is None:
+            return _ask(f"There's no {raw_n} {WEEKDAYS[weekday].capitalize()} in "
+                        f"{_month_name(month)}, sir — which day did you mean?")
+        if fixed or (got <= today if backward else got >= today):
+            return got.isoformat()
+    return _ask("I couldn't make that out as a date, sir — which day did you "
+                "mean?")                          # pragma: no cover - scan-bounded
+
+
+def _word_day(word: str, today: date) -> date:
+    """today / tonight / now, tomorrow, yesterday, or the NEXT such weekday
+    counting today -- the same rule format_events uses, so they cannot
+    drift."""
+    word = word.lower()
+    if word in ("today", "tonight", "now"):
+        return today
+    if word == "tomorrow":
+        return today + timedelta(days=1)
+    if word == "yesterday":
+        return today - timedelta(days=1)
+    return today + timedelta(days=(WEEKDAYS.index(word) - today.weekday()) % 7)
+
+
+def _base_span(text: str, today: date, backward: bool) -> Optional[tuple]:
+    """(value, end) for the day an OFFSET is measured from: an explicit
+    date, "today", "tomorrow", "yesterday", "now" or a weekday.  None when
+    ``text`` names none."""
+    found = _find_date(text, today, backward)
+    if found:
+        return found[0], found[2]                # an ISO date, or an ask
+    match = _TOMORROW_RX.search(text)
+    if match:
+        return (today + timedelta(days=1)).isoformat(), match.end()
+    match = _DAY_WORD_RX.search(text)
+    if match:
+        return _word_day(match.group("w"), today).isoformat(), match.end()
     return None
 
 
-def _offset_date(text: str, today: date, backward: bool) -> Optional[str]:
-    """"the day after the 12th" -> the 13th; an ISO date or an ask, and
-    None when the sentence carries no offset phrase at all."""
+def _base_day(text: str, today: date, backward: bool) -> Optional[str]:
+    got = _base_span(text, today, backward)
+    return got[0] if got else None
+
+
+def _count(raw) -> int:
+    raw = (raw or "one").lower().removesuffix(" of").strip()
+    got = _COUNT_WORDS.get(raw)
+    if got is None:
+        try:
+            got = int(raw)
+        except ValueError:                  # pragma: no cover - regex-bounded
+            got = 1
+    return got
+
+
+def _unit_days(unit: str) -> int:
+    unit = unit.lower()
+    return 7 if unit.startswith("week") else 14 if unit.startswith("fortnight") else 1
+
+
+def _offset_span(text: str, today: date, backward: bool) -> Optional[tuple]:
+    """"the day after the 12th" -> the 13th, with the span of the whole
+    phrase; an ISO date or an ask, and None when the sentence carries no
+    offset phrase at all."""
     match = _OFFSET_RX.search(text)
     if match is None:
         return None
-    raw = (match.group("n") or "one").lower().removesuffix(" of").strip()
-    count = _COUNT_WORDS.get(raw)
-    if count is None:
-        try:
-            count = int(raw)
-        except ValueError:                  # pragma: no cover - regex-bounded
-            count = 1
-    unit = match.group("unit").lower()
-    step = 7 if unit.startswith("week") else 14 if unit.startswith("fortnight") else 1
+    count = _count(match.group("n"))
+    step = _unit_days(match.group("unit"))
     sign = -1 if _BACKWARD_DIRS.match(match.group("dir")) else 1
-    base = _base_day(text[match.end():], today, backward)
+    base = _base_span(text[match.end():], today, backward)
     if base is None:
         # Understood as an offset, unable to name its base: ASK.  Dropping
         # the offset and answering about the base is the bug itself.
-        return _ask(f"Which day is that {'before' if sign < 0 else 'after'}, sir?")
-    if is_ask(base):
-        return base
-    return (date.fromisoformat(base) +
-            timedelta(days=sign * count * step)).isoformat()
+        return (_ask(f"Which day is that {'before' if sign < 0 else 'after'}, "
+                     "sir?"), match.start(), match.end())
+    value, end = base
+    if is_ask(value):
+        return value, match.start(), match.end() + end
+    got = date.fromisoformat(value) + timedelta(days=sign * count * step)
+    return got.isoformat(), match.start(), match.end() + end
+
+
+def _offset_date(text: str, today: date, backward: bool) -> Optional[str]:
+    got = _offset_span(text, today, backward)
+    return got[0] if got else None
+
+
+def _stepped_span(text: str, today: date, backward: bool) -> Optional[tuple]:
+    """"in two days", "three days ago", "a week on tuesday": see _IN_RX."""
+    match = _IN_RX.search(text)
+    if match:
+        got = today + timedelta(days=_count(match.group("n")) *
+                                _unit_days(match.group("unit")))
+        return got.isoformat(), match.start(), match.end()
+    match = _AGO_RX.search(text)
+    if match:
+        got = today - timedelta(days=_count(match.group("n")) *
+                                _unit_days(match.group("unit")))
+        return got.isoformat(), match.start(), match.end()
+    match = _FROM_RX.search(text)
+    if match:
+        base = _base_span(text[match.end():], today, backward)
+        if base is not None:
+            value, end = base
+            if is_ask(value):
+                return value, match.start(), match.end() + end
+            got = date.fromisoformat(value) + timedelta(
+                days=_count(match.group("n")) * _unit_days(match.group("unit")))
+            return got.isoformat(), match.start(), match.end() + end
+    return None
+
+
+def _second_date(text: str, today: date, backward: bool) -> bool:
+    """True when ``text`` -- the words before or after a date already read
+    -- carries another day.  A joiner ("to", "and", "or") stands in for the
+    frame the second date usually lacks."""
+    lead = _JOINER_RX.match(text)
+    if lead:
+        text = "on " + text[lead.end():]
+    return _find_date(text, today, backward) is not None
+
+
+def _unreadable(text: str) -> Optional[str]:
+    """The question for a thing that is date-shaped and cannot be read;
+    None when nothing date-shaped is there."""
+    match = _MONTH_ONLY_RX.search(text)
+    if match:
+        month = _month_name(_MONTHS[match.group("mon").rstrip(".").lower()])
+        year = f" {match.group('y')}" if match.group("y") else ""
+        return _ask(f"Which day in {month}{year}, sir?")
+    if _DATEISH_RX.search(text):
+        return _ask("I couldn't work out which date you meant, sir — "
+                    "which day did you want?")
+    return None
+
+
+def _read(raw: str, today: date, backward) -> Optional[tuple]:
+    """THE ONE READER, over prepared text: (value, start, end), or None
+    when the sentence names no specific day.  ``value`` is an ISO date or
+    an ask; the positions are where his day-words sit in ``raw``."""
+    if backward is None:
+        backward = bool(_PAST_RX.search(raw))
+    got = _offset_span(raw, today, backward)
+    if got:
+        return got
+    got = _stepped_span(raw, today, backward)
+    if got:
+        return got
+    found = _find_date(raw, today, backward)
+    if found:
+        value, start, end = found
+        if is_ask(value):
+            return found
+        # TWO days in one breath -- "the 12th to the 14th", "yesterday and
+        # the 14th" -- were answered about the first with no word about the
+        # second: a confident partial answer.  One range value cannot carry
+        # two days, so a span is a question, never the first day of it.
+        if _YESTERDAY_RX.search(raw) or _second_date(raw[:start], today, backward) \
+                or _second_date(raw[end:], today, backward):
+            return _ask(SPAN_ASK), start, end
+        return found
+    match = _YESTERDAY_RX.search(raw)
+    if match:
+        return (today - timedelta(days=1)).isoformat(), match.start(), match.end()
+    got = _unreadable(raw)
+    if got:
+        return got, 0, len(raw)
+    return None
+
+
+def _prepared(text, clean: bool) -> tuple:
+    """(the text the rules read, the offset its positions carry)."""
+    raw = digit_ordinals(_clean(text) if clean else (text or "")).lower()
+    if _BARE_VALUE_RX.match(raw):
+        return "on " + raw, 3
+    return raw, 0
 
 
 def sentence_date(text, today: date, backward=None) -> Optional[str]:
@@ -786,20 +1063,39 @@ def sentence_date(text, today: date, backward=None) -> Optional[str]:
     -> coerce_range) and the model path (get_calendar's ``derive``) used to
     read the sentence with two different functions, and MEASURED 2026-09-05
     they disagreed: "what was on my calendar yesterday" was the 4th through
-    one door and TODAY through the other, on the same eight words.  Word
-    ranges ("tomorrow", "monday") are deliberately NOT resolved here -- the
-    model door must leave those to the model, which can resolve a follow-up
-    from the conversation that this function cannot see.
+    one door and TODAY through the other, on the same eight words.  Since
+    round three the day-shift rewrite (commander.day_shift_followup) reads
+    through here as well, via date_span.  Word ranges ("tomorrow",
+    "monday") are deliberately NOT resolved here -- the model door must
+    leave those to the model, which can resolve a follow-up from the
+    conversation that this function cannot see.
+
+    THE FRAME RULE, in his register: a date is read only when the sentence
+    is about WHEN -- a calendar word or a preposition stands in front of the
+    number.  A number nobody framed as a date is not a date.  A thing that
+    looks like a date and cannot be read is a question back to him, never
+    today.
     """
-    raw = digit_ordinals(_clean(text).lower())
-    if backward is None:
-        backward = bool(_PAST_RX.search(raw))
-    got = _offset_date(raw, today, backward)
-    if got:
-        return got
-    if _YESTERDAY_RX.search(raw):
-        return (today - timedelta(days=1)).isoformat()
-    return _explicit_date(raw, today, backward)
+    raw, _shift = _prepared(text, clean=True)
+    got = _read(raw, today, backward)
+    return got[0] if got else None
+
+
+def date_span(text, today: date, backward=None) -> Optional[tuple]:
+    """(value, start, end): the day ``text`` names, read by the SAME reader
+    as sentence_date, and where his day-words sit in ``digit_ordinals(text)``
+    -- so commander.day_shift_followup can move the day in place and keep
+    the rest of his sentence.  None when it names no day, or when the
+    positions cannot be trusted (lower-casing moved the letters)."""
+    plain = digit_ordinals(text or "")
+    raw, shift = _prepared(plain, clean=False)
+    if len(raw) - shift != len(plain):
+        return None
+    got = _read(raw, today, backward)
+    if not got:
+        return None
+    value, start, end = got
+    return value, max(start - shift, 0), max(end - shift, 0)
 
 
 def coerce_range(value, now: datetime = None) -> str:
@@ -824,7 +1120,10 @@ def coerce_range(value, now: datetime = None) -> str:
     dated = sentence_date(text, today)
     if dated:
         return dated
-    # "on monday", "for Monday", "this monday"
+    # "on monday", "for Monday", "this monday" -- and "next monday", which
+    # keeps its old meaning here: the COMING Monday, the day "monday" names.
+    # DEFAULT LEFT FOR HIM (round three, 2026-09-05): to some ears "next
+    # Monday" is the Monday after that.  Not changed without his say.
     for day in WEEKDAYS:
         if re.search(rf"\b{day}\b", text):
             return day
@@ -834,13 +1133,10 @@ def coerce_range(value, now: datetime = None) -> str:
         return "week"
     if "next" in text or "upcoming" in text or "soon" in text or "coming up" in text:
         return "next"
-    if _DATEISH_RX.search(digit_ordinals(text)):
-        # Date-shaped and unreadable. ASK; do not assume.
-        return _ask("I couldn't work out which date you meant, sir — "
-                    "which day did you want?")
-    # THE ONE line that may answer "today", and the reason the guard above
-    # it exists: he named no date, so today is the honest default. Every
-    # unrecognised DATE leaves through an ask, never through here.
+    # THE ONE line that may answer "today": he named no date, so today is
+    # the honest default.  Every unrecognised DATE left through an ask in
+    # sentence_date above (_unreadable, _DATEISH_RX): the guard lives THERE,
+    # where both doors and the day-shift rewrite meet it, not only here.
     return "today"
 
 
