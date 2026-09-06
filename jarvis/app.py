@@ -318,6 +318,13 @@ ARRIVAL_MAIL_LIMIT = 25
 # (see speak_catch_up: it is not even taken until this has passed).
 ARRIVAL_CATCH_UP_LATENESS_S = 10.0
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
+# The SAME rule for the other flag, and it is not the same number. This one
+# bounds a Whisper decode plus the routing behind it, and a long clip on
+# this box's CPU path measures ~20 s, so the bar is well clear of an
+# honest slow turn and still short enough that he does not sit there
+# saying the wake word into a dead microphone. MEASURED 2026-09-06: he
+# was locked out for 62 minutes because nothing bounded this at all.
+AUDIO_TIMEOUT_S = 90.0          # watchdog: a hung decode must not wedge the mic
 
 # The sources that arrive from somewhere other than this desk: a shell /
 # SSH / cron client and a clip sent over the command socket
@@ -5394,7 +5401,7 @@ class JarvisApp:
             self.turns.abandon("no_audio")
             self._nudge("no_audio")
             return
-        self._audio_busy.set()
+        self._audio_started()
         threading.Thread(target=self._process_audio, args=(audio,),
                          daemon=True).start()
 
@@ -5776,6 +5783,21 @@ class JarvisApp:
         finally:
             # Must run on every path: a leaked flag makes every future wake
             # word a no-op, which looks exactly like a dead microphone.
+            # A `finally` covers a RAISE and NOT A HANG, which is why
+            # _audio_started arms a watchdog as well -- see _audio_timed_out.
+            #
+            # REACHED DEFENSIVELY, and that is the point rather than a
+            # concession. This whole commit exists because the flag was not
+            # released; a release path that can itself raise AttributeError
+            # would be the same bug wearing a helper. The direct clear is
+            # the floor and always runs. (It is also what lets the many
+            # tests that drive this function on a hand-built namespace --
+            # one that owns the flag and nothing else -- keep working
+            # without teaching each of them about the watchdog.)
+            try:
+                self._audio_cancel_watchdog()
+            except AttributeError:
+                pass
             self._audio_busy.clear()
 
     # The Tier-1 probe is a whole-utterance matcher ("volume 40",
@@ -6044,7 +6066,89 @@ class JarvisApp:
         log.warning("turn watchdog fired after %.0fs; releasing the wake word",
                     self._turn_timeout_s)
         self._turn_finished()
+        # AND THE OTHER FLAG, because this line promises the wake word back.
+        # On 2026-09-06 it cleared _turn_busy, printed exactly that sentence,
+        # and left _audio_busy set -- so the wake word stayed dead and every
+        # hotword for the next two minutes logged "still transcribing the
+        # previous clip". Releasing one half of a two-flag gate is not
+        # releasing the gate.
+        self._audio_finished(reason="the turn watchdog")
         self.turns.abandon("timeout")
+
+    # ------------------------------------------- the audio flag and its clock
+    def _audio_started(self) -> None:
+        """Hold the microphone gate for this clip, and arm its release.
+
+        THE FLAG IS THE EASY HALF. `_process_audio` runs on its own daemon
+        thread and clears the flag in a `finally`, which covers every way
+        that function can RAISE and no way it can HANG. A hang is what
+        happened on 2026-09-06: the thread never returned, the finally never
+        ran, and `_should_record` dropped five wake words at 0.85-0.98
+        confidence over ninety seconds with the line "still transcribing the
+        previous clip". He described it as soft locked, and it stayed that
+        way for 62 minutes until the process was killed.
+
+        The watchdog is the half that survives a hang. It is armed here
+        rather than in the caller so there is ONE place that sets this flag
+        and it cannot be set without a release being armed -- pinned by the
+        census in tests/test_audio_busy_never_wedges.py.
+        """
+        self._audio_busy.set()
+        self._audio_cancel_watchdog()
+        try:
+            timeout = float(getattr(self, "_audio_timeout_s", AUDIO_TIMEOUT_S))
+            self._audio_watchdog = threading.Timer(timeout,
+                                                   self._audio_timed_out)
+            self._audio_watchdog.daemon = True
+            self._audio_watchdog.start()
+        except Exception:      # noqa: BLE001 - a timer we cannot arm is not
+            # a reason to refuse the clip; it is a reason to say so. The
+            # flag is still cleared by the finally on every non-hang path.
+            log.exception("audio watchdog could not be armed; a hung decode "
+                          "would wedge the wake word")
+
+    def _audio_finished(self, reason: str = "") -> None:
+        """Release the gate and disarm the clock. Safe to call twice."""
+        self._audio_cancel_watchdog()
+        if reason and self._audio_busy.is_set():
+            log.warning("audio flag released by %s", reason)
+        self._audio_busy.clear()
+
+    def _audio_cancel_watchdog(self) -> None:
+        t = getattr(self, "_audio_watchdog", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:  # noqa: BLE001 - a dead timer is already off
+                log.debug("audio watchdog cancel failed", exc_info=True)
+            self._audio_watchdog = None
+
+    def _audio_timed_out(self) -> None:
+        """The decode never came back. Give him his microphone.
+
+        The orphan thread is left to finish or not: it holds no lock, its
+        own finally clears an already-clear flag, and the turn machinery
+        stamps replies with a sequence so a late one cannot be mistaken for
+        an answer to the next question. Waiting for a thread that is by
+        definition stuck is the one thing that must not happen here.
+        """
+        self._audio_watchdog = None
+        if not self._audio_busy.is_set():
+            return
+        log.error("audio watchdog fired after %.0fs: the last clip never "
+                  "finished decoding. Releasing the wake word -- it was "
+                  "being dropped as 'still transcribing the previous clip'.",
+                  float(getattr(self, "_audio_timeout_s", AUDIO_TIMEOUT_S)))
+        self._audio_busy.clear()
+        try:
+            bus.publish(Status(text="Sorry, sir -- I lost that one",
+                               kind="warn"))
+        except Exception:      # noqa: BLE001 - the UI is not the point here
+            log.debug("could not publish the lost-clip status", exc_info=True)
+        try:
+            self.turns.abandon("audio_timeout")
+        except Exception:      # noqa: BLE001 - the ledger is not the point
+            log.debug("could not abandon the turn", exc_info=True)
 
     def _turn_cancel_timers(self):
         for name in ("_turn_timer", "_turn_watchdog"):
