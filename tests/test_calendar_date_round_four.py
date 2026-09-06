@@ -418,7 +418,12 @@ def test_the_deriver_rule_holds_even_with_a_hole_in_the_reader(reg, monkeypatch)
     hole = re.compile(rf"\b{calendar._MONTH}\s+(?P<d>\d{{1,2}})(?!\d)"
                       rf"(?P<ord>{calendar._ORD})?{calendar._YEAR}", re.I)
     monkeypatch.setattr(calendar, "_D_MD_RX", hole)
-    monkeypatch.setattr(calendar, "_NEAR_MONTH_RX", re.compile(r"(?!x)x"))
+    # ROUND SEVEN moved this seam: the near-month readings were one
+    # alternation (_NEAR_MONTH_RX) and are now a priority-ordered tuple of
+    # patterns, because the single alternation SWALLOWED the words behind
+    # a non-month ("calendar the 12th" hid "12th of febuary").  The hole
+    # this test puts back is still the same hole.
+    monkeypatch.setattr(calendar, "_NEAR_MONTH_ORDER", ())
     assert calendar.sentence_date("what do i have on january the 5th", TODAY) \
         == TODAY.isoformat()                                # the hole is back
     text = reg.call("get_calendar", {"range": "2027-01-05"}, from_model=True,

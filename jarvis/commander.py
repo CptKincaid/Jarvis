@@ -10094,7 +10094,25 @@ def _shift_named_day(prev: str, today) -> Optional[str]:
     9th", "Thursday the 1st of October" -- so every downstream reader lands
     on exactly that day."""
     from jarvis.tools.calendar import (as_date, date_span, date_words,
-                                       digit_ordinals, full_date_words, is_ask)
+                                       digit_ordinals, full_date_words, is_ask,
+                                       sentence_date, without_step)
+
+    def _rewrite(source: str, span, words: str) -> str:
+        """``source`` with the day at ``span`` replaced by ``words``."""
+        start, end = span
+        # "on tuesday the 8th": the weekday is part of the same phrase and
+        # would contradict the new day if it stayed.
+        lead = _DAY_BEFORE_DATE_RX.search(source[:start])
+        if lead:
+            start = lead.start()
+        trail = _DAY_AFTER_DATE_RX.match(source[end:])
+        if trail:
+            end += trail.end()
+        return source[:start] + words + source[end:]
+
+    def _names(candidate: str, want) -> bool:
+        """Does the rewritten sentence read back as exactly the day meant?"""
+        return as_date(sentence_date(candidate, today) or "") == want
 
     text = digit_ordinals(prev)
     found = date_span(text, today)
@@ -10104,21 +10122,41 @@ def _shift_named_day(prev: str, today) -> Optional[str]:
     day = as_date(value)
     if is_ask(value) or day is None:
         return ""
-    # "on tuesday the 8th": the weekday is part of the same phrase and would
-    # contradict the new day if it stayed.
-    lead = _DAY_BEFORE_DATE_RX.search(text[:start])
-    if lead:
-        start = lead.start()
-    trail = _DAY_AFTER_DATE_RX.match(text[end:])
-    if trail:
-        end += trail.end()
     moved = day + timedelta(days=1)
     # A moved day that lies BEFORE today is named in full: "Friday the 4th"
     # past the 4th is next month's to every reader, and "the 3rd of the
     # month" moved on became a question about a Sunday in October (round
     # five, 2026-09-06).
     words = full_date_words(moved) if moved < today else date_words(moved, today)
-    return text[:start] + words + text[end:]
+    out = _rewrite(text, (start, end), words)
+    if _names(out, moved):
+        return out
+    # THE DOUBLE STEP (round seven, 2026-09-06).  The rewrite puts an
+    # ABSOLUTE date into a sentence that still carries the STEP that
+    # produced it: "in a month on the 12th" answers the 12th of October,
+    # and the rewrite made "in a month on Tuesday the 13th of October",
+    # which the reader stepped a SECOND time to the 6th.  MEASURED 246 of
+    # 324 trials across 17 phrasings, 6 follow-ups and 9 instants.
+    #
+    # The repair takes the step words out and re-reads; the CHECK above it
+    # is the part that matters, though.  Six rounds of this bug have each
+    # been a rewrite or a rule that looked right and was never read back,
+    # so this one reads its own output and refuses to hand over a sentence
+    # that does not name the day it meant -- whatever the next coat is.
+    plain = without_step(text)
+    if plain != text:
+        again = date_span(plain, today)
+        if again is not None:
+            # The stripped sentence need NOT still name the same day --
+            # the step is often what gave the ordinal its month ("in a
+            # month on the 12th" is October's 12th and "on the 12th"
+            # alone is September's).  The moved day is written out in
+            # full, so the words carry the month themselves; the read-back
+            # below is what proves it.
+            out = _rewrite(plain, (again[1], again[2]), words)
+            if _names(out, moved):
+                return out
+    return ""                    # cannot be said exactly: do not guess
 
 
 def day_shift_followup(prev_text: str, text: str,
