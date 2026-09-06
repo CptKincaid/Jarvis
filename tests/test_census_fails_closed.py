@@ -227,10 +227,10 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
     was censused by neither."""
     import ast
 
-    from tests.write_census import (_assigned_in, _classify, _exports,
-                                    _first_party, _lane_names, _method_names,
-                                    _module_bindings, _resolve, _scope_imports,
-                                    _scopes)
+    from tests.write_census import (_ancestry, _assigned_in, _classify,
+                                    _exports, _first_party, _lane_names,
+                                    _method_names, _module_bindings,
+                                    _resolve, _scope_imports, _scopes)
     walked = _first_party(MODULES)
     # ROUND 8.  Rule S now asks whether a name is a def or a class of the
     # OTHER walked module, so the hand rebuild has to carry that map too --
@@ -238,14 +238,18 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
     # an instrument wearing a new sign, which is the whole point of this
     # test, so _classify takes `exports` with no default and this call is
     # the reason it may not have one.
-    exports = {rel[:-3].replace("/", "."):
-               _exports(ast.parse((REPO / rel).read_text()))
+    # ROUND 9.  And whether that class's ANCESTRY is proven, which is a
+    # question about all three modules at once, so _ancestry runs first
+    # and _module_bindings and _exports both take its verdict, undefaulted.
+    trees = {rel: ast.parse((REPO / rel).read_text()) for rel in MODULES}
+    verdicts = _ancestry(trees)
+    exports = {rel[:-3].replace("/", "."): _exports(trees[rel], verdicts[rel])
                for rel in MODULES}
     escapes = set()
     for rel in MODULES:
-        tree = ast.parse((REPO / rel).read_text())
-        b, m, lane = (_module_bindings(tree), _method_names(tree),
-                      _lane_names(tree))
+        tree = trees[rel]
+        b, m, lane = (_module_bindings(tree, verdicts[rel]),
+                      _method_names(tree), _lane_names(tree))
         for _q, calls, owner in _scopes(tree):
             local = _assigned_in(owner)
             # THE SAME BINDINGS THE CENSUS ITSELF USES, scope imports and

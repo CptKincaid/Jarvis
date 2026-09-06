@@ -1,5 +1,108 @@
 """Every call in this lane that is not PROVEN harmless, derived from source.
 
+=============================== THE THREAT MODEL ===============================
+
+READ THIS FIRST.  Nine rounds in, this is what the census is for, what it
+catches, what it does not and never will, and what the safety of his files
+actually rests on.  It is written down because six adversaries in a row beat
+this instrument and every one of them beat it the same way -- which says the
+question being asked of it was the wrong question.
+
+WHAT IT IS FOR.  One threat, and one only: an HONEST author -- us, next
+week, tired -- shipping a read-then-write pair without noticing.
+
+    os.replace(raw, dest) with no claim in front of it
+    shutil.rmtree in a new helper
+    a second write_text in a function that already has one
+    a run_ssh whose command line happens to be `del`
+
+Round 4 lost files of his to exactly those shapes, and since round 6 every
+one of them is a ROW here: a line in a table that a person has to write a
+sentence about, and a test that fails until they do.  That is the whole
+job.  THE CENSUS IS A REGRESSION PIN OVER THE WRITES WE KNOW ABOUT.  It is
+not a proof that no write exists, and nothing below should be read as one.
+
+WHAT IT CATCHES.  Each of these was planted and the row recorded:
+
+  * a new call to a name in WRITES, on ANY receiver, spelled through a real
+    import or a real alias: os.replace, raw.replace, `_rm = os.remove`,
+    p.unlink() inside a comprehension;
+  * a second write in a function that already has one -- rows are per
+    CALL SITE, not per function;
+  * a write at module level, in a class body, in a decorator expression,
+    in a lambda, in a lambda inside a lambda, in a class's base list;
+  * a write moved into a first-party module the census does not walk
+    (rule R: a ?uncensused row, and the walked set itself is pinned);
+  * a call reached THROUGH a vouched name into one it merely re-exports --
+    remote.subprocess.getoutput, shlex.os.posix_spawn (rule S stops at one
+    segment since round 8);
+  * a call on a receiver it cannot type -- a parameter, an injected seam,
+    the result of another call -- whatever the method is called (rule T);
+  * a callee it cannot resolve at all -- getattr, a subscript, a dict of
+    operations, operator.methodcaller (rule U);
+  * a guard that got weaker: claim -> check -> nothing, on any row;
+  * and, from round 9, a class whose ANCESTRY it cannot vouch for.
+    Constructing `class _Sub(logging.FileHandler)` runs an inherited
+    __init__ the walk never reads, so such a class is a row at every call
+    site (?inherits:) unless every base resolves to something proven.
+
+WHAT IT DOES NOT CATCH, AND NEVER WILL.  This is a static walk over source
+text.  Python will always have one more way to name a thing at run time,
+and an author who WANTS a write to be silent here has these, none of which
+is a mistake anyone makes by accident:
+
+  * building the callee at run time -- getattr(os, "re" + "move"), a dict
+    of operations, exec of a string.  These are ROWS, but the row says
+    ?unresolved, and it is the SENTENCE a person writes for it that
+    decides; the census cannot tell `sleep` from `unlink` behind a seam;
+  * changing what an existing receiver IS, so that a vouched method name
+    -- append, get, warning -- lands on a different object;
+  * swapping a class after it is written: a decorator, a metaclass reached
+    through a base, __init_subclass__, or a def that RETURNS a writer
+    class without a single call in its body.  Round 9 refuses a class
+    keyword and an unproven base; it does not, and cannot, read what a
+    decorator returns;
+  * rewriting the module on disk after import, or monkeypatching os.
+
+Six adversarial rounds each found one of these and each one was closed;
+there will be a seventh.  That game cannot be won by a static walk, and
+the product is not held hostage to it: a bypass that needs a deliberate
+subclass of logging.FileHandler is an ATTACK, and the author of this lane
+is us.  Those six rounds measured the wrong thing.
+
+WHAT HIS FILES ACTUALLY REST ON is not this file.  It is three properties
+of the product itself, confirmed by seven adversaries and reopened by none:
+
+  ORDERING   the ledger records which name we are taking, and is fsynced,
+             BEFORE the claim is made; the landing is recorded BEFORE the
+             original moves to Sent.  A crash at any point re-derives the
+             same answer, so a file cannot be sent twice.
+  IDENTITY   nothing of his is ever deleted by its NAME.  A note goes only
+             if it carries our marker, read through a descriptor first
+             (the sub-millisecond window between that read and the unlink
+             is stated in _unlink_if_ours, not hidden); a staging folder
+             goes only if THIS process took it in THIS run.
+  CLAIM      every write that could land where a file already is takes
+             one operation that creates the name or refuses -- an sftp
+             `rename -l` and an exclusive mkdir on his machine (a property
+             HE confirmed of his own box), O_EXCL here -- so the window is
+             zero, not small.  Absence is never inferred from a listing.
+
+Those live in jarvis/foldersync.py and jarvis/tools/remote.py and are
+pinned by tests/test_foldersync_hand_and_identity.py,
+tests/test_foldersync_round5.py, tests/test_write_chokepoint.py and
+tests/test_provenance.py.  What THIS file adds is a fence around the calls
+those properties are made of, so that an honest edit cannot quietly take
+one apart -- a downgraded guard, a write added beside a claimed one, a new
+helper that deletes.
+
+TODAY'S TABLE IS 502 ROWS.  Measured here on 0cfad85 and on this tip, and
+pinned by a test that DERIVES the number from the two tables in
+tests/test_write_census.py rather than typing it; the round-8 report said
+490, and that number was stale the day it was written.
+
+============================== HOW IT GOT HERE ==============================
+
 READ THIS BEFORE YOU ADD AN EIGHTH PATTERN.  Rounds 2 and 3 hand-wrote a
 table of dangerous writes and both were wrong.  Round 4 computed one and an
 adversary stepped over it three ways.  Round 5 rebuilt it -- per call site,
@@ -99,12 +202,17 @@ they are total over `ast.Call`:
      WHATEVER THE METHOD IS CALLED.  This branch used to be silence when the
      name was not in WRITES, and that silence is what routes A, B and C
      walked through.
-  S  SAFE.  It resolves to a BARE def or class in a censused module (its
-     body is a scope of its own, walked separately), or to a
-     fully-qualified name in PROVEN_SAFE, or to a safe builtin.  Note BARE:
-     `<lane>.helper` is safe, `<lane>._Ops.rm` is NOT -- a class ATTRIBUTE
-     is not a scope and can hold anything, which is how `_Ops.rm = os.remove`
-     stayed silent through the first nine routes of round 7.
+  S  SAFE.  It resolves to a BARE def in a censused module (its body is a
+     scope of its own, walked separately), or to a BARE class of one whose
+     ANCESTRY is proven (round 9: every base resolves to object, an
+     exception, a harmless module's own name, PROVEN_SAFE, or another
+     proven class -- see _ancestry), or to a fully-qualified name in
+     PROVEN_SAFE, or to a safe builtin.  Note BARE: `<lane>.helper` is
+     safe, `<lane>._Ops.rm` is NOT -- a class ATTRIBUTE is not a scope and
+     can hold anything, which is how `_Ops.rm = os.remove` stayed silent
+     through the first nine routes of round 7.  And note PROVEN: a class
+     is not its body.  `class _Sub(logging.FileHandler): pass` has an
+     empty body and a constructor that truncates; it is a ?inherits: row.
 
 There is no per-call-site ignore list any more.  IGNORE_CALLEES is gone: it
 was matched by SPELLING, so a dead entry in it was a live hole.  Its honest
@@ -324,7 +432,7 @@ class _Unresolved(str):
     """A callee this file could not follow to a name.  It is a ROW."""
 
 
-def _module_bindings(tree: ast.AST) -> dict:
+def _module_bindings(tree: ast.AST, verdict: dict) -> dict:
     """Module-level name -> the dotted thing it is bound to.
 
     Imports, defs, classes, and simple module-level aliases.  A name bound
@@ -332,6 +440,16 @@ def _module_bindings(tree: ast.AST) -> dict:
     -- maps to None, which means UNRESOLVED, which means every call through
     it is a row.  That is how `_rm = os.remove` and
     `_rm = getattr(os, "remove")` both stop being free passes.
+
+    ``verdict`` is this module's slice of :func:`_ancestry`: class name ->
+    "" when the class may be blessed, else why not.  A class with a reason,
+    AT ANY DEPTH, is bound here to ``<inherits>.<name>`` rather than to
+    ``<lane>.<name>`` -- and bound here, at module level, on purpose: the
+    lane set (:func:`_lane_names`) blesses a nested class module-wide, so
+    the refusal has to be found first, and ``_resolve`` reads this dict
+    before it reads that set.  It is required, not defaulted, for the same
+    reason ``_classify`` requires ``exports``: a caller that forgets it gets
+    a census that blesses every class, silently.
     """
     out = {}
     pending = []
@@ -356,6 +474,12 @@ def _module_bindings(tree: ast.AST) -> dict:
                         pending.append((t.id, node.value))
                     else:
                         out.setdefault(t.id, None)
+    # ROUND 9.  A class the ancestry check could not vouch for is spelled
+    # <inherits>.<name>, whatever else the name is bound to, so that every
+    # call site of it -- and every alias to it, below -- is a row.
+    for name, why in verdict.items():
+        if why:
+            out[name] = "<inherits>." + name
     # aliases, to a fixpoint: `_rm = os.remove` then `_r2 = _rm`.
     for _ in range(4):
         for name, value in pending:
@@ -409,6 +533,12 @@ def _lane_names(tree: ast.AST) -> set:
     a row there.  Nesting matters: `read_config` defines `get`, `num` and
     `folder` inside itself, and a census that only read module-level
     statements called all fourteen of those unresolved.
+
+    TRUE OF A DEF, AND ONLY OF A DEF.  A class's body is walked, but what
+    runs when the class is CALLED is its constructor, which may be
+    inherited from a module nobody walked.  That is why this set is
+    consulted AFTER ``_module_bindings``, where every class with an
+    unproven ancestry is already bound to ``<inherits>.<name>``.
     """
     out = set()
     for node in ast.walk(tree):
@@ -493,7 +623,7 @@ def _resolve(node: ast.AST, bindings: dict, methods: set, lane: set,
             # -- `log.warning` included; called bare, rule U.
             return ("<method>." + attrs[-1]) if attrs else _Unresolved(
                 "opaque-alias:" + root)
-        if attrs and base.startswith("<lane>."):
+        if attrs and base.startswith(("<lane>.", "<inherits>.")):
             # A DEF OR CLASS OF THIS MODULE WITH AN ATTRIBUTE AFTER IT.
             # `<lane>.helper` is safe because helper's BODY is a scope of its
             # own, walked separately -- but `<lane>._Ops.rm` is not a scope,
@@ -533,11 +663,13 @@ def _resolve(node: ast.AST, bindings: dict, methods: set, lane: set,
 def _classify(resolved, walked: set, exports: dict):
     """(is_row, primitive).  Rules U, S, M, T, R applied in that order.
 
-    ``exports`` maps each walked module's dotted name to the names it binds
-    with a module-level ``def`` or ``class`` STATEMENT.  It is required, not
-    defaulted: a caller that forgets it would silently get a different
-    answer from the census, and this file already has one test whose whole
-    point is that a hand-rebuilt resolver must not drift from the real one.
+    ``exports`` maps each walked module's dotted name to what its
+    module-level ``def`` and ``class`` STATEMENTS bind: name -> "def",
+    "class" (ancestry proven) or "inherits" (ancestry NOT proven; a row at
+    every call site).  It is required, not defaulted: a caller that forgets
+    it would silently get a different answer from the census, and this file
+    already has one test whose whole point is that a hand-rebuilt resolver
+    must not drift from the real one.
     """
     if isinstance(resolved, _Unresolved):
         return True, "?unresolved"                              # rule U
@@ -547,6 +679,13 @@ def _classify(resolved, walked: set, exports: dict):
         return False, tail
     if tail in WRITES:                                          # rule M
         return True, tail
+    if resolved.startswith("<inherits>."):                      # rule S, no
+        # ROUND 9.  A class of this module whose ancestry _ancestry could
+        # not prove.  Its body was walked and is clean; its CONSTRUCTOR is
+        # inherited from somewhere the walk never read.  MEASURED on
+        # 0cfad85: `class _Sub(logging.FileHandler): pass` then
+        # `_Sub(p, "w")` -- 100000 bytes to 0, census delta ZERO.
+        return True, "?inherits:" + tail
     if resolved.startswith("<lane>."):                          # rule S
         return False, tail
     if resolved.startswith("<method>."):                        # rule T
@@ -622,8 +761,16 @@ def _classify(resolved, walked: set, exports: dict):
         # its body is a scope of its own and is censused in its own module;
         # everything else behind that prefix is a namespace this file has
         # not walked and cannot type.
-        if rest and "." not in rest and rest in exports.get(mod, ()):
-            return False, tail   # rule S: a real function of a walked module
+        what = (exports.get(mod, {}).get(rest)
+                if rest and "." not in rest else None)
+        if what in ("def", "class"):
+            return False, tail   # rule S: a real def, or a PROVEN class
+        if what == "inherits":
+            # ROUND 9, the cross-module half.  It IS a class statement of
+            # that module, and rule S used to stop reading there.  The
+            # class is a row because its ancestry is not proven; the
+            # reason is in _ancestry's verdict for it.
+            return True, "?inherits:" + tail
         return True, "?through:" + tail
     if root == "jarvis":                                        # rule R
         return True, "?uncensused"
@@ -744,21 +891,165 @@ def _method_names(tree: ast.AST) -> set:
     return out
 
 
-def _exports(tree: ast.AST) -> set:
-    """The names a MODULE-LEVEL ``def`` or ``class`` STATEMENT binds here.
+def _exports(tree: ast.AST, verdict: dict) -> dict:
+    """What each MODULE-LEVEL ``def`` or ``class`` STATEMENT binds here:
+    name -> "def", "class" or "inherits".
 
     This is what one walked module may reach for in another and still be
-    silent.  Deliberately NOT ``_lane_names``, which walks to any depth: a
-    def nested inside a function is not reachable as ``<module>.<name>`` at
+    silent -- a def, or a class whose ancestry ``verdict`` (this module's
+    slice of :func:`_ancestry`) has proven.  A class it has NOT proven is
+    "inherits", which ``_classify`` turns into a row: round 9's adversary
+    put `class _Sub(logging.FileHandler): pass` in remote.py and called
+    `remote._Sub(p, "w")` from foldersync, and "a class statement of a
+    walked module" was the whole of the old test.
+
+    Deliberately NOT ``_lane_names``, which walks to any depth: a def
+    nested inside a function is not reachable as ``<module>.<name>`` at
     all, and blessing it would be blessing a name that does not exist.
     Deliberately NOT ``_module_bindings`` either, which is every name bound
     at module level -- that includes ``import subprocess`` and
     ``from logging import FileHandler``, which are the two shapes this
     whole rule exists to stop.
     """
-    return {n.name for n in ast.iter_child_nodes(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
-                              ast.ClassDef))}
+    out = {}
+    for n in ast.iter_child_nodes(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = "inherits" if verdict.get(n.name) else "def"
+        elif isinstance(n, ast.ClassDef):
+            out[n.name] = "inherits" if verdict.get(n.name) else "class"
+    return out
+
+
+def _ancestry(trees: dict) -> dict:
+    """rel -> {class name -> "" when the class may be blessed, else why not}.
+
+    ROUND 9.  Rule S blessed a def and a class alike, on one sentence: "its
+    body is a scope of its own and is censused in its own module".  TRUE
+    FOR A DEF.  FALSE FOR A CLASS THAT SUBCLASSES A WRITER: what runs when
+    you call ``_Sub(path, "w")`` is the INHERITED ``__init__``, in a module
+    the walk never reads.  MEASURED on 0cfad85, git-archive copy, nothing
+    of his touched:
+
+        class _Sub(logging.FileHandler): pass     planted in remote.py
+        class _Kill(subprocess.Popen): pass       no new import at all
+        remote._Sub(p, "w")                       100000 bytes -> 0
+        remote._Kill(["rm", "-f", p])             GONE
+        the same class, local to foldersync       100000 bytes -> 0
+        census                                    502 rows, delta ZERO
+        census suite                              63 passed
+
+    So a class earns silence only when EVERYTHING that runs to construct
+    it is already vouched for: every base, to the root, and no class
+    keyword at all (``metaclass=`` is exactly "who constructs this").  A
+    base is proven when it resolves, THROUGH A REAL BINDING, to one of:
+
+      nothing                      an implicit object
+      <builtin>.object, or a builtin that is an exception class
+      <harmless>.<one segment>     enum.Enum, typing.NamedTuple, abc.ABC
+      a name in PROVEN_SAFE        pathlib.Path
+      a class STATEMENT of a walked module that is itself proven, by this
+      same rule, to a fixpoint -- in this module or across one
+
+    Everything else is a REASON: an unresolved name, a walked class whose
+    own base is not proven, a def, an attribute, a module the census has
+    not walked, a keyword, a cycle.  A reason makes the class a row at
+    every call site, spelled ``?inherits:<name>``, and the reason is the
+    sentence somebody has to answer in KNOWN.  This is structural, not a
+    list: a base reached through an alias, a mixin two levels up, and a
+    walked class inheriting a walked class inheriting a writer are all the
+    same one rule and none of them is named anywhere in this file.
+
+    A def stays blessed: its body IS the behaviour.  A DECORATOR IS NOT
+    CHECKED, and honestly so -- ``@swap`` where ``def swap(cls): return
+    logging.FileHandler`` makes a writer out of an innocent class without
+    a single call in its body, and no static walk sees that.  It is the
+    dynamism game, named at the top of this file as not played.
+    """
+    binds = {rel: _module_bindings(tree, {}) for rel, tree in trees.items()}
+    mod_of = {rel: rel[:-3].replace("/", ".") for rel in trees}
+    rel_of = {m: r for r, m in mod_of.items()}
+    groups = {rel: {} for rel in trees}          # rel -> name -> [ClassDef]
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                groups[rel].setdefault(node.name, []).append(node)
+    top = {rel: {n.name for n in ast.iter_child_nodes(tree)
+                 if isinstance(n, ast.ClassDef)}
+           for rel, tree in trees.items()}
+    verdict = {rel: {} for rel in trees}         # decided names only
+
+    def lineage(rel, name):
+        """A class STATEMENT `name` at the top of `rel`: "" proven, a reason,
+        or None while undecided."""
+        if name not in top[rel]:
+            return (f"has a base, {name}, that is not a class statement at "
+                    f"the top of {mod_of[rel]}")
+        if name not in verdict[rel]:
+            return None
+        why = verdict[rel][name]
+        return f"inherits {name}, which {why}" if why else ""
+
+    def judge_base(rel, base):
+        r = _resolve(base, binds[rel], set(), set(), set())
+        if isinstance(r, _Unresolved):
+            return f"has a base this census cannot resolve ({r})"
+        if r.startswith("<lane>."):
+            return lineage(rel, r[len("<lane>."):])
+        if r.startswith("<method>."):
+            return ("has a base reached through an attribute this census "
+                    f"cannot type ({r})")
+        if r.startswith("<builtin>."):
+            obj = getattr(builtins, r[len("<builtin>."):], None)
+            if obj is object or (isinstance(obj, type)
+                                 and issubclass(obj, BaseException)):
+                return ""
+            return f"has a builtin base this census does not vouch for ({r})"
+        if r in PROVEN_SAFE:
+            return ""
+        if r.split(".")[0] in HARMLESS_MODULES and r.count(".") == 1:
+            return ""
+        for mod in sorted(rel_of):
+            if r.startswith(mod + "."):
+                rest = r[len(mod) + 1:]
+                if "." in rest:
+                    return f"has a base reached through {mod}'s namespace ({r})"
+                return lineage(rel_of[mod], rest)
+        return f"has a base this census has not walked ({r})"
+
+    def judge(rel, node):
+        """"" proven, a reason, or None while a base is still undecided."""
+        for kw in node.keywords:
+            return (f"is built with a class keyword ({kw.arg or '**'}=...), "
+                    "which runs code of its own at every construction")
+        waiting = False
+        for base in node.bases:
+            got = judge_base(rel, base)
+            if got:
+                return got
+            if got is None:
+                waiting = True
+        return None if waiting else ""
+
+    pending = {(rel, name) for rel in trees for name in groups[rel]}
+    for _ in range(len(pending) + 1):
+        moved = False
+        for rel, name in sorted(pending):
+            results = [judge(rel, n) for n in groups[rel][name]]
+            reason = next((r for r in results if r), None)
+            if reason is not None:
+                verdict[rel][name] = reason           # dirty wins, at once
+            elif all(r == "" for r in results):
+                verdict[rel][name] = ""
+            else:
+                continue                              # a base is undecided
+            pending.discard((rel, name))
+            moved = True
+        if not pending or not moved:
+            break
+    for rel, name in pending:
+        verdict[rel][name] = ("is part of a cycle of bases this census "
+                              "cannot order")
+    return verdict
 
 
 def _first_party(paths) -> set:
@@ -804,12 +1095,16 @@ def census(paths=MODULES, sources=None) -> list:
         if text is None:
             text = (REPO / rel).read_text()
         trees[rel] = ast.parse(text)
-    exports = {rel[:-3].replace("/", "."): _exports(t)
+    # ROUND 9: and every class's ANCESTRY is judged across the whole set
+    # before any module is classified, for the same reason -- a class in
+    # foldersync may inherit a class in remote that inherits a writer.
+    verdicts = _ancestry(trees)
+    exports = {rel[:-3].replace("/", "."): _exports(t, verdicts[rel])
                for rel, t in trees.items()}
     found = []
     for rel in paths:
         tree = trees[rel]
-        bindings = _module_bindings(tree)
+        bindings = _module_bindings(tree, verdicts[rel])
         methods = _method_names(tree)
         lane = _lane_names(tree)
         for qual, calls, owner in _scopes(tree):
