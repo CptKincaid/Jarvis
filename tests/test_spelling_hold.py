@@ -785,3 +785,19 @@ def test_what_the_clause_costs_and_it_is_pinned_not_hidden():
     That is the same trade as his ruling (A) and the same size."""
     assert spelling.spelling_run("it's in b 4") == 2
     assert spelling.spelling_run("he's at c 5") == 2
+
+
+def test_what_ruling_b_costs_is_measured_and_pinned():
+    """The price of the run-together domain, said out loud. A verb before
+    "at" and a domain after it drafts a mailbox out of prose -- and did
+    ALREADY on jarvis-v3 for the spoken-dot shape; the tight dot adds the
+    same sentence spelt the way whisper spells it, plus ONE new sub-shape:
+    a file extension read as a top level. Both only ever reach a read-back
+    (tests/test_send_file.py section 27). Change these rows knowingly."""
+    from jarvis import outbox
+    assert outbox.parse_address("have a look at example dot com") == "look@example.com"  # v3 did this
+    assert outbox.parse_address("have a look at example.com") == "look@example.com"      # ruling (B)
+    assert outbox.parse_address("have a look at notes.txt") == "look@notes.txt"          # the new sub-shape
+    assert outbox.parse_address("the file is notes.txt") == ""      # no "at": never an address
+    assert outbox.parse_address("open report.pdf") == ""
+    assert outbox.parse_address("have a look at 4.30") == ""        # a digit top level never

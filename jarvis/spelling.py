@@ -90,6 +90,31 @@ he starts spelling an address, and being chopped off mid-address is worse
 than a pause. That is a DECISION, not a defect: it is not to be removed
 or watered down without asking him again.
 
+KNOWN LIMIT -- THE [1, 6] SPLIT (named by the 09-05 verdict)
+------------------------------------------------------------
+The hold reads the PREVIEW's newest decode, and the preview runs at a
+0.9 s cadence against a 0.8 s endpoint. When the decode of his first
+letter has not landed by the time the stop is due, that first character
+closes a capture of its own and the remaining six open the next one:
+"send it to q" / "z-v-k-b-w-7 at example.com". The second capture then
+drafts a PLAUSIBLE address missing its first letter -- zvkbw7@example.com
+-- where the baseline's four-way chop produced obvious nonsense. This is a
+NEW failure shape, not a fixed one. This module cannot see across
+captures and does not try to. The only thing that catches it is the
+spoken READ-BACK, and that is unconditional by construction: every draft
+in the send lane is armed by ONE function (jarvis/commander.py
+_send_file_finish), which returns outbox.read_back for it, and the ONE
+call to outbox.send sits behind the yes to that sentence.
+tests/test_send_file.py section 27 drives the split end to end through
+the fake transport -- "email ... to q", then "z-v-k-b-w-7 at
+example.com" -- and pins both counts: zero sends before the read-back,
+one after the yes, and the To: on the wire is the address the read-back
+spoke (test_nothing_reassembled_goes_on_the_wire_unread). A source-level
+test (test_every_draft_is_read_back_before_it_can_be_sent_by_construction)
+holds the arming point and the send call at one each, so a second of
+either is a deliberate act. A wrong address is heard before it can go;
+nothing reassembled is ever sent unread.
+
 THE REASSEMBLY
 --------------
 Holding the mic open is only half of it — the letters then have to become
@@ -217,6 +242,22 @@ def spelling_run(text) -> int:
         return 0
     if n != 1:
         return 0
+    # THE DANGLING CASE -- and the trade it is, written where it lives.
+    # One bare letter after a function word ("send an email to q") holds.
+    #   WHAT IT COSTS. MEASURED with the real poll loop, 09-05: a turn
+    #   like "switch to b" or "the answer is c" ends after 2592 ms of
+    #   quiet instead of 800 -- +1.8 s, ONCE, on that one turn. (Not
+    #   0.8 + 2.0 = 2.8 s: his 2.5 s energy timer gets there first, so
+    #   the wait is 2.5 s not 2.8.) Nine of the verdict's 67 realistic
+    #   phrases have this shape; an ordinary sentence with no dangling
+    #   letter is not delayed by a millisecond.
+    #   WHAT IT BUYS. The FIRST spelled character. Without this rule the
+    #   capture closes 0.8 s after "q", the "q" becomes a turn of its
+    #   own, and the address he then spells has no first letter -- which
+    #   is the 09-05 chop, and the reason this module exists.
+    #   HE CHOSE IT. Asked on 09-05 with the cost in front of him whether
+    #   to keep the behaviour: "yeah keep it". A decision, not a defect;
+    #   not to be removed or narrowed without asking him again.
     tail = toks[-1]
     if not tail.isalpha() or tail.lower() in _NOT_A_DANGLING_LETTER:
         return 0                       # a digit, "a" or "I": an ordinary turn

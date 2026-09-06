@@ -621,6 +621,22 @@ _DOMAIN_LABEL = r"[A-Za-z0-9][\w\-]*"
 # The trailing (?!\.?\w) lets a full stop that ENDS the sentence sit
 # after the domain ("dana at example.com.") without eating into it, while
 # still preferring the longest real domain ("example.co.uk").
+#
+# WHAT RULING (B) COSTS, MEASURED (09-06, an invented 93-phrase corpus of
+# ordinary non-spelling sentences, numbers only). A verb before "at" and
+# a domain after it drafts a mailbox out of prose: "have a look at
+# example.com" -> look@example.com. That class is NOT new -- jarvis-v3
+# already drafted look@example.com from "have a look at example dot com"
+# and is@example.com from "the site is at example dot com"; the tight
+# dot only adds the same sentence spelt the way whisper spells it. The
+# ONE sub-shape that is new is a file extension read as a top level:
+# "have a look at notes.txt" -> look@notes.txt. On that corpus: 2 of 93
+# drafted at HEAD, both this class; 0 of 93 at 996408d for the tight
+# shape. Neither can reach the wire without a read-back
+# (tests/test_send_file.py section 27), and a hand-written extension
+# list here would be the always-missing-one list rounds 5 and 6 buried.
+# Pinned, not hidden: tests/test_spelling_hold.py
+# ::test_what_ruling_b_costs_is_measured_and_pinned.
 _DOMAIN_TIGHT = (_DOMAIN_LABEL + r"(?:\." + _DOMAIN_LABEL + r")*"
                  r"\.[A-Za-z]{2,24}\b(?!\.?\w)")
 _DOMAIN_SPOKEN = (_DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
