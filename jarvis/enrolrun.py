@@ -141,6 +141,11 @@ E10 = "An enrolment is already running, sir. Say stop to end it."
 E11 = ("{name} has to type their own name at a terminal before I store "
        "their face, sir. That isn't one I'll take by voice. The command is "
        "on your clipboard.")
+# THE CROSS-CHECK. A voice run holds the microphone for its whole length and
+# this run's entire progress channel is SPEECH, so starting one over the other
+# reads five station prompts straight into the takes being kept.
+E13 = ("I'm recording your voice just now, sir, and I'd talk straight over "
+       "it. Stop that one first.")
 E12 = ("The camera confidence bar in your config won't make sense, sir, so "
        "I've stopped before opening anything. It's on the card.")
 
@@ -730,10 +735,24 @@ def preflight(cfg, *, sensing=None, worker=None, services=None) -> dict:
     was aborted halfway would leave "faces may be written down" switched on
     behind it with no terminal output to notice it in.
     """
-    if getattr(services, "enrol_run", None) is not None:
+    # ONE PLACE DECIDES WHO OWNS THE DEVICES -- jarvis/voicerun.runs_live --
+    # asked by both preflights, because the defect that shipped was exactly
+    # two preflights each looking only at its own slot. Imported lazily: this
+    # module is on the camera path and that one is on the microphone path,
+    # and neither should pull the other in at import time.
+    from jarvis.voicerun import runs_live       # noqa: PLC0415 - lazy
+    live = runs_live(services)
+    if "face" in live:
         return {"ok": False, "reply": E10, "reason": "a run is already live"}
     if worker is None:
         return {"ok": False, "reply": E9, "reason": "no preview worker"}
+    # AFTER the worker check on purpose: with no preview worker there is no
+    # console, so E9's "the command is on your clipboard" hand-over stays the
+    # answer for a headless box -- where a terminal face enrolment is not in
+    # the microphone's way at all. Every IN-APP door needs a worker to get
+    # this far, so no in-app run can start over a live voice run.
+    if "voice" in live:
+        return {"ok": False, "reply": E13, "reason": "a voice run is live"}
     # 1. SENSING, FIRST AND ALWAYS.
     st = {}
     if sensing is not None:

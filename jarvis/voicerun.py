@@ -74,6 +74,8 @@ SETTLE_S = 2.0
 # spoken prompt is a second or two; anything past this is a stuck TTS and the
 # run says so rather than recording over it.
 QUIET_WAIT_S = 8.0
+# How often the quiet wait looks again.
+POLL_S = 0.1
 # How many attempts a run may make in total. Eight kept takes with a few
 # retries is normal; an unbounded loop on a muted microphone is a run that
 # never ends, and every loop in this tree carries a hard bound.
@@ -104,6 +106,7 @@ V8 = ("Something went wrong in the middle of that, sir. The microphone is "
       "back, nothing was written, and your gallery is untouched.")
 V9 = ("I'm still talking, sir, so I can't record yet -- try again in a "
       "moment.")
+V10 = ("I started talking over that one, sir, so I've thrown it away. Again.")
 
 # Preflight refusals. No capture is opened on any of these paths.
 P1 = ("Not while I'm talking, sir -- I'd enrol my own voice. Try again in a "
@@ -115,6 +118,11 @@ P5 = ("I can't tell whether I'm talking, sir, so I won't open the microphone "
       "and record myself. That one needs a terminal.")
 P6 = ("That would store a measurement of somebody else, sir, and only they "
       "can agree to it. The command is on your clipboard.")
+# THE CROSS-CHECK. The face run's whole progress channel is SPEECH -- five
+# stations, each announced -- so recording through one stores Jarvis reading
+# the stations out, under his label.
+P7 = ("I'm enrolling your face just now, sir, and I talk my way through that "
+      "-- recording now would enrol my own voice. Stop that one first.")
 
 
 def _speakable(why: str, cap: int = 400) -> str:
@@ -146,6 +154,82 @@ def _arbiter_of(recorder):
     return None
 
 
+# ------------------------------------------------- who owns the devices
+# THE SLOT NAMES ARE HERE ONCE. Both preflights ask this function rather than
+# each reading the namespace itself, because the defect that shipped was
+# exactly two preflights each looking only at its own slot.
+FACE_SLOT = "enrol_run"
+VOICE_SLOT = "voice_run"
+
+
+def runs_live(services) -> tuple:
+    """Which in-app enrolments are parked right now: ``()``, ``("face",)``,
+    ``("voice",)`` or both.
+
+    WHY THIS EXISTS AND WHY IT IS NOT A LOCK. ``recorder.MicArbiter`` looks
+    like the thing that should stop two consumers and it is not: it is a
+    re-entrant DEPTH COUNTER whose only job is pausing the hotword on the
+    first acquire and resuming it on the last. Two runs on two threads both
+    get their context manager and both proceed, and a deeper or longer
+    acquire only makes the wake word deafer. So the exclusion is decided
+    BEFORE a device opens, in the preflight, and both preflights ask here.
+
+    PARKED COUNTS AS LIVE, deliberately. A run clears its own slot in a
+    ``finally``, so the window in which a finished run is still parked is
+    short -- and erring the other way means starting a second consumer
+    against a run that is one instruction from its last capture. The cost of
+    being wrong in this direction is one sentence; in the other it is a pool
+    of Jarvis's own voice.
+    """
+    if services is None:
+        return ()
+    out = []
+    if getattr(services, FACE_SLOT, None) is not None:
+        out.append("face")
+    if getattr(services, VOICE_SLOT, None) is not None:
+        out.append("voice")
+    return tuple(out)
+
+
+def talking(tts):
+    """Is Jarvis making sound, or about to? ``True``/``False``, or ``None``
+    when the seam cannot be read at all.
+
+    THE SHAPE IS READ, NOT ASSUMED, and that is a bug fix rather than
+    politeness. ``jarvis.tts.TTS`` exposes ``busy`` and ``is_speaking`` as
+    PROPERTIES returning bools; this module called ``tts.is_speaking()``,
+    which against the shipped object raises ``TypeError: 'bool' object is
+    not callable``. The preflight caught it, fell to "I can't tell whether
+    I'm talking" and refused -- so the safe button that replaces the drawer's
+    dangerous one refused every press on his live box, and only the suite's
+    method-shaped stand-in ever said otherwise.
+
+    ``busy`` IS PREFERRED over ``is_speaking``: it is "speaking now OR lines
+    still queued", and a queued burst is a burst that will land inside the
+    take. ``SpeakingState`` marks first AUDIO, so during the render window
+    ``is_speaking`` alone says idle while a sentence is on its way to the
+    speakers.
+    """
+    if tts is None:
+        return None
+    for name in ("busy", "is_speaking"):
+        try:
+            got = getattr(tts, name)
+        except AttributeError:
+            continue
+        except Exception:            # noqa: BLE001 - a property that raises
+            log.warning("voicerun: tts.%s could not be read", name,
+                        exc_info=True)
+            return None
+        try:
+            return bool(got() if callable(got) else got)
+        except Exception:            # noqa: BLE001 - a seam that cannot say
+            log.warning("voicerun: tts.%s could not be read", name,
+                        exc_info=True)
+            return None
+    return None
+
+
 def _rms(audio) -> float:
     try:
         arr = np.asarray(audio, dtype=np.float64).ravel()
@@ -167,8 +251,14 @@ def preflight(*, recorder=None, tts=None, services=None, label="",
 
     NOTHING HERE WRITES and nothing here opens a device.
     """
-    if getattr(services, "voice_run", None) is not None:
+    live = runs_live(services)
+    if "voice" in live:
         return {"ok": False, "reply": P3, "reason": "a run is already live"}
+    # THE CROSS-CHECK, and it is the whole of defect 1. A face run holds no
+    # microphone, but it TALKS -- five stations, each announced -- and with
+    # no AEC on this box a capture underneath that is a capture of Jarvis.
+    if "face" in live:
+        return {"ok": False, "reply": P7, "reason": "a face run is live"}
     if recorder is None:
         return {"ok": False, "reply": P4, "reason": "no recorder"}
     if not getattr(recorder, "mic_available", False):
@@ -180,10 +270,8 @@ def preflight(*, recorder=None, tts=None, services=None, label="",
     # holding Jarvis's voice.
     if tts is None:
         return {"ok": False, "reply": P5, "reason": "no tts seam"}
-    try:
-        speaking = bool(tts.is_speaking())
-    except Exception:                # noqa: BLE001 - a seam that cannot say
-        log.warning("voicerun: tts.is_speaking failed", exc_info=True)
+    speaking = talking(tts)
+    if speaking is None:
         return {"ok": False, "reply": P5, "reason": "tts unreadable"}
     if speaking:
         return {"ok": False, "reply": P1, "reason": "tts is speaking"}
@@ -386,17 +474,7 @@ class VoiceRun:
             self.tries += 1
             self._speak(V2.format(n=len(staged) + 1, total=self.takes,
                                   heading=heading, line=line.format(name=name)))
-            if not self._wait_for_quiet():
-                self._speak(V9)
-                continue
-            if self.settle_s > 0:
-                self._sleep(self.settle_s)
-            if self._should_stop():
-                return staged
-            self._tone("listen")
-            audio = self._record()
-            self._tone("done")
-            take = self._keep(audio, heading)
+            take = self._take_once(heading)
             if take is None:
                 continue
             staged.append(take)
@@ -406,6 +484,38 @@ class VoiceRun:
                        % (len(staged), take[2], take[1]))
         return staged
 
+    def _take_once(self, heading):
+        """One capture, with Jarvis proved silent at BOTH ENDS of it.
+
+        THE BEFORE-CHECK ALONE IS NOT ENOUGH, and that is the second half of
+        defect 1. Excluding the face run closes the door the adversary found;
+        this closes the one behind it, because Jarvis speaks from a dozen
+        places that have nothing to do with this run -- a timer going off, an
+        arriving message, a reminder he set this morning. A burst that begins
+        one second into an eight-second capture is a take of his voice with
+        seven seconds of Jarvis's underneath it, and with no AEC on this box
+        it cannot be salvaged. So it is DROPPED and the run tries again,
+        which costs him one prompt rather than his voiceprint.
+
+        FAIL CLOSED at the far edge too: a seam that cannot answer after the
+        capture is not evidence of silence.
+        """
+        if not self._wait_for_quiet():
+            self._speak(V9)
+            return None
+        if self.settle_s > 0:
+            self._sleep(self.settle_s)
+        if self._should_stop():
+            return None
+        self._tone("listen")
+        audio = self._record()
+        self._tone("done")
+        if self.tts is not None and talking(self.tts) is not False:
+            log.info("voicerun: a take was discarded -- Jarvis spoke through it")
+            self._speak(V10)
+            return None
+        return self._keep(audio, heading)
+
     def _wait_for_quiet(self) -> bool:
         """Do not record over Jarvis. Bounded, and a seam that cannot answer
         is treated as still talking -- fail closed, for the same reason the
@@ -413,16 +523,20 @@ class VoiceRun:
         if self.tts is None:
             return True
         deadline = self._now() + self.quiet_wait_s
-        while self._now() < deadline:
-            try:
-                if not bool(self.tts.is_speaking()):
-                    return True
-            except Exception:        # noqa: BLE001 - a seam that cannot say
-                log.warning("voicerun: tts.is_speaking failed", exc_info=True)
+        # BOUNDED BOTH WAYS. The clock is injected, so a frozen ``now`` in a
+        # test would make a while-on-the-clock loop run for ever; every loop
+        # in this tree carries a hard count as well.
+        for _ in range(max(1, int(self.quiet_wait_s / POLL_S) + 1)):
+            speaking = talking(self.tts)
+            if speaking is None:
                 return False
+            if not speaking:
+                return True
             if self._should_stop():
                 return False
-            self._sleep(0.1)
+            if self._now() >= deadline:
+                return False
+            self._sleep(POLL_S)
         return False
 
     def _record(self):

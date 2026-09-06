@@ -49,7 +49,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from jarvis import consent as cs
 from jarvis.identity import LABEL_RX, ROLE_KNOWN, ROLE_OWNER
@@ -156,18 +156,28 @@ NOTE_OTHERS = ("Enrolling somebody else's face or voice still needs a "
                "own name themselves, and nobody may type it for them. The "
                "command is handed over ready to run.")
 
+# THE PURGE SENTENCES CARRY THE ORDERING, which the first draft left out and
+# which is the half of defect 2 that no wording change alone would have fixed:
+# the gallery buttons live ON THE ROW, and Forget removes the row. So "forget
+# them, then press the two buttons" is an instruction that cannot be followed,
+# and the panel used to imply exactly that.
 NOTE_PURGE_NO = ("Forgetting somebody removes their entry here only. Their "
-                 "face measurements stay in the gallery until that command "
-                 "is run.")
-NOTE_PURGE_FACE_ONLY = ("Forgetting somebody removes their entry and, "
-                        "separately, their face measurements. A voice pool "
-                        "stays until that command is run.")
-NOTE_PURGE_VOICE_ONLY = ("Forgetting somebody removes their entry and, "
-                         "separately, their voice pool. Face measurements "
-                         "stay until that command is run.")
-NOTE_PURGE_BOTH = ("Forgetting somebody removes their entry only. Their face "
-                   "measurements and their voice pool are separate buttons, "
-                   "and each says what it did NOT touch.")
+                 "face measurements stay in the gallery and any voice pool "
+                 "stays with them, until that command is run.")
+NOTE_PURGE_FACE_ONLY = ("Forgetting somebody removes their entry here only. "
+                        "Their face measurements have their own button on "
+                        "their row — press it BEFORE you forget them, "
+                        "because forgetting takes the row away. A voice pool "
+                        "needs a terminal.")
+NOTE_PURGE_VOICE_ONLY = ("Forgetting somebody removes their entry here only. "
+                         "Their voice pool has its own button on their row — "
+                         "press it BEFORE you forget them, because forgetting "
+                         "takes the row away. Face measurements need a "
+                         "terminal.")
+NOTE_PURGE_BOTH = ("Forgetting somebody removes their entry here only. Their "
+                   "face measurements and their voice pool each have their "
+                   "own button on their row — press those BEFORE you forget "
+                   "them, because forgetting takes the row away.")
 
 # The asymmetry this work creates, said rather than smoothed over. Every
 # button below is under GUARDED and asks for the override code. The SPOKEN
@@ -183,6 +193,72 @@ ENROL_ASYMMETRY = (
 )
 
 
+# The seam behind each thing this console can do. ONE mapping, so the note and
+# the buttons cannot come to different conclusions about the same capability.
+SEAM_FOR = {"phrase": "people_set_phrase",
+            "code": "people_new_code",
+            "face": "face_enrol_start",
+            "voice": "voice_enrol_start",
+            "purge_face": "people_purge_face",
+            "purge_voice": "people_purge_voice"}
+
+# What the owner's row draws for a capability it HAS, and what it draws
+# instead when it has not. The hand-over is not a fallback: NOTE_FACE_NO and
+# NOTE_VOICE_NO both promise "the command is handed over ready to run", so a
+# console without the seam owes him that button rather than a bare gap.
+OWNER_BUTTON = {"phrase": "Change phrase",
+                "code": "Send me a new code",
+                "face": "Enrol my face",
+                "voice": "Enrol my voice"}
+HANDOVER_BUTTON = {"face": "Copy the face command",
+                   "voice": "Copy the voice command"}
+STOP_BUTTON = "Stop"
+
+
+def console_can(services=None) -> Dict[str, bool]:
+    """WHAT THIS CONSOLE CAN ACTUALLY DO, asked once and answered once.
+
+    THE FOOT NOTE AND THE BUTTONS READ THE SAME DICT, and that is the whole
+    of defect 3. Deriving the NOTE from the seams -- which is what the first
+    pass did -- only fixed one side of the sentence: the buttons were still
+    drawn from nothing at all, so a console where ``face_enrol_start`` never
+    landed said "Enrolling a face still needs a terminal" in the foot and
+    drew a button labelled "Enrol my face" two inches above it. He caught the
+    ORIGINAL version of that contradiction himself on 2026-09-05, which is
+    why this lane exists, so a second stale foot note is the one outcome that
+    would make this work worse than not doing it.
+
+    CALLABLE, not merely present. The half-wired case that actually happens
+    is ``build_ui_services`` dropping a name the dataclass has not declared
+    yet, or a field landing as None -- both of which read as "there" to a
+    bare getattr and as a broken button to him.
+    """
+    out = {name: bool(services is not None
+                      and callable(getattr(services, seam, None)))
+           for name, seam in SEAM_FOR.items()}
+    # ONE Stop for both runs, so it survives either seam landing alone.
+    out["stop"] = bool(services is not None and (
+        callable(getattr(services, "face_enrol_stop", None))
+        or callable(getattr(services, "voice_enrol_stop", None))))
+    return out
+
+
+def owner_buttons(can: Dict[str, bool]) -> Tuple[str, ...]:
+    """The labels the OWNER'S row will draw, in order, for a given set of
+    capabilities. Read by ``_build_actions`` and by the tests, so the
+    agreement between the note and the buttons is structural rather than
+    remembered."""
+    out = []
+    for cap in ("phrase", "code"):
+        if can.get(cap):
+            out.append(OWNER_BUTTON[cap])
+    for cap in ("face", "voice"):
+        out.append(OWNER_BUTTON[cap] if can.get(cap) else HANDOVER_BUTTON[cap])
+    if can.get("stop"):
+        out.append(STOP_BUTTON)
+    return tuple(out)
+
+
 def cannot_do(services=None) -> Tuple[str, ...]:
     """The pinned foot note, BUILT FROM THE SEAMS THAT ARE WIRED.
 
@@ -191,23 +267,34 @@ def cannot_do(services=None) -> Tuple[str, ...]:
     app and the window merged in either order) describes itself correctly
     instead of promising a button that is not there.
     """
-    def wired(name):
-        return callable(getattr(services, name, None)) if services else False
-
+    can = console_can(services)
     out = [NOTE_NOT_A_LOCK]
-    if not wired("people_set_phrase"):
+    if not can["phrase"]:
         out.append(NOTE_PHRASE_NO)
-    out.append(NOTE_CODE_MAIL if wired("people_new_code") else NOTE_CODE_NO)
-    if not wired("face_enrol_start"):
+    out.append(NOTE_CODE_MAIL if can["code"] else NOTE_CODE_NO)
+    if not can["face"]:
         out.append(NOTE_FACE_NO)
-    if not wired("voice_enrol_start"):
+    if not can["voice"]:
         out.append(NOTE_VOICE_NO)
     out.append(NOTE_OTHERS)
-    face, voice = wired("people_purge_face"), wired("people_purge_voice")
+    face, voice = can["purge_face"], can["purge_voice"]
     out.append(NOTE_PURGE_BOTH if (face and voice) else
                NOTE_PURGE_FACE_ONLY if face else
                NOTE_PURGE_VOICE_ONLY if voice else NOTE_PURGE_NO)
     out.append(NOTE_NO_UNDO)
+    return tuple(out)
+
+
+def foot_lines(services=None) -> Tuple[str, ...]:
+    """EVERY line of the pinned foot, including the asymmetry pair.
+
+    Those two say "this button does ask for the override code", which is a
+    lie on a console that draws no such button -- so they are derived from
+    the same dict as the button, not appended by the painter.
+    """
+    out = list(cannot_do(services))
+    if console_can(services)["face"]:
+        out += list(ENROL_ASYMMETRY)
     return tuple(out)
 
 
@@ -823,8 +910,9 @@ class ForgetArm:
         return "forget"
 
 
-def forget_warning(label: str, voices=(), gallery=()) -> Tuple[str, ...]:
-    """What is destroyed, what SURVIVES, and that none of it comes back.
+def forget_warning(label: str, voices=(), gallery=(),
+                   can: Optional[Dict[str, bool]] = None) -> Tuple[str, ...]:
+    """What is destroyed, what SURVIVES, HOW TO REMOVE IT, and in what order.
 
     MEASURED in ``identity.Registry.forget``: it removes the ROW and nothing
     else. Saying "removed" and leaving the rest implied is how somebody comes
@@ -838,14 +926,47 @@ def forget_warning(label: str, voices=(), gallery=()) -> Tuple[str, ...]:
     while her pool sat on the disk. The sentence is now built from what the
     two galleries actually hold. The old wording is not quoted here: a test
     greps this file for it.
+
+    THEN IT PROMISED BUTTONS IT DID NOT DRAW -- defect 2, and two separate
+    faults in one sentence. It said "each is a separate button below"
+    whatever the console had actually been wired with, so a half-wired page
+    sent him looking for a control that was not on it; and it never said that
+    those buttons live ON THIS ROW and that Forget removes the row, so the
+    only order the panel implied -- forget them, then press the two buttons --
+    is one that cannot be followed.
+
+    SO THE PANEL DOES NOT PURGE, AND THAT IS A DECISION RATHER THAN AN
+    OMISSION. Three reasons, and the third is the one that settles it:
+
+    * ONE TYPED CONFIRMATION MEANS ONE THING. He is asked to type a label to
+      remove a ROW. Making that same keystroke destroy two biometric stores
+      changes what he is agreeing to without changing what he was asked.
+    * ``purge_label`` CAN HONESTLY SUCCEED IN PART. Its own contract is that a
+      generation it cannot read, that another model wrote, or that holds a
+      bystander it could not carry is LEFT ALONE and reported. A combined
+      action would have to report that in the same breath as a registry write
+      that either happened or did not -- and rounding a partial purge up to
+      "done" is precisely the class of defect this lane exists to fix.
+    * THERE IS NOTHING TO ROLL BACK TO. The people file has no history and no
+      backup (this panel says so). If the purge failed after the row was
+      gone, he would have lost the row, kept the measurements, and lost the
+      button that removes them. Ordering it the other way -- purge first,
+      forget after -- is the safe sequence, so the panel says that instead of
+      hiding it inside one press.
+
+    The commands are printed WHATEVER is wired, because after the row is gone
+    the button is gone with it and the command is the only thing that still
+    works.
     """
     who = str(label or "")
     have_face = who in {str(g) for g in (gallery or ())}
     have_voice = who in {str(v) for v in (voices or ())}
+    can = dict(can or {})
+    btn_face = have_face and bool(can.get("purge_face"))
+    btn_voice = have_voice and bool(can.get("purge_voice"))
     if have_face and have_voice:
         survives = ("%s's face measurements AND %s's voice pool stay on the "
-                    "disk. Each is a separate button below, and each says "
-                    "what it did not touch." % (who, who))
+                    "disk." % (who, who))
     elif have_face:
         survives = ("%s's face measurements stay in the gallery. There is no "
                     "voice pool under that name." % who)
@@ -855,7 +976,7 @@ def forget_warning(label: str, voices=(), gallery=()) -> Tuple[str, ...]:
     else:
         survives = ("There are no face measurements and no voice pool under "
                     "that name, so this row is all there is of %s." % who)
-    return (
+    out = [
         "Forget %s?" % who,
         "",
         "This removes %s's entry: their name, their role, the face label "
@@ -863,12 +984,31 @@ def forget_warning(label: str, voices=(), gallery=()) -> Tuple[str, ...]:
         "added." % who,
         "",
         "WHAT SURVIVES. " + survives,
+    ]
+    # THE ORDER, said only when there is actually a button to lose.
+    if btn_face or btn_voice:
+        which = ("the buttons Remove face measurements and Remove voice pool "
+                 "are" if (btn_face and btn_voice) else
+                 "the button Remove face measurements is" if btn_face else
+                 "the button Remove voice pool is")
+        out += ["",
+                "IN THAT ORDER. On this row %s, and forgetting %s takes the "
+                "row away with them -- so press them BEFORE you confirm here, "
+                "not after." % (which, who)]
+    if have_face or have_voice:
+        out += ["", "Once the row is gone these are the only way left:"]
+        if have_face:
+            out.append(forget_face_command(who))
+        if have_voice:
+            out.append(forget_voice_command(who))
+    out += [
         "",
         "THIS CANNOT BE UNDONE. The people file is rewritten in place; "
         "there is no history and no backup.",
         "",
         "Type %s to confirm." % who,
-    )
+    ]
+    return tuple(out)
 
 
 PURGE_WARN_FACE = (
@@ -944,6 +1084,20 @@ def forget_face_command(label: str, *, python: Optional[str] = None,
     from jarvis import enrolentry
     return enrolentry.command_line(str(label or ""), delete=True,
                                    python=python, script=script)
+
+
+def forget_voice_command(label: str, *, python: Optional[str] = None,
+                         script: Optional[str] = None) -> str:
+    """The exact command that removes their VOICE pool, quoted.
+
+    THE FACE HALF ALREADY HAD ONE AND THE VOICE HALF DID NOT, which is how a
+    destructive panel came to list what survives and hand over a way to
+    remove only some of it. Built by the same seam ``scripts/voice_enrol.py``
+    documents -- there is no second way to delete somebody.
+    """
+    from jarvis import enrolentry
+    return enrolentry.voice_command_line(str(label or ""), delete=True,
+                                         python=python, script=script)
 
 
 # ============================================================ adding a row
@@ -1452,9 +1606,7 @@ class UsersPage(tk.Frame):
             # that lands turns its own sentence off, and a half-wired UI
             # describes itself correctly instead of promising a button it
             # has not got.
-            lines = list(cannot_do(self.services))
-            if self._service("face_enrol_start") is not None:
-                lines += list(ENROL_ASYMMETRY)
+            lines = list(foot_lines(self.services))
             self._note_lbl.configure(
                 text="\n".join("· " + line for line in lines))
         except Exception:                 # noqa: BLE001 - torn down
@@ -1707,7 +1859,8 @@ class UsersPage(tk.Frame):
         warn = tk.Label(parent, text="\n".join(forget_warning(
                             label,
                             voices=self._snapshot.get("voices") or (),
-                            gallery=self._snapshot.get("gallery") or ())),
+                            gallery=self._snapshot.get("gallery") or (),
+                            can=console_can(self.services))),
                         font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN,
                         bg=bg, anchor="w", justify="left", bd=0, padx=0,
                         pady=0)
@@ -2185,29 +2338,60 @@ class UsersPage(tk.Frame):
         """
         widgets = self._row_widgets.setdefault(row.label, {})
         is_owner = row.role == ROLE_OWNER
+        # THE SAME DICT THE FOOT NOTE READS. A capability this console has not
+        # got may not be drawn as a button, and one it HAS may not be denied
+        # in the note -- ``owner_buttons`` is the list this branch must
+        # produce, and tests/test_users_note_matches_buttons.py walks every
+        # wiring to prove the two agree.
+        can = console_can(self.services)
         if is_owner:
-            secrets = self._btn_row(parent, bg)
-            widgets["phrase"] = self._action(
-                secrets, bg, "Change phrase",
-                lambda who=row.label: self._phrase_pressed(who))
-            widgets["code"] = self._action(
-                secrets, bg, "Send me a new code",
-                lambda who=row.label: self._code_pressed(who))
-            enrol = self._btn_row(parent, bg)
-            widgets["face"] = self._action(
-                enrol, bg, "Enrol my face",
-                lambda who=row.label: self._face_pressed(who))
-            widgets["voice"] = self._action(
-                enrol, bg, "Enrol my voice",
-                lambda who=row.label: self._voice_pressed(who))
-            # STOP IS ALWAYS THERE while this page is open, not only once a
-            # run is known to be live. The page has no live view of the run
-            # -- it is on its own thread inside the app -- and a Stop that
-            # appears only when the page happens to know is a Stop that is
-            # missing at exactly the moment station four has put the keyboard
-            # out of reach. It answers "Nothing is running, sir." when there
-            # is nothing to stop, which costs him one line and never a lens.
-            widgets["stop"] = self._action(enrol, bg, "Stop", self._enrol_stop)
+            secrets = None
+            for cap, press in (("phrase", self._phrase_pressed),
+                               ("code", self._code_pressed)):
+                if not can[cap]:
+                    continue
+                if secrets is None:
+                    secrets = self._btn_row(parent, bg)
+                widgets[cap] = self._action(
+                    secrets, bg, OWNER_BUTTON[cap],
+                    lambda who=row.label, fn=press: fn(who))
+            # THE HAND-OVERS GO ONE PER ROW and the short buttons share one.
+            # MEASURED at 2.0 scale: "Copy the face command" is 441 px and
+            # "Copy the voice command" 458, which side by side with their
+            # padding is 911 px of the 856 px a 920x1440 window leaves inside
+            # the block -- and the body scrolls only downwards, so the excess
+            # is CUT rather than reached. "Enrol my face" and "Enrol my voice"
+            # are short enough to sit together and are measured as such.
+            enrol = None
+            for cap, press in (("face", self._face_pressed),
+                               ("voice", self._voice_pressed)):
+                if can[cap]:
+                    if enrol is None:
+                        enrol = self._btn_row(parent, bg)
+                    widgets[cap] = self._action(
+                        enrol, bg, OWNER_BUTTON[cap],
+                        lambda who=row.label, fn=press: fn(who))
+                else:
+                    # NOTE_FACE_NO and NOTE_VOICE_NO both promise "the command
+                    # is handed over ready to run", so a console without the
+                    # seam owes him that rather than a gap where a button was.
+                    widgets["%s_handover" % cap] = self._action(
+                        self._btn_row(parent, bg), bg, HANDOVER_BUTTON[cap],
+                        lambda who=row.label, k=cap, n=row.name:
+                        self._copy(enrol_command(who, k, n)))
+            # STOP IS ALWAYS THERE while this page is open AND a stop seam
+            # exists, not only once a run is known to be live. The page has no
+            # live view of the run -- it is on its own thread inside the app
+            # -- and a Stop that appears only when the page happens to know is
+            # a Stop that is missing at exactly the moment station four has
+            # put the keyboard out of reach. It answers "Nothing is running,
+            # sir." when there is nothing to stop, which costs him one line
+            # and never a lens.
+            if can["stop"]:
+                if enrol is None:
+                    enrol = self._btn_row(parent, bg)
+                widgets["stop"] = self._action(enrol, bg, STOP_BUTTON,
+                                               self._enrol_stop)
         else:
             # ONE PER ROW, and this is measured rather than cautious. At 2.0
             # scale "Copy the face command" is 441 px and "Copy the voice
@@ -2229,15 +2413,15 @@ class UsersPage(tk.Frame):
         # REMOVE. A "remove their face measurements" on a row with none is a
         # button whose only possible answer is "there was nothing", which
         # reads as a failure.
-        if row.face_known and self._service("people_purge_face") is not None:
-            self._action(self._btn_row(parent, bg),
-                         bg, "Remove face measurements",
-                         lambda who=row.label: self._purge_pressed(who, "face"))
+        if row.face_known and can["purge_face"]:
+            widgets["purge_face"] = self._action(
+                self._btn_row(parent, bg), bg, "Remove face measurements",
+                lambda who=row.label: self._purge_pressed(who, "face"))
         if row.label in set(self._snapshot.get("voices") or ()) \
-                and self._service("people_purge_voice") is not None:
-            self._action(self._btn_row(parent, bg), bg, "Remove voice pool",
-                         lambda who=row.label:
-                         self._purge_pressed(who, "voice"))
+                and can["purge_voice"]:
+            widgets["purge_voice"] = self._action(
+                self._btn_row(parent, bg), bg, "Remove voice pool",
+                lambda who=row.label: self._purge_pressed(who, "voice"))
 
     def _action(self, parent, bg, text, command):
         btn = RoundButton(parent, text=text, kind="ghost", bg=bg, pad_x=8,

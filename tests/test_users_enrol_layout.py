@@ -149,7 +149,11 @@ def _snapshot(code=True):
         "admin_line": "an owner has set an override code"}
 
 
-def _page(root, geometry, look="holo", code=True):
+def _page(root, geometry, look="holo", code=True, drop=()):
+    """``drop`` names seams this console was NEVER HANDED -- the half-wired
+    build, which is not hypothetical: ``app.build_ui_services`` drops any
+    name the window's Services dataclass has not declared yet, so a window
+    older or newer than the app arrives here missing exactly these."""
     import tkinter as tk
     theme.select_look(look)
     w, h = geometry
@@ -160,6 +164,8 @@ def _page(root, geometry, look="holo", code=True):
     stage = tk.Frame(host, bg=theme.BG)
     stage.pack(fill="both", expand=True)
     svc = Svc(_snapshot(code))
+    for name in drop:
+        setattr(svc, name, None)
     page = up.UsersPage(host, services=svc, cover=(stage,))
     root.update_idletasks()
     page.show()
@@ -370,3 +376,112 @@ def test_the_module_captures_no_look_at_import_time():
             name = stripped.split("=")[0].strip()
             assert name.startswith("_") is False or True, name
             pytest.fail("module-level theme capture: %r" % stripped)
+
+
+# ================================ the half-wired console, MEASURED not assumed
+HALF_WIRED = [
+    (),
+    ("face_enrol_start",),
+    ("voice_enrol_start",),
+    ("face_enrol_start", "voice_enrol_start"),
+    ("people_purge_face", "people_purge_voice"),
+    ("face_enrol_start", "voice_enrol_start", "people_purge_face",
+     "people_purge_voice", "face_enrol_stop", "voice_enrol_stop"),
+]
+
+
+def _button_texts(page):
+    """Every MAPPED button's label. ``RoundButton`` is a Canvas that draws
+    its own text, so the string is on ``_text`` and never on a cget."""
+    out = []
+    for w in _walk(page):
+        if not isinstance(w, wg.RoundButton) or not w.winfo_ismapped():
+            continue
+        text = str(getattr(w, "_text", "") or "")
+        if text:
+            out.append(text)
+    return out
+
+
+def _note_text(page):
+    return str(page._note_lbl.cget("text"))
+
+
+@pytest.mark.parametrize("geometry", BOTH)
+@pytest.mark.parametrize("drop", HALF_WIRED)
+def test_a_half_wired_console_never_draws_a_button_its_note_denies(
+        root, geometry, drop):
+    """DEFECT 3, on a real tree rather than in the abstract. The derived note
+    and the buttons ACTUALLY DRAWN are read off the same window, in six
+    wirings, at both his geometries."""
+    page, _svc, _host = _page(root, geometry, drop=drop)
+    root.update_idletasks()
+    root.update()
+    note, drawn = _note_text(page), _button_texts(page)
+    if up.NOTE_FACE_NO in note:
+        assert "Enrol my face" not in drawn, (drop, geometry)
+        assert "Copy the face command" in drawn, (drop, geometry)
+    else:
+        assert "Enrol my face" in drawn, (drop, geometry)
+    if up.NOTE_VOICE_NO in note:
+        assert "Enrol my voice" not in drawn, (drop, geometry)
+        assert "Copy the voice command" in drawn, (drop, geometry)
+    else:
+        assert "Enrol my voice" in drawn, (drop, geometry)
+    if up.ENROL_ASYMMETRY[0] in note:
+        assert "Enrol my face" in drawn, (drop, geometry)
+
+
+@pytest.mark.parametrize("geometry", BOTH)
+@pytest.mark.parametrize("drop", HALF_WIRED)
+def test_nothing_overflows_in_any_half_wired_state(root, geometry, drop):
+    """The hand-over buttons are the WIDE ones -- "Copy the voice command" is
+    458 px at 2.0 scale -- so the wirings that draw them are exactly the ones
+    that can cut, and the body scrolls only downwards."""
+    page, _svc, _host = _page(root, geometry, drop=drop)
+    root.update_idletasks()
+    root.update()
+    assert _overflowing(page) == [], (drop, geometry, _overflowing(page)[:4])
+    assert _rows_wider_than_the_body(page) == [], (drop, geometry)
+
+
+@pytest.mark.parametrize("geometry", BOTH)
+@pytest.mark.parametrize("drop", HALF_WIRED)
+def test_the_forget_panel_fits_and_promises_only_drawn_buttons(
+        root, geometry, drop):
+    """DEFECT 2, measured. The panel grew -- it now carries the ordering
+    sentence and up to two full command lines -- so it is re-measured in
+    every wiring, and it may not name a button this console did not draw."""
+    page, _svc, _host = _page(root, geometry, drop=drop)
+    page._forget_pressed("heather")
+    root.update_idletasks()
+    root.update()
+    assert _overflowing(page) == [], (drop, geometry, _overflowing(page)[:4])
+    assert _rows_wider_than_the_body(page) == [], (drop, geometry)
+    warn = "\n".join(t for t in [str(w.cget("text")) for w in _walk(page)
+                                 if _has_text(w)] if "WHAT SURVIVES" in t)
+    assert warn, "the forget panel did not draw its warning"
+    drawn = _button_texts(page)
+    if "Remove face measurements" in warn:
+        assert "Remove face measurements" in drawn, (drop, geometry)
+    if "Remove voice pool" in warn:
+        assert "Remove voice pool" in drawn, (drop, geometry)
+    # The commands are printed WHATEVER is wired: after the row is gone they
+    # are the only way left.
+    assert up.forget_face_command("heather") in warn
+
+
+@pytest.mark.parametrize("geometry", BOTH)
+def test_the_voice_command_is_offered_where_a_pool_exists(root, geometry):
+    """heather has face measurements and no pool; alderman has both. The
+    panel must hand over the VOICE command for the one who has one -- the
+    half that had no builder at all before tonight."""
+    page, _svc, _host = _page(root, geometry)
+    page._forget_pressed("alderman")
+    root.update_idletasks()
+    root.update()
+    blob = "\n".join(str(w.cget("text")) for w in _walk(page)
+                      if _has_text(w))
+    assert up.forget_voice_command("alderman") in blob
+    assert _overflowing(page) == [], geometry
+    assert _rows_wider_than_the_body(page) == [], geometry

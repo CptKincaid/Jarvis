@@ -7205,12 +7205,20 @@ class JarvisApp:
         return self._people_write("set-role", change, now=now)
 
     def people_forget(self, label, *, now=None) -> tuple:
-        """Remove a row, and SAY WHAT SURVIVED IT.
+        """Remove a row, and SAY WHAT SURVIVED IT -- from the galleries
+        themselves, not from a guess.
 
         MEASURED in ``identity.Registry.forget``: it removes the row and
         nothing else. The face gallery entry is untouched, so a line that
         said only "forgotten" would leave him believing a gallery was
         scrubbed when it was not.
+
+        IT NAMED ONLY THE FACE HALF, and after the voice gallery merged that
+        was the same half-truth one store over: a pool under that label could
+        outlive the row with nothing in this line to say so. It is asked of
+        both galleries now, AFTER the write, and it names the store rather
+        than "that command" -- because by the time he reads this the row and
+        its buttons are gone, and the terminal is what is left.
         """
         who = str(label or "").strip().lower()
 
@@ -7218,9 +7226,8 @@ class JarvisApp:
             ok, why = registry.forget(who)
             if not ok:
                 return False, why
-            return True, ("%s is forgotten here. Their face measurements "
-                          "stay in the gallery until that command is run."
-                          % who)
+            return True, "%s is forgotten here.%s" % (who,
+                                                      _survivors_line(who))
 
         return self._people_write("forget", change, now=now)
 
@@ -7836,6 +7843,37 @@ def voice_labels() -> tuple:
         log.debug("users: the voice gallery could not be listed",
                   exc_info=True)
         return ()
+
+
+def _survivors_line(who: str) -> str:
+    """"" when nothing is left, else what is STILL on the disk under ``who``,
+    named store by store.
+
+    NEVER RAISES and never claims more than it read: a gallery that could not
+    be listed is reported as unknown rather than quietly dropped, because
+    "forgotten" with a silent omission is the exact shape of the sentence
+    this lane exists to stop.
+    """
+    kept, unknown = [], []
+    for kind, lister in (("face measurements", gallery_labels),
+                         ("voice pool", voice_labels)):
+        try:
+            if who in {str(x) for x in lister()}:
+                kept.append(kind)
+        except Exception:                              # noqa: BLE001 - a store
+            log.exception("users: the %s could not be listed after a forget",
+                          kind)
+            unknown.append(kind)
+    out = ""
+    if kept:
+        out += (" Their %s stay on the disk; the row and its buttons are gone,"
+                " so removing them now needs a terminal." % " and their ".join(kept))
+    if unknown:
+        out += (" I could not read the %s, so I can't say whether anything of"
+                " theirs is left there." % " or the ".join(unknown))
+    if not kept and not unknown:
+        out += " Nothing of theirs is left in either gallery."
+    return out
 
 
 def gallery_labels() -> tuple:
