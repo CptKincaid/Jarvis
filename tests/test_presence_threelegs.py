@@ -235,33 +235,73 @@ def test_the_fabrics_own_stuck_flag_is_honoured_too(stuck):
 # THE 2026-09-05 CHAIN, REPLAYED
 # ================================================================
 def test_tonight_the_latched_office_no_longer_costs_him_the_greeting(clocked):
-    """20:43:13. The office has read occupied since 19:07:11 with the flat
-    empty; the kitchen is correctly clear; his phone is out with him; the
-    camera has been stopped since 17:04:25 so it cannot look.
+    """20:43:13. The office has read occupied since 19:07:11; the kitchen is
+    correctly clear; his phone is out with him; the camera has been stopped
+    since 17:04:25 so it cannot look.
 
     Before: HouseView called the house occupied because ANY room was, the
-    phone was never even asked ("if seen: return True"), the sentinel
-    never said away, and door_arrival needs away and only away.
+    phone was never even asked ("if seen: return True"), the sentinel never
+    said away, and door_arrival needs away and only away.
 
-    After: nothing has corroborated the office run, so the room is dropped,
-    the house falls through to the phone, and the phone says no.
+    THE RUN STARTS WHILE HE IS STILL HOME, AND CORROBORATED. That is the
+    realistic latch and the first cut of this test did not have it: it
+    started the office run with him ALREADY OUT and with nothing ever
+    agreeing, which is the one variant of the latch the "ever corroborated"
+    tie-break happened to get right. A radar that latches on has almost
+    always seen a real body first -- him, at the desk, with his phone on the
+    Wi-Fi stamping the run every minute -- so "has anything EVER agreed"
+    answers yes for ever and the greeting stays lost. What must decide it is
+    whether anything has agreed RECENTLY.
     """
     stuck, now = clocked
-    stuck.observe("office", True)                            # 19:07:11
-    now["t"] += 96 * 60.0                                    # 20:43:13
+    # 18:07 -- he is at the desk. The run starts and his phone stamps it
+    # every minute for an hour, exactly as the real box does.
     stuck.observe("office", True)
-    assert stuck.faulted() == frozenset({"office"})
+    for _ in range(60):
+        now["t"] += 60.0
+        stuck.corroborate("phone")
+        stuck.observe("office", True)
+    assert stuck.status()["office"]["corroborated_s_ago"] is not None, \
+        "the run must be corroborated, or this is not the realistic latch"
+
+    # 19:07:11 -> 20:43:13. He is out; the office never cleared.
+    now["t"] += 96 * 60.0
+    stuck.observe("office", True)
 
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False)
+                                 phone=lambda ip, mac: False,
+                                 mic=lambda: 96 * 60.0)
     assert leg("192.168.50.34", "") is False
     assert leg.verdict.strictly_away is True
 
     from jarvis import arrival
     watch = arrival.DoorWatch()
     assert watch.observe(room="kitchen", away=True, state="away") is True
+
+
+def test_the_same_latch_after_a_short_trip_also_reaches_away(clocked):
+    """The variant that survived the first cut. He was home, the run was
+    stamped every minute, then he went to the shop for half an hour."""
+    stuck, now = clocked
+    stuck.observe("office", True)
+    for _ in range(60):
+        now["t"] += 60.0
+        stuck.corroborate("phone")
+        stuck.observe("office", True)
+    now["t"] += 30 * 60.0                       # a thirty-minute errand
+    stuck.observe("office", True)
+    assert stuck.faulted() == frozenset(), \
+        "30 minutes is well inside the 45-minute stuck fault"
+
+    fab = build_fabric(office=True, kitchen=False)
+    fab.tick()
+    leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
+                                 phone=lambda ip, mac: False,
+                                 mic=lambda: 30 * 60.0)
+    assert leg("192.168.50.34", "") is False
+    assert leg.verdict.cell == 6
 
 
 def test_the_same_cell_with_him_at_the_desk_does_not_call_him_out(clocked):
@@ -278,7 +318,8 @@ def test_the_same_cell_with_him_at_the_desk_does_not_call_him_out(clocked):
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False)
+                                 phone=lambda ip, mac: False,
+                                 mic=lambda: 60.0)
     assert leg("192.168.50.34", "") is True
     assert leg.verdict.cell == 6
     assert leg.verdict.strictly_away is False

@@ -82,21 +82,26 @@ def test_a_camera_that_could_not_look_is_never_read_as_not_seeing_him():
     assert v.cell == 6 and v.state != AWAY
 
 
-def test_cell_six_splits_on_whether_anything_ever_corroborated_the_run():
-    seated = pv.decide(phone=N, camera=X, rooms=ON, corroborated=True)
-    latched = pv.decide(phone=N, camera=X, rooms=ON, corroborated=False)
+def test_cell_six_splits_on_whether_anything_agreed_with_the_run_RECENTLY():
+    """Not "ever". One phone hit an hour ago is not agreement now -- see
+    tests/test_presence_recency.py for the two failures that came of it."""
+    seated = pv.decide(phone=N, camera=X, rooms=ON, agreed_s_ago=60.0,
+                       mic=pv.MIC_SILENT)
+    latched = pv.decide(phone=N, camera=X, rooms=ON, agreed_s_ago=3600.0,
+                        mic=pv.MIC_SILENT)
     assert seated.state == HOME and seated.cell == 6
     assert latched.state == AWAY and latched.cell == 6
-    assert "corroborat" in latched.reason
+    assert "agreed" in latched.reason
 
 
-def test_an_uncorroborated_run_is_the_only_thing_that_can_turn_cell_six_away():
-    """Corroboration may not leak into any other cell's answer."""
+def test_a_stale_run_is_the_only_thing_that_can_turn_cell_six_away():
+    """The history clock may not leak into any other cell's answer."""
     for cell, rooms, phone, camera, want in TABLE:
         if cell == 6:
             continue
         assert pv.decide(phone=phone, camera=camera, rooms=rooms,
-                         corroborated=False).state == want, cell
+                         agreed_s_ago=3600.0,
+                         mic=pv.MIC_SILENT).state == want, cell
 
 
 # --------------------------------------------------------- the bedroom

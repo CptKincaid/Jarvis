@@ -853,7 +853,40 @@ class JarvisApp:
             # (types.SimpleNamespace) on purpose, and that path has no
             # fabric, so no legs, so nothing to wire.
             self._wire_camera_leg(legs)
+            self._wire_mic_leg(legs)
         return sentinel
+
+    def _wire_mic_leg(self, legs) -> bool:
+        """Attach the mic leg: SECONDS SINCE A TURN, off the turn ledger.
+
+        The voter's cell 6 -- radar on, phone silent past the grace, camera
+        unable to look -- reads identically for a latched radar with him
+        out and for him sitting still at his desk with his phone asleep. A
+        spoken turn is the one fact that tells those apart, and
+        ``arrival.departure_ready`` already reads it off the same ledger
+        for its own veto. This hands the voter the same number.
+
+        Late-bound on purpose: ``self.turns`` is built by
+        ``_wire_turn_clock`` AFTER ``_construct`` builds presence, so the
+        leg looks the ledger up at call time (``_mic_leg``) rather than
+        capturing an attribute that does not exist yet.
+        """
+        if legs is None:
+            return False
+        legs.mic = self._mic_leg
+        return True
+
+    def _mic_leg(self):
+        """``TurnLedger.idle_s()`` or None. A number, never audio: the
+        ledger holds timestamps, and this reads one of them."""
+        turns = getattr(self, "turns", None)
+        idle = getattr(turns, "idle_s", None)
+        if not callable(idle):
+            return None
+        try:
+            return idle()
+        except Exception:  # noqa: BLE001 - the ledger must not cost the vote
+            return None
 
     def _wire_camera_leg(self, legs) -> bool:
         """Attach the camera leg and SAY OUT LOUD whether it can answer.

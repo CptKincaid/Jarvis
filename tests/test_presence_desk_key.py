@@ -40,7 +40,12 @@ class Cfg:
 
 
 def his_config(**extra):
-    """His box: presence.desk is the BOOLEAN, and no desk_room is set."""
+    """His box: presence.desk is the BOOLEAN, and no desk_room is set.
+
+    ``presence.three_legs`` is turned ON here explicitly: the voter ships
+    OFF (tests/test_presence_recency.py pins that), and this file is about
+    which key names the desk room, not about the default.
+    """
     values = {
         "presence.room_sensor_enabled": True,
         "presence.rooms": [{"name": "office", "url": "http://192.168.50.51"},
@@ -48,6 +53,7 @@ def his_config(**extra):
         "presence.phone_ip": "192.168.50.34",
         "presence.desk": True,
         "presence.door_room": "kitchen",
+        "presence.three_legs": True,
     }
     values.update(extra)
     return Cfg(**values)
@@ -55,7 +61,7 @@ def his_config(**extra):
 
 def test_the_voter_takes_the_desk_room_from_desk_room_not_the_switch():
     s = presence.PresenceSentinel(his_config(), publish=lambda e: None)
-    assert s.legs is not None, "his config has rooms, so the voter must build"
+    assert s.legs is not None, "rooms and three_legs on, so the voter must build"
     assert s.legs.desk_room == "office"
     assert s.legs.desk_room != "True"
 

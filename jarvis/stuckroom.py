@@ -179,12 +179,19 @@ class StuckRooms:
             log.debug("stuckroom: could not write %s", self.path, exc_info=True)
 
     # ------------------------------------------------------- the inputs
-    def corroborate(self, source: str = "", at: Optional[float] = None) -> None:
+    def corroborate(self, source: str = "", at: Optional[float] = None,
+                    ago: Optional[float] = None) -> None:
         """Something independent agreed that somebody is here.
 
         Stamps EVERY open run (see the module docstring on why house-level
-        corroboration is the conservative choice).
+        corroboration is the conservative choice). ``ago`` is seconds
+        before now on THIS detector's clock -- the turn ledger's shape --
+        so the voter can place a turn it learned of at a poll back where
+        it happened; a stamp older than a run's last is ignored, so the
+        same turn reported at every poll lands once.
         """
+        if ago is not None:
+            at = self._now() - max(0.0, float(ago))
         at = self._now() if at is None else float(at)
         touched = False
         for room, run in self.runs.items():

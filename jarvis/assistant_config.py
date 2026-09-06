@@ -560,6 +560,21 @@ DEFAULTS: dict = {
                  "rooms_poll_s": 2.0, "rooms_enter_hold_s": 2.0,
                  "rooms_leave_hold_s": 8.0, "rooms_switch_min_s": 6.0,
                  "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0,
+                 # HIS THREE-LEG VOTER (jarvis/presencevote.py): camera,
+                 # then phone, then room sensor, in his order. OFF BY
+                 # DEFAULT. Turning it on changes what "away" means: every
+                 # poll asks all three legs, so a room reading occupied no
+                 # longer stops the phone being asked and a latched radar
+                 # cannot cost him the greeting (2026-09-05, 20:43). Off,
+                 # the room-or-phone composition runs exactly as before.
+                 "three_legs": False,
+                 # With the voter on: how fresh an agreement (phone, camera
+                 # or a spoken turn) must be, in minutes, for a room reading
+                 # occupied to still count as him when his phone is silent
+                 # and the camera cannot look. DERIVED from away_after_min,
+                 # not measured (presencevote.RECENCY_S_PROVENANCE); the
+                 # right value is how long his short trips are.
+                 "corroboration_recency_min": 15,
                  # THE DOOR ROOM (jarvis/arrival.py, app._on_room_changed).
                  # His words: "kitchen to see if i enter my apartment since
                  # the kitchen and door are next to each other". That room

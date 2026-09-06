@@ -54,7 +54,9 @@ WHAT THIS MODULE IS NOT. It owns no thread, no socket, no clock and no
 config reader. It is a pure function over three enums plus two hints, so
 every one of the 27 cells is testable without a network, and
 tests/test_presencevote.py writes the table out in full rather than
-deriving it.
+deriving it. Cell 6 alone takes two more inputs -- an age in seconds and
+the mic's word -- and ``cell6`` below is the whole of that, so the table
+stays 27 rows a person can read against his design.
 
 A NOTE ON "AWAY" AND WHO IT IS ABOUT. This answers "is HUNTER in the
 flat", not "is the flat empty". A guest in the flat with him out is
@@ -85,9 +87,67 @@ ROOMS_ON = "rooms-on"            # some room reads occupied
 ROOMS_CLEAR = "rooms-clear"      # every configured room answered, all clear
 ROOMS_UNREACHABLE = "rooms-unreachable"   # no room answered
 
+# THE FOURTH LEG, and it only ever speaks inside cell 6. It is not part of
+# the 27-cell table and must not become part of it: the table is his three
+# legs in his order, and adding a fourth would make it 81 cells nobody can
+# read against the design. This leg exists because cell 6 is the ONE cell
+# whose three legs are identical in two situations with opposite truths --
+# a latched radar with him out, and him sitting still at his desk with his
+# phone asleep -- and a spoken turn is the one piece of evidence that can
+# tell them apart. A radar can latch and a phone can nap; a microphone
+# cannot hallucinate a sentence.
+MIC_HEARD = "mic-heard"          # a turn in the ledger inside the window
+MIC_SILENT = "mic-silent"        # the ledger was read; the last turn is older
+MIC_UNKNOWN = "mic-unknown"      # no ledger, unreadable, nonsense
+
 _PHONES = (PHONE_YES, PHONE_NO, PHONE_UNKNOWN)
 _CAMERAS = (CAM_SAW, CAM_LOOKED, CAM_BLIND)
 _ROOMS = (ROOMS_ON, ROOMS_CLEAR, ROOMS_UNREACHABLE)
+_MICS = (MIC_HEARD, MIC_SILENT, MIC_UNKNOWN)
+
+# ------------------------------------------------- the recency window
+# HOW FRESH AN AGREEMENT HAS TO BE for cell 6 to keep saying "he is here".
+#
+# DERIVED, NOT MEASURED, and the derivation is the whole justification.
+# He was asked how long his short trips are -- the shop, a walk, the bins
+# -- and has not answered, so there is no ground truth to fit. What there
+# IS is a number he already owns: ``presence.away_after_min`` is 12
+# minutes, and it exists for exactly one reason -- an iPhone drops off
+# Wi-Fi power-save for minutes at a time and 12 minutes is the nap length
+# the box is willing to forgive. A recency window SHORTER than that would
+# call a phone's silence stale faster than the sentinel is willing to call
+# the same phone absent, which is incoherent, and it would manufacture
+# false aways at the desk. So the floor is 12 minutes. The stamp itself is
+# up to one home poll (60 s) old on top, and a minute of cadence slack is
+# cheap, so: 12 + 1 + 2 = 15.
+#
+# WHAT THE NUMBER BUYS AND COSTS, both MEASURED on the sentinel end to end
+# (scripts/presence_cliff.py; tests/test_presence_recency.py pins them):
+#   * a latched radar plus a trip now reaches "away" at 26 minutes -- the
+#     window, then the 12-minute grace, less the one poll still fresh --
+#     instead of 56, so a half-hour errand is greeted where it was not.
+#   * he must be out for 26 minutes to be greeted at all. A five-minute
+#     bin trip earns silence, which is the right answer anyway.
+#   * THE RESIDUAL, same cell, opposite truth: at his desk with the phone
+#     asleep, the camera dark and NO spoken turn for 26 minutes, he is
+#     called away. Any turn inside that resets it (the mic leg below); a
+#     live camera ends it by his rule 1. The first cut did the same at 13
+#     minutes on an unstamped run; jarvis-v3 never does while a room is on.
+# ONE EDIT CHANGES IT: presence.corroboration_recency_min.
+DEFAULT_RECENCY_S = 15 * 60.0
+RECENCY_S_PROVENANCE = (
+    "DERIVED, not measured: he has not said how long his short trips are. "
+    "Floored on presence.away_after_min (12 min), which is his own tolerance "
+    "for an iPhone napping off Wi-Fi -- a shorter window would call a nap "
+    "stale faster than the sentinel will call the phone absent -- plus one "
+    "60 s home poll for stamp granularity and two minutes of cadence slack. "
+    "Revise it from his own answer: presence.corroboration_recency_min.")
+
+# The mic window is NOT a new number. arrival.departure_ready already vetoes
+# a departure on ``presence.departure_mic_silence_min`` (10 min) read off the
+# same turn ledger, and it is the same physical question -- how long does a
+# spoken turn go on proving he is in the flat. One number, one meaning.
+DEFAULT_MIC_WINDOW_S = 10 * 60.0
 
 # --------------------------------------------------------- the verdicts
 HOME = "home"
@@ -373,13 +433,118 @@ def bedroom_split(*, last_room: str = "", age_s: Optional[float] = None,
     return (BED, "%s: his phone is on the Wi-Fi and no room sees him" % _R2)
 
 
+def mic_leg(*, s_ago, window_s: float = DEFAULT_MIC_WINDOW_S) -> str:
+    """The mic's vote -- FROM ONE NUMBER OFF THE TURN LEDGER, never audio.
+
+    ``s_ago`` is ``TurnLedger.idle_s()``: seconds since the microphone last
+    completed a turn, or None when it never has (a fresh process, an empty
+    box). Nothing here, or in anything it reaches, opens a capture device
+    or touches a sample -- the leg takes a float and returns a word.
+
+    A turn inside ``window_s`` is HEARD; older is SILENT. No ledger,
+    nonsense, or a negative age is UNKNOWN -- the camera's rule again: a
+    leg that could not be READ has not heard nothing.
+    """
+    try:
+        age, window = float(s_ago), float(window_s)
+    except (TypeError, ValueError):
+        return MIC_UNKNOWN
+    if age != age or window != window or age < 0.0:      # NaN, negative
+        return MIC_UNKNOWN
+    return MIC_HEARD if age < window else MIC_SILENT
+
+
+def _mins(seconds) -> str:
+    """The number IN the sentence: '44 min', '30 s'. A verdict that says
+    'recently' while the code asks 'ever' is the bug this file had."""
+    try:
+        s = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "an unknown time"
+    if s == float("inf"):
+        return "for ever"
+    return ("%d s" % int(round(s))) if s < 60.0 else ("%d min" % int(s // 60.0))
+
+
+def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
+          mic: str = MIC_UNKNOWN, mic_s_ago=None) -> tuple:
+    """Cell 6: a room reads occupied, his phone did not answer past the
+    grace, and the camera could not look. Returns ``(state, reason)``.
+
+    THE CELL 2026-09-05 LANDED IN, and the one his three rules cannot reach.
+    Rule 1 needs a camera that LOOKED; a camera that could not look is not
+    evidence of an empty room, so R1's precondition was never met and the
+    rules fall silent -- which is that night, again.
+
+    It is also the NAPPING-PHONE-AT-THE-DESK cell, where the truth is the
+    opposite: he is sitting still in the office with his phone asleep. The
+    three legs are IDENTICAL in both situations. Only history separates
+    them, and the first cut asked history the wrong question -- "has
+    anything EVER agreed with this run?" -- while printing "recently". A
+    radar that latches has almost always seen a real body first, so "ever"
+    is yes for the rest of the run and a shop trip reproduces 2026-09-05.
+
+    TWO CLOCKS, AND THE ASYMMETRY IS THE DESIGN:
+
+      * ``agreed_s_ago`` -- seconds since anything independent (phone,
+        camera, mic) last agreed with the occupied run, or since the run
+        began if nothing has yet. Fresh means inside ``recency_s``.
+      * ``mic`` -- the turn ledger's word, on its own window.
+
+    HOME when EITHER clock is fresh. AWAY only when BOTH have run out. A
+    false away greets him mid-sentence and can hand a guest his turn; a
+    false home merely delays a greeting. So away must be the harder verdict
+    to reach, and it is: of the six (agreement x mic) states, two are away.
+
+    ``agreed_s_ago=None`` -- no run on the books at all -- is HOME: absence
+    of history is not evidence of a fault.
+    """
+    try:
+        window = float(recency_s)
+    except (TypeError, ValueError):
+        window = DEFAULT_RECENCY_S
+    if window != window or window <= 0.0:
+        window = DEFAULT_RECENCY_S
+    win = _mins(window)
+    if mic == MIC_HEARD:
+        when = ("%s ago" % _mins(mic_s_ago)) if mic_s_ago is not None \
+            else "inside its window"
+        return (HOME, "a room sees somebody and the mic heard him %s, so he "
+                      "is in the flat whatever his phone's radio is doing"
+                % when)
+    if agreed_s_ago is None:
+        return (HOME, "a room sees somebody and its run has no history yet "
+                      "to hold against it (%s window); absence of history "
+                      "is not a fault" % win)
+    try:
+        age = float(agreed_s_ago)
+    except (TypeError, ValueError):
+        return (HOME, "a room sees somebody and its history could not be "
+                      "read; never away on that")
+    if age < window:
+        return (HOME, "a room sees somebody and something else agreed with "
+                      "that run %s ago, inside the %s window, so the radar "
+                      "is telling the truth and his phone is napping"
+                % (_mins(age), win))
+    silence = ("the mic has been silent past its own window"
+               if mic == MIC_SILENT else "the mic ledger could not be read")
+    return (AWAY, "a room reads occupied but nothing has agreed with that "
+                  "run for %s -- not his phone, not the camera, not the mic "
+                  "(%s) -- past the %s window, and the radar is the one leg "
+                  "that can latch; %s" % (_mins(age), silence, win, _P2))
+
+
 def decide(*, phone: str, camera: str, rooms: str,
-           corroborated: bool = True,
+           agreed_s_ago: Optional[float] = None,
+           recency_s: float = DEFAULT_RECENCY_S,
+           mic: str = MIC_UNKNOWN, mic_s_ago: Optional[float] = None,
            last_room: str = "", last_room_age_s: Optional[float] = None,
            door_room: str = "kitchen", desk_room: str = "office") -> Verdict:
     """The vote. Never raises; an unrecognised leg value is UNKNOWN.
 
-    ``corroborated`` is the ONE cell that needs history -- see cell 6.
+    ``agreed_s_ago``, ``recency_s``, ``mic`` and ``mic_s_ago`` reach ONE
+    cell -- see ``cell6``. The other 26 never read them, and
+    tests/test_presencevote.py pins that they cannot leak.
     """
     if phone not in _PHONES or camera not in _CAMERAS or rooms not in _ROOMS:
         return Verdict(UNKNOWN, "a leg reported a value this voter does not "
@@ -388,25 +553,12 @@ def decide(*, phone: str, camera: str, rooms: str,
     cell, state, reason = _TABLE[(rooms, phone, camera)]
 
     if state == _CELL6:
-        # THE CELL TONIGHT LANDED IN, and the one his three rules cannot
-        # reach. Rule 1 needs a camera that LOOKED; a camera that could not
-        # look is not evidence of an empty room, so R1's precondition was
-        # never met and the rules fall silent -- which is tonight, again.
-        #
-        # It is also the NAPPING-PHONE-AT-THE-DESK cell, where the truth is
-        # the opposite: he is sitting still in the office with his phone
-        # asleep. The three legs are IDENTICAL in both situations. Only
-        # history separates them, and the question history answers is: has
-        # anything ever agreed with this ON run? (jarvis/stuckroom.py)
-        if corroborated:
-            return Verdict(HOME, "a room sees somebody and something else "
-                                 "has corroborated that run recently, so the "
-                                 "radar is telling the truth and his phone "
-                                 "is napping", cell)
-        return Verdict(AWAY, "a room reads occupied but nothing has "
-                             "corroborated that run -- not his phone, not "
-                             "the camera, not the mic -- and the radar is "
-                             "the one leg that can latch; %s" % _P2, cell)
+        # The mic is not one of the three; a bad value there cannot cost
+        # the vote, it only silences the fourth leg.
+        state, reason = cell6(agreed_s_ago=agreed_s_ago, recency_s=recency_s,
+                              mic=(mic if mic in _MICS else MIC_UNKNOWN),
+                              mic_s_ago=mic_s_ago)
+        return Verdict(state, reason, cell)
 
     if state == _CELL_BED:
         state, reason = bedroom_split(last_room=last_room,
