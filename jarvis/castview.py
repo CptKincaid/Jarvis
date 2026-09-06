@@ -297,6 +297,12 @@ STOP_FAILED_LINE = ("I couldn't close that viewer, sir — it's still up. "
 NO_WATCHDOG_LINE = ("I can't set the check that would tell me if that cast "
                     "drops, sir, so I'll not say it landed. Nothing's cast.")
 
+# ROUND 7. A stop that succeeds INSIDE the landing probe. The stop already
+# spoke "Cast stopped, sir." and released the deck; the landing line must
+# not follow it. One short sentence, so the pair he hears is true.
+STOPPED_MID_LANDING_LINE = "Stopped before it landed, sir."
+STOPPED_MID_LANDING_REASON = "stopped during the landing probe"
+
 NO_HELPER_REASON = "the startup script isn't running on HPCOMPUTER"
 NO_VIEWER_REASON = "there is no viewer wired on this box"
 NO_PROBE_REASON = "there is no way to tell whether the viewer is up"
@@ -840,6 +846,25 @@ class _ViewSink:
                                    NOT_CONNECTED_REASON)
         if linked is None:
             return self._give_back(CANNOT_TELL_LINE, CANNOT_TELL_REASON)
+        # ROUND 7: IS THE DECK STILL MINE? The settle and the probe above
+        # are a window -- ~0.35 s of real probing on the Spark side, a
+        # modelled round trip on the HP side -- and a typed, phone or
+        # socket "stop the cast" can land inside it and SUCCEED: the
+        # viewer closes, the deck is released, "Cast stopped, sir." is
+        # said. The probe's answer is then true of a moment ago, and
+        # without this check deliver went on to say "The Spark's screen is
+        # on HPCOMPUTER, sir." with nothing on any monitor, and the
+        # watchdog -- seeing the deck free -- stayed silent, so it was
+        # never retracted. Named by the round-6 adversary as its first
+        # remaining item. This is the same re-read _confirm already does
+        # after ITS probe. NOT _give_back: the stop has already stopped
+        # the viewer and released the deck, and stopping twice is how a
+        # second viewer gets orphaned.
+        if self.state.live != self.name:
+            log.info("castview: %s was stopped during its landing probe; "
+                     "not claiming it", self.name)
+            return held_result(STOPPED_MID_LANDING_LINE, sink=self.name,
+                               detail=STOPPED_MID_LANDING_REASON)
         if not self._arm_confirm():
             # ROUND 5: A LANDING IS NOT CLAIMED WHEN THE WATCHDOG CANNOT BE
             # ARMED. ``_arm_confirm`` used to swallow the exception from
@@ -850,6 +875,14 @@ class _ViewSink:
             # under thread exhaustion; that is not hypothetical on a box
             # that has had an OOM kill. Failing to arm it HOLDS.
             return self._give_back(NO_WATCHDOG_LINE, NO_WATCHDOG_REASON)
+        if self.state.live != self.name:
+            # The same stop, landing between the check above and the arm.
+            # The stale watchdog is harmless -- _confirm re-reads the deck
+            # and the epoch after its own probe -- but the claim is not.
+            log.info("castview: %s was stopped while its watchdog armed; "
+                     "not claiming it", self.name)
+            return held_result(STOPPED_MID_LANDING_LINE, sink=self.name,
+                               detail=STOPPED_MID_LANDING_REASON)
         return None
 
     def _give_back(self, line: str, why: str):
