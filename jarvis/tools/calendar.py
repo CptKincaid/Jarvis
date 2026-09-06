@@ -614,38 +614,90 @@ def _tail_ok(rest: str) -> bool:
 # beside the word.
 #
 # Every word here comes off the round-4/5/6 adversary grids (the non-date
-# family) or the round-seven rank set, measured 2026-09-06:
+# family), the round-seven rank set, or the round-eight grid -- measured
+# 2026-09-06.  ROUND EIGHT finished the method the paragraph above only
+# promised: on dccb261 two entries (lecturer, weekend) appeared nowhere in
+# the comment and ten more leaned on a phrase written for their group, so
+# the list could grow by habit.  It cannot now: the block below is ONE
+# WORD ONE PHRASE, tests/test_calendar_rank_coat_eight.py reads it, and
+# the suite fails if the block and the frozenset ever disagree or if any
+# phrase in it stops reading as a rank.  Add a word here and you must be
+# able to write down the sentence that earned it.
 #
-#   lecture "when is my 3rd lecture"      meeting "the 2nd and last meeting"
-#   class   "the 1st and only class"      lab     "when is the 2nd lab"
-#   exam/quiz/attempt "the 2nd attempt"   try     "the 1st try"
-#   time    "for the 3rd time"            one     "the 4th one"
-#   week    "january the 2nd week"        quarter "the 4th quarter"
-#   floor   "the 3rd floor"               item    "the 4th item"
-#   page/chapter "the 5th chapter"        row     "the 3rd row"
-#   place   "the 1st place"               person  "the 3rd person"
-#   semester/session/round "the 1st round"  lap/set/game/half "the 2nd half"
-#   period/year (as a COUNT, not a date)  inning  "the 9th inning"
-#   sense   "the 6th sense"               version "the 2nd version"
-#   draft   "the 1st draft"               opinion "the 2nd opinion"
-#   party   "the 3rd party"               amendment "the 22nd amendment"
-#   language "the 2nd language"           leg     "the 1st leg"
-#   option  "the 3rd option"              choice  "the 2nd choice"
-#   grade   "the 7th grade"               shift   "the 3rd shift"
-#   base    "the 2nd base"                wonder  "the 8th wonder"
-#   wall    "the 4th wall"
+# The last six are ROUND EIGHT's own finding and matter more than the
+# other fifty-nine: appointment, event, plan, calendar, schedule and
+# agenda are all in commander._CAL_READ_RX, so a sentence carrying one is
+# GUARANTEED to reach the calendar.  "when is the 2nd appointment on my
+# calendar" answered "Friday the 2nd of October" -- the highest-traffic
+# rank phrase a calendar assistant hears, and the one it got wrong.
 #
-# ...and the ones the round-3/4/5 suites had already measured, which the
-# inversion would otherwise have turned into days (13 rows, 2026-09-06):
-#
-#   hour    "the 1st hour of the meeting" / "is the 11th hour meeting on
-#           my calendar"                  century "the 21st century"
-#   thing   "what's the 1st thing on my calendar"
-#   gate    "boarding at the 4th gate"    flight  "the 1st flight out"
-#   copy    "i need the 4th copy"         revision "open the 3rd revision"
-#   edition "python 3 the 2nd edition"    question "read me the 5th question"
-#   level   "room 12 on the 3rd level"    day     "the 2nd day of class"
-#   man     "the 6th man award"           minute  "the 90th minute"
+# RANK PHRASES BEGIN
+#   lecture      "when is my 3rd lecture"
+#   lecturer     "who is the 2nd lecturer"
+#   meeting      "the 2nd and last meeting"
+#   class        "the 1st and only class"
+#   lab          "when is the 2nd lab"
+#   exam         "the 2nd exam"
+#   quiz         "the 3rd quiz"
+#   attempt      "the 2nd attempt"
+#   try          "the 1st try"
+#   time         "for the 3rd time"
+#   one          "the 4th one"
+#   week         "the 2nd week"
+#   weekend      "the 3rd weekend"
+#   quarter      "the 4th quarter"
+#   floor        "the 3rd floor"
+#   item         "the 4th item"
+#   page         "the 5th page"
+#   chapter      "the 5th chapter"
+#   row          "the 3rd row"
+#   place        "the 1st place"
+#   person       "the 3rd person"
+#   semester     "the 2nd semester"
+#   session      "the 1st session"
+#   round        "the 1st round"
+#   lap          "the 3rd lap"
+#   set          "the 2nd set"
+#   game         "the 3rd game"
+#   half         "the 2nd half"
+#   period       "the 3rd period"
+#   year         "the 2nd year"
+#   inning       "the 9th inning"
+#   sense        "the 6th sense"
+#   version      "the 2nd version"
+#   draft        "the 1st draft"
+#   opinion      "the 2nd opinion"
+#   party        "the 3rd party"
+#   amendment    "the 22nd amendment"
+#   language     "the 2nd language"
+#   leg          "the 1st leg"
+#   option       "the 3rd option"
+#   choice       "the 2nd choice"
+#   grade        "the 7th grade"
+#   shift        "the 3rd shift"
+#   base         "the 2nd base"
+#   wonder       "the 8th wonder"
+#   wall         "the 4th wall"
+#   hour         "the 1st hour of the meeting"
+#   century      "the 21st century"
+#   thing        "what's the 1st thing on my calendar"
+#   gate         "boarding at the 4th gate"
+#   flight       "the 1st flight out"
+#   copy         "i need the 4th copy"
+#   revision     "open the 3rd revision"
+#   edition      "python 3 the 2nd edition"
+#   question     "read me the 5th question"
+#   level        "room 12 on the 3rd level"
+#   day          "the 2nd day of class"
+#   man          "the 6th man award"
+#   minute       "the 90th minute"
+#   appointment  "when is the 2nd appointment on my calendar"
+#   event        "the 2nd event on my calendar"
+#   plan         "what's the 3rd plan"
+#   calendar     "the 2nd calendar"
+#   schedule     "the 3rd schedule"
+#   agenda       "the 2nd agenda"
+# RANK PHRASES END
 _RANK_NOUNS = frozenset("""
     lecture lecturer meeting class lab exam quiz attempt try time one
     week weekend quarter floor item page chapter row place person
@@ -654,7 +706,42 @@ _RANK_NOUNS = frozenset("""
     option choice grade shift base wonder wall
     hour century thing gate flight copy revision edition question level
     day man minute
+    appointment event plan calendar schedule agenda
 """.split())
+
+
+# THE PLURAL AND THE POSSESSIVE (round eight).  _TAIL_WORD_RX captures
+# [a-z][\w'.]* WHOLE, so the matcher compares surface forms while the list
+# holds singulars only -- and every plural and possessive of a word
+# ALREADY ON THE LIST fell through into a date.  MEASURED 2026-09-06, all
+# today on 61f0945 and all a date on dccb261: "the 3rd classes", "the 2nd
+# meetings", "the 2nd meeting's time", "the 3rd labs", "the 4th items",
+# "the 2nd lecture's slides", "the 3rd rows", "the 2nd exams", "the 5th
+# pages", "the 2nd persons", "the 3rd sessions".
+#
+# THE GUARD-ONE-HALF PATTERN, a sixth time on this project: a guard built
+# for one of a symmetric pair and never applied to its twin.
+#
+# The stem is only ever CONSULTED, never substituted: a word whose stem is
+# not on the list stays exactly what it was, so "the 12th buses" is the
+# 12th ("bus" is no rank) and "the 12th is" is the 12th ("i" is no rank).
+def _rank_stems(word: str):
+    """The word, then the singulars it could be the plural or possessive
+    of.  "meeting's" and "meetings" are the noun "meeting"; "classes" is
+    "class" and not "classe"."""
+    yield word
+    if word.endswith(("'s", "s'")):
+        yield word[:-2]
+    elif word.endswith("'"):
+        yield word[:-1]
+    elif word.endswith("s") and len(word) > 2:
+        yield word[:-1]
+        if word.endswith(("ses", "xes", "zes", "ches", "shes")):
+            yield word[:-2]
+
+
+def _is_rank_noun(word: str) -> bool:
+    return any(stem in _RANK_NOUNS for stem in _rank_stems(word))
 # The rank's own frames after "in".  Anything else after "in" opens a DATE
 # ("the 12th in october", "in the morning") or names a PLACE ("in london",
 # "in the lab") -- which is how "on the 12th in the lab" stopped being a
@@ -719,7 +806,14 @@ def _ord_tail_ok(rest: str) -> bool:
         return _RANK_PREP_RX[word].match(after) is not None
     if word in _TAIL_ADJ:
         return _ord_tail_ok(after)           # "the 3rd FREE slot"
-    return word not in _RANK_NOUNS
+    if after.startswith("-"):
+        # _TAIL_WORD_RX stops at the hyphen, so a COMPOUND arrives here as
+        # its first half: "the 12th calendar-wise" reached the rank rule
+        # as the word "calendar" and became a silent today the moment
+        # round eight put "calendar" on the list.  The first half of a
+        # compound is not the ordinal's noun.
+        return True
+    return not _is_rank_noun(word)           # the noun, its plural, its "'s"
 
 
 # A SLASHED PAIR carries no ordinal suffix and no month name: the only thing
@@ -783,11 +877,94 @@ def _elided_rank(rest: str) -> bool:
     return False
 
 
+# ------------------------- THE ELIDED RANK READ FROM THE FRONT (round 8)
+#
+# dccb261's _elided_rank fired only on a PRONOUN AFTER the ordinal, so the
+# same elision in predicate position was a day: "what's the first on my
+# calendar" -> 2026-10-01, "which one is the 2nd", "which is the 4th",
+# "that's the 2nd", "what number is the 4th" (MEASURED 2026-09-06, both
+# doors, nine instants).
+#
+# WHERE THE READING COMES FROM, and this is the whole of the rule: what
+# stands IN FRONT of the ordinal, never the bare fact that something
+# follows it -- because "the 12th" standing alone must stay a date, and a
+# tail-driven rule cannot tell it from "the first" standing alone.  A
+# SUBJECT and a COPULA in front make the ordinal a COMPLEMENT, and a
+# complement is a rank: there is no subject a DAY can be the complement
+# of.  A prepositional frame ("on the 12th", "for the 12th") is read
+# first and beats all of this outright.
+_ELIDED_FRONT_RX = re.compile(
+    # "which is the 4th", "which one is the 2nd", "which meeting is the
+    # first", "which class is the 2nd", "which of these is the 5th"
+    r"(?:^|[\s,;])(?:"
+    r"which(?:\s+(?:of\s+)?(?:the|these|those|my)?\s*[a-z][\w']*)?"
+    r"\s+(?:is|was|are|were)"
+    # "what number is the 4th".  A BARE "what is the 12th" is a DAY, so
+    # the noun between them is required -- that is the whole difference,
+    # and it is why this alternative is not folded into the one above.
+    r"|what\s+(?:the\s+|my\s+)?[a-z][\w']*\s+(?:is|was|are|were)"
+    # "that's the 2nd", "mine was the 2nd"
+    r"|(?:that|this|it|he|she|they|mine|yours|hers|ours|theirs)"
+    r"(?:'s|'re|s'|\s+(?:is|was|are|were))"
+    # "is that the 3rd" -- the same clause, inverted into a question
+    r"|(?:is|was|are|were)\s+(?:that|this|it|these|those)"
+    r")\s*,?\s*$", re.I)
+# A BARE "what's the Nth" IS DELIBERATELY NOT HERE, and this is the one
+# place round eight refused the adversary.  "what's the first on my
+# calendar" is a rank and "what's the 12th on my calendar" is a day, and
+# they are the same sentence: "what" is not a subject the ordinal can be
+# the complement of -- the ordinal IS the subject.  A rule that caught the
+# first caught the second, MEASURED 2026-09-06: "what's the 12th on my
+# calendar" -> today, silently, which is his original complaint restored
+# in a new coat.  So the elided rank requires a subject DISTINCT from the
+# ordinal, "what's the first on my calendar" answers about the 1st, and
+# that is the declared trade doing its job -- a wrong day he can hear.
+# What may stand after the ordinal and still leave the clause ended.
+_ELIDED_END_RX = re.compile(r"^\s*(?:[,.;:!?]\s*)*$")
+# "...ON MY CALENDAR" is not a rank frame and not a date frame: it is
+# where the question lives.  It ends the clause for this rule and for no
+# other, which is why it is spelt out here rather than in _ord_tail_ok.
+_ELIDED_CAL_RX = re.compile(
+    r"^\s+(?:on|in|from)\s+(?:my|the|his|her|our|your)\s+"
+    r"(?:calendar|calender|schedule|agenda|diary|planner|list)\b"
+    r"\s*[,.;:!?]?\s*$", re.I)
+# The rank's OWN FRAMES behind a preposition that is not "in".  _RANK_IN_RX
+# already knew "the 2nd IN the list" and "in line"; the identical frame
+# behind "on", "from", "up" and "after" was still a day -- "the first on
+# the list", "the 3rd from the top", "the first up", "the 1st after that"
+# (MEASURED 2026-09-06).  Each is anchored so that a DAY wearing the same
+# preposition survives: "on MY calendar" has no "the", "from 2 to 4" has
+# no direction word, and "up" must end the clause.
+_ELIDED_FRAME_RX = re.compile(
+    r"^\s+(?:"
+    r"on\s+(?:the|this|that)\s+(?:list|agenda|docket|roster|line-?up|order|"
+    r"bill|card|slate|rota)\b"
+    r"|from\s+(?:the\s+)?(?:top|bottom|end|start|beginning|front|back|left|"
+    r"right)\b"
+    r"|up(?=\s*(?:[,.;:!?]\s*)*$|\s+(?:next|on\s+(?:my|the)\s))"
+    r"|after\s+(?:that|this|it|those|these|him|her|them)\b"
+    r")", re.I)
+
+
+def _elided_front(text: str, match) -> bool:
+    """True when the words IN FRONT of a bare ordinal make it the
+    complement of a copula, or the rank's own frame follows a bare "the"."""
+    before, rest = text[:match.start()], text[match.end():]
+    ended = _ELIDED_END_RX.match(rest) is not None
+    named = _ELIDED_CAL_RX.match(rest) is not None
+    if _ELIDED_FRONT_RX.search(before) and (ended or named):
+        return True                          # "which one is the 2nd"
+    return _ELIDED_FRAME_RX.match(rest) is not None   # "the 3rd from the top"
+
+
 def _ord_ok(text: str, match) -> bool:
     """The rank rule behind a BARE ORDINAL -- the round-seven direction."""
     rest = text[match.end():]
-    if not _PREP_LEAD_RX.match(match.group(0)) and _elided_rank(rest):
-        return False                         # "the 2nd he walked in"
+    if not _PREP_LEAD_RX.match(match.group(0)):
+        if _elided_rank(rest):
+            return False                     # "the 2nd he walked in"
+        if _elided_front(text, match):
+            return False                     # "which one is the 2nd"
     pair = _PAIR_RX.match(rest)
     if pair is not None and not _ord_tail_ok(rest[pair.end():]):
         return False                         # "the 1st or 2nd FLOOR"
