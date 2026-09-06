@@ -162,6 +162,70 @@ def _blocked_player(argv) -> bool:
 _blocked_player.calls = []
 
 
+# CONFIG fields the suite must not read off his live box. Add a name here
+# when a setting he can flip changes what a test asserts. This is the ONE
+# such pin: the 09-05 integration brought a second autouse fixture setting
+# the same field to the same value (_config_defaults_not_his_settings, from
+# jarvis-v3), written the same day for the same incident. Harmless and
+# redundant -- and redundant suite-wide autouse state is how the third one
+# gets added without anybody noticing the first two. This one was kept
+# because it restores inside try/finally (a throw into the fixture at the
+# yield cannot leave his setting stamped on CONFIG for the rest of the
+# session) and because the field list is a named constant with this note on
+# it rather than a tuple buried in a body.
+# tests/test_filled_yes.py::test_exactly_one_autouse_fixture_pins_the_live_config
+# holds the line.
+_PINNED_CONFIG_FIELDS = ("filler_prompt_hint",)
+
+
+@pytest.fixture(autouse=True)
+def _pin_live_tuning_settings():
+    """CONFIG is read from his LIVE ~/.aiws_trainer/voice_settings.json.
+
+    Everything else in this firewall redirects a PATH, but CONFIG is built
+    at import time from that file and nothing here redirects it -- so a
+    setting he changes on the box changes what the suite asserts. On
+    2026-09-05 he turned ``filler_prompt_hint`` on by hand at 11:5x and
+    FOUR tests went red on a tree where nothing had been committed
+    (test_prompt_echo::test_the_preview_fetches_the_prompt_once_per_pass
+    and three in test_transcriber_prompt), each of them asserting the
+    preview's initial_prompt equals the vocab prompt -- true only while
+    the hint is off, which is how it ships.
+
+    Nothing was broken and he did nothing wrong: turning the hint on was a
+    correct change to his own box, made because the probe measured that the
+    filler hold does nothing without it. The fault is a test that reads his
+    settings, which is the same fault as a test that reads the wall clock,
+    and it makes the suite unusable as a merge gate for anyone whose
+    machine is configured differently from the author's.
+
+    Pinned to the DATACLASS DEFAULT rather than to a literal, so the pin
+    follows the shipped value instead of freezing today's. A test that
+    wants the other state still monkeypatches it itself (test_filler_hold
+    turns it on); this only stops the box deciding.
+
+    Saved and restored by hand rather than through ``monkeypatch``: this
+    is autouse over the whole suite, and requesting monkeypatch here would
+    build that fixture before every other one and unwind its undo stack
+    after them, which is a scheduling change nothing in this file needs.
+    A test's own monkeypatch still wins -- it is set up later, so its
+    teardown runs first and lands back on the pinned default.
+    """
+    import dataclasses
+
+    from jarvis.config import CONFIG
+    saved = {}
+    for field in dataclasses.fields(CONFIG):
+        if field.name in _PINNED_CONFIG_FIELDS:
+            saved[field.name] = getattr(CONFIG, field.name)
+            setattr(CONFIG, field.name, field.default)
+    try:
+        yield
+    finally:
+        for name, was in saved.items():
+            setattr(CONFIG, name, was)
+
+
 @pytest.fixture(autouse=True)
 def _reset_brain_calibration():
     """brain._CALIBRATION is process state fed by every fake Ollama reply's
@@ -175,37 +239,6 @@ def _reset_brain_calibration():
     yield
     if brain is not None and "_CALIBRATION" in vars(brain):
         brain._CALIBRATION.update(factor=brain.CALIBRATION_INITIAL, samples=0)
-
-
-@pytest.fixture(autouse=True)
-def _config_defaults_not_his_settings():
-    """A test asserts against the SHIPPED default, never against whatever
-    is in his ~/.aiws_trainer/voice_settings.json today.
-
-    2026-09-05: he turned CONFIG.filler_prompt_hint on -- a real, correct
-    change to his own box, made because the probe measured that the filler
-    hold does nothing without it. Four tests in tests/test_transcriber_prompt.py
-    and tests/test_prompt_echo.py then went red on a green tree, asserting
-    prompts of "Peyrovi, BIOSENSORS" against the live "Peyrovi, BIOSENSORS
-    Um, uh, hmm, er.". Nothing was broken; the tests were reading his
-    settings. That is the same fault as a test that reads the wall clock,
-    and it makes the suite unusable as a merge gate for anyone whose
-    machine is configured differently from the author's.
-
-    Only fields listed here are pinned, and each is pinned to the dataclass
-    default rather than a literal, so the pin tracks the code. A test that
-    WANTS another value still monkeypatches it and wins -- 13 already do.
-    """
-    from dataclasses import fields as _fields
-    from jarvis.config import CONFIG, Config
-    pinned = ("filler_prompt_hint",)
-    defaults = {f.name: f.default for f in _fields(Config) if f.name in pinned}
-    before = {k: getattr(CONFIG, k) for k in defaults}
-    for k, v in defaults.items():
-        setattr(CONFIG, k, v)
-    yield
-    for k, v in before.items():
-        setattr(CONFIG, k, v)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +303,8 @@ _DESKTOP_MODULES = {
     "jarvis.workflows": "shell steps, xdotool key, notify-send",
     "jarvis.desktop": "every xdotool/xclip primitive",
     "jarvis.reader": "xclip -o: the contents of his clipboard/selection",
+    "jarvis.knightfall_weekly": "ssh to the Oracle box (production, the "
+                                "dead-man's switch)",
     "jarvis.context": "xdotool window titles, git, ps, nvidia-smi, find",
     "jarvis.brain": "the claude CLI (a paid, acting agent) and the "
                     "autonomous RUN shell",

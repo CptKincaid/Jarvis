@@ -4548,6 +4548,144 @@ The typed code is a way back in, not a wall: anybody already at this
 keyboard can edit or delete `people.json`, which turns the gate off
 entirely. It is written down here so it is not mistaken for security.
 
+### Weekly, in the backup email (2026-09-06)
+
+Your ruling, verbatim: *"I want the nightfall code to send weekly in the
+same email as the encrypted back up."* So once a week the code arrives in
+the **"Knightfall encrypted backup"** email Oracle already sends — same
+subject, same address, same `.db.enc` attachment, same first three
+paragraphs. After "Encrypted size: N bytes." there are two new lines:
+
+    Jarvis override code for this week: ········
+    Typed only, never spoken; it replaces the previous code once Jarvis confirms this email went out.
+
+The master key is **not** in that email and never was (the body only names
+it), so the line cannot be confused with it; it avoids the word "key".
+
+**How the week goes (times CDT; the timers are written in UTC and do not
+move on Nov 1 — after it the same steps land an hour earlier):**
+
+* **02:30 Sunday** — `jarvis-knightfall-push.timer` runs
+  `jarvis.knightfall_weekly push`. The Spark makes an eight-character code
+  (no `0`/`o`, no `1`/`l`), hands the plaintext to Oracle over ssh into a
+  0600 spool file, and only on a clean hand-over stores its hash in
+  `people.json` as **pending**, beside your current one.
+  From now **both codes work**. The plaintext is never written on the
+  Spark; it dies with the process.
+* **03:30** — Oracle's own `knightfall-backup.timer` composes the email.
+  `app/jarvis_override.py` (one additive block in `app/backup_main.py`)
+  reads the spool if present and under 36 hours old, appends the two
+  lines, sends, deletes the spool and writes a receipt. No spool → the
+  email is byte-for-byte what it always was. A stale spool is deleted
+  unread.
+* **04:30** — `jarvis-knightfall-pull.timer` runs `jarvis.knightfall_weekly
+  pull`: **reads** the receipt; "sent" → the pending hash is **promoted**
+  and the previous code is gone. "failed" / "stale" / error → the pending
+  is dropped and your current code stands. Only once that is written down
+  here does it send `receipt --ack <id>`, which is the one verb that
+  deletes the receipt on Oracle; a pull that could not write
+  `people.json` leaves the receipt where it was and the next pull acts on
+  it. The pull repeats Monday, Tuesday and Wednesday 04:30; **no receipt
+  by Wednesday** → dropped, previous code stands.
+* **Typing this week's code before the pull** counts as the receipt: the
+  drawer, the users tab's unlock and `scripts/jarvis_people.py` all
+  promote it on the spot, and the later receipt is logged as already
+  handled.
+
+**Who burns a code you type, and who does not.** All three typed paths
+promote this week's pending code the moment you type it — you can only
+have that code from the email, so typing it *is* the receipt. What happens
+next is deliberately different, and it is worth knowing which box you are
+standing in front of:
+
+| where you typed it | promotes it | rotates and mails the next |
+|---|---|---|
+| the Knightfall **drawer** (Settings → Privacy) | yes | **yes** — the code you just typed is burned |
+| the **users tab**'s unlock | yes | no |
+| `scripts/jarvis_people.py` at a terminal | yes | no |
+
+The drawer is the break-glass door and rotating is what it has always done
+with an accepted code. The other two are *administrative* unlocks: making
+them mail a fresh code every time you ran `forget` would fill the notice
+mailbox with live break-glass codes. So a weekly code typed at the drawer
+is spent; the same code typed at the users tab or the terminal goes on
+working until the next week replaces it.
+
+**What you are told, and where:** the Knightfall caption in the drawer
+gains one sentence starting "Weekly:" (this week's code took effect /
+Oracle was unreachable / the Spark was off / the code in Sunday's email
+will NOT work / dropped on Wednesday / in flight, unstored — that last
+one is what you see if the Spark is killed in the second between handing
+the code to Oracle and writing it down here), `jarvis -q status` carries
+the same sentence, and the log lines are prefixed `knightfall-weekly:`.
+Nothing is spoken. A push that was *refused* — already pending, or too
+early to reach the email — writes nothing at all, so it never overwrites
+the caption of the push already in flight; you get the sentence on the
+terminal instead. No log, toast, receipt or state file ever carries a code — only
+its length, the push id (eight hex characters that name the push, not the
+code) and a hash prefix.
+
+**What touches the running app.** `gate.registry` is the copy loaded at
+boot and nothing watches the file, so after each write the issuer sends
+the existing non-speaking **`people reload`** verb over the command socket
+(`jarvis -q "people reload"`: a read of the file, no turn, no speech). The
+drawer's typed check now reads the file itself as well, so a weekly code
+is honoured even without it — before 2026-09-06 the drawer checked the
+boot copy while the users tab read the file, and a code set at a terminal
+opened one and not the other.
+
+**Never zero working codes.** A push never touches the current hash; a
+promote replaces it only with a hash whose email Oracle reported sent; a
+drop only forgets the pending.
+
+**What `--force` will and will not do (2026-09-06).** Two pushes in one
+week: the second is refused unless `--force`. After 03:30 Sunday `--force`
+kills the code in the email that already went out, and the caption says
+so — that is yours to decide. But it is **refused outright before Friday
+15:30 CDT (20:30 UTC)**, because Oracle discards any spool more than 36
+hours old *unread*: a push earlier than that could only make a code that
+never reaches the email, and the pending it stored would then refuse
+Sunday's real push and be dropped on Wednesday. One exploratory `--force`
+on a Tuesday used to cost the whole week and the caption could only say
+"too late". The refusal names the hour it becomes possible. The mirror of
+that rule: the Sunday timer now **replaces** a pending Oracle can no
+longer send, instead of standing down behind it for ever.
+
+**A rotate you did yourself wins.** If you rotate at the drawer between
+Sunday's push and the pull, the code in your hand is the one you were
+handed most recently — so the weekly code is **dropped**, not applied, and
+the caption reads "this week's code was not applied — you rotated your own
+after …". Before 2026-09-06 it promoted over the top and retired the newer
+code.
+
+**Rehearsing before the first live week:**
+
+```bash
+cd ~/Jarvis
+~/vss_env/bin/python -m jarvis.knightfall_weekly --rehearse   # makes+hashes a code, pushes nothing
+~/vss_env/bin/python -m jarvis.knightfall_weekly --probe      # one ssh ping to Oracle's gate
+~/vss_env/bin/python -m jarvis.knightfall_weekly --status     # the caption
+ssh opc@163.192.101.18 'cd /home/opc/knightfall && .venv/bin/python -m app.jarvis_override --dry-run'
+```
+
+The last one prints exactly one line, `extra line: would include` or
+`extra line: would not`, composes nothing real and sends nothing.
+
+**The timers are not installed by the build.** `scripts/systemd/
+jarvis-knightfall-push.timer` and `jarvis-knightfall-pull.timer` (with
+their services) ship in the repo; `scripts/setup_knightfall_weekly.sh`
+installs and starts them as user units — run it yourself, after the live
+app has been restarted on a build that knows the pending fields (an older
+app saving `people.json` silently drops them) and after the attack has
+cleared. Either half alone is inert: no spool → Oracle's email is as
+today; no Oracle module → the push fails cleanly and the caption says so.
+
+**The key.** The first cut uses `oracle.key_path`, which is root on Oracle
+(`opc` has passwordless sudo). `deploy/oracle/jarvis-override-gate.sh` is
+the forced command for a dedicated key that can speak only the four verbs
+this lane sends; installing it is one additive `authorized_keys` line on
+Oracle and `knightfall_weekly.key_path` in `assistant.json`. Your call.
+
 ### If it does not work
 
 * `grep knightfall /tmp/vss_voice/jarvis.log` — the lines carry who and

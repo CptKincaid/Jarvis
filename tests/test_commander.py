@@ -2491,8 +2491,8 @@ def test_timer_label_phrase_helper():
 # intent classifier (Uncertain, 0.50), "Was that for me?", yes -- and the
 # MODEL answered "Understood, sir; I'll stand down." and did nothing. He had
 # to say "JARVIS, CANCEL TIMER!".
-def test_strip_fillers():
-    from jarvis.commander import strip_fillers
+def test_strip_inline_fillers():
+    from jarvis.commander import strip_inline_fillers as strip_fillers
     assert strip_fillers("BELAY THAT LAST Uhhh... ORDER") == "BELAY THAT LAST ORDER"
     assert strip_fillers("scratch, um, that") == "scratch that"
     assert strip_fillers("undo that… please") == "undo that please"

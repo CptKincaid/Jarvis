@@ -47,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from jarvis import consent                                # noqa: E402
 from jarvis import gate as gate_mod                       # noqa: E402
+from jarvis import identity as identity_mod               # noqa: E402
+from jarvis import knightfall_weekly as weekly_mod        # noqa: E402
 from jarvis import passphrase as pp                       # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
 from jarvis.config import PATHS                           # noqa: E402
@@ -76,6 +78,19 @@ def _keyboard_only(what: str) -> str:
     return ""
 
 
+def _save(reg: Registry) -> bool:
+    """Every write here lands through ``Registry.save_checked``: this tool
+    loads the file, asks questions at a prompt, and saves minutes later,
+    and since 2026-09-06 the app and the weekly Knightfall issuer may
+    have written in between. A save that finds the file changed refuses
+    and says so rather than writing this process's memory over theirs;
+    the command is simply run again."""
+    ok, why = reg.save_checked()
+    if not ok:
+        say("REFUSED: %s" % why)
+    return ok
+
+
 # ------------------------------------------------------- who is asking
 def _authorise(reg: Registry) -> tuple:
     """``(ok, why)`` -- may whoever is at this keyboard administer the gate?
@@ -102,6 +117,14 @@ def _authorise(reg: Registry) -> tuple:
     * THE FILE IS THERE AND BROKEN. REFUSED, and this one is new (2026-09-05).
       It used to fall into the first case, so `add` on a registry that failed
       to parse wrote a fresh one-row file over the top of everyone in it.
+
+    A TYPED WEEKLY CODE IS PROMOTED HERE TOO (2026-09-06). It asks
+    ``check_override_code_leg``, the same function the drawer and the users
+    tab ask, so that a code out of Sunday's backup email is not left
+    pending after it has been used -- he can only have that code from the
+    email, so typing it is the receipt in person. Until this it used the
+    two-tuple ``check_override_code``, which admits on the pending hash and
+    says nothing, and the pending sat there until Wednesday dropped it.
     """
     state, why = gate_mod.admin_gate(reg)
     if state == gate_mod.ADMIN_REFUSE:
@@ -114,13 +137,58 @@ def _authorise(reg: Registry) -> tuple:
     if why:
         return False, why
     code = getpass.getpass("Override code: ")
-    who, reason = gate_mod.check_override_code(
+    who, reason, leg = gate_mod.check_override_code_leg(
         reg, code, attempts=pp.Attempts(limit=pp.CODE_LIMIT,
                                         window_s=pp.CODE_WINDOW))
     del code
     if not who:
         return False, reason
+    if leg == gate_mod.LEG_PENDING:
+        _promote_weekly(reg, who)
     return True, who
+
+
+def _promote_weekly(reg: Registry, who: str) -> None:
+    """He typed THIS WEEK'S code: promote it, under the file lock, and note
+    it in the weekly lane's state so the pull knows the receipt is already
+    handled.
+
+    IT DOES NOT ROTATE AND MAILS NOTHING -- his decision #3, 2026-09-06.
+    The DRAWER burns a typed weekly code (it mails the next one, as it does
+    for any accepted code); the users tab's unlock and this terminal tool
+    do not, because an administrative unlock that posted a fresh code every
+    time he ran `forget` would be a mailbox full of live break-glass codes.
+
+    THE REGISTRY THE CALLER HOLDS IS REFRESHED. This writes through
+    ``locked_update``, which loads its own copy; leaving ``reg`` as it was
+    would leave it carrying the digest of a file that has just changed, and
+    ``save_checked`` would then refuse the very command the code authorised
+    with "the people book changed since this command started".
+
+    Every failure here is a line and nothing more: both codes simply stay
+    honoured until the weekly pull resolves them.
+    """
+    person = reg.person(who)
+    code_id = getattr(person, "pending_code_id", "") if person else ""
+    if not code_id:
+        return
+    ok, why = identity_mod.locked_update(
+        reg.path, lambda r: r.promote_pending(who, code_id))
+    if not ok:
+        say("note: that was this week's code from the backup email, but it "
+            "could not be promoted (%s). Both codes still work." % why)
+        return
+    fresh = Registry.load(reg.path)
+    if fresh.usable:
+        reg.people = fresh.people
+        reg.digest = fresh.digest
+    try:
+        weekly_mod.note_promoted_by_use(PATHS.KNIGHTFALL_WEEKLY, code_id)
+    except Exception:  # noqa: BLE001 - narration, never the command
+        pass
+    say("note: that was this week's code from the backup email, so it is now "
+        "your code and the previous one no longer works. Nothing was mailed: "
+        "only the Knightfall drawer rotates a code you type.")
 
 
 def _read_twice(prompt: str, check, transform=None) -> tuple:
@@ -215,8 +283,7 @@ def do_add(reg: Registry, cfg, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("enrolled %s as %s (addressed as %s, consent: %s)"
         % (label, role, hon or "no form of address", how))
@@ -258,8 +325,7 @@ def do_set_honorific(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is addressed as %s" % (args.label, hon or "no form of address"))
     return 0
@@ -271,8 +337,7 @@ def do_set_role(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is now %s" % (args.label, args.role))
     return 0
@@ -283,8 +348,7 @@ def do_forget(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is forgotten. Their face stays in the gallery; "
         "scripts/face_enrol.py --forget removes that." % args.label)
@@ -330,8 +394,7 @@ def do_secret(reg: Registry, cfg, args, which: str) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     # Never printed back, never logged, never echoed.
     say("set. It is stored salted-hashed; nothing here can read it back.")

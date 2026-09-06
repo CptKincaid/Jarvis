@@ -1,0 +1,18 @@
+[Unit]
+Description=Jarvis weekly Knightfall code: push
+Documentation=file:%h/Jarvis/jarvis/knightfall_weekly.py
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Jarvis
+ExecStart=%h/vss_env/bin/python -m jarvis.knightfall_weekly push
+# Three put tries five minutes apart, each bounded to 20 s of ssh, plus a
+# revoke: the whole run is under 15 min by construction; 25 is the belt.
+TimeoutStartSec=25min
+# It touches people.json, ~/.local/state/jarvis, the command socket (the
+# non-speaking `people reload` verb) and ssh's key file, read-only.
+NoNewPrivileges=true
+PrivateTmp=false
+Nice=10
