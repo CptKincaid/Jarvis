@@ -115,7 +115,7 @@ from jarvis.recorder import (SAMPLE_RATE, MicArbiter, Recorder,
                              play_beep)
 from jarvis.speaker import SpeakerVerifier
 from jarvis.tools.registry import ToolRegistry
-from jarvis.transcriber import Transcriber
+from jarvis.transcriber import Transcriber, shown_words
 from jarvis.tts import TTS
 from jarvis.workflows import Workflows
 
@@ -3982,10 +3982,15 @@ class JarvisApp:
 
         The rule this whole pass enforces, in one place: WORDS ARE WRITTEN
         DOWN ONLY AFTER SOMETHING HAS SAID THEY ARE NOT THE PHRASE.
+
+        And when they are written, an address in them is masked
+        (transcriber.shown_words): this is the speculative-decode line,
+        which carried a spelled address raw while the `Transcribed:` line
+        was being closed -- the twin the 09-06 verdict did not name.
         """
         if text and self._owner_has_phrase():
             return repr(gate_mod.REDACTED_TEXT)
-        return repr(text)
+        return repr(shown_words(text))
 
     def _log_transcript(self, result) -> None:
         """The `Transcribed:` line the quiet decode deliberately did not
@@ -3996,14 +4001,16 @@ class JarvisApp:
         it. Deliberately the same wording and the same numbers as that
         line, so a reader of jarvis.log (and every grep and script written
         against it, scripts/measure_confidence_gate.py included) sees one
-        format, not two.
+        format, not two -- and the same mask over an address in the words
+        (transcriber.shown_words), or the quiet decode would be the one
+        path on which a spelled address reaches jarvis.log raw.
         """
         if not self._owner_has_phrase():
             return                     # transcriber.py wrote it already
         text = getattr(result, "text", "") or ""
         if not text:
             return                     # nothing was said; nothing to say
-        log.info("Transcribed: %r (avg_logprob=%.2f)", text,
+        log.info("Transcribed: %r (avg_logprob=%.2f)", shown_words(text),
                  float(getattr(result, "confidence", 0.0) or 0.0))
 
     def decode_clip(self, audio, verify=True):
