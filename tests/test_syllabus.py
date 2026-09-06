@@ -37,7 +37,14 @@ from tests.test_docs import RECIPE, SYLLABUS, FakeEmbed
 # breaks test_merge_items_lets_canvas_win_a_duplicate between 23:00 and
 # midnight -- merge_items dedupes on due.date() (syllabus.py:275, "the same
 # local day"), so its NOW + 30d + 1h would land on the following date.
-NOW = datetime.now().astimezone().replace(hour=9, minute=0, second=0, microsecond=0)
+# Naive first, zone attached LAST (see tests/test_clock_hygiene.py): the old
+# .astimezone().replace(...) carried the CURRENT offset onto 09:00, an hour
+# wrong on a morning when the change falls between midnight and now.
+# clock-hygiene: the live read is deliberate -- the fixture must write with the
+# same clock syllabus.py reads, and a frozen NOW writes items at a fixed epoch
+# that the real clock later crosses.
+NOW = datetime.now().replace(hour=9, minute=0, second=0,
+                             microsecond=0).astimezone()
 
 
 def _iso(days, clock="09:00"):

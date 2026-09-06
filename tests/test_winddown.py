@@ -20,6 +20,27 @@ import jarvis.winddown as wd_mod
 from jarvis.commander import Commander, CommandResult
 from tests.test_app_wiring import build, paths, seams  # noqa: F401 - fixtures
 
+# 2026-09-05: three tests below built their instant as
+#     datetime.now().astimezone().replace(hour=23, minute=30)
+# which snapshots TODAY's UTC offset and then does wall-clock arithmetic
+# with it. Across a DST change that offset is wrong for the instant it
+# ends up attached to, so "the next 07:00" came out an hour off: measured
+# red at 01:30 on 2026-11-01 and 2027-03-14, and reproduced live under
+# TZ=Pacific/Easter, which changes over today.
+#
+# Two corrections, both of which these tests wanted anyway. Build the
+# instant NAIVE and attach the zone LAST, so Python resolves the offset
+# that actually applies to it. And put it on a fixed ordinary day at a
+# fixed no-DST offset (the @local_tz mark on each test): all three assert
+# an exact DURATION between two wall-clock times, which is only a fact at
+# all when no transition falls in between. None of them is about today.
+_DAY = (2026, 9, 14)                      # an ordinary Monday
+
+
+def _local(hour, minute=0):
+    """A wall-clock instant on _DAY, in the local zone."""
+    return datetime(*_DAY, hour, minute).astimezone()
+
 XRANDR_OUT = """Screen 0: minimum 8 x 8, current 3840 x 2160, maximum 32767 x 32767
 HDMI-0 connected primary 3840x2160+0+0 (0x18d) normal (normal left inverted right) 596mm x 335mm
 \tIdentifier: 0x18b
@@ -243,19 +264,19 @@ def test_each_half_has_its_own_switch(tmp_path, runs):
     assert argv_of(runs, "xrandr", "--output")          # the dim still happened
 
 
+@pytest.mark.local_tz("XXX5")
 def test_without_quiet_hours_dnd_runs_to_the_configured_morning(tmp_path, runs):
     quiet = FakeQuiet(end=None)
-    now = datetime.now().astimezone().replace(hour=23, minute=0, second=0,
-                                              microsecond=0)
+    now = _local(23, 0)
     wd = make(tmp_path, spotify=None, quiet=quiet, morning="07:00")
     wd._now = lambda: now.timestamp()
     assert wd.start() and wait_idle(wd)
     assert len(quiet.dnd) == 1 and abs(quiet.dnd[0] - 8 * 3600) < 1
 
 
+@pytest.mark.local_tz("XXX5")
 def test_the_clock_helper_walks_to_tomorrow(tmp_path):
-    at = datetime.now().astimezone().replace(hour=23, minute=30, second=0,
-                                             microsecond=0)
+    at = _local(23, 30)
     assert abs(wd_mod._clock_seconds(at.timestamp(), "07:00") - 7.5 * 3600) < 1
     early = at.replace(hour=5)                      # 05:30, so 07:00 is today
     assert abs(wd_mod._clock_seconds(early.timestamp(), "07:00") - 1.5 * 3600) < 1
@@ -388,13 +409,13 @@ def test_the_commander_survives_a_box_without_the_module():
 
 
 # --------------------------------------------------------- quiet policy
+@pytest.mark.local_tz("XXX5")
 def test_quiet_hours_end_is_a_public_seam(tmp_path):
     from jarvis.quiet import QuietPolicy
     store = {"quiet.hours": {"start": "23:00", "end": "07:00"}}
     pol = QuietPolicy(SimpleNamespace(
         get=lambda k, d=None: store.get(k, d), set=store.__setitem__))
-    at = datetime.now().astimezone().replace(hour=23, minute=30, second=0,
-                                             microsecond=0)
+    at = _local(23, 30)
     assert abs(pol.hours_end(at.timestamp()) - (at + timedelta(hours=7.5)).timestamp()) < 2
     store["quiet.hours"] = {"start": "", "end": ""}
     assert pol.hours_end(at.timestamp()) is None
