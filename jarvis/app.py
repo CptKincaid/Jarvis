@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import contextlib
 import threading
 import uuid
 import time
@@ -79,6 +80,7 @@ from jarvis import gate as gate_mod
 from jarvis import honorific as honorific_mod
 from jarvis import passphrase as pp
 from jarvis import identity as identity_mod
+from jarvis import knightfall_weekly as knightfall_weekly_mod
 from jarvis import scope as scope_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
@@ -5390,7 +5392,12 @@ class JarvisApp:
         answer is the film-register rendering of the same dict (commander
         _h_diagnostics); this stays the card, the cmdsock "status" reply
         and ask.py --status."""
-        return selfstate.diagnostics_line(self.self_state())
+        state = self.self_state()
+        # The weekly Knightfall caption rides on the card and the socket
+        # reply only: this sheet's film-register rendering (what he HEARS)
+        # does not read the key, so nothing about a code is ever spoken.
+        state.setdefault("knightfall_weekly", self._knightfall_weekly_caption())
+        return selfstate.diagnostics_line(state)
 
     def open_modes_line(self) -> str:
         """The sticky modes that are open, or "".
@@ -7720,15 +7727,76 @@ class JarvisApp:
         if gate is None:
             return "Knightfall: the gate is not built; see the log"
         with _KNIGHTFALL_LOCK:
-            who, why = gate_mod.check_override_code(gate.registry, code,
-                                                    attempts=gate.code_attempts)
+            # THE FILE AS IT IS, not the boot copy (2026-09-06). This used
+            # to check gate.registry while people_unlock two methods down
+            # checked the file, so a code set at a terminal opened the
+            # users tab and was refused here until a reload or a restart
+            # -- and the weekly issuer writes the file from another
+            # process. The boot copy is the fallback ONLY when the file is
+            # unusable: a corrupted file must not lock the break-glass
+            # that the boot copy would still open.
+            registry = self._knightfall_check_registry()
+            who, why, leg = gate_mod.check_override_code_leg(
+                registry, code, attempts=gate.code_attempts)
             del code
             if not who:
                 return "Knightfall: %s" % why
+            if leg == gate_mod.LEG_PENDING:
+                # TYPED PENDING = THE RECEIPT IN PERSON. He can only have
+                # this week's code from Sunday's email, so typing it
+                # proves the email arrived: promote it now, then rotate
+                # exactly as any accepted code rotates.
+                self._knightfall_promote_by_use(who, registry)
             gate.open_window(who, gate_mod.HOW_CODE, now=now)
             line, _mailed = self._knightfall_rotate(who, mail=mail,
                                                     smtp=smtp, accepted=True)
             return line
+
+    def _knightfall_check_registry(self):
+        """The registry a TYPED code is checked against: the people file
+        re-read now, or -- only when that file is unusable -- the copy the
+        gate loaded at boot. See knightfall_code."""
+        gate = getattr(self, "gate", None)
+        registry, _why = self._people_registry()
+        if registry is not None and getattr(registry, "usable", False):
+            return registry
+        return gate.registry
+
+    def _knightfall_promote_by_use(self, who, registry) -> None:
+        """He typed this week's PENDING code: promote it under the file
+        lock, tell the weekly lane, reload the live gate. Every failure is
+        a log line -- both codes simply stay honoured until the pull."""
+        gate = getattr(self, "gate", None)
+        person = registry.person(who) if registry is not None else None
+        code_id = getattr(person, "pending_code_id", "") if person else ""
+        if not code_id:
+            return
+        path = getattr(getattr(gate, "registry", None), "path", None)
+        ok, why = identity_mod.locked_update(
+            path, lambda r: r.promote_pending(who, code_id))
+        if not ok:
+            log.error("knightfall: this week's code (id %s) was typed but could "
+                      "not be promoted (%s); both codes stay honoured", code_id, why)
+            return
+        log.info("knightfall: %s typed this week's code; id %s promoted; the "
+                 "previous code is retired", who, code_id)
+        try:
+            knightfall_weekly_mod.note_promoted_by_use(PATHS.KNIGHTFALL_WEEKLY, code_id)
+        except Exception:                          # noqa: BLE001 - narration
+            log.exception("knightfall: the weekly state could not be noted")
+        try:
+            gate.reload()
+        except Exception:                          # noqa: BLE001 - a belt
+            log.exception("knightfall: the gate could not be reloaded")
+
+    def _knightfall_weekly_caption(self) -> str:
+        """The weekly lane's one sentence, off its state file. A file read,
+        never a socket; "" when the lane has never run."""
+        try:
+            return knightfall_weekly_mod.caption(PATHS.KNIGHTFALL_WEEKLY)
+        except Exception:                          # noqa: BLE001 - a caption
+            log.exception("knightfall: the weekly caption could not be read")
+            return ""
 
     # ------------------------------------------- the people book (USERS tab)
     def people_snapshot(self) -> dict:
@@ -7933,7 +8001,7 @@ class JarvisApp:
         if registry is None:
             return False, why
         try:
-            who, why = gate_mod.check_override_code(
+            who, why, leg = gate_mod.check_override_code_leg(
                 registry, code, attempts=gate.code_attempts)
         except Exception as exc:                   # noqa: BLE001 - never str
             # Never the exception's text and never a traceback: what that
@@ -7946,6 +8014,11 @@ class JarvisApp:
             del code
         if not who:
             return False, why
+        if leg == gate_mod.LEG_PENDING:
+            # The same receipt-in-person rule as the drawer: this week's
+            # code, typed, is proof the email arrived. No rotate here --
+            # an administrative unlock mails nothing.
+            self._knightfall_promote_by_use(who, registry)
         self._people_open_unlock(now=now)
         return True, "Unlocked, sir."
 
@@ -7988,7 +8061,20 @@ class JarvisApp:
         if gate is None:
             return False, "the owner gate is not built; see the log"
         with _PEOPLE_LOCK:
-            return self._people_write_now(what, change, gate, now)
+            # ...and the cross-process one (identity.registry_lock, an
+            # flock), since 2026-09-06 there is a third writer under a
+            # timer. The in-process RLock still orders the drawer's
+            # threads; the flock orders the processes.
+            path = getattr(getattr(gate, "registry", None), "path", None)
+            try:
+                lock = (identity_mod.registry_lock(path) if path
+                        else contextlib.nullcontext())
+                with lock:
+                    return self._people_write_now(what, change, gate, now)
+            except identity_mod.RegistryBusy as exc:
+                log.error("users: %s refused: %s", what, exc)
+                return False, ("the people book is held by another writer; "
+                               "try again in a moment")
 
     def _people_write_now(self, what, change, gate, now) -> tuple:
         """``_people_write`` with ``_PEOPLE_LOCK`` already held. Split out
@@ -8436,7 +8522,8 @@ class JarvisApp:
         was made before he pressed. A read only: no socket, no code.
         """
         from jarvis.tools import mail as mail_mod
-        out = {"to": "", "problem": "", "setup": ""}
+        out = {"to": "", "problem": "", "setup": "",
+               "weekly": self._knightfall_weekly_caption()}
         try:
             accounts = mail_mod.mail_accounts(self.assistant)
         except Exception:                          # noqa: BLE001 - config
@@ -8523,6 +8610,30 @@ class JarvisApp:
             return keep % "no Message-ID came back", True
         hashed = pp.hash_secret(new)
         del new
+        # UNDER THE FILE LOCK (2026-09-06): the weekly issuer is a third
+        # writer of people.json from another process, and the flock in
+        # identity.registry_lock is what the re-read below serialises
+        # against. A lock that cannot be taken is the store failing.
+        path = getattr(getattr(self.gate, "registry", None), "path", None)
+        try:
+            lock = (identity_mod.registry_lock(path) if path
+                    else contextlib.nullcontext())
+            with lock:
+                return self._knightfall_store(who, hashed, head, keep,
+                                              accepted=accepted)
+        except identity_mod.RegistryBusy:
+            log.error("knightfall: the new code was mailed but the people book "
+                      "is held by another writer; the old code stands")
+            return head + ("the new code could not be stored, so the old one "
+                           "stands; the one in your inbox will not work."), True
+
+    def _knightfall_store(self, who, hashed, head, keep, *, accepted=False):
+        """The store half of _knightfall_rotate, with the file lock held.
+
+        ``accepted`` rides along because the success line differs: a
+        code he TYPED answers "Knightfall accepted"; the "email me a
+        new code" button answers with the plain new-code line.
+        """
         # RE-READ BEFORE WRITING. self.gate.registry is the copy loaded at
         # BOOT, and the save below writes that whole object over the file --
         # so anything added to the people book since this process started

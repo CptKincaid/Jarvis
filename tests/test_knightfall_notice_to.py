@@ -389,6 +389,11 @@ def test_the_one_door_to_the_transport_is_still_one_door():
 def _status_app(cfg):
     a = SimpleNamespace(assistant=FakeCfg(cfg))
     a.knightfall_status = app_mod.JarvisApp.knightfall_status.__get__(a)
+    # The caption now carries the weekly lane's sentence when there is
+    # one (jarvis/knightfall_weekly.py); these tests are about the
+    # DESTINATION half, so the lane has simply never run.
+    a._knightfall_weekly_caption = \
+        app_mod.JarvisApp._knightfall_weekly_caption.__get__(a)
     return a
 
 
@@ -424,5 +429,10 @@ def test_a_config_that_raises_reads_as_no_account_rather_than_crashing():
 
     a = SimpleNamespace(assistant=Boom())
     a.knightfall_status = app_mod.JarvisApp.knightfall_status.__get__(a)
+    # The caption now carries the weekly lane's sentence when there is
+    # one (jarvis/knightfall_weekly.py); these tests are about the
+    # DESTINATION half, so the lane has simply never run.
+    a._knightfall_weekly_caption = \
+        app_mod.JarvisApp._knightfall_weekly_caption.__get__(a)
     st = a.knightfall_status()
     assert st["to"] == "" and st["problem"] == ""

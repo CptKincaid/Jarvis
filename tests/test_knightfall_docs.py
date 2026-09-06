@@ -77,3 +77,26 @@ def test_no_secret_is_written_down():
                   if len(w) == 8 and set(w) <= set(pp.CODE_ALPHABET)
                   and any(c.isdigit() for c in w)]
     assert looks_like == [], looks_like
+
+
+# ------------------------------------------------- the weekly lane (09-06)
+def test_the_section_writes_down_the_weekly_lane():
+    """His ruling, 2026-09-06: the code goes out weekly in the same email
+    as the encrypted backup. The document has to say what he will see,
+    which timers do it, what installs them, and that the issuer sends the
+    non-speaking `people reload` verb to the running app."""
+    section = _section()
+    low = section.lower()
+    for phrase in ("weekly", "knightfall encrypted backup", "people reload",
+                   "jarvis-knightfall-push.timer", "jarvis-knightfall-pull.timer",
+                   "scripts/setup_knightfall_weekly.sh", "wednesday",
+                   "both codes work", "--rehearse", "--probe"):
+        assert phrase in low, phrase
+    # the Oracle half and its only rehearsal
+    assert "app/jarvis_override.py" in section
+    assert "--dry-run" in section
+
+
+def test_the_weekly_paragraph_says_the_timers_are_not_installed_by_the_build():
+    section = _section().lower()
+    assert "not installed" in section or "does not install" in section

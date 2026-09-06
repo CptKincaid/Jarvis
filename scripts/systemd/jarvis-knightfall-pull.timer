@@ -1,0 +1,16 @@
+[Unit]
+Description=Jarvis weekly Knightfall code: fetch Oracle's receipt
+Documentation=file:%h/Jarvis/jarvis/knightfall_weekly.py
+
+[Timer]
+# 09:30 UTC Sunday = one hour after Oracle sent the email; then daily to
+# Wednesday, which is the drop deadline: no receipt by Wed 09:30 UTC and
+# the pending code is dropped, the previous one stands, the caption says
+# so. A pull with nothing pending is a local no-op (no ssh). UTC, as the
+# push timer is, and for the same reason.
+OnCalendar=Sun,Mon,Tue,Wed *-*-* 09:30:00 UTC
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

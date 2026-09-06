@@ -53,14 +53,18 @@ AND THE ONE THAT KEEPS IT FROM BECOMING A BRICK
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from jarvis.config import PATHS
 from jarvis.logs import get_logger
@@ -202,6 +206,19 @@ class Person:
     # Salted hashes. Never plaintext, never printed, never logged.
     phrase_hash: str = ""
     code_hash: str = ""
+    # THE PENDING OVERRIDE CODE (Knightfall weekly, 2026-09-06). The weekly
+    # issuer hands a fresh code to Oracle BEFORE it knows whether Sunday's
+    # backup email will carry it, so until Oracle's receipt comes back
+    # BOTH hashes open the door -- gate.check_override_code tries this one
+    # after code_hash. ``pending_code_id`` is eight hex characters that
+    # travel in the spool, the receipt and the log; it names the push and
+    # says nothing about the code. ``pending_code_since`` is the UTC stamp
+    # of the push, from which the drop deadline is computed. The three
+    # move together, through set_pending_code / promote_pending /
+    # drop_pending and nothing else. An OLDER build's to_json drops them.
+    pending_code_hash: str = ""
+    pending_code_id: str = ""
+    pending_code_since: str = ""
     enrolled_at: str = ""
     # "owner" (his own row) or "typed" (they typed their own name at a
     # terminal -- scripts/face_enrol.consent's existing rule, not a new one).
@@ -225,6 +242,7 @@ class Person:
                 "face_dim": int(self.face_dim),
                 "has_phrase": bool(self.phrase_hash),
                 "has_code": bool(self.code_hash),
+                "has_pending": bool(self.pending_code_hash),
                 "enrolled_at": self.enrolled_at, "consent": self.consent}
 
     # A dataclass __repr__ would print both hashes into any log line that
@@ -239,8 +257,12 @@ class Person:
         out = self.redacted()
         out.pop("has_phrase", None)
         out.pop("has_code", None)
+        out.pop("has_pending", None)
         out["phrase_hash"] = self.phrase_hash
         out["code_hash"] = self.code_hash
+        out["pending_code_hash"] = self.pending_code_hash
+        out["pending_code_id"] = self.pending_code_id
+        out["pending_code_since"] = self.pending_code_since
         return out
 
     @classmethod
@@ -275,6 +297,9 @@ class Person:
                    face=str(row.get("face", "") or ""), face_dim=dim,
                    phrase_hash=str(row.get("phrase_hash", "") or ""),
                    code_hash=str(row.get("code_hash", "") or ""),
+                   pending_code_hash=str(row.get("pending_code_hash", "") or ""),
+                   pending_code_id=str(row.get("pending_code_id", "") or ""),
+                   pending_code_since=str(row.get("pending_code_since", "") or ""),
                    enrolled_at=str(row.get("enrolled_at", "") or ""),
                    consent=str(row.get("consent", "") or ""))
 
@@ -327,6 +352,10 @@ class Registry:
     fault: str = ""
     # The same fault, as a token a caller can branch on (see above).
     fault_kind: str = FAULT_NONE
+    # A fingerprint of the file's bytes AS LOADED ("" for no file), so a
+    # writer that loaded minutes ago can tell, under the lock, whether
+    # somebody else wrote in between (save_checked).
+    digest: str = ""
 
     # ------------------------------------------------------------ read
     @classmethod
@@ -350,6 +379,7 @@ class Registry:
                          % (p, type(exc).__name__))
             reg.fault_kind = FAULT_UNREADABLE
             return reg
+        reg.digest = _digest(raw)
         try:
             data = json.loads(raw)
         except Exception:  # noqa: BLE001 - any parse failure is one fault
@@ -546,18 +576,237 @@ class Registry:
         setattr(p, field_name, str(hashed or ""))
         return True, ""
 
+    # ---------------------------------------- the pending code (weekly)
+    def _owner_for_pending(self, label) -> Tuple[Optional[Person], str]:
+        p = self.person(label)
+        if p is None:
+            return None, "%s is not enrolled" % label
+        if p.role != ROLE_OWNER:
+            return None, ("only an owner has a way back in to set; %s is %s"
+                          % (label, p.role or "not enrolled"))
+        return p, ""
+
+    def set_pending_code(self, label, hashed, code_id, since) -> Tuple[bool, str]:
+        """Store an ALREADY-HASHED weekly code BESIDE the current one.
+        Never sees a plaintext, like set_secret. Replaces any pending
+        already there (a forced re-push); never touches code_hash."""
+        p, why = self._owner_for_pending(label)
+        if p is None:
+            return False, why
+        if not PENDING_ID_RX.match(str(code_id or "")):
+            return False, "a pending code needs an id of 8 hex characters"
+        if not str(hashed or ""):
+            return False, "a pending code needs a hash"
+        p.pending_code_hash = str(hashed)
+        p.pending_code_id = str(code_id)
+        p.pending_code_since = str(since or "")
+        return True, ""
+
+    def promote_pending(self, label, code_id) -> Tuple[bool, str]:
+        """The receipt came back (or he typed it): the pending hash becomes
+        THE code and the previous one is gone. The id must match, so a
+        receipt for a replaced push cannot promote the wrong hash."""
+        p, why = self._owner_for_pending(label)
+        if p is None:
+            return False, why
+        if not p.pending_code_hash:
+            return False, "there is no pending code to promote"
+        if p.pending_code_id != str(code_id or ""):
+            return False, ("the pending code's id does not match (%s)"
+                           % p.pending_code_id)
+        p.code_hash = p.pending_code_hash
+        p.pending_code_hash = ""
+        p.pending_code_id = ""
+        p.pending_code_since = ""
+        return True, ""
+
+    def drop_pending(self, label, code_id) -> Tuple[bool, str]:
+        """No receipt, a failed send, a stale spool: the pending hash is
+        forgotten and the current code stands untouched."""
+        p, why = self._owner_for_pending(label)
+        if p is None:
+            return False, why
+        if not p.pending_code_hash:
+            return False, "there is no pending code to drop"
+        if p.pending_code_id != str(code_id or ""):
+            return False, ("the pending code's id does not match (%s)"
+                           % p.pending_code_id)
+        p.pending_code_hash = ""
+        p.pending_code_id = ""
+        p.pending_code_since = ""
+        return True, ""
+
     def save(self) -> bool:
         if self.path is None:
             return False
         payload = {"format": FORMAT,
                    "people": [p.to_json() for p in self.people]}
+        raw = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
         try:
-            _write_private(Path(self.path),
-                           json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            _write_private(Path(self.path), raw)
         except OSError:
             log.exception("registry save failed: %s", self.path)
             return False
+        # THE FINGERPRINT FOLLOWS THE WRITE. ``digest`` means "the bytes
+        # this object last knew the file to hold", and save_checked refuses
+        # when the file no longer matches it. Without this line a registry
+        # that has saved once still carried the digest it LOADED with (or
+        # "", for one built in memory), so its next save_checked compared
+        # against stale bytes and refused a write nobody had raced --
+        # measured 2026-09-06: scripts/jarvis_people.py add/set-role/forget
+        # all returned "REFUSED: the people book changed since this command
+        # started" against a registry that was simply built and saved.
+        self.digest = _digest(raw)
         return True
+
+    def save_checked(self, timeout_s: float = 10.0) -> Tuple[bool, str]:
+        """Save ONLY if the file still holds the bytes this object was
+        loaded from. ``(ok, why)``.
+
+        For the writer that cannot hold the lock across its work: the
+        terminal tool loads, asks questions at a prompt, and saves minutes
+        later. Under the lock the file is read again and its fingerprint
+        compared with ``digest``; a mismatch means another writer (the app,
+        the weekly issuer) got there first, and writing this object over
+        the top would silently undo what they wrote. It refuses and says
+        so; the caller runs the command again against the new file.
+        """
+        if self.path is None:
+            return False, "this registry has no file"
+        path = Path(self.path)
+        try:
+            with registry_lock(path, timeout_s=timeout_s):
+                try:
+                    now = _digest(path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    now = ""
+                except OSError as exc:
+                    return False, ("%s could not be read (%s)"
+                                   % (path, type(exc).__name__))
+                if now != self.digest:
+                    return False, ("the people book changed since this "
+                                   "command started (another writer); "
+                                   "nothing was written -- run it again")
+                if not self.save():
+                    return False, "the registry could not be written"
+                self.digest = _digest(path.read_text(encoding="utf-8"))
+                return True, ""
+        except RegistryBusy as exc:
+            return False, str(exc)
+
+
+def _digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ------------------------------------------------- the cross-process lock
+# THREE PROCESSES WRITE people.json: the app (the drawer's rotate and the
+# users tab), scripts/jarvis_people.py at a terminal, and -- since the
+# weekly lane -- the issuer under a systemd timer. Until 2026-09-06 nothing
+# locked between them; the app's own docstrings said so and shrank the
+# window by re-reading immediately before each write. The window was
+# milliseconds and the worst case one dead code, never a lockout, because
+# every path leaves a working hash. This closes it anyway: an flock on
+# <people.json>.lock, taken around load -> change -> save.
+#
+# Re-entrant ON ONE THREAD, and that is not a nicety: flock() is per open
+# file description, so a second open() + flock() from the same process
+# BLOCKS against the first. The app nests these (a users-tab write that
+# then rotates), so a thread that already holds it just passes through.
+PENDING_ID_RX = re.compile(r"^[0-9a-f]{8}$")
+LOCK_POLL_S = 0.05
+_lock_depth = threading.local()
+
+
+class RegistryBusy(RuntimeError):
+    """Another writer held the people book for the whole wait."""
+
+
+@contextlib.contextmanager
+def registry_lock(path, timeout_s: float = 10.0):
+    """Hold <path>.lock (flock, exclusive) for the block. Raises
+    RegistryBusy after ``timeout_s`` rather than waiting forever: a timer
+    job or a drawer thread stuck behind a lock is worse than a refusal
+    that says so."""
+    depth = int(getattr(_lock_depth, "n", 0) or 0)
+    if depth:
+        _lock_depth.n = depth + 1
+        try:
+            yield
+        finally:
+            _lock_depth.n = depth
+        return
+    lock_path = Path(str(path) + ".lock")
+    # NO IN-PROCESS MUTEX AROUND THIS. There was one, an RLock held for the
+    # whole critical section, and it made ``timeout_s`` a lie for threads:
+    # a second THREAD blocked on the mutex forever (only another PROCESS
+    # ever reached the polling loop below), so a wedged drawer write would
+    # hang the users tab instead of refusing it -- measured 2026-09-06, a
+    # 5 s hold made a 0.3 s timeout wait the full five and then succeed.
+    # flock() is per open file description, and two open() calls from ONE
+    # process are separate descriptions that conflict with each other just
+    # as two processes do, so the loop below serialises threads too. What
+    # the thread-local depth above handles is the case flock cannot: the
+    # SAME thread nesting these (a users-tab write that then rotates),
+    # which would otherwise deadlock against itself.
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RegistryBusy(
+                        "another writer holds the people book (%s); "
+                        "nothing was changed" % lock_path.name)
+                time.sleep(LOCK_POLL_S)
+        _lock_depth.n = 1
+        try:
+            yield
+        finally:
+            _lock_depth.n = 0
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
+def locked_update(path, change: Callable[["Registry"], Tuple[bool, str]],
+                  *, timeout_s: float = 10.0) -> Tuple[bool, str]:
+    """load -> change(registry) -> save, under the lock. ``(ok, why)``.
+
+    NEVER RAISES. Refuses a registry that is not usable, for the reason
+    admin_gate refuses it: a file that failed to parse loads as EMPTY, and
+    saving that over it destroys whatever it held. The change callable
+    answers ``(ok, why)`` like every Registry writer, and its refusal is
+    handed back untouched.
+    """
+    p = Path(path)
+    try:
+        with registry_lock(p, timeout_s=timeout_s):
+            reg = Registry.load(p)
+            if not reg.usable:
+                return False, reg.fault or "the registry could not be read"
+            try:
+                ok, why = change(reg)
+            except Exception as exc:  # noqa: BLE001 - a boundary, never a raise
+                log.exception("registry: a locked change failed")
+                return False, "the change failed (%s)" % type(exc).__name__
+            if not ok:
+                return False, why
+            if not reg.save():
+                return False, "the people file could not be written; see the log"
+            return True, ""
+    except RegistryBusy as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 - a boundary, never a raise
+        log.exception("registry: the locked update failed")
+        return False, "the locked update failed (%s)" % type(exc).__name__
 
 
 # -------------------------------------------------------- the one line

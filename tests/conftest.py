@@ -270,6 +270,8 @@ _DESKTOP_MODULES = {
     "jarvis.workflows": "shell steps, xdotool key, notify-send",
     "jarvis.desktop": "every xdotool/xclip primitive",
     "jarvis.reader": "xclip -o: the contents of his clipboard/selection",
+    "jarvis.knightfall_weekly": "ssh to the Oracle box (production, the "
+                                "dead-man's switch)",
     "jarvis.context": "xdotool window titles, git, ps, nvidia-smi, find",
     "jarvis.brain": "the claude CLI (a paid, acting agent) and the "
                     "autonomous RUN shell",

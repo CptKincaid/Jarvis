@@ -38,7 +38,8 @@ def _app(tmp_path, mode="shadow"):
     a.gate = gate_mod.OwnerGate(registry=reg, owner="hunter",
                                 get_option=a.get_option)
     for name in ("knightfall_code", "knightfall_new_code",
-                 "_knightfall_rotate"):
+                 "_knightfall_rotate", "_knightfall_store",
+                 "_knightfall_check_registry", "_people_registry"):
         setattr(a, name, getattr(app_mod.JarvisApp, name).__get__(a))
     return a
 

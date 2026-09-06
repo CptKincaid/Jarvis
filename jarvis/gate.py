@@ -1243,25 +1243,57 @@ def check_override_code(registry, code, *, attempts=None) -> Tuple[str, str]:
     the keyboard can edit ``people.json`` or delete it, which turns the gate
     off. This is HIS way back in, nothing more.
     """
+    who, why, _leg = check_override_code_leg(registry, code, attempts=attempts)
+    return who, why
+
+
+# Which hash admitted him. The CURRENT code is the one he has had all
+# along; the PENDING one is this week's, handed to Oracle for Sunday's
+# backup email and honoured beside the current one until the receipt
+# comes back (jarvis/knightfall_weekly.py). A caller that sees "pending"
+# promotes it on the spot -- he can only have that code from the email,
+# so typing it IS the receipt.
+LEG_CURRENT = "current"
+LEG_PENDING = "pending"
+
+
+def check_override_code_leg(registry, code, *, attempts=None) -> Tuple[str, str, str]:
+    """``check_override_code`` with a third answer: WHICH leg matched
+    (LEG_CURRENT / LEG_PENDING / ""). The two-tuple callers stay as they
+    are; the app's typed paths ask this one so a typed weekly code can be
+    promoted at once.
+
+    Every owner is tried on the current hash and then, if one is pending,
+    on that -- so a wrong code costs two derivations per owner while a
+    week's code is in flight and one otherwise. Both refusals are the same
+    sentence; nothing says which hash was close.
+    """
     plain = str(code or "").strip()
     if not plain:
-        return "", "no code was given"
+        return "", "no code was given", ""
     try:
-        owners = [p for p in registry.owners() if p.code_hash]
+        owners = [p for p in registry.owners()
+                  if p.code_hash or getattr(p, "pending_code_hash", "")]
     except Exception:  # noqa: BLE001 - a registry that cannot say has no code
         log.exception("gate: the registry could not be asked for a code")
-        return "", "the registry could not be read"
+        return "", "the registry could not be read", ""
     if not owners:
-        return "", "no override code has been set"
+        return "", "no override code has been set", ""
     if attempts is not None:
         ok, wait = attempts.allow()
         if not ok:
             return "", ("too many tries; wait %.0f seconds and try again"
-                        % wait)
+                        % wait), ""
         attempts.record()
     for person in owners:
-        if pp.check_secret(plain, person.code_hash):
+        if person.code_hash and pp.check_secret(plain, person.code_hash):
             log.info("gate: the override code admitted %s at the keyboard",
                      person.label)
-            return person.label, ""
-    return "", "that is not a code I know"
+            return person.label, "", LEG_CURRENT
+        pending = getattr(person, "pending_code_hash", "")
+        if pending and pp.check_secret(plain, pending):
+            log.info("gate: this week's pending code admitted %s at the "
+                     "keyboard (id %s)", person.label,
+                     getattr(person, "pending_code_id", "") or "?")
+            return person.label, "", LEG_PENDING
+    return "", "that is not a code I know", ""
