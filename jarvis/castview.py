@@ -274,6 +274,21 @@ BUSY_LINE = "There's a cast up already, sir"
 BUSY_FULL_LINE = BUSY_LINE + "; say stop the cast and try again."
 STOPPED_LINE = "Cast stopped, sir."
 NOTHING_UP_LINE = "There's nothing cast, sir."
+# ROUND 5. WHAT A STOP SAYS WHEN IT DID NOT HAPPEN, which until now was
+# "Cast stopped, sir." in every case. ``HELPER_FAIL_LINES["stop-failed"]``
+# already existed for the Spark -> HPCOMPUTER direction and was reachable
+# only through a LATER show-spark; these two are the cases it does not
+# cover -- the helper that never came back for the stop at all, and the
+# local viewer on THIS box that would not die.
+NO_STOP_RECEIPT_LINE = ("HPCOMPUTER didn't come back for that, sir, so I "
+                        "can't say the cast has stopped. Say it again and "
+                        "I'll ask once more.")
+STOP_FAILED_LINE = ("I couldn't close that viewer, sir — it's still up. "
+                    "I've left the cast marked as live.")
+# ...and what a landing says when the thing that would CATCH it dropping
+# could not be started. Failing to arm the watchdog holds; it never lands.
+NO_WATCHDOG_LINE = ("I can't set the check that would tell me if that cast "
+                    "drops, sir, so I'll not say it landed. Nothing's cast.")
 
 NO_HELPER_REASON = "the startup script isn't running on HPCOMPUTER"
 NO_VIEWER_REASON = "there is no viewer wired on this box"
@@ -285,6 +300,42 @@ CANNOT_TELL_REASON = "the connection probe had no opinion"
 CAST_GONE_REASON = "the viewer was gone when it was checked again"
 NO_RECEIPT_REASON = "HPCOMPUTER never acknowledged the verb"
 VIEWER_DIED_REASON = "the viewer was gone a moment after it started"
+NO_STOP_RECEIPT_REASON = "HPCOMPUTER never acknowledged the stop"
+STOP_FAILED_REASON = "the viewer was still there after it was told to close"
+NO_WATCHDOG_REASON = "the second look could not be armed"
+NOTHING_OF_OURS_REASON = "nothing of ours is up"
+
+
+class StopReport:
+    """What a stop actually did. TRUTHY ONLY WHEN IT HAPPENED.
+
+    Round 4 left ``stop_cast`` returning a bare bool that was True the
+    moment the verb was PARKED, and the courier could not tell "that
+    wasn't mine" from "I asked and it did not work" -- so a stop the
+    helper reported as failed fell through to "There's nothing cast,
+    sir." while the window was still on his middle monitor.
+
+    ``ok`` is the only thing ``bool()`` reads, so every existing
+    ``assert sink.stop_cast()`` still means what it meant. ``mine`` is
+    what the courier needs: it says the sink OWNED the cast, which
+    separates the two silences.
+    """
+
+    __slots__ = ("ok", "mine", "line", "detail")
+
+    def __init__(self, ok: bool, mine: bool, line: str = "",
+                 detail: str = "") -> None:
+        self.ok = bool(ok)
+        self.mine = bool(mine)
+        self.line = str(line)
+        self.detail = str(detail)
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __repr__(self) -> str:                       # pragma: no cover
+        return ("StopReport(ok=%r, mine=%r, line=%r, detail=%r)"
+                % (self.ok, self.mine, self.line, self.detail))
 
 
 def view_subject(machine: str, *, at: float) -> Optional[CastSubject]:
@@ -640,6 +691,7 @@ class _ViewSink:
                  settle: Optional[Callable[[float], object]] = None,
                  later: Optional[Callable[[float, Callable], object]] = None,
                  retract: Optional[Callable[[str], object]] = None,
+                 arm: Optional[Callable[[], object]] = None,
                  settle_s: float = VIEWER_SETTLE_S,
                  confirm_s: float = VIEWER_CONFIRM_S) -> None:
         self._now = now
@@ -653,9 +705,24 @@ class _ViewSink:
         # sleeps nor spawns; the default is a daemon timer.
         self._later = later if callable(later) else _default_later
         self._retract = retract if callable(retract) else None
+        # HOW THE PROBE IS TIED TO THIS CAST. The Spark -> HPCOMPUTER probe
+        # answers "is there an established RustDesk socket from HPCOMPUTER",
+        # which is true of a session HE opened himself before Jarvis was
+        # asked for anything. ``arm`` is called BEFORE the cast starts, so
+        # the probe can answer about what appeared AFTER it. Optional: a
+        # sink with no arm behaves exactly as round 4 did.
+        self._arm = arm if callable(arm) else None
         self.settle_s = float(settle_s)
         self.confirm_s = float(confirm_s)
         self._watch = None
+        # THE GENERATION COUNTER, and it is what makes a stop he asked for
+        # unable to be retracted. ``_confirm`` reads the deck, then spends
+        # VIEWER_STREAM sampling time inside the real probe (0.35 s), and a
+        # "stop the cast" inside that window used to still get "The cast has
+        # dropped, sir." -- and to re-stamp the suppression window with it.
+        # Every end of a cast bumps this; the timer carries the value it was
+        # armed with and does nothing at all if it has moved.
+        self._epoch = 0
 
     def needs_readback(self, subject: Optional[CastSubject] = None) -> bool:
         return False
@@ -690,13 +757,43 @@ class _ViewSink:
             return None
         return held_result(BUSY_FULL_LINE, sink=self.name, detail=why)
 
-    def stop_cast(self) -> bool:
-        """Stop what THIS sink started. False when nothing of ours is up."""
+    def stop_cast(self) -> StopReport:
+        """Stop what THIS sink started, AND WAIT FOR THE RECEIPT.
+
+        ROUND 5, AND IT IS THE ONE HE CAN HIT TODAY. This method used to
+        call ``_stop()``, release the deck and return True unconditionally,
+        so Jarvis said "Cast stopped, sir." at the instant the verb was
+        PARKED -- measured at that moment: viewers up on HPCOMPUTER 1, kill
+        attempts 0. The helper then failed to kill it, reported
+        ``stop-failed``, and NOTHING SPOKE IT: the deck was already
+        released and ``failed_for(seq)`` was read by nobody. Asking again
+        did not help, because ``state.live`` was already "" and the second
+        "stop the cast" answered "There's nothing cast, sir." with the
+        window still on his middle monitor.
+
+        This is the same PARKED-IS-NOT-RECEIVED rule round 4 applied to the
+        show verb, and it uses the same three pieces: ``await_ack``,
+        ``failed_for`` and ``HELPER_FAIL_LINES``. The other direction has
+        the mirror of it -- after telling the local viewer to die, ask the
+        same ``alive`` probe the landing claim already trusts whether it
+        did.
+
+        THE DECK IS NOT GIVEN BACK BY A STOP THAT DID NOT HAPPEN. The deck
+        is the record of what is on his screens; releasing it for a viewer
+        that is still up is precisely what made the second ask unanswerable.
+        A stop that failed leaves the cast live, says why, and can be asked
+        again.
+        """
         if self.state.live != self.name:
-            return False
-        self._stop()
+            return StopReport(False, False, NOTHING_UP_LINE,
+                              NOTHING_OF_OURS_REASON)
+        ok, line, why = self._stop(confirm=True)
+        if not ok:
+            log.warning("castview: %s would not stop (%s); the deck stays "
+                        "held", self.name, why)
+            return StopReport(False, True, line or STOP_FAILED_LINE, why)
         self.state.release()
-        return True
+        return StopReport(True, True, STOPPED_LINE, "")
 
     # -- the evidence ---------------------------------------------------
     def _settle_and_confirm(self) -> Optional[object]:
@@ -721,13 +818,49 @@ class _ViewSink:
                                    NOT_CONNECTED_REASON)
         if linked is None:
             return self._give_back(CANNOT_TELL_LINE, CANNOT_TELL_REASON)
-        self._arm_confirm()
+        if not self._arm_confirm():
+            # ROUND 5: A LANDING IS NOT CLAIMED WHEN THE WATCHDOG CANNOT BE
+            # ARMED. ``_arm_confirm`` used to swallow the exception from
+            # ``_later`` and return, and ``deliver`` still said landed and
+            # still held the deck -- so the one thing that would notice the
+            # cast dropping was gone and nothing said so. The shipped
+            # ``_later`` is ``threading.Timer(...).start()``, which raises
+            # under thread exhaustion; that is not hypothetical on a box
+            # that has had an OOM kill. Failing to arm it HOLDS.
+            return self._give_back(NO_WATCHDOG_LINE, NO_WATCHDOG_REASON)
         return None
 
     def _give_back(self, line: str, why: str):
-        self._stop()
+        """Give the deck back and say why. Best-effort on the stop itself.
+
+        This is the path for a cast that did NOT land, so the deck must
+        come back whatever the stop does -- holding it here is what round 3
+        did, and the next genuine cast was refused as busy for ever. A stop
+        that fails on the way out is logged and named in the detail; it is
+        not allowed to strand the deck.
+        """
+        ok, _line, stop_why = self._stop()
+        if not ok:
+            log.warning("castview: %s could not be stopped on the way out "
+                        "(%s)", self.name, stop_why)
+            why = "%s; %s" % (why, stop_why)
         self.state.release()
         return held_result(line, sink=self.name, detail=why)
+
+    def _arm_probe(self) -> None:
+        """Tell the connection probe that THIS cast is what it is about.
+
+        Called before anything is started, and never allowed to stop a
+        cast: a probe that cannot take a baseline is a probe with less
+        evidence, which the tri-state already knows how to say.
+        """
+        if self._arm is None:
+            return
+        try:
+            self._arm()
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: arming the connection probe raised",
+                      exc_info=True)
 
     def _is_connected(self) -> Optional[bool]:
         """True, False, or None for CANNOT TELL. A probe that raises has
@@ -746,28 +879,77 @@ class _ViewSink:
         direction; the base has nothing of its own to look at."""
         return True
 
-    def _arm_confirm(self) -> None:
+    def _arm_confirm(self) -> bool:
         """The SECOND LOOK. A cast alive at the settle and gone at three
         seconds was claimed and never revisited, so the deck stayed held
         by something that was not there and the next genuine cast was
         refused as busy. This gives the deck back and takes the sentence
-        back."""
-        try:
-            self._watch = self._later(self.confirm_s, self._confirm)
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: the confirm timer would not arm",
-                      exc_info=True)
-            self._watch = None
+        back.
 
-    def _confirm(self) -> None:
+        ROUND 5 MADE IT REPORT AND MADE IT REPEAT. It returned None
+        whether it armed or not, and the caller claimed a landing either
+        way; now the caller HOLDS when it cannot be armed. And the timer
+        it arms carries the generation it was armed in, so a cast he
+        stopped in the meantime cannot be spoken about by a timer that was
+        already in flight.
+        """
+        epoch = self._epoch
+        try:
+            self._watch = self._later(self.confirm_s,
+                                      lambda: self._confirm(epoch))
+        except Exception:                           # noqa: BLE001 - the seam
+            log.warning("castview: the confirm timer would not arm for %s",
+                        self.name, exc_info=True)
+            self._watch = None
+            return False
+        return True
+
+    def _confirm(self, epoch: Optional[int] = None) -> None:
+        """Look again -- AND KEEP LOOKING.
+
+        ROUND 5, TWO DEFECTS IN ONE METHOD.
+
+        IT WAS ONE-SHOT. MEASURED: the confirm fired at 4.0 s, found
+        everything well, and no timer was ever armed again. Run the clock
+        200 s with the viewer gone and the deck was still held, retractions
+        0, timers 0, and the next genuine cast refused as busy -- which is
+        the exact failure the second look was added to close, arriving one
+        confirm later. It re-arms itself now for as long as the cast is
+        both live and ours.
+
+        AND IT COULD RETRACT A STOP HE ASKED FOR. It read ``state.live``,
+        then spent 0.35 s inside the real probe, and a "stop the cast" in
+        that window still got "The cast has dropped, sir. What I told you a
+        moment ago is no longer true." -- and pushed the suppression window
+        forward with it, so the cast he asked for next was refused as too
+        soon. The deck and the generation are BOTH re-read after the probe,
+        because the probe is where the time goes.
+        """
+        if epoch is not None and epoch != self._epoch:
+            return                                  # a stale timer
         self._watch = None
         if self.state.live != self.name:
             return                                  # already stopped
-        if self._still_there() and self._is_connected() is True:
+        there = self._still_there()
+        linked = self._is_connected()
+        if epoch is not None and epoch != self._epoch:
+            return                                  # he stopped it mid-probe
+        if self.state.live != self.name:
+            return
+        if there and linked is True:
+            if not self._arm_confirm():
+                # The cast IS there; refusing to believe it because a timer
+                # would not start would be a second untrue sentence. Say so
+                # in the log and stop watching, which is a degradation and
+                # not a lie: ``stop_cast`` still works.
+                log.warning("castview: %s is up but can no longer be "
+                            "watched", self.name)
             return
         log.warning("castview: the cast was gone %.1fs after it was claimed",
                     self.confirm_s)
-        self._stop()
+        ok, _line, why = self._stop()
+        if not ok:
+            log.warning("castview: ...and it would not stop either (%s)", why)
         self.state.release()
         if self._retract is not None:
             try:
@@ -776,7 +958,20 @@ class _ViewSink:
                 log.debug("castview: the retraction raised", exc_info=True)
 
     # -- stopping -------------------------------------------------------
-    def _stop(self) -> None:
+    def _stop(self, *, confirm: bool = False) -> tuple:
+        """``(ok, line, detail)``. ``ok`` is whether it actually stopped.
+
+        ``confirm`` is what separates the two callers. HIS stop asks for a
+        receipt and must not lie about it. The internal give-backs -- a
+        cast that never landed, a second look that found it gone -- are
+        cleanup on a cast that is already not there, and they must not
+        spend the ack budget or hold the deck; they take the best-effort
+        path and log what went wrong.
+
+        The generation moves HERE, on every end of a cast, which is what
+        makes an in-flight second look harmless.
+        """
+        self._epoch += 1
         watch, self._watch = self._watch, None
         cancel = getattr(watch, "cancel", None)
         if callable(cancel):
@@ -786,12 +981,25 @@ class _ViewSink:
                 log.debug("castview: the confirm timer would not cancel",
                           exc_info=True)
         try:
-            self._stop_here()
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: stopping the cast raised", exc_info=True)
+            ok, line, why = self._stop_here(confirm=confirm)
+        except Exception as exc:                    # noqa: BLE001 - the seam
+            # ROUND 5: A RAISING ``_stop_here`` MUST NOT BECOME A TRUE.
+            # It was swallowed here, so a kill that raised still returned,
+            # still said "Cast stopped, sir.", still released the deck --
+            # and left a viewer alive that nothing was tracking, so the
+            # next cast opened a second one on top of it.
+            log.warning("castview: stopping %s raised: %s", self.name, exc,
+                        exc_info=True)
+            return False, self.stop_failed_line, str(exc) or STOP_FAILED_REASON
+        return bool(ok), str(line or ""), str(why or "")
 
-    def _stop_here(self) -> None:                   # pragma: no cover - base
-        pass
+    # What THIS direction says when the thing it started would not close.
+    stop_failed_line = STOP_FAILED_LINE
+
+    def _stop_here(self, *, confirm: bool = False) -> tuple:
+        """``(ok, line, detail)``. The base has nothing of its own to stop,
+        so there is nothing that can fail."""
+        return True, "", ""
 
 
 class SparkViewSink(_ViewSink):
@@ -820,6 +1028,7 @@ class SparkViewSink(_ViewSink):
                  settle: Optional[Callable[[float], object]] = None,
                  later: Optional[Callable[[float, Callable], object]] = None,
                  retract: Optional[Callable[[str], object]] = None,
+                 arm: Optional[Callable[[], object]] = None,
                  settle_s: float = VIEWER_SETTLE_S,
                  confirm_s: float = VIEWER_CONFIRM_S,
                  host: str = HPCOMPUTER_HOST,
@@ -827,7 +1036,7 @@ class SparkViewSink(_ViewSink):
                  now: Callable[[], float] = time.monotonic) -> None:
         super().__init__(state=state, now=now, connected=connected,
                          settle=settle, later=later, retract=retract,
-                         settle_s=settle_s, confirm_s=confirm_s)
+                         arm=arm, settle_s=settle_s, confirm_s=confirm_s)
         self._launch = launch if callable(launch) else None
         self._stop_fn = stop if callable(stop) else None
         # ``alive`` answers one question a moment after the launch: is the
@@ -866,6 +1075,7 @@ class SparkViewSink(_ViewSink):
         busy = self._busy()
         if busy is not None:
             return busy
+        self._arm_probe()
         try:
             self._launch(self.host)
         except Exception as exc:                    # noqa: BLE001 - the seam
@@ -889,10 +1099,25 @@ class SparkViewSink(_ViewSink):
             log.debug("castview: the viewer probe raised", exc_info=True)
             return False
 
-    def _stop_here(self) -> None:
+    def _stop_here(self, *, confirm: bool = False) -> tuple:
+        """Close the viewer THIS app started, and -- when he asked for it --
+        CHECK. The mirror of the helper's ``stop-failed`` code, made out of
+        the probe the landing claim already trusts: after telling it to die,
+        ask whether it did.
+
+        A ``_stop_fn`` that raises is caught by ``_stop`` and is never a
+        True; before round 5 it was swallowed, so a kill that raised still
+        said "Cast stopped, sir." with the viewer alive and the deck given
+        back, and the next cast opened a second viewer on top of it.
+        """
         if self._stop_fn is None:
-            return
+            return True, "", ""
         self._stop_fn()
+        if not confirm or self._alive is None:
+            return True, "", ""
+        if self._still_there():
+            return False, STOP_FAILED_LINE, STOP_FAILED_REASON
+        return True, "", ""
 
 
 class HpViewSink(_ViewSink):
@@ -944,12 +1169,13 @@ class HpViewSink(_ViewSink):
                  settle: Optional[Callable[[float], object]] = None,
                  later: Optional[Callable[[float, Callable], object]] = None,
                  retract: Optional[Callable[[str], object]] = None,
+                 arm: Optional[Callable[[], object]] = None,
                  settle_s: float = VIEWER_SETTLE_S,
                  confirm_s: float = VIEWER_CONFIRM_S,
                  now: Callable[[], float] = time.monotonic) -> None:
         super().__init__(state=state, now=now, connected=connected,
                          settle=settle, later=later, retract=retract,
-                         settle_s=settle_s, confirm_s=confirm_s)
+                         arm=arm, settle_s=settle_s, confirm_s=confirm_s)
         self.relay = relay
         self.ack_s = float(ack_s)
         # How the receipt is waited for. None is the real one -- the
@@ -993,6 +1219,9 @@ class HpViewSink(_ViewSink):
         busy = self._busy()
         if busy is not None:
             return busy
+        # BEFORE THE VERB, so the probe can tell this cast's connection from
+        # a RustDesk session he had open already.
+        self._arm_probe()
         try:
             seq = self.relay.set_verb(VERB_SHOW)
         except Exception as exc:                    # noqa: BLE001 - the seam
@@ -1028,10 +1257,30 @@ class HpViewSink(_ViewSink):
         the connection probe is the fast half."""
         return self.relay is not None and bool(self.relay.alive())
 
-    def _stop_here(self) -> None:
+    stop_failed_line = HELPER_FAIL_LINES["stop-failed"]
+
+    def _stop_here(self, *, confirm: bool = False) -> tuple:
+        """Park the stop verb -- AND, WHEN HE ASKED FOR IT, WAIT FOR THE
+        RECEIPT. PARKED IS NOT RECEIVED, exactly as for the show verb.
+
+        The Windows script has reported ``stop-failed`` since round 4 and
+        deliberately does NOT move its receipt on one, so the two outcomes
+        are already distinguishable on the wire: an ack means the viewer is
+        gone, a code means it is still up, and silence means the machine
+        never came back for it. All three now reach a sentence.
+        """
         if self.relay is None:
-            return
-        self.relay.set_verb(VERB_STOP)
+            return True, "", ""
+        seq = self.relay.set_verb(VERB_STOP)
+        if not confirm:
+            return True, "", ""
+        if self.relay.await_ack(seq, self.ack_s, wait=self._wait):
+            return True, "", ""
+        why = self.relay.failed_for(seq)
+        line = HELPER_FAIL_LINES.get(why, NO_STOP_RECEIPT_LINE)
+        log.warning("castview: no receipt for the stop %d after %.1fs (%s)",
+                    seq, self.ack_s, why or "silence")
+        return False, line, (why or NO_STOP_RECEIPT_REASON)
 
 
 def _default_later(delay_s: float, fn: Callable[[], object]):
@@ -1069,8 +1318,11 @@ __all__ = [
     "HELPER_ACK_S", "HELPER_ALIVE_S", "HPCOMPUTER_HOST", "HpViewSink",
     "MAX_LAYOUT_CHARS",
     "NOTHING_UP_LINE", "NO_EVIDENCE_LINE", "NO_HELPER_LINE",
-    "NO_HELPER_REASON",
+    "NO_HELPER_REASON", "NOTHING_OF_OURS_REASON",
     "NO_PROBE_REASON", "NO_RECEIPT_LINE", "NO_RECEIPT_REASON",
+    "NO_STOP_RECEIPT_LINE", "NO_STOP_RECEIPT_REASON", "NO_WATCHDOG_LINE",
+    "NO_WATCHDOG_REASON", "STOP_FAILED_LINE", "STOP_FAILED_REASON",
+    "StopReport",
     "NO_VIEWER_LINE", "NO_VIEWER_REASON", "SHOWN_LINE", "SPARK_HOST",
     "STOPPED_LINE", "SparkViewSink", "VERBS", "VERB_NONE", "VERB_SHOW",
     "VERB_STOP", "VIEWER_DIED_LINE", "VIEWER_DIED_REASON",

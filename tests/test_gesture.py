@@ -651,11 +651,16 @@ def test_events_and_status_are_numbers_only():
     assert_numbers_only(m.status())
     ev = CastEvent(kind="throw", at=1.0, frame=3, sector="left", toward="left")
     # ROUND 4 added the two a silent drop never told him: how fast the
-    # hand actually went, and which bar refused it.
+    # hand actually went, and which bar refused it. ROUND 5 added the two
+    # that made those honest -- ``fling_us``, the speed the bar was
+    # ACTUALLY compared against (``speed_us`` is the peak of the whole
+    # carry and could sit above the bar on a refusal), and ``windup_u``,
+    # how far the hand pulled back before it swung.
     assert set(ev.numbers_only()) == {"kind", "at", "frame", "dist_u",
                                       "bearing_deg", "sector", "why", "reach",
                                       "closed", "payload", "toward",
-                                      "speed_us", "refused"}
+                                      "speed_us", "fling_us", "windup_u",
+                                      "refused"}
 
 
 def test_the_machine_holds_no_array_and_no_observation():

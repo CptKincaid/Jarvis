@@ -84,10 +84,24 @@ def deck(clock=None, *, launch=True, helper_at=None, answers=True,
     # ROUND 3: a live process is not a connection, so the sink now needs a
     # ``connected`` probe too, and a ``later`` for the second look. Both
     # are injected recorders here; nothing opens a viewer or a socket.
+    # ROUND 5: THE RECORDER MODELS THE REAL SEAM'S OWN DEATH. ``stop`` used
+    # to record the call and leave ``alive`` answering True for ever, which
+    # no real viewer does -- ``JarvisApp._rustdesk_close`` drops the Popen
+    # so ``_rustdesk_alive()`` is False the moment after. The stop verb now
+    # CHECKS with that probe, so a recorder that never dies is a recorder
+    # that models a viewer which would not close.
+    up = {"viewer": bool(viewer_up)}
+
+    def stop_viewer():
+        rec["stopped"].append(1)
+        up["viewer"] = False
+
     spark = cv.SparkViewSink(
-        launch=(lambda host: rec["launched"].append(host)) if launch else None,
-        stop=lambda: rec["stopped"].append(1),
-        alive=lambda: viewer_up, connected=lambda: viewer_up,
+        launch=(lambda host: (rec["launched"].append(host),
+                              up.__setitem__("viewer", bool(viewer_up)))
+                ) if launch else None,
+        stop=stop_viewer,
+        alive=lambda: up["viewer"], connected=lambda: up["viewer"],
         settle=rec["naps"].append,
         later=lambda d, fn: rec["later"].append((d, fn)),
         state=state, now=clock)

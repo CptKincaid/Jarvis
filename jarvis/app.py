@@ -1571,6 +1571,7 @@ class JarvisApp:
                 view_alive=self._rustdesk_alive,
                 view_connected=self._rustdesk_connected,
                 view_served=self._hpcomputer_watching,
+                view_serve_arm=self._hpcomputer_watch_arm,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
@@ -1679,6 +1680,33 @@ class JarvisApp:
     # same idea as _STREAM_SAMPLE_S and the same GUESS.
     _SERVE_SAMPLE_S = 0.35
 
+    def _hpcomputer_watch_arm(self) -> None:
+        """Remember which RustDesk connections from HPCOMPUTER were ALREADY
+        there, so the probe below can answer about THIS cast.
+
+        ROUND 5. ``_hpcomputer_watching`` said True for ANY established
+        socket from HPCOMPUTER on a screen-sharing port -- including a
+        RustDesk session he opened himself an hour earlier, which is a live
+        connection carrying a stream and is not a cast Jarvis landed. The
+        sink calls this before it parks the verb; anything in this set is
+        not evidence for what happens next.
+
+        THE LIMIT, and it is real: inode numbers are reused, and a
+        reconnect of his own session inside the same cast would look new.
+        This narrows the probe from "he has RustDesk open" to "a connection
+        appeared after I asked" and no further. It reads /proc/net and
+        nothing else -- no socket is opened, nothing leaves this box.
+        """
+        try:
+            self._serve_seen = set(procnet.established_to(
+                castview_mod.HPCOMPUTER_HOST, castview_mod.RUSTDESK_PORTS))
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving baseline could not be read",
+                      exc_info=True)
+            self._serve_seen = set()
+        log.info("cast: %d RustDesk connection(s) from HPCOMPUTER were "
+                 "already up before this cast", len(self._serve_seen))
+
     def _hpcomputer_watching(self) -> Optional[bool]:
         """Is HPCOMPUTER actually PULLING the Spark's screen?
 
@@ -1722,6 +1750,11 @@ class JarvisApp:
         try:
             inodes = procnet.established_to(castview_mod.HPCOMPUTER_HOST,
                                             castview_mod.RUSTDESK_PORTS)
+            # TIED TO THIS CAST, as far as local evidence reaches: a
+            # connection that was already up when the cast was asked for is
+            # his own session, not this one. With no baseline taken the
+            # behaviour is round 4's exactly.
+            inodes = set(inodes) - set(getattr(self, "_serve_seen", ()) or ())
             if not inodes:
                 return False
             pid = None

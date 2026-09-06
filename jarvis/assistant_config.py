@@ -902,36 +902,46 @@ DEFAULTS: dict = {
     # THIS KEY THAT MATTERS.
     #
     # This gesture FIRES WHEN HE IS NOT MAKING IT, and the rate is not
-    # close. MEASURED over 172 families of ordinary desk motion at his own
-    # desk geometry, 2752 synthetic sequences, same seeds across rounds
-    # (castgrid/, an independent adversarial grid):
+    # close. MEASURED at his own desk geometry on an independent
+    # adversarial grid (castgrid/), same seeds across every round:
     #
-    #   P(fire | NOT a cast gesture)
-    #     7.5 fps   0.2362   95% CI [0.2207, 0.2524]
-    #     6.0 fps   0.2322   95% CI [0.2168, 0.2483]
-    #     3.7 fps   0.1435   95% CI [0.1309, 0.1571]
+    #   P(fire | NOT a cast gesture), 226 families, 4192 sequences
+    #     7.5 fps   0.4986   95% CI [0.4834, 0.5137]
+    #     6.0 fps   0.4945   95% CI [0.4794, 0.5096]
+    #   ...of which the preserved 172-family grid alone, 2752 sequences,
+    #   is 0.2362 [0.2207, 0.2524] at 7.5 and 0.2322 at 6.0 -- unchanged
+    #   from round 4, because round 5 changed no bar that ships.
     #
-    # THE BAR IS 0.005. That is forty-seven times over it. About a fifth of
-    # the brisk motions near that monitor that anyone could invent -- a mug
-    # carried out in a second, a thing handed to someone beside him, a hand
-    # that leaves the picture and comes back -- fire a cast, and what a
-    # cast does is put a desktop on a monitor he is using.
+    # THE BAR IS 0.005. HALF the brisk motions near that monitor that
+    # anyone could invent -- a mug carried out in a second, a thing handed
+    # to someone beside him, a mug pulled toward him and then taken away --
+    # fire a cast, and what a cast does is put a desktop on a monitor he is
+    # using.
     #
-    # IT CANNOT BE TUNED DOWN FROM HERE. Six families still fire and they
-    # ARE his gesture by every signal this rig has: same approach, same
-    # dwell, same grip, same speed, same exit through the same edge. The
-    # second signal is a switch and not a dial -- ``yaw_hold_deg`` at or
-    # under 25 deg vetoes nothing, over 25 deg it refuses every throw he
-    # makes, and there is nothing between. Tightening ``throw_speed_us``
-    # buys rate by cutting into his own throw: round 3 did exactly that and
-    # the gesture stopped firing when his swing was 10 mm shorter.
+    # IT CANNOT BE TUNED DOWN FROM HERE, AND THREE SIGNALS HAVE NOW BEEN
+    # TRIED. Speed: his brisk desk motion sits on the same side of the bar
+    # as his own throw, and tightening it cuts into his gesture (round 3
+    # did exactly that and the gesture stopped firing when his swing was
+    # 10 mm shorter). Head yaw: a switch and not a dial -- ``yaw_hold_deg``
+    # at or under 25 deg vetoes nothing, over 25 deg it refuses every
+    # throw he makes, nothing between.
     #
-    # THE ONE SIGNAL LEFT NEEDS AN ANSWER FROM HIM, NOT MORE MEASUREMENT.
-    # It is a true WIND-UP: a small backward retraction immediately before
-    # the swing. No synthetic grid can settle it -- a grid that invents a
-    # wind-up and then detects it has proved nothing -- so the question is
-    # HIS: does his own throw pull back before it goes? He has been asked
-    # and has not answered. Until he has, this stays False.
+    # AND THE WIND-UP, WHICH IS ROUND 5 AND IS THE END OF THE LINE. He was
+    # asked whether his throw pulls back before it swings and HE SAID YES,
+    # so it was built and measured (``windup_min_u``,
+    # castgrid/test_r5_windup.py). It is real -- an injected 40 mm
+    # retraction measures 0.247 hand-units -- and it does not separate,
+    # because his ORDINARY CARRIES retract by the same amount: at 40 mm,
+    # his throw 0.218 u against a carry that pulls back first at 0.239.
+    # The best bar in the sweep, 0.60 u, leaves the rate at 0.1054 (still
+    # 21x the bar) and needs a 120 mm pull-back before every throw. Worse,
+    # a wind-up made TOWARD HIS BODY reads 0.000 u at any amplitude,
+    # because it barely moves in the image plane -- so if that is the one
+    # he makes, any bar refuses every throw. His own amplitude and
+    # direction are UNKNOWN; the instrument is
+    #   ~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30 \
+    #       --windup
+    # and NOTHING it reports would change this switch. Leave it False.
     # ==================================================================
     #
     # OFF by default, like every other lens key. It RIDES THE CAMERA
@@ -1041,6 +1051,15 @@ DEFAULTS: dict = {
                 # Raising it cuts into his own throw; lowering it raises
                 # the false-fire rate above.
                 "throw_speed_us": 2.45, "fling_window_s": 0.55,
+                # ROUND 5's third signal, SHIPPED INERT AT 0.0. How far the
+                # hand must pull BACK along the throw axis before it swings,
+                # in hand-units. It is a real measurement and it does not
+                # separate -- see the block above and
+                # castgrid/test_r5_windup.py. It is a key here so he can
+                # raise it from his own room after running the self-check
+                # with --windup, and so a value he sets is printed beside
+                # the refusals it causes (screens_status()["bars"]).
+                "windup_min_u": 0.0,
                 # The pose-corrected fist scalar. MEASURED and shipped as a
                 # sanity floor rather than a gate (jarvis/gesture.py says
                 # why); open_ratio_min is deliberately at a value nothing

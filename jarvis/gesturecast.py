@@ -193,6 +193,7 @@ class GestureCast:
                  view_alive: Optional[Callable[[], bool]] = None,
                  view_connected: Optional[Callable[[], Optional[bool]]] = None,
                  view_served: Optional[Callable[[], Optional[bool]]] = None,
+                 view_serve_arm: Optional[Callable[[], object]] = None,
                  view_later: Optional[Callable[[float, Callable],
                                                object]] = None,
                  view_ack_wait: Optional[Callable[[float], object]] = None,
@@ -312,6 +313,7 @@ class GestureCast:
                                            state=self.view_state,
                                            wait=view_ack_wait,
                                            connected=view_served,
+                                           arm=view_serve_arm,
                                            later=view_later,
                                            retract=self._speak,
                                            settle=view_settle, now=now),
@@ -636,10 +638,23 @@ class GestureCast:
         """
         live = self.view_state.live
         for sink in self.views.values():
-            if getattr(sink, "name", "") == live and sink.stop_cast():
+            if getattr(sink, "name", "") != live:
+                continue
+            out = sink.stop_cast()
+            if out:
                 self._chip_do("dropped", "")
                 log.info("gesture: cast stopped (%s)", live)
                 return view_mod.STOPPED_LINE
+            # ROUND 5: A STOP THAT DID NOT HAPPEN IS NOT "NOTHING CAST".
+            # A bare False from the sink used to be indistinguishable from
+            # "that wasn't mine", so a viewer HPCOMPUTER could not close
+            # fell through to "There's nothing cast, sir." while it was
+            # still on his middle monitor. The sink now says which, and
+            # the cast stays live so he can ask again.
+            if getattr(out, "mine", False):
+                log.warning("gesture: the cast would not stop (%s): %s",
+                            live, getattr(out, "detail", ""))
+                return getattr(out, "line", "") or view_mod.STOP_FAILED_LINE
         return view_mod.NOTHING_UP_LINE
 
     def cast_screen(self, target: str) -> tuple:
@@ -728,10 +743,18 @@ class GestureCast:
             return
         self.short_throws += 1
         t = self.machine.t
-        log.info("gesture: throw refused (%s) -- travelled %.2f u, fastest "
-                 "%.2f u/s against a bar of %.2f, toward %r: %s",
-                 code, float(ev.dist_u), float(ev.speed_us),
-                 float(t.throw_speed_us), ev.toward or "?", ev.why)
+        # ROUND 5: THE NUMBER THE BAR WAS ACTUALLY COMPARED WITH GOES
+        # FIRST. This line used to quote ``speed_us``, the fastest step of
+        # the WHOLE carry, against a bar that is only ever compared with
+        # the speed INSIDE the fling window -- so it could tell him he
+        # threw at 2.61 against a bar of 2.45 and was refused on speed.
+        # The carry peak is still printed, named as what it is.
+        log.info("gesture: throw refused (%s) -- travelled %.2f u, %.2f u/s "
+                 "inside the fling window against a bar of %.2f (carry peak "
+                 "%.2f, wind-up %.2f u), toward %r: %s",
+                 code, float(ev.dist_u), float(ev.fling_us),
+                 float(t.throw_speed_us), float(ev.speed_us),
+                 float(ev.windup_u), ev.toward or "?", ev.why)
 
     # ---------------------------------------------------------- the cast
     def _propose_with(self, speak: Callable[[str], None]):
@@ -993,7 +1016,11 @@ class GestureCast:
                 "throw_exit_u": float(t.throw_exit_u),
                 "throw_lost_u": float(t.throw_lost_u),
                 "fling_window_s": float(t.fling_window_s),
-                "fling_grant_s": round(self.machine.fling_grant_s(), 4)}
+                "fling_grant_s": round(self.machine.fling_grant_s(), 4),
+                # ROUND 5's third signal. 0.0 is INERT and is what ships;
+                # it is printed anyway so a box where he has raised it says
+                # so beside the refusals it caused.
+                "windup_min_u": float(t.windup_min_u)}
 
     def relearn(self, why: str = "") -> None:
         """Forget the map and say so once. The three tripwires all land

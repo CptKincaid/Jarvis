@@ -171,18 +171,67 @@ its bar is not usefully different: both mean the gesture cannot be trusted
 to stay off his screens, and a recall cliff he cannot see is a worse thing
 to ship than a number that was already unshippable.
 
-WHAT WOULD ACTUALLY CLOSE IT, and it is not in this file's gift. The one
-remaining candidate signal is a true WIND-UP -- a small backward
-retraction immediately before the swing. It is absent from every throw
-model here, so NO SYNTHETIC GRID CAN SETTLE IT: a grid that invents a
-wind-up and then detects it proves only that the invention was
-detectable. HUNTER HAS BEEN ASKED WHETHER HIS OWN THROW HAS ONE AND HAS
-NOT ANSWERED. Until he does, this gesture stays ``enabled: False`` in
-jarvis/assistant_config.py and no amount of tuning in this file changes
-that. The second signal cannot help either and cannot be tuned into
-helping: ``yaw_hold_deg`` is a switch, not a dial -- at or under 25 deg of
-head movement it vetoes nothing and the rate is unchanged, over 25 deg it
-refuses every throw he makes, and there is no setting between.
+ROUND 5 ASKED HIM THE QUESTION AND MEASURED THE ANSWER. THIS IS THE END
+OF THE LINE FOR THIS GESTURE, AND IT IS A LEGITIMATE OUTCOME.
+
+Round 4 said the one remaining candidate was a true WIND-UP -- a small
+backward retraction immediately before the swing -- and that only he could
+say whether his throw has one. Asked directly on 2026-09-05, "when you
+throw, does your hand pull back a little first, before it swings?", HE
+ANSWERED YES. It is built, it is measured, and it is not enough.
+
+It is a real signal. ``CastEvent.windup_u`` is the most negative
+projection of the carry path onto the axis the throw took, over the prefix
+up to the furthest forward point, in hand-units; injected retractions come
+back monotonically (5 mm -> 0.049 u, 40 mm -> 0.247, 120 mm -> 0.822,
+MEASURED over 8 sub-frame phases and four retraction durations).
+
+AND IT DOES NOT SEPARATE, for two independent reasons.
+
+  * THE AMPLITUDE IS SHARED. On the PRESERVED 172-family grid a bar of
+    0.05 u takes P(fire | NOT a cast gesture) from 0.2362 to 0.0000, which
+    looks like a solution and IS AN ARTEFACT: that grid was built to
+    attack speed and distance and contains no retractions at all. Round 5
+    added 54 families that DO retract, invented adversarially and swept to
+    the same amplitudes his throw is -- pulling a mug toward himself
+    before lifting it away, drawing back to get a run at something heavy,
+    a hand that hesitates, settling a grip. They measure the SAME wind-up
+    his throw does: at 40 mm, his throw 0.218 u against a carry's 0.239.
+    On the honest 226-family grid, 4192 sequences, same seeds:
+
+        P(fire | NOT a cast gesture), by wind-up bar, 7.5 fps
+          bar 0.00 u   0.4986  95% CI [0.4834, 0.5137]   recall needs 0 mm
+          bar 0.15 u   0.2600  95% CI [0.2470, 0.2735]   ...needs  40 mm
+          bar 0.30 u   0.1935  95% CI [0.1818, 0.2057]   ...needs  80 mm
+          bar 0.60 u   0.1054  95% CI [0.0965, 0.1151]   ...needs 120 mm
+        and at 6.0 fps: 0.4945, 0.2510, 0.1868, 0.0942.
+
+    THE BAR IS 0.005. The best point in the sweep is TWENTY-ONE TIMES over
+    it and it asks him to pull his hand back 120 mm before every throw.
+    That is a performance, not a gesture, and it is not shippable.
+
+  * THE DIRECTION MAY MAKE IT INVISIBLE, which is worse than weak. The
+    wind-up is measured in the IMAGE PLANE. A retraction straight back
+    TOWARD HIS BODY reads 0.000 u at every amplitude up to 120 mm
+    (MEASURED) -- it does not even end the carry, recall stays 1.0000 with
+    the gate off -- so if that is the wind-up he makes, every bar above
+    0.02 refuses every throw he makes. THE AMPLITUDE AND THE DIRECTION OF
+    HIS OWN WIND-UP ARE UNKNOWN. He said it exists; he did not measure it,
+    and nothing in this repo has ever seen his hand. The numbers-only
+    instrument is:
+
+        ~/vss_env/bin/python scripts/gesture_selfcheck.py \
+            --seconds 30 --windup
+
+So ``windup_min_u`` ships at 0.0, which refuses nothing, and this gesture
+stays ``enabled: False`` in jarvis/assistant_config.py. The second signal
+cannot help either and cannot be tuned into helping: ``yaw_hold_deg`` is a
+switch, not a dial -- at or under 25 deg of head movement it vetoes
+nothing and the rate is unchanged, over 25 deg it refuses every throw he
+makes, and there is no setting between. Three independent signals have now
+been measured against this grid and none of them separates his throw from
+his desk. THE SPOKEN CAST IS NOT BEHIND THIS SWITCH and is where the work
+belongs.
 
 EVERY THRESHOLD BELOW IS A CALIBRATED STARTING POINT, NOT A VALIDATED VALUE.
 They come from arithmetic over a synthetic hand whose proportions match the
@@ -262,6 +311,13 @@ MIN_PALM_DIAG_PX = 1e-6
 # rather than averaged in.
 UNIT_MEDIAN_FRAMES = 3
 
+# How many carry frames the round-5 traces keep. The carry cap is 30 frames
+# and ``for_fps`` may scale it up for a faster feed; this is comfortably
+# above any of that and it is a HARD BOUND -- neither trace may grow with
+# session length, because an unbounded record on the capture thread is how
+# this box has already lost a session.
+CARRY_TRACE_FRAMES = 96
+
 # The frame rate every frame counter below was designed at. The camera
 # delivers ~7.5 fps (measured 09-02, 133 ms per frame) and camera.preview_fps
 # defaults to 6.0; the counters are correct across that band and are scaled
@@ -314,8 +370,10 @@ NO_HEAD = _NoHead()
 # ROUND 4 ADDED THESE BECAUSE THE FAILURE WAS SILENT. A throw refused by
 # the speed bar produced a drop, a tone, and nothing he could read; "it
 # just did nothing" was the whole story he had, and he cannot debug that.
+#   "windup"    ROUND 5: it never pulled back before it swung. Inert at
+#               the shipped bar of 0.0 -- see ``windup_min_u``.
 REFUSALS = ("", "speed", "distance", "look", "direction", "sector",
-            "cancel", "carry")
+            "cancel", "carry", "windup")
 
 # Frame edges and the four sectors, in HIS frame. Sector centres are the
 # bearings to_his_frame produces for the four cardinal directions.
@@ -771,6 +829,43 @@ class CastThresholds:
     # be spent at the end of it. 0.55 s is four frames at 7.5 fps and one
     # at the camera's 2 fps idle rate.
     fling_window_s: float = 0.55
+    # ================================================================
+    # ROUND 5, AND IT IS THE SIGNAL THE LAST THREE ROUNDS RAN OUT OF.
+    #
+    # THE WIND-UP. Asked directly on 2026-09-05 -- "when you throw, does
+    # your hand pull back a little first, before it swings?" -- HE ANSWERED
+    # YES. It was absent from every throw model in this lane, whose spans
+    # are reach, close, hold still, swing, which is exactly why it had to
+    # be asked rather than measured. It is the one signal a carry cannot
+    # fake at any speed, because carrying something away never reverses
+    # before it leaves.
+    #
+    # It is NOT the reversal round 3 disproved. That was APPROACH versus
+    # EXIT and it scored nothing, because his hand comes in from his left
+    # in the throw and in the carry alike, so it only ever encoded which
+    # side he threw to. THIS is a backward retraction WITHIN the throw,
+    # after the dwell and before the fling, measured along the axis the
+    # throw eventually took: the most negative projection of the carry path
+    # onto that axis, over the prefix up to the furthest forward point, in
+    # hand-units.
+    #
+    # THE AMPLITUDE AND DURATION OF HIS OWN WIND-UP ARE UNKNOWN. He said it
+    # exists; he did not measure it, and nothing in this repo has seen his
+    # hand. ``scripts/gesture_selfcheck.py --windup`` is the numbers-only
+    # instrument that lets him find out.
+    #
+    # AND THE BAR SHIPS AT 0.0, WHICH IS INERT, BECAUSE THE MEASUREMENT
+    # SAYS IT DOES NOT SEPARATE. castgrid/test_r5_windup.py sweeps the bar
+    # against the preserved 172-family grid PLUS 40 new families invented
+    # adversarially to contain a retraction of their own -- pulling a mug
+    # toward himself before lifting it away, drawing back to get a run at
+    # something heavy, a hand that hesitates before it leaves. Those
+    # families retract exactly as his throw does, so every bar that keeps
+    # his own recall also keeps them, and the numbers are in that file and
+    # in the module docstring. A gate that only looks like it works is
+    # worse than none: this one is MEASURED, REPORTED, and OFF.
+    windup_min_u: float = 0.0
+    # ================================================================
     # ROUND 3, AND THE SECOND INDEPENDENT SIGNAL. One scalar cannot
     # separate his throw from his desk motion: MEASURED, his brisk desk
     # motion sits on the SAME SIDE of the speed bar as his own slow throw
@@ -930,6 +1025,22 @@ class CastEvent:
     # ``refused`` is one of ``REFUSALS`` and is "" on a throw.
     speed_us: float = 0.0
     refused: str = ""
+    # ROUND 5. ``speed_us`` IS NOT THE NUMBER THE BAR WAS COMPARED WITH,
+    # and the comment above it said it was. ``_was_flung`` asks whether the
+    # hand was at ``throw_speed_us`` inside ``fling_grant_s`` OF THE MOMENT
+    # THE THROW WOULD FIRE; ``speed_us`` is the peak of the WHOLE carry, so
+    # a carry with one quick correction early and a slow exit is refused on
+    # speed while this number sits above the bar. MEASURED on the jerk-carry
+    # family: peak 2.61 against a bar of 2.45, refused on speed. This is the
+    # instrument he is being handed to settle whether his own throw is
+    # inside the surface, so it now carries BOTH: the carry peak, and
+    # ``fling_us`` -- the fastest CREDITED step inside the window the bar
+    # actually used.
+    fling_us: float = 0.0
+    # ROUND 5, THE SECOND SIGNAL: how far the hand pulled BACK along the
+    # axis the throw eventually took, before it swung, in hand-units.
+    # Measured on every carry end, gated only when ``windup_min_u`` > 0.
+    windup_u: float = 0.0
 
     def numbers_only(self) -> dict:
         return {"kind": self.kind, "at": round(float(self.at), 4),
@@ -940,6 +1051,8 @@ class CastEvent:
                 "reach": round(float(self.reach), 4),
                 "closed": round(float(self.closed), 4),
                 "speed_us": round(float(self.speed_us), 3),
+                "fling_us": round(float(self.fling_us), 3),
+                "windup_u": round(float(self.windup_u), 4),
                 "refused": self.refused,
                 "payload": self.payload, "toward": self.toward}
 
@@ -1061,6 +1174,17 @@ class CastGesture:
         # was refusing. Reset wherever _fling_at is.
         self._peak_us = 0.0
         self._fling_at = -1e9
+        # ROUND 5. Two bounded records of the carry, and neither is a frame.
+        # ``_win`` is (clock, credited speed) per carry frame, so a refusal
+        # can quote the peak INSIDE the fling window rather than the peak of
+        # the whole carry -- which is the number the bar was never compared
+        # against. ``_path`` is (cx, cy, unit) per carry frame, which is
+        # what the wind-up is measured out of at the end, when the axis the
+        # throw took is finally known. Both are hard-bounded by the carry
+        # cap; neither grows with session length.
+        self._win: deque = deque(maxlen=CARRY_TRACE_FRAMES)
+        self._path: deque = deque(maxlen=CARRY_TRACE_FRAMES)
+        self._windup_u = 0.0
         # Tri-state, and it is the SECOND SIGNAL: was he looking at the
         # screen he grabbed, from before the reach through to the last
         # frame that held the hand? None until a frame says otherwise;
@@ -1149,6 +1273,8 @@ class CastGesture:
                 "dist_u": round(float(self._dist_u), 4),
                 "speed_us": round(float(self._speed_us), 3),
                 "peak_us": round(float(self._peak_us), 3),
+                "fling_us": round(float(self.fling_us(now)), 3),
+                "windup_u": round(float(self.windup_u()), 4),
                 "flung": bool(self._was_flung(now)),
                 "looking": ("" if self._look is NO_HEAD
                             else "?" if self._look is None
@@ -1386,6 +1512,12 @@ class CastGesture:
                 self._jumped = True
             self._last_step_u = 0.0 if self._jumped else step
         self._note_speed(now)
+        if not self._jumped:
+            # THE PATH THE WIND-UP IS MEASURED OUT OF, and it takes the
+            # same credit rule the fling does: a frame the association
+            # could not be sure about is followed but is not evidence. A
+            # wind-up made of his OTHER hand appearing is not a wind-up.
+            self._path.append((o.cx, o.cy, step_unit))
         self._last = (o.cx, o.cy)
         self._dist_u = math.hypot(o.cx - self._anchor[0],
                                   o.cy - self._anchor[1]) / unit
@@ -1441,6 +1573,12 @@ class CastGesture:
         # A step that had to be a RE-ASSOCIATION is not travel, so it is
         # not fling evidence either -- however fast the arithmetic makes
         # it look. The hand is still followed; only the credit is refused.
+        if not self._jumped:
+            # THE SAMPLE THE BAR IS ACTUALLY COMPARED WITH. Credited steps
+            # only, exactly like ``_fling_at`` below -- a re-association is
+            # not travel, so it is not evidence and must not be quoted back
+            # to him as a speed he made.
+            self._win.append((now, float(self._speed_us)))
         if self._speed_us >= self.t.throw_speed_us and not self._jumped:
             self._fling_at = now
         self._last_seen_at = now
@@ -1472,6 +1610,58 @@ class CastGesture:
         crawl -- which is the tightest honest answer there.
         """
         return (float(now) - self._fling_at) <= self.fling_grant_s()
+
+    def fling_us(self, now: float) -> float:
+        """The fastest CREDITED step inside the window the fling bar was
+        compared against, in hand-units per second.
+
+        ROUND 5, AND IT IS A DIAGNOSTIC FIX WITH TEETH. ``_peak_us`` is the
+        peak of the WHOLE carry and the refusal quoted it, so a carry with
+        one quick correction early and a slow exit was refused on speed
+        while the number printed sat ABOVE the bar -- it could tell him he
+        threw at 2.61 against a bar of 2.45 and was refused on speed. This
+        is the number that decided it, and the law it keeps is exact:
+        ``fling_us(now) >= throw_speed_us`` is true if and only if
+        ``_was_flung(now)`` is, because both read the same credited samples
+        over the same grant.
+        """
+        grant = self.fling_grant_s()
+        best = 0.0
+        for at, speed in self._win:
+            if (float(now) - at) <= grant and speed > best:
+                best = speed
+        return best
+
+    def windup_u(self) -> float:
+        """How far the hand pulled BACK before it swung, in hand-units.
+
+        Measured along the axis the throw eventually took -- anchor to the
+        last frame that held the fist -- as the most negative projection of
+        the carry path, over the PREFIX up to the furthest forward point.
+        The prefix is what makes it a wind-up rather than a return: a hand
+        that goes out and comes back (``exit-return``, one of the
+        attacker's own non-gesture families) has its retraction AFTER the
+        furthest point and scores zero.
+
+        Each point is divided by the unit measured on ITS OWN frame, so the
+        number is a ratio and does not move with his reach.
+        """
+        anchor = self._anchor
+        end = self._last_fist or self._last
+        if anchor is None or end is None or len(self._path) < 2:
+            return 0.0
+        ax, ay = end[0] - anchor[0], end[1] - anchor[1]
+        span = math.hypot(ax, ay)
+        if span < MIN_PALM_DIAG_PX:
+            return 0.0
+        ax, ay = ax / span, ay / span
+        projs = [((px - anchor[0]) * ax + (py - anchor[1]) * ay)
+                 / max(unit, MIN_PALM_DIAG_PX) for px, py, unit in self._path]
+        if not projs:
+            return 0.0
+        far = projs.index(max(projs))
+        back = min(projs[:far + 1])
+        return -back if back < 0.0 else 0.0
 
     def fling_grant_s(self) -> float:
         """How long ago the hand may last have been flinging and the exit
@@ -1518,6 +1708,9 @@ class CastGesture:
         self._last_fist = None
         self._dist_u = 0.0
         self._last_step_u = 0.0
+        self._win.clear()
+        self._path.clear()
+        self._windup_u = 0.0
         self._last_seen_at = None
         self._speed_us = 0.0
         self._peak_us = 0.0
@@ -1584,6 +1777,13 @@ class CastGesture:
         self._peak_us = 0.0
         self._fling_at = -1e9
         self._jumped = False
+        # The traces start EMPTY except for the anchor itself, which is
+        # where the wind-up is measured from. A fist that was moving before
+        # it was picked up brings no credit with it, and no path either.
+        self._win.clear()
+        self._path.clear()
+        self._path.append((o.cx, o.cy, max(self._unit, MIN_PALM_DIAG_PX)))
+        self._windup_u = 0.0
         # The look starts from THIS frame's opinion: the grab is part of
         # "through the grab and through the swing".
         self._look = self._looking
@@ -1606,6 +1806,9 @@ class CastGesture:
         self._speed_us = 0.0
         self._peak_us = 0.0
         self._fling_at = -1e9
+        self._win.clear()
+        self._path.clear()
+        self._windup_u = 0.0
         self._look = NO_HEAD
         self._jumped = False
 
@@ -1629,6 +1832,13 @@ class CastGesture:
         # TAKEN NOW, because _enter_cooldown below clears it and the whole
         # point of the field is that the refusal can say what it refused.
         peak_us = float(self._peak_us)
+        # ...and the number the bar was ACTUALLY compared with, which is
+        # not that one. See ``fling_us``.
+        window_us = float(self.fling_us(now))
+        # THE WIND-UP, measured before the traces are cleared. Measured on
+        # every carry end, gated only when ``windup_min_u`` is above zero.
+        windup = float(self.windup_u())
+        self._windup_u = windup
         end = self._last_fist or self._last or anchor
         unit = max(self._unit, MIN_PALM_DIAG_PX)
         dx, dy = end[0] - anchor[0], end[1] - anchor[1]
@@ -1687,6 +1897,18 @@ class CastGesture:
         # held the hand. A carry that he watched leave, or one made while
         # his head was turned, is a drop. NO OPINION (no clean face row)
         # falls whichever way ``yaw_required`` says, and it says refuse.
+        # THE THIRD SIGNAL, ROUND 5, AND IT IS ANDED LIKE THE SECOND. A
+        # throw pulls back before it swings; carrying something away never
+        # reverses before it leaves. ``windup_min_u`` ships at 0.0, which
+        # refuses nothing -- the measurement is the deliverable and the gate
+        # is off, because the adversarial retraction families measure the
+        # same retraction his throw does (castgrid/test_r5_windup.py).
+        if thrown and self.t.windup_min_u > 0.0 \
+                and windup < self.t.windup_min_u:
+            thrown, refused = False, "windup"
+            why = "%s (no wind-up: pulled back %.2f u, needs %.2f)" \
+                % (why, windup, self.t.windup_min_u)
+
         if thrown and self._look is not NO_HEAD:
             if self._look is False:
                 thrown, refused = False, "look"
@@ -1727,7 +1949,8 @@ class CastGesture:
             dist_u=dist_u, bearing_deg=bearing,
             sector=where if thrown else "", why=why, reach=reach,
             closed=closed, payload=name,
-            speed_us=peak_us, refused=refused,
+            speed_us=peak_us, fling_us=window_us, windup_u=windup,
+            refused=refused,
             toward=where if dist_u >= TOWARD_MIN_U else ""))
 
 
