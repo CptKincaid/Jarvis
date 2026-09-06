@@ -1003,9 +1003,15 @@ class SetupSheet(tk.Frame):
         self._wrapped.append(note)
 
     # -------------------------------------------------------- the form
-    def select(self, room: str) -> None:
+    def select(self, room: str, *, poll: Optional[bool] = None) -> None:
         """Show one room's profile, or a blank new one. Clears both secret
-        boxes: they are never pre-filled, on any path."""
+        boxes: they are never pre-filled, on any path.
+
+        ``poll`` overrides where the "poll this room" switch starts: the
+        SENSORS page's ADD A SENSOR opens the new-room form with it ON, so
+        that one SAVE adds a sensor Jarvis reads (decided 2026-09-06). Left
+        None, the switch shows the room's own state -- OFF for a new room.
+        """
         self._room = str(room or "").strip()
         form = form_for(self._room, self._dir)
         for key, entry in self._field.items():
@@ -1035,7 +1041,8 @@ class SetupSheet(tk.Frame):
         self._dhcp.set(bool(form.get("dhcp", False)), animate=False)
         state = {s.room: s for s in room_states(self._get_option,
                                                 self._dir)}.get(self._room)
-        self._poll.set(bool(state and state.polled), animate=False)
+        self._poll.set(bool(state and state.polled) if poll is None
+                       else bool(poll), animate=False)
         self._primary.set(bool(state and state.primary), animate=False)
         self._ladder.set(False, animate=False)
         self._preset = str(form.get("preset") or sp.DEFAULTS["preset"])

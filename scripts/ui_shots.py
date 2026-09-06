@@ -136,6 +136,11 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       the words that say a row stores no measurement of
                       anybody -- whole, above the box they type their own
                       label into, on one screen
+  36  users-role      the make-owner confirmation armed on a guest: the
+                      question naming the owner who must be typed, the box,
+                      and BOTH buttons whole -- the row that drew its Cancel
+                      1 px wide at both windows until 2026-09-06. Arming
+                      promotes nobody
 """
 from __future__ import annotations
 
@@ -198,6 +203,7 @@ STATES = (
     ("33", "users-phrase", None),
     ("34", "users-purge", None),
     ("35", "users-agree", None),
+    ("36", "users-role", None),
 )
 
 
@@ -1511,6 +1517,20 @@ class Rig:
             "cannot be finished honestly is left alone and named, that it "
             "does not touch their voice pool, and the label typed to confirm. "
             "Arming destroys nothing")), 0)
+
+        def users_role():
+            page = win.users
+            page._cancel()
+            page.services._rig_people.unlocked = True
+            page._lock.unlock()
+            page._role_pressed("pemberton", "known")
+
+        S(lambda: (self.begin("36", "users-role"), users_role()), 700)
+        S(lambda: self.capture("36", "users-role", note=(
+            "the make-owner confirmation on a guest: the question names the "
+            "owner whose label must be typed, the box gives way and both "
+            "buttons are drawn whole -- this row cut its Cancel to 1 px at "
+            "both windows until 2026-09-06. Arming promotes nobody")), 0)
 
         S(lambda: (win.users.hide() if getattr(win, "users", None) is not None
                    else None), 200)

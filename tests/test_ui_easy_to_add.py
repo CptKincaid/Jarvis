@@ -987,3 +987,247 @@ def test_classic_keeps_its_caption_and_grows_no_thumb(root):
     drawer._key_scroll("end")
     _settle(root)
     assert drawer._canvas.canvasy(0) > 0
+
+
+# ============================ 8: every confirm row on the page keeps its buttons
+def _row_buttons(page) -> list:
+    """(label, text) for every acting button inside a PERSON block, on the
+    page as it stands and NOT inside an open panel. Found by walking the
+    blocks, never by name, so the next button that opens a confirm panel is
+    in this list the day it is added."""
+    out = []
+    for label, widgets in page._row_widgets.items():
+        block = widgets.get("block")
+        if block is None:
+            continue
+        inside = set()
+        for w in (widgets.get("panel") or ()):
+            inside.update(id(x) for x in _walk(w))
+        for w in _walk(block):
+            if isinstance(w, wg.RoundButton) and w.winfo_ismapped() \
+                    and id(w) not in inside:
+                out.append((label, str(w._text)))
+    return out
+
+
+def _find_button(page, label, text):
+    for w in _walk(page._row_widgets[label]["block"]):
+        if isinstance(w, wg.RoundButton) and str(w._text) == text:
+            return w
+    return None
+
+
+def _open_panels(page) -> dict:
+    """{label: (question, acting row)} for every confirm panel open now."""
+    return {label: w["panel"] for label, w in page._row_widgets.items()
+            if w.get("panel")}
+
+
+def _panel_shape(page, bottom) -> list:
+    """Every button and box on a panel's acting row: (what, asked, drawn,
+    ends inside the viewport, wholly inside the viewport)."""
+    view = page._canvas
+    right = view.winfo_rootx() + view.winfo_width()
+    out = []
+    for w in _walk(bottom):
+        if isinstance(w, wg.RoundButton) or w.__class__.__name__ == "Entry":
+            what = str(getattr(w, "_text", "") or "the box")
+            out.append((what, int(w.winfo_reqwidth()), int(w.winfo_width()),
+                        int(w.winfo_rootx() + w.winfo_width()) <= right,
+                        _inside(w, view)))
+    return out
+
+
+LABELS = ["Bartholomew1", "Abcdefghijklmnopqrstuvwxyz01234"]   # 12; the 31 cap
+
+
+@pytest.mark.parametrize("name", LABELS)
+@pytest.mark.parametrize("geometry", BOTH)
+def test_every_confirm_row_on_the_page_keeps_its_buttons_whole(root,
+                                                                geometry,
+                                                                name):
+    """MEASURED at 872efe0 with a 12-letter label ("bartholomew1"): the
+    make-owner row asked 1130 px of the 974 it has at 1040 (854 at 920); its
+    Cancel was drawn 1 px wide of 151 at BOTH windows and the confirm button
+    itself 422 of 539 at 920 -- the cut-Cancel defect he photographed on
+    09-05, fixed three times on other rows and shipped a fourth time on this
+    one, because _build_role_panel packed a fixed 18-character entry and two
+    buttons LEFT with nothing giving way.
+
+    THIS TEST NAMES NO ROW. It presses every acting button on every person
+    block, and every panel that opens is measured: the acting row asks no
+    more width than it has, every button and box on it is drawn at the width
+    it asked for and ends inside the viewport, and the question and the row
+    sit inside it vertically. Run on the 12-letter label quoted above AND on
+    a label at the 31-character cap (facegallery._LABEL_RE): at 920 a
+    20-letter label left the box 11 px and a 24-letter one cut the confirm
+    button itself, until the label inside the button learned to give way.
+    """
+    snap = _snapshot(3, names=[name, "Marchbanks"])
+    page, _svc, _host = _page(root, geometry, snapshot=snap)
+    # THE CLIPBOARD IS HIS. The hand-over buttons go to a recorder, never
+    # to xclip on whatever DISPLAY this process inherited.
+    copied = []
+    page._copy = lambda text: copied.append(text)
+    seen = {}
+    for label, text in _row_buttons(page):
+        page._cancel()
+        _settle(root)
+        btn = _find_button(page, label, text)
+        assert btn is not None, (label, text)
+        btn.invoke()
+        _settle(root)
+        for who, (top, bottom) in _open_panels(page).items():
+            want, got = int(bottom.winfo_reqwidth()), int(bottom.winfo_width())
+            shape = _panel_shape(page, bottom)
+            seen[(text, who)] = (want, got, shape)
+            assert want <= got, (
+                "%s on %s: the row asks %d px of the %d it has at %r"
+                % (text, who, want, got, geometry))
+            # THE WIDTH IS THE DEFECT UNDER TEST at both labels. The vertical
+            # fit (question down to the row on one screen) is pinned on the
+            # quoted label only: MEASURED 2026-09-06 at 920, a 31-character
+            # label wraps the forget warning one line further and the span
+            # is 775 px in a 771-px viewport -- 4 px, on the axis that
+            # scrolls. Stated, not chased.
+            if name == LABELS[0]:
+                assert _inside(top, page._canvas), (text, who, geometry)
+                assert _inside(bottom, page._canvas), (text, who, geometry)
+            for what, asked, drawn, ends_inside, inside in shape:
+                assert drawn >= asked, (
+                    "%s on %s: %s is drawn %d px wide of the %d it asked "
+                    "for at %r" % (text, who, what, drawn, asked, geometry))
+                assert ends_inside, (text, who, what, geometry)
+                if name == LABELS[0]:
+                    assert inside, (text, who, what, geometry)
+            assert _overflowing(bottom) == [], (text, who,
+                                                _overflowing(bottom))
+    page._cancel()
+    # The walk found the rows this file already knows about -- a FLOOR on
+    # the walk's reach, not a list of what it covers.
+    opened = {t.lower() for t, _who in seen}
+    assert any("owner" in t for t in opened), sorted(opened)
+    assert any("forget" in t for t in opened), sorted(opened)
+    assert any("remove" in t for t in opened), sorted(opened)
+    assert len(seen) >= 5, sorted(seen)
+
+
+def test_add_pressed_while_locked_puts_the_cursor_in_the_code_box(root):
+    """The remedy toast says to type the override code; the cursor should
+    be where that code goes, not left on the button he pressed."""
+    page, _svc, _host = _page(root, OLD)
+    page._lock.lock()
+    page._paint_lock()
+    _settle(root)
+    assert page._code_entry is not None and page._code_entry.winfo_ismapped()
+    page._add_pressed()
+    _settle(root)
+    assert not page._adding
+    assert page.focus_lastfor() is page._code_entry
+
+
+# ================ 9: the SENSORS page says a room is on it only when it is
+def _fill_new_room(sheet, room: str) -> None:
+    """A whole new-room form, INVENTED: a TEST-NET address, a pretend
+    network, two pretend secrets. Nothing of his is read or written."""
+    for key, value in (("room", room), ("ip", "192.0.2.20"),
+                       ("ssid", "PRETEND-NET-5G"), ("nearest_m", "2.0"),
+                       ("range_m", "3.5"), ("timeout_s", "10")):
+        box = sheet._field[key]
+        box.configure(state="normal")
+        box.delete(0, "end")
+        box.insert(0, value)
+    sheet._secret["password"].insert(0, "invented-psk-0000")
+    sheet._secret["ota_password"].insert(0, "invented-ota-0000")
+
+
+def _room_names(page) -> list:
+    return [str(getattr(s, "name", s)) for s in page.specs]
+
+
+@pytest.mark.parametrize("poll", [False, True])
+@pytest.mark.parametrize("geometry", BOTH)
+def test_the_page_says_a_room_is_on_it_only_when_it_is(root, geometry,
+                                                        tmp_path, poll):
+    """MEASURED at 872efe0: ADD A SENSOR -> room, address, wi-fi, password,
+    ota -> SAVE PROFILE with "poll this room" OFF wrote the profile only --
+    set_option never called, the list still office -- and the page printed
+    "hallway is on this page now — Jarvis reads it at the next restart"
+    directly under the sheet's own "saved to the profile only ... Tick poll
+    this room to add it". Two sentences on one screen; the page's was false.
+
+    The page may say "on this page now" exactly when the room IS in the
+    list it polls after the save, whichever way the switch was set.
+    """
+    from jarvis import sensorprofile
+    page, _host = _sensors(root, geometry, tmp_path)
+    assert _room_names(page) == ["office"]
+    page.add_sensor()
+    _settle(root)
+    sheet = page.setup
+    _fill_new_room(sheet, "hallway")
+    sheet._poll.set(poll, animate=False)
+    sheet.save()
+    _settle(root)
+    names = _room_names(page)
+    note = str(page._note.cget("text"))
+    line = sheet.result()
+    assert "hallway" in sensorprofile.list_rooms(tmp_path), line
+    assert ("hallway" in names) is poll, (names, line)
+    assert ("on this page now" in note) is ("hallway" in names), (
+        "the page says %r while its list is %r and the sheet says %r"
+        % (note, names, line))
+    assert ("profile only" in line) is (not poll), line
+    sheet.hide()
+
+
+@pytest.mark.parametrize("geometry", BOTH)
+def test_add_a_sensor_adds_a_sensor_jarvis_reads_in_one_save(root, geometry,
+                                                              tmp_path):
+    """DECISION (4), 2026-09-06: a button that says ADD A SENSOR must add a
+    sensor Jarvis reads, in one SAVE. At 872efe0 the sheet it opened had
+    "poll this room" OFF, so the advertised path wrote a profile nothing
+    polled. Opened by ADD A SENSOR the switch starts ON; a room chip still
+    shows that room's own state, and the sheet's own + NEW chip keeps the
+    default it had."""
+    page, _host = _sensors(root, geometry, tmp_path)
+    page.setup_btn.invoke()
+    _settle(root)
+    sheet = page.setup
+    assert sheet._room == ""
+    assert sheet._poll.get() is True, (
+        "ADD A SENSOR opened the sheet with 'poll this room' OFF")
+    _fill_new_room(sheet, "hallway")
+    sheet.save()
+    _settle(root)
+    assert "hallway" in _room_names(page), sheet.result()
+    rooms = page.services.data["presence"]["rooms"]
+    assert any(str(r.get("name")) == "hallway" for r in rooms), rooms
+    note = str(page._note.cget("text"))
+    assert "hallway is on this page now" in note, note
+    assert "profile only" not in sheet.result(), sheet.result()
+    assert "hallway" in page._blocks, sorted(page._blocks)
+    sheet.select("office")
+    assert sheet._poll.get() is True
+    sheet.select("")
+    assert sheet._poll.get() is False, "the sheet's own + NEW chip"
+    sheet.hide()
+
+
+# ============================ 10: the drawer's close glyph is a button in holo
+@pytest.mark.parametrize("geometry", BOTH)
+def test_the_drawers_close_glyph_wears_a_border_in_holo(root, geometry):
+    """At 872efe0 the ✕ was the one bare acting control left in holo."""
+    drawer, _host = _drawer(root, geometry)
+    glyphs = [b for b in _buttons(drawer) if b._text == "✕"]
+    assert glyphs and glyphs[0]._spec.get("outline"), glyphs
+    assert _bare(drawer) == [], _bare(drawer)
+
+
+def test_classic_keeps_its_ghost_close_glyph(root):
+    """Classic's drawer is a FROZEN surface (tests/test_ui_classic_frozen.py):
+    the glyph stays a ghost there, read off theme.LOOK at call time."""
+    drawer, _host = _drawer(root, OLD, look="classic")
+    glyphs = [b for b in _buttons(drawer) if b._text == "✕"]
+    assert glyphs and glyphs[0]._kind == "ghost", [
+        (b._text, b._kind) for b in glyphs]

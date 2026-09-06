@@ -1183,6 +1183,7 @@ def label_fault(label) -> str:
 
 # ============================================================ the Tk surface
 import tkinter as tk                                   # noqa: E402
+from tkinter import font as tkfont                     # noqa: E402
 
 
 # A Tk Label's requested width is its text plus its own border and
@@ -2191,35 +2192,12 @@ class UsersPage(tk.Frame):
             RoundButton(cmd, text=text, kind=_btn_kind(), bg=bg, pad_x=8,
                         pad_y=4, command=lambda c=command: self._copy(c)
                         ).pack(side="left")
-        row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(4), 0))
-        # ASKS FOR LITTLE AND GROWS. pack() never shrinks a widget below
-        # its requested width -- fill and expand only ever ADD space -- so
-        # a fixed 18-character entry is a hard floor that pushed the
-        # buttons off the edge at 920x1440. Asking for 8 and expanding
-        # into whatever is left fits every window and still gives him a
-        # wide field at his own.
-        entry = tk.Entry(row, width=8, bd=0, relief="flat",
-                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
-                         fg=theme.INK, insertbackground=theme.CYAN,
-                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        # THE BUTTONS TAKE THEIR WIDTH FIRST, anchored right, and the entry
-        # gives up whatever is left. MEASURED 2026-09-05 at 920x1440: with
-        # a fixed 18-character entry and both buttons packed left this row
-        # asked for 977 px of a 920 px body, and because the body scrolls
-        # only VERTICALLY the missing 57 px were not scrolled to -- they
-        # were cut, and what was cut was the right-hand end of "Cancel".
-        # A confirm entry 57 px narrower still takes a typed label; half a
-        # Cancel button on the destructive panel is not acceptable.
-        RoundButton(row, text="Cancel", kind=_btn_kind(), bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="right",
-                                                        padx=(px(4), 0))
-        RoundButton(row, text="Forget %s" % label, kind=_btn_kind(), bg=bg,
-                    pad_x=10, pad_y=4,
-                    command=lambda who=label, e=entry:
-                    self._forget_confirm(who, e.get())).pack(
-            side="right", padx=(theme.PAD_S, 0))
-        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        # ONE SHAPE FOR EVERY CONFIRM ROW: _confirm_row carries the two
+        # measurements it stands on (the cut Cancel of 09-05, and the box a
+        # long label squeezed to 1 px on 09-06).
+        row, entry = self._confirm_row(
+            parent, bg, label, "Forget %s",
+            lambda typed, who=label: self._forget_confirm(who, typed))
         widgets = self._row_widgets.setdefault(label, {})
         widgets["confirm"] = entry
         # The SPAN _reveal keeps on screen: the question down to the box.
@@ -2235,22 +2213,91 @@ class UsersPage(tk.Frame):
                        pady=0)
         ask.pack(fill="x", pady=(px(4), 0))
         self._wrapped.append(ask)
+        row, entry = self._confirm_row(
+            parent, bg, label, "Make %s an owner",
+            lambda typed, who=label: self._role_confirm(who, typed), pady=2)
+        widgets = self._row_widgets.setdefault(label, {})
+        widgets["role_confirm"] = entry
+        widgets["panel"] = (ask, row)
+
+    # ------------------------------------------- the confirm rows' one shape
+    def _confirm_row(self, parent, bg, label: str, verb: str, confirm,
+                     *, pady: int = 4):
+        """The acting row every confirm panel ends in -- the typed box, then
+        the two buttons anchored RIGHT with Cancel outermost -- built ONE
+        way, because this project shipped a cut Cancel four times by
+        building it four ways. ``verb`` is the confirm button's words with
+        one %s for the label; ``confirm`` is called with what was typed.
+
+        THE BUTTONS TAKE THEIR WIDTH FIRST and the box gives way. pack()
+        never shrinks a widget below what it asked for and hands the LAST
+        one packed whatever is left, so with a fixed 18-character box and
+        both buttons packed left the make-owner row asked 1130 px of the
+        976 it has at his own 1040x1760 (856 at 920x1440) on a 12-letter
+        label and drew Cancel 1 px wide of 151 at BOTH windows -- MEASURED
+        2026-09-06, S=2; the forget row had done the same on 09-05 (977 of
+        920), and the body scrolls only downwards, so the excess is cut,
+        never reached.
+
+        THE NAME GIVES WAY NEXT, not the box. Packed right, a long label
+        squeezes the box instead: at 920 a 20-letter label left it 11 px
+        and a 24-letter one cut the confirm button itself (681 of 759).
+        Labels run to 31 characters (facegallery._LABEL_RE). So the row
+        fits itself on its own <Configure>, like the head row does: the
+        box keeps the width it asked for and the label inside the button
+        is trimmed with an ellipsis to what is left. The block's head still
+        names the person in full.
+        """
         row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(2), 0))
-        entry = tk.Entry(row, width=18, bd=0, relief="flat",
+        row.pack(fill="x", pady=(px(pady), 0))
+        entry = tk.Entry(row, width=8, bd=0, relief="flat",
                          bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
                          fg=theme.INK, insertbackground=theme.CYAN,
                          font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        entry.pack(side="left", ipady=px(3))
-        RoundButton(row, text="Make %s an owner" % label, kind=_btn_kind(),
-                    bg=bg, pad_x=10, pad_y=4,
-                    command=lambda who=label, e=entry:
-                    self._role_confirm(who, e.get())).pack(
-            side="left", padx=(theme.PAD_S, 0))
-        RoundButton(row, text="Cancel", kind=_btn_kind(), bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="left",
-                                                        padx=(px(4), 0))
-        self._row_widgets.setdefault(label, {})["panel"] = (ask, row)
+        cancel = RoundButton(row, text="Cancel", kind=_btn_kind(), bg=bg,
+                             pad_x=8, pad_y=4, command=self._cancel)
+        cancel.pack(side="right", padx=(px(4), 0))
+        btn = RoundButton(row, text=verb % label, kind=_btn_kind(), bg=bg,
+                          pad_x=10, pad_y=4,
+                          command=lambda e=entry: confirm(e.get()))
+        btn.pack(side="right", padx=(theme.PAD_S, 0))
+        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        floor = int(entry.winfo_reqwidth())
+        row.bind("<Configure>",
+                 lambda e, r=row, b=btn, c=cancel, f=floor, v=verb, n=label:
+                 self._fit_confirm(r, b, c, f, v, n), add=True)
+        return row, entry
+
+    def _fit_confirm(self, row, btn, cancel, floor: int, verb: str,
+                     label: str) -> None:
+        """Trim the label inside the confirm button until the row fits the
+        width it was given with the box no narrower than ``floor``. Runs on
+        the row's own <Configure>, against real numbers. A RoundButton
+        sizes itself ONCE, from its first text, so the width is re-asked
+        here along with the words -- measured with the button's own ruler
+        (tkfont, as RoundButton.__init__ does), so the two agree."""
+        try:
+            room = int(row.winfo_width())
+            if room <= 1:
+                return
+            font = tkfont.Font(font=btn._font)
+            pad = int(btn._btn_w) - font.measure(str(btn._text))
+            taken = (int(cancel.winfo_reqwidth()) + px(4) + theme.PAD_S
+                     + floor + pad + 2 + _INK_SLACK)
+            slot = max(0, room - taken)
+            full = verb % label
+            if font.measure(full) <= slot:
+                want = full
+            else:
+                want = verb % ellipsize(
+                    label, font, max(0, slot - font.measure(verb % "")))
+            if str(btn._text) != want:
+                btn._btn_w = font.measure(want) + pad
+                btn.configure(width=btn._btn_w)
+                btn.set_text(want)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: a confirm row could not be fitted",
+                      exc_info=True)
 
     # ------------------------------------------------------- the add form
     def _build_add_form(self, parent, bg) -> None:
@@ -2638,6 +2685,10 @@ class UsersPage(tk.Frame):
 
     def _add_pressed(self) -> None:
         if not self._guard("add"):
+            # The toast says to type the override code; put the cursor
+            # where that code goes rather than leaving it on the button.
+            if self._lock.locked():
+                self._focus_code()
             return
         self._adding = not self._adding
         self._add_step = 1
@@ -3041,26 +3092,10 @@ class UsersPage(tk.Frame):
                         pady=0)
         warn.pack(fill="x", pady=(px(4), 0))
         self._wrapped.append(warn)
-        row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(px(4), 0))
-        entry = tk.Entry(row, width=8, bd=0, relief="flat",
-                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
-                         fg=theme.INK, insertbackground=theme.CYAN,
-                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        # THE BUTTONS TAKE THEIR WIDTH FIRST and the entry gives up what is
-        # left -- the rule this file already learned twice, most recently
-        # when a fixed 18-character entry pushed "Cancel" off the right edge
-        # at 920x1440 on the destructive panel. A confirm box 57 px narrower
-        # still takes a typed label; half a Cancel button does not.
-        RoundButton(row, text="Cancel", kind=_btn_kind(), bg=bg, pad_x=8,
-                    pad_y=4, command=self._cancel).pack(side="right",
-                                                        padx=(px(4), 0))
-        RoundButton(row, text="Remove %s" % label, kind=_btn_kind(), bg=bg,
-                    pad_x=10, pad_y=4,
-                    command=lambda who=label, k=kind, e=entry:
-                    self._purge_confirm(who, k, e.get())).pack(
-            side="right", padx=(theme.PAD_S, 0))
-        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        row, entry = self._confirm_row(
+            parent, bg, label, "Remove %s",
+            lambda typed, who=label, k=kind:
+            self._purge_confirm(who, k, typed))
         widgets = self._row_widgets.setdefault(label, {})
         widgets["purge_confirm"] = entry
         widgets["panel"] = (warn, row)

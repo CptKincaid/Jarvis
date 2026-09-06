@@ -23,6 +23,7 @@ from jarvis.ui import widgets as wg
 
 FORBIDDEN_DISPLAYS = (":0", ":1")
 FD_SETSIZE = 1024
+FONT_GLOBALS = ("_FAMILY", "_FAMILY_MONO", "_HAS_DISPLAY", "_DISPLAY")
 HIS_W, HIS_H = 1040, 1760
 OLD_W, OLD_H = 920, 1440
 SCALE = 2.0
@@ -55,6 +56,11 @@ def root():
         fds = 0
     if fds >= FD_SETSIZE - 32:
         pytest.skip("this process already holds %d descriptors" % fds)
+    # resolve_fonts() flips theme._HAS_DISPLAY and the family names for
+    # the whole process; put them back, or tests/test_theme_look.py's
+    # no-display oracle fails when this file runs first (seen 2026-09-06
+    # in a hand-picked order; the alphabetical suite never showed it).
+    fonts = {k: getattr(theme, k) for k in FONT_GLOBALS}
     try:
         r = tk.Tk(screenName=display)
     except tk.TclError as exc:
@@ -71,6 +77,8 @@ def root():
     theme.apply_scale(1.0)
     wg.set_scale(1.0)
     theme.select_look(theme.DEFAULT_LOOK)
+    for k, v in fonts.items():
+        setattr(theme, k, v)
 
 
 class Svc:

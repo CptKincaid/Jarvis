@@ -2166,8 +2166,14 @@ class SettingsDrawer(tk.Frame):
         tk.Label(head, text="SETTINGS",
                  font=ui_display(theme.SIZE_BODY, "semibold"),
                  fg=theme.INK, bg=theme.RAISED).pack(side="left")
-        RoundButton(head, text="✕", kind="ghost", command=self.close,
-                    pad_x=8, pad_y=4, bg=theme.RAISED).pack(side="right")
+        # OUTLINED IN HOLO: to him a bare glyph is not a button (the rule
+        # every acting control on the Users and Sensors pages follows). Read
+        # at CALL time; classic keeps "ghost" -- its drawer is a FROZEN
+        # surface (tests/test_ui_classic_frozen.py).
+        RoundButton(head, text="✕",
+                    kind="default" if theme.LOOK == "holo" else "ghost",
+                    command=self.close, pad_x=8, pad_y=4,
+                    bg=theme.RAISED).pack(side="right")
 
         # scrollable body
         self._canvas = tk.Canvas(self, bg=theme.RAISED, highlightthickness=0,

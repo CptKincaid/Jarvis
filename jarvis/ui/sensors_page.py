@@ -2857,7 +2857,13 @@ class SensorsPage(tk.Frame):
                 return
         self.setup.show()
         if new:
-            self.setup.select("")
+            # A BUTTON THAT SAYS ADD A SENSOR ADDS A SENSOR JARVIS READS, in
+            # one SAVE: "poll this room" starts ON here. Decided for him
+            # 2026-09-06 after the advertised path (ADD A SENSOR -> room,
+            # address, wi-fi, password, ota -> SAVE PROFILE) was measured
+            # to write the profile only, with the switch at its OFF default.
+            # The sheet's own + NEW chip keeps the default it had.
+            self.setup.select("", poll=True)
 
     def _setup_saved(self, room: str) -> None:
         """A room was added or changed: re-read the config and rebuild.
@@ -2870,12 +2876,24 @@ class SensorsPage(tk.Frame):
         result line says both halves; this is only the half the page owns.
         """
         self.reload()
+        # SAY "ON THIS PAGE" ONLY WHEN IT IS. MEASURED 2026-09-06: a save
+        # with "poll this room" OFF writes the profile only -- set_option is
+        # never called and the room list is unchanged -- and this line said
+        # "hallway is on this page now" directly under the sheet's own
+        # "saved to the profile only ... Tick poll this room to add it". The
+        # list this page polls is the fact; the sentence follows it.
+        listed = any(str(getattr(s, "name", "")) == str(room)
+                     for s in self.specs)
         try:
             if self.setup is not None:
                 self.setup.lift()
-            self._note.configure(text="%s is on this page now — Jarvis reads "
-                                      "it at the next restart" % room,
-                                 fg=tone_color(TONE_FAINT))
+            if listed:
+                text = ("%s is on this page now — Jarvis reads it at the "
+                        "next restart" % room)
+            else:
+                text = ("%s is saved to its profile but is not on this page "
+                        "— it is not in the list Jarvis polls" % room)
+            self._note.configure(text=text, fg=tone_color(TONE_FAINT))
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("sensors page: could not repaint after a setup save",
                       exc_info=True)
