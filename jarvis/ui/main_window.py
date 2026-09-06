@@ -544,6 +544,31 @@ class Services:
     people_forget: Optional[Callable] = None
     people_admin_state: Optional[Callable] = None
     people_relock: Optional[Callable] = None
+    # ...and the six this work adds, each a declared field for the same
+    # reason the seven above are: build_ui_services keeps only the fields the
+    # installed UI declares, so an app and a window that merged in either
+    # order simply leave the new buttons unwired rather than raising.
+    #
+    # people_set_phrase(label, hashed) takes a HASH and never a plaintext --
+    # the hashing happens in the page's own frame (UsersSecretControl) so a
+    # passphrase cannot cross this boundary even by accident. There is
+    # deliberately NO people_set_code: the override code's whole value is
+    # that it is generated rather than chosen, and people_new_code() asks the
+    # existing mail-first rotate for a fresh one instead.
+    people_set_phrase: Optional[Callable] = None
+    people_new_code: Optional[Callable] = None
+    # The in-app enrolments. Each start() is gated like a registry write;
+    # each stop() is not, because stopping a camera or a microphone is the
+    # safe direction and must never be the thing a missing code blocks.
+    face_enrol_start: Optional[Callable] = None
+    face_enrol_stop: Optional[Callable] = None
+    voice_enrol_start: Optional[Callable] = None
+    voice_enrol_stop: Optional[Callable] = None
+    # The galleries. Both answer (ok, line) where ok is the purge's own
+    # `complete` -- never "the call did not raise" -- and the line is built
+    # from the numbers it returned.
+    people_purge_face: Optional[Callable] = None
+    people_purge_voice: Optional[Callable] = None
 
 
 # ------------------------------------------------------------------ tray

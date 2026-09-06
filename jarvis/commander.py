@@ -12866,49 +12866,20 @@ class Commander:
     def _start_enrol(self) -> CommandResult:
         """Build the run, park it, and start its thread.
 
-        The preflight is run AGAIN here rather than trusted from the offer.
-        Ninety seconds is long enough for the curfew to start or for him to
-        have said "offline mode" in between, and the cost of re-asking is one
-        dictionary read against opening a lens sensing has since shut.
+        THE SEQUENCE LIVES IN ``enrolrun.launch``, not here, because there are
+        two doors to this lens now -- this one and the USERS tab's button --
+        and the preflight-again, the five injected seams and the unpark on a
+        failed start have to be identical through both or the button's run
+        would behave differently from the spoken one.
         """
-        from jarvis import earcons
-        from jarvis import enrolentry as ee
         from jarvis import enrolrun as er
-        services = getattr(self, "services", None)
-        cfg = self._svc("assistant")
-        worker = getattr(services, "preview_worker", None)
-        pre = er.preflight(cfg, sensing=self._svc("sensing"), worker=worker,
-                           services=services)
-        if not pre["ok"]:
-            return CommandResult(handled=True, speak=True, reply=pre["reply"],
-                                 status="Enrolment: %s" % pre["reason"])
-        run = er.EnrolRun(
-            cfg=cfg, worker=worker, sensing=self._svc("sensing"),
-            services=services,
-            say=self._speak,
-            # DISPLAY-ONLY, which is the mechanism that keeps the card out of
-            # the plaintext journal: a JarvisReply with speak=False does not
-            # go through context.add_exchange.
-            card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
-            lease=getattr(services, "preview_lease", None),
-            # cooldown_s=0.0 on every tone: the default four-second same-tone
-            # cooldown exists to stop a false-wake tone repeating, and here it
-            # would silently swallow the second and third "kept one" ticks of
-            # a three-sample station -- the ticks he is counting.
-            earcon=lambda name: earcons.play(name, cooldown_s=0.0),
-            clipboard=ee.to_clipboard)
-        try:
-            services.enrol_run = run
-        except Exception:                # noqa: BLE001 - a slim services
-            log.debug("could not park the enrolment run", exc_info=True)
-            return CommandResult(handled=True, speak=True, reply=er.E35,
-                                 status="Enrolment: could not start")
-        if not run.start():
-            self._clear_enrol_run(run)
-            return CommandResult(handled=True, speak=True, reply=er.E35,
-                                 status="Enrolment: could not start")
-        return CommandResult(handled=True, speak=True, reply=er.E2,
-                             status="Enrolling your face")
+        ok, reply, _run = er.launch(cfg=self._svc("assistant"),
+                                    services=getattr(self, "services", None),
+                                    sensing=self._svc("sensing"),
+                                    say=self._speak)
+        return CommandResult(
+            handled=True, speak=True, reply=reply,
+            status="Enrolling your face" if ok else "Enrolment: refused")
 
     def _clear_enrol_run(self, run) -> None:
         try:

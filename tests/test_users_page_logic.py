@@ -339,14 +339,27 @@ def test_a_row_carries_no_hash_in_any_form():
             assert "hash" not in text.lower()
 
 
-def test_the_voice_chip_tells_the_truth_about_one_voiceprint():
-    """MEASURED in gate._voice_leg: there is ONE voiceprint pool and the
-    leg returns the OWNER's label on a match, whoever spoke. A voice
-    tickbox on a guest row would let him create a row that lies."""
-    rows = up.rows_from(_snapshot())
-    assert "owner only" in rows[0].voice_text
-    assert rows[1].voice_text == up.VOICE_GUEST
-    assert "cannot" in up.VOICE_GUEST.lower()
+def test_the_voice_chip_says_who_has_a_pool_rather_than_who_may():
+    """THIS TEST PINNED A SENTENCE THAT STOPPED BEING TRUE, and it is
+    rewritten rather than deleted so the correction is on the record.
+
+    It used to assert the chip on every guest row read "cannot name a guest
+    -- there is one voiceprint and it is the owner's", which was correct when
+    the tab shipped. jarvis/voicegallery.py then merged: gate._voice_leg
+    names guests out of it through speaker.py, so the chip was asserting the
+    opposite of what the system does -- the same defect class Hunter caught
+    in the foot note on 2026-09-05, one chip over. It is now derived from the
+    voice gallery's own label list, carried on the snapshot.
+    """
+    snap = _snapshot()
+    snap["voices"] = ["pemberton"]
+    rows = up.rows_from(snap)
+    assert rows[0].label == "alderman" and rows[1].label == "pemberton"
+    assert rows[0].voice_text == up.VOICE_NONE
+    assert rows[1].voice_text == up.VOICE_POOL
+    # ...and with no pools at all, nobody is claimed to have one.
+    snap["voices"] = []
+    assert all(r.voice_text == up.VOICE_NONE for r in up.rows_from(snap))
 
 
 def test_a_face_pointer_at_nothing_is_flagged_amber():
@@ -454,15 +467,20 @@ def test_arming_one_person_never_confirms_another():
 
 
 def test_the_warning_says_what_survives_and_that_it_cannot_be_undone():
-    """MEASURED in identity.Registry.forget: it removes the ROW and
-    nothing else. The face gallery entry is untouched, and there is no
-    voice pool of theirs to scrub because there is only one and it is
-    his."""
-    lines = "\n".join(up.forget_warning("pemberton"))
+    """MEASURED in identity.Registry.forget: it removes the ROW and nothing
+    else. What SURVIVES is now read off the two galleries rather than
+    asserted: the old line told him there was no voice pool of theirs to
+    scrub, on the grounds that only the owner had one, and that was printed
+    on a destructive panel after it stopped being true."""
+    lines = "\n".join(up.forget_warning("pemberton", gallery=("pemberton",),
+                                        voices=("pemberton",)))
     assert "cannot be undone" in lines.lower()
-    assert "gallery" in lines.lower()
-    assert "voice" in lines.lower()
+    assert "face measurements" in lines.lower()
+    assert "voice pool" in lines.lower()
     assert "pemberton" in lines
+    # ...and when there is genuinely nothing of theirs, it says THAT.
+    bare = "\n".join(up.forget_warning("pemberton")).lower()
+    assert "no face measurements and no voice pool" in bare
     cmd = up.forget_face_command("pemberton")
     assert "--delete" in cmd and "--label pemberton" in cmd
     assert "face_enrol.py" in cmd
@@ -518,13 +536,23 @@ def test_a_label_the_gallery_could_not_store_is_refused_before_anything():
 
 # ============================================== the page says what it cannot do
 def test_the_standing_note_never_claims_to_be_a_lock():
-    text = " ".join(up.CANNOT_DO).lower()
-    assert "terminal" in text
-    assert "camera" in text or "face" in text
-    for word in ("secure", "locked out", "prevents"):
-        assert word not in text
-    assert "recognition, not a lock" in " ".join(up.CANNOT_DO).lower() or \
-        "not a lock" in text
+    """``CANNOT_DO`` was a hand-edited tuple and went stale in three places
+    at once, so the note is DERIVED from the seams that are wired now
+    (tests/test_users_footnote.py pins the derivation). What must hold
+    whatever ships is that it never sounds like a security boundary."""
+    for services in (None, _AllSeams()):
+        text = " ".join(up.cannot_do(services)).lower()
+        assert "terminal" in text
+        assert "camera" in text or "face" in text
+        for word in ("secure", "locked out", "prevents"):
+            assert word not in text
+        assert "recognition, not a lock" in text
+
+
+class _AllSeams:
+    people_set_phrase = people_new_code = staticmethod(lambda *a: None)
+    face_enrol_start = voice_enrol_start = staticmethod(lambda *a: None)
+    people_purge_face = people_purge_voice = staticmethod(lambda *a: None)
 
 
 # ============================== the page must not load a face detector
@@ -640,9 +668,23 @@ def test_no_press_reaches_a_write_without_asking_the_gate_first():
         body = ast.unparse(fn)
         if "self._write(" in body and fn.name != "_write":
             callers.append((fn.name, body))
-    assert {n for n, _b in callers} == {"_forget_confirm", "_role_pressed",
-                                        "_role_confirm", "_create_pressed"}, \
-        [n for n, _b in callers]
+    # A WHITELIST, DELIBERATELY, and it is the point of the test rather than
+    # bookkeeping: a new press that writes has to be ADDED here by somebody
+    # who then has to notice the two assertions below it. The four that
+    # arrived with the enrolment work -- a new code, a face run, a voice run
+    # and a gallery purge -- are each a door into the people book or into a
+    # gallery, and each is in users_page.GUARDED.
+    assert {n for n, _b in callers} == {
+        "_forget_confirm", "_role_pressed", "_role_confirm",
+        "_create_pressed", "_code_confirm", "_face_pressed",
+        "_voice_pressed", "_purge_confirm"}, [n for n, _b in callers]
+    # ...and the passphrase, which does not go through _write because the
+    # control spawns its own thread, is guarded in exactly the same place.
+    for name in ("_phrase_pressed", "_phrase_confirm"):
+        body = ast.unparse([f for f in page.body
+                            if isinstance(f, ast.FunctionDef)
+                            and f.name == name][0])
+        assert "self._guard(" in body or "self._open_panel(" in body, name
     for name, body in callers:
         assert "self._guard(" in body, name
         # ...and the guard comes FIRST, before anything is handed over

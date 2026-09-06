@@ -124,8 +124,16 @@ tests/test_ui_shots.py pins ``STATES`` to it.
   32  users-add       the add form, with the consent paragraph named for
                       the person being added -- the words that say a row
                       stores no measurement of anybody
+  33  users-phrase    the passphrase panel on the owner's row: two MASKED
+                      boxes, empty, and the sentences saying why this one
+                      secret may be typed here when the override code may
+                      not. No value is rendered anywhere
+  34  users-purge     the gallery purge armed on a guest: what is destroyed,
+                      what SURVIVES, that it may refuse rather than lie, and
+                      the label typed to confirm. Arming destroys nothing
 """
 from __future__ import annotations
+
 
 import argparse
 import dataclasses
@@ -182,6 +190,8 @@ STATES = (
     ("30", "users", None),
     ("31", "users-forget", None),
     ("32", "users-add", None),
+    ("33", "users-phrase", None),
+    ("34", "users-purge", None),
 )
 
 
@@ -653,6 +663,10 @@ class RigPeople:
                 # marchbanks points at a gallery label that is not there,
                 # which is what the amber face chip is for.
                 "gallery": ["alderman", "pemberton"],
+                # The VOICE gallery's labels, beside the face gallery's: the
+                # chip on each row is drawn from this rather than from a rule
+                # about who is allowed a pool.
+                "voices": ["alderman"],
                 "admin": gate_mod.ADMIN_CODE,
                 "admin_line": ("an owner has set an override code, so it is "
                                "asked for before anything is changed")}
@@ -674,6 +688,54 @@ class RigPeople:
     def forget(self, label) -> tuple:
         self.calls.append(("forget", label))
         return True, "%s is forgotten here" % label
+
+    # ---- the enrolment seams (states 30-35). NOTHING HERE OPENS A DEVICE:
+    # each answers a line, exactly as the app's seams do, so the page draws
+    # its real face without a camera, a microphone or a gallery existing.
+    # The rig asserts at teardown that no vision module was imported.
+    def set_phrase(self, label, hashed) -> tuple:
+        # The HASH is what crosses the seam; the rig records that it was
+        # asked and never what it was handed.
+        self.calls.append(("set_phrase", label))
+        del hashed
+        for person in self.people:
+            if person["label"] == label:
+                person["has_phrase"] = True
+        return True, "Set, sir. It is stored salted-hashed; nothing here can "\
+                     "read it back."
+
+    def new_code(self) -> tuple:
+        self.calls.append("new_code")
+        return True, "Knightfall: a new code is in your inbox."
+
+    def knightfall_status(self) -> dict:
+        return {"to": "h\u2022\u2022\u2022\u2022@example.invalid",
+                "problem": "", "setup": ""}
+
+    def face_start(self) -> tuple:
+        self.calls.append("face_enrol_start")
+        return True, ("Right. The camera is coming on. Hold still when you "
+                      "hear the tone.")
+
+    def face_stop(self) -> tuple:
+        self.calls.append("face_enrol_stop")
+        return True, "Stopped, sir. Nothing was written."
+
+    def voice_start(self) -> tuple:
+        self.calls.append("voice_enrol_start")
+        return True, "Right, sir. Eight takes of about eight seconds."
+
+    def voice_stop(self) -> tuple:
+        self.calls.append("voice_enrol_stop")
+        return True, "Stopped, sir. Nothing was written."
+
+    def purge_face(self, label) -> tuple:
+        self.calls.append(("purge_face", label))
+        return True, "Removed. 3 face generation(s) held %s." % label
+
+    def purge_voice(self, label) -> tuple:
+        self.calls.append(("purge_voice", label))
+        return True, "Removed. 1 voice generation(s) held %s." % label
 
 
 def build_services(sensing: Optional[RigSensing] = None,
@@ -737,6 +799,15 @@ def build_services(sensing: Optional[RigSensing] = None,
     svc.people_forget = book.forget
     svc.people_admin_state = book.admin_state
     svc.people_relock = book.relock
+    svc.people_set_phrase = book.set_phrase
+    svc.people_new_code = book.new_code
+    svc.knightfall_status = book.knightfall_status
+    svc.face_enrol_start = book.face_start
+    svc.face_enrol_stop = book.face_stop
+    svc.voice_enrol_start = book.voice_start
+    svc.voice_enrol_stop = book.voice_stop
+    svc.people_purge_face = book.purge_face
+    svc.people_purge_voice = book.purge_voice
     svc._rig_people = book               # type: ignore[attr-defined]
     svc._rig_calls = calls               # type: ignore[attr-defined]
     return svc
@@ -1389,6 +1460,39 @@ class Rig:
             "row stores a name, a role and a face LABEL and no measurement "
             "of anybody, so these are not the words the camera ceremony "
             "shows. They type their own label to agree")), 0)
+        def users_phrase():
+            page = win.users
+            page._cancel()
+            page.services._rig_people.unlocked = True
+            page._lock.unlock()
+            page._phrase_pressed("alderman")
+
+        S(lambda: (self.begin("33", "users-phrase"), users_phrase()), 700)
+        S(lambda: self.capture("33", "users-phrase", note=(
+            "the spoken passphrase, set without a terminal. Two MASKED boxes "
+            "and EMPTY -- the control empties both before it hashes, so "
+            "nothing typed survives the press -- with the sentences saying "
+            "why this secret may be typed on his own console (it is said out "
+            "loud in normal use and can be overheard; that is accepted) when "
+            "the override code may not. There is no box to choose a code")),
+          0)
+
+        def users_purge():
+            page = win.users
+            page._cancel()
+            page.services._rig_people.unlocked = True
+            page._lock.unlock()
+            page._purge_pressed("pemberton", "face")
+
+        S(lambda: (self.begin("34", "users-purge"), users_purge()), 700)
+        S(lambda: self.capture("34", "users-purge", note=(
+            "removing somebody's FACE measurements from the tab: what is "
+            "destroyed, that everybody else is carried forward and READ BACK "
+            "off the disk before one old byte is touched, that anything which "
+            "cannot be finished honestly is left alone and named, that it "
+            "does not touch their voice pool, and the label typed to confirm. "
+            "Arming destroys nothing")), 0)
+
         S(lambda: (win.users.hide() if getattr(win, "users", None) is not None
                    else None), 200)
 
