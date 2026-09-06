@@ -34,10 +34,31 @@ NO_MATCH = {"total": 3, "matched": 0, "scores": [0.11, 0.09, 0.12]}
 NOT_RUNNING = {}
 
 
-def _registry(tmp_path, *, phrase=False, known=False):
+FAKE_CODE = "xxx000code"
+
+
+def _registry(tmp_path, *, phrase=False, known=False, code=True):
+    """``code`` puts a typed override code on the owner row, and it is ON.
+
+    WHY IT HAS TO BE. The people-signin lane added a lockout guard to
+    gate._mode_unsafe: enforce is silently downgraded to SHADOW whenever no
+    owner row carries a typed override code, because a wrong verdict would
+    otherwise leave no way back in. A fixture written before that guard
+    builds a gate that SAYS enforce and BEHAVES as shadow -- and shadow
+    admits everybody, so test_an_enforced_refusal_is_recorded_too got
+    admit=True where it asked for False.
+
+    The dangerous half is the one that does not go red: a counting test in
+    shadow stays GREEN and stops measuring anything, because nobody is
+    refused there. That is a merge that looks clean with a guard switched
+    off, and it is why the code goes on by default here rather than being
+    added to the one test that happened to notice.
+    """
     r = Registry(path=tmp_path / "people.json")
     r.add_person(Person(label="hunter", name="Hunter", role=ROLE_OWNER,
                         voice=True))
+    if code:
+        r.set_secret("hunter", "code_hash", pp.hash_secret(FAKE_CODE))
     if known:
         r.add_person(Person(label="heather", name="Heather", role=ROLE_KNOWN,
                             face="heather", consent="typed"))

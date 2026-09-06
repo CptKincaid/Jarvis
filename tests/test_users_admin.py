@@ -277,6 +277,22 @@ def _cli():
 
 
 class _Args:
+    """A stand-in for the argparse namespace ``do_add`` is handed.
+
+    IT CARRIES EVERY FIELD do_add READS, and deliberately does not use
+    getattr defaults on the production side to make that unnecessary. The
+    honorific in particular: the security lane made ``--honorific``
+    REQUIRED with no default, on the stated rule that a form of address is
+    never inferred from a name -- so a stand-in that omits it is not
+    "close enough", it is a namespace argparse could never produce. This
+    class was written before that flag existed and lost four tests to it
+    on the co-merge (AttributeError at scripts/jarvis_people.py:181);
+    ``first`` and ``last`` arrived in the same lane and would have been
+    next. Add the field here when do_add grows one -- never a getattr
+    fallback there, which would let a missing form of address through as
+    a silent "none".
+    """
+
     def __init__(self, **kw):
         self.label = kw.get("label", "pemberton")
         self.name = kw.get("name", "Pemberton")
@@ -285,6 +301,9 @@ class _Args:
         self.face_dim = 0
         self.voice = False
         self.confirm_owner = kw.get("confirm_owner")
+        self.honorific = kw.get("honorific", "none")
+        self.first = kw.get("first", "")
+        self.last = kw.get("last", "")
 
 
 def test_adding_a_guest_at_a_terminal_still_asks_them_to_type_their_name(
