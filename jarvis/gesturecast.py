@@ -103,6 +103,11 @@ PREPARE_TTL_S = 5.0              # a prepared subject older than this is re-reso
 PREPARE_MIN_GAP_S = 1.0          # reach flicker must not spawn xdotool repeatedly
 RECENT_TTL_S = 1800.0            # how long the board's CAST slab shows the last one
 EVENT_LOG = 32                   # events kept for status()
+# WHICH REFUSALS ARE A GESTURE HE MEANT THAT DID NOT FIRE. "cancel" is his
+# own down-fling put-back and "carry" is a carry he ended himself or that
+# simply ran out; neither is the machine turning him down, and counting
+# them would bury the one number he actually needs.
+SHORT_THROW_CODES = ("speed", "distance", "look", "direction", "sector")
 
 # --- the screen cast (jarvis/screens.py, jarvis/castview.py) --------------
 # How stale the last hand row may be and still name the screen he grabbed
@@ -241,6 +246,22 @@ class GestureCast:
         self.yaw_misses = 0
         self.source_reads = 0
         self.refusals = 0
+        # ROUND 4: A GESTURE THAT FAILS MUTELY CANNOT BE DEBUGGED. A throw
+        # refused by the speed bar used to produce a drop, a tone and
+        # nothing he could read -- "it just did nothing" was the whole
+        # story he had, and the round-3 recall cliff was invisible from
+        # his side for exactly that reason. Every carry that ends without
+        # a throw now names the bar that refused it (jarvis/gesture.py's
+        # REFUSALS), it is counted by code, the last one is kept whole,
+        # and one INFO line carries the two numbers that decided it.
+        #
+        # ``short_throws`` is the count that matters: a gesture he MEANT
+        # that the machine turned down. A put-back (his down-fling) and a
+        # carry he simply ended are refusals too, and are deliberately not
+        # in it.
+        self.short_throws = 0
+        self.refused: dict = {}
+        self.last_refusal: dict = {}
 
         self.registry = {
             "board": BoardSink(self._board_publish,
@@ -671,6 +692,7 @@ class GestureCast:
             return
         if ev.kind == "drop":
             self._source = None
+            self._note_refusal(ev)
             with self._lock:
                 silent = self._silence_drops > 0
                 if silent:
@@ -693,6 +715,23 @@ class GestureCast:
             if not silent:
                 self._earcon(DROP_TONE)
             self._chip_do("dropped", ev.toward)
+
+    def _note_refusal(self, ev: CastEvent) -> None:
+        """Count it, keep it, and SAY it in the log. Cheap: this runs on
+        the capture thread inside the machine's lock."""
+        code = str(getattr(ev, "refused", "") or "")
+        if not code:
+            return
+        self.refused[code] = self.refused.get(code, 0) + 1
+        self.last_refusal = ev.numbers_only()
+        if code not in SHORT_THROW_CODES:
+            return
+        self.short_throws += 1
+        t = self.machine.t
+        log.info("gesture: throw refused (%s) -- travelled %.2f u, fastest "
+                 "%.2f u/s against a bar of %.2f, toward %r: %s",
+                 code, float(ev.dist_u), float(ev.speed_us),
+                 float(t.throw_speed_us), ev.toward or "?", ev.why)
 
     # ---------------------------------------------------------- the cast
     def _propose_with(self, speak: Callable[[str], None]):
@@ -931,11 +970,30 @@ class GestureCast:
                "yaw_misses": int(self.yaw_misses),
                "yaw_miss_pct": round(100.0 * self.yaw_misses / reads, 1),
                "refusals": int(self.refusals),
+               # ROUND 4: what he can read when a throw did nothing.
+               "short_throws": int(self.short_throws),
+               "refused": dict(self.refused),
+               "last_refusal": dict(self.last_refusal),
+               "bars": self.throw_bars(),
                "live": self.cast_live}
         out.update(self.relay.numbers_only())
         out["deck"] = self.view_state.numbers_only()
         out["learner"] = self.learner.numbers_only()
         return out
+
+    def throw_bars(self) -> dict:
+        """The bars a refusal is measured against, beside the refusal. A
+        counter that says "refused on speed 4 times" is only half a story
+        without the number it was refused against, and the bar is one key
+        in assistant.json -- so what is printed has to be the LIVE value,
+        never the module default."""
+        t = self.machine.t
+        return {"throw_speed_us": float(t.throw_speed_us),
+                "throw_release_u": float(t.throw_release_u),
+                "throw_exit_u": float(t.throw_exit_u),
+                "throw_lost_u": float(t.throw_lost_u),
+                "fling_window_s": float(t.fling_window_s),
+                "fling_grant_s": round(self.machine.fling_grant_s(), 4)}
 
     def relearn(self, why: str = "") -> None:
         """Forget the map and say so once. The three tripwires all land

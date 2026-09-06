@@ -440,7 +440,21 @@ class TestTheStartupFile:
         # only a pid this script started is ever stopped.
         assert "Stop-Process -Id $ProcId" in src
         assert "Stop-Cast -ProcId $castPid" in src
-        assert "Get-Process" not in src
+        # ROUND 4 needed Get-Process to tell "already exited" (which is a
+        # SUCCESS and must not be reported) from "would not die" (which
+        # must). Banning the cmdlet by name was a proxy for the real law;
+        # the law itself is that EVERY process this script touches is
+        # named by the pid it recorded, and never by a name -- because
+        # ``Get-Process rustdesk | Stop-Process`` would close a session he
+        # opened himself.
+        import re as _re
+        code = "\n".join(ln for ln in src.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        for call in _re.findall(r"(?:Get|Stop)-Process[^\n]*", code):
+            assert "-Id $ProcId" in call, call
+        for by_name in ("Get-Process rustdesk", "-Name ", "-ProcessName",
+                        "-InputObject"):
+            assert by_name not in code, by_name
 
     def test_it_backs_off_rather_than_hammering_a_spark_that_is_down(self):
         src = self.source()

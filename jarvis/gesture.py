@@ -152,6 +152,38 @@ because the families that still fire -- a mug carried out in under 1.2 s,
 a thing handed to someone, a hand that leaves the picture and comes back
 -- are the same motion as the gesture by every signal this rig has.
 
+ROUND 4 MOVED THAT NUMBER THE WRONG WAY ON PURPOSE, AND HERE IT IS.
+Round 3 bought part of its 0.1995 by placing ``throw_speed_us`` inside
+the spread of HIS OWN throw: measured over the full recall surface, 41 of
+84 cells were below round 2 and the gesture stopped firing when his swing
+was 10 mm shorter or ended 10 mm further from the lens. The bar moved to
+2.45, which is at or above round 2 in every cell, and the false-fire rate
+went with it:
+
+    P(fire | NOT a cast gesture), the preserved 172-family grid,
+    2752 sequences, same seeds:
+      7.5 fps  0.2362  95% CI [0.2207, 0.2524]   (round 3 0.1995)
+      6.0 fps  0.2322  95% CI [0.2168, 0.2483]   (round 3 0.2002)
+      3.7 fps  0.1435  95% CI [0.1309, 0.1571]   (round 3 0.1134)
+
+THE BAR IS 0.005. It is forty-seven times over. A rate that is 40x or 47x
+its bar is not usefully different: both mean the gesture cannot be trusted
+to stay off his screens, and a recall cliff he cannot see is a worse thing
+to ship than a number that was already unshippable.
+
+WHAT WOULD ACTUALLY CLOSE IT, and it is not in this file's gift. The one
+remaining candidate signal is a true WIND-UP -- a small backward
+retraction immediately before the swing. It is absent from every throw
+model here, so NO SYNTHETIC GRID CAN SETTLE IT: a grid that invents a
+wind-up and then detects it proves only that the invention was
+detectable. HUNTER HAS BEEN ASKED WHETHER HIS OWN THROW HAS ONE AND HAS
+NOT ANSWERED. Until he does, this gesture stays ``enabled: False`` in
+jarvis/assistant_config.py and no amount of tuning in this file changes
+that. The second signal cannot help either and cannot be tuned into
+helping: ``yaw_hold_deg`` is a switch, not a dial -- at or under 25 deg of
+head movement it vetoes nothing and the rate is unchanged, over 25 deg it
+refuses every throw he makes, and there is no setting between.
+
 EVERY THRESHOLD BELOW IS A CALIBRATED STARTING POINT, NOT A VALIDATED VALUE.
 They come from arithmetic over a synthetic hand whose proportions match the
 official MediaPipe reference to within 1.5% and from his own lens constants.
@@ -263,6 +295,27 @@ class _NoHead:
 
 
 NO_HEAD = _NoHead()
+
+# WHY A CARRY DID NOT BECOME A THROW, as a CLOSED SET -- the same
+# discipline the cast verbs are held to, and for the same reason: this
+# code goes into a log line, a counter and the stage status, and a
+# free-text reason cannot be counted or compared.
+#
+#   ""          it WAS a throw
+#   "speed"     far enough, never fast enough -- the fling bar refused it
+#   "distance"  it did not travel far enough from the anchor
+#   "look"      his head was not on the screen he grabbed (or no face row)
+#   "direction" the bearing fell between two sectors and is unnameable
+#   "sector"    a clean throw at a sector that is not a target (his up)
+#   "cancel"    his deliberate down-fling, which is the put-back
+#   "carry"     it never got as far as the three bars: it timed out, it
+#               stalled, he pulled it back, or a word ended it
+#
+# ROUND 4 ADDED THESE BECAUSE THE FAILURE WAS SILENT. A throw refused by
+# the speed bar produced a drop, a tone, and nothing he could read; "it
+# just did nothing" was the whole story he had, and he cannot debug that.
+REFUSALS = ("", "speed", "distance", "look", "direction", "sector",
+            "cancel", "carry")
 
 # Frame edges and the four sectors, in HIS frame. Sector centres are the
 # bearings to_his_frame produces for the four cardinal directions.
@@ -647,21 +700,71 @@ class CastThresholds:
     #   handing a thing over in 0.70 s (336 mm/s)   2.60
     #   setting a thing down in 0.7 s (300 mm/s)    2.34
     #
-    # 2.65 -- about 337 mm/s at any pose and any depth now, where 3.0 was
-    # worth anywhere from 204 to 381 mm/s depending on where his hand
-    # happened to be -- is the highest bar that keeps all 64 of the
-    # deliberate 300 mm throws at 7.5 fps with landmark noise up to 3 px
-    # (2.75 kept them all at 0 px and lost 3 of 64 at 3 px). IT IS STILL
-    # NOT A SEPARATION
-    # and no value of it can be: a mug hurried out in 1.2 s is genuinely
-    # faster than his own slow throw. What it costs is stated rather than
-    # hidden -- his slow throw at the SHORT 250 mm swing lands 32 of 64,
-    # and that hole is older than this change.
+    # ROUND 3 SET THIS TO 2.65 ON ONE POINT OF A SURFACE AND IT CUT INTO
+    # HIS OWN GESTURE. That value was chosen against a single family --
+    # a 300-310 mm swing ending at z = 440 -- and round 4 measured the
+    # whole surface: swings 270-330 mm in 10 mm steps, end depths 420-470
+    # in 10 mm steps, both directions, the 5.5-8.0 fps band, 0/3/5 px of
+    # landmark noise, 16 sub-frame phases, both finger orientations
+    # (castgrid/test_r4_recall.py, 24192 sequences a pass). At 2.65,
+    # 41 of the 84 cells were BELOW round 2, worst 0.7569 -> 0.1910, and
+    # the machine said why on every one of them: "carried out of frame,
+    # NOT FLUNG".
+    #
+    # AND IT WAS NOT THE DISTANCE RESCALE, which is what it looked like.
+    # ABLATED one change at a time on the same grid: putting every
+    # distance bar back to its round-2 value changed the surface by
+    # NOTHING (219/336 either way at 7.5 fps, 0 px), and so did switching
+    # off closed_ratio_max and assoc_step_u. Only this bar moved it.
+    #
+    # WHY IT CUT, and this is the whole of it -- MEASURED, not derived.
+    # His own slow deliberate throw is not one speed, it is a spread, and
+    # the machine measures it across this surface as:
+    #
+    #   peak u/s on HIS OWN throw, 7.5 fps, 0 px, his-left
+    #     swing 270 mm   2.576 (z=420) .. 2.512 (z=470)
+    #     swing 290 mm   2.777         .. 2.709
+    #     swing 310 mm   2.978         .. 2.906
+    #     swing 330 mm   3.180         .. 3.104
+    #
+    # 2.65 SITS INSIDE THAT SPREAD. It refuses every 270 and 280 mm swing
+    # and most 290s, which is exactly the cliff. 2.45 sits BELOW all of it
+    # (the minimum measured is 2.512), which is why recall comes back
+    # wherever the frame geometry allows a throw at all.
+    #
+    # And the mm figure above is NOT what it says. One hand-unit measures
+    # 112.0 mm at z=420 and 113.4 mm at z=470 on this hand at his working
+    # pitch -- the pose correction still UNDER-reads the 127 mm it is
+    # documented as by about 11%, which is the residual the round-3 attack
+    # measured (34% -> 11%). So "about 337 mm/s at any pose and any depth"
+    # is wrong twice over: wrong in value and wrong in claiming it does not
+    # move. Any bar stated in mm/s here would be stating a number this rig
+    # cannot yet support, so the value above is defended by the recall
+    # surface and the false-fire grid and by nothing else.
+    #
+    # 2.45 IS THE HIGHEST VALUE THAT IS AT OR ABOVE ROUND 2 IN EVERY ONE
+    # OF THE 84 CELLS (measured: 2.48 was below in 2, 2.50 in 6, 2.55 in
+    # 24). Over the whole surface it is 22001/24192 = 0.9094 against round
+    # 2's own 20712/24192 = 0.8562, with no throw to the wrong side.
+    # THE FLING WINDOW WAS NOT TRADED AWAY TO GET IT: fling_window_s stays
+    # at 0.55 and stays measured to the moment the throw would fire, so
+    # round 3's measurement fix is kept whole.
+    #
+    # WHAT IT COSTS, stated rather than hidden. On the attacker's
+    # preserved 172-family grid, 2752 sequences, same seeds:
+    # P(fire | NOT a cast gesture) 0.1995 -> 0.2362 at 7.5 fps,
+    # 0.2002 -> 0.2322 at 6.0, 0.1134 -> 0.1435 at 3.7. The bar is 0.005.
+    # It was forty times over before and it is forty-seven times over now;
+    # it is still under round 2's 0.2700, and the gesture ships OFF for
+    # exactly this reason. See the module docstring.
+    #
+    # IT IS STILL NOT A SEPARATION and no value of it can be: a mug
+    # hurried out in 1.2 s is genuinely faster than his own slow throw.
     #
     # PER SECOND, NOT PER FRAME, and so ``for_fps`` must not touch it: a
     # throw is fast in the world, not fast per sample, and the same fling
     # sampled at 15 fps moves half as far between frames.
-    throw_speed_us: float = 2.65
+    throw_speed_us: float = 2.45
     # How stale the fling may be when the carry ends. The hand must have
     # been travelling at throw speed within this much of the LAST FRAME
     # THAT SAW IT -- so a jerk at the start of a four-second carry cannot
@@ -816,6 +919,17 @@ class CastEvent:
     closed: float = 0.0
     payload: str = ""
     toward: str = ""
+    # ROUND 4. The two things a silent drop never told him: how fast the
+    # hand actually went, and which bar said no.
+    #
+    # ``speed_us`` is the FASTEST the hand was measured travelling during
+    # the carry, not the last step -- the last step of a throw is the
+    # follow-through and is slow by design. It is the number the fling bar
+    # was compared against, so he can read "you threw at 2.41 and the bar
+    # is 2.45" instead of guessing.
+    # ``refused`` is one of ``REFUSALS`` and is "" on a throw.
+    speed_us: float = 0.0
+    refused: str = ""
 
     def numbers_only(self) -> dict:
         return {"kind": self.kind, "at": round(float(self.at), 4),
@@ -825,6 +939,8 @@ class CastEvent:
                 "sector": self.sector, "why": self.why,
                 "reach": round(float(self.reach), 4),
                 "closed": round(float(self.closed), 4),
+                "speed_us": round(float(self.speed_us), 3),
+                "refused": self.refused,
                 "payload": self.payload, "toward": self.toward}
 
 
@@ -941,6 +1057,9 @@ class CastGesture:
         # that saw it, not to the frame that noticed it was gone.
         self._last_seen_at: Optional[float] = None
         self._speed_us = 0.0
+        # The FASTEST step of this carry, kept so a refusal can say what it
+        # was refusing. Reset wherever _fling_at is.
+        self._peak_us = 0.0
         self._fling_at = -1e9
         # Tri-state, and it is the SECOND SIGNAL: was he looking at the
         # screen he grabbed, from before the reach through to the last
@@ -1029,6 +1148,7 @@ class CastGesture:
                 "carry_s": round(now - started, 3) if started else 0.0,
                 "dist_u": round(float(self._dist_u), 4),
                 "speed_us": round(float(self._speed_us), 3),
+                "peak_us": round(float(self._peak_us), 3),
                 "flung": bool(self._was_flung(now)),
                 "looking": ("" if self._look is NO_HEAD
                             else "?" if self._look is None
@@ -1316,6 +1436,8 @@ class CastGesture:
         if dt <= 0.0:
             dt = 1.0 / self.preview_fps
         self._speed_us = self._last_step_u / dt
+        if self._speed_us > self._peak_us:
+            self._peak_us = self._speed_us
         # A step that had to be a RE-ASSOCIATION is not travel, so it is
         # not fling evidence either -- however fast the arithmetic makes
         # it look. The hand is still followed; only the credit is refused.
@@ -1398,6 +1520,7 @@ class CastGesture:
         self._last_step_u = 0.0
         self._last_seen_at = None
         self._speed_us = 0.0
+        self._peak_us = 0.0
         self._fling_at = -1e9
         self._look = NO_HEAD
         self._jumped = False
@@ -1458,6 +1581,7 @@ class CastGesture:
         # was moving before it was ever picked up brings no credit with it.
         self._last_seen_at = now
         self._speed_us = 0.0
+        self._peak_us = 0.0
         self._fling_at = -1e9
         self._jumped = False
         # The look starts from THIS frame's opinion: the grab is part of
@@ -1480,6 +1604,7 @@ class CastGesture:
         self._last_fist = None
         self._last_seen_at = None
         self._speed_us = 0.0
+        self._peak_us = 0.0
         self._fling_at = -1e9
         self._look = NO_HEAD
         self._jumped = False
@@ -1501,12 +1626,20 @@ class CastGesture:
         not a target, and both are reported as drops that say which way.
         """
         anchor = self._anchor or (0.0, 0.0)
+        # TAKEN NOW, because _enter_cooldown below clears it and the whole
+        # point of the field is that the refusal can say what it refused.
+        peak_us = float(self._peak_us)
         end = self._last_fist or self._last or anchor
         unit = max(self._unit, MIN_PALM_DIAG_PX)
         dx, dy = end[0] - anchor[0], end[1] - anchor[1]
         dist_u = math.hypot(dx, dy) / unit
         vec_bearing = bearing_deg(*to_his_frame(dx, dy, self.mirrored))
         why, thrown, bearing = reason, False, vec_bearing
+        # ROUND 4: WHICH BAR REFUSED IT, from REFUSALS. A carry that never
+        # reached the three-bar decision at all -- a timeout, a stall, a
+        # hand pulled back, a word -- is "carry" and is NOT a gesture that
+        # failed; it is him having put the thing down.
+        refused = "carry"
         # A THROW MUST BE A THROW. Every distance bar below is kept exactly
         # as it was and every one of them now has this in front of it: the
         # hand has to have been FLINGING when the picture last held it.
@@ -1516,6 +1649,7 @@ class CastGesture:
             far = dist_u >= self.t.throw_release_u
             thrown = far and flung
             why = "released" if (flung or not far) else "set down, not flung"
+            refused = "" if thrown else ("distance" if not far else "speed")
         elif reason == "exit":
             edge, frac, edge_bear = edge_bearing(
                 end[0], end[1], self.frame_w, self.frame_h, self.mirrored)
@@ -1532,11 +1666,15 @@ class CastGesture:
                 thrown = far and flung
                 why = ("left frame (his %s)" % edge if (flung or not far)
                        else "carried out of frame, not flung")
+                refused = "" if thrown else ("distance" if not far
+                                             else "speed")
             else:
                 far = (dist_u >= self.t.throw_lost_u
                        and self._last_step_u >= self.t.exit_step_u)
                 thrown = far and flung
                 why = "lost" if (flung or not far) else "lost, not flung"
+                refused = "" if thrown else ("distance" if not far
+                                             else "speed")
         # 'timeout', 'stalled', 'withdrawn' and 'cancelled (...)' are never
         # throws: a carry that ran out, was pulled back closed, or that he
         # ended with a word, is him having put it down, not flung it.
@@ -1551,23 +1689,25 @@ class CastGesture:
         # falls whichever way ``yaw_required`` says, and it says refuse.
         if thrown and self._look is not NO_HEAD:
             if self._look is False:
-                thrown = False
+                thrown, refused = False, "look"
                 why = "%s (he was not looking at it)" % why
             elif self._look is None and self.t.yaw_required:
-                thrown = False
+                thrown, refused = False, "look"
                 why = "%s (no clean face to read his head from)" % why
 
         where = sector(bearing, self.t.sector_half_deg)
         if thrown and where == "ambiguous":
             # Measured but unnameable. Ambiguity resolves to the cheap,
             # reversible outcome, always.
-            thrown = False
+            thrown, refused = False, "direction"
             why = "%s (ambiguous direction)" % why
         elif thrown and where not in self.t.target_sectors:
             thrown = False
             if where == "down":
+                refused = "cancel"
                 why = "cancelled (his down)"
             else:
+                refused = "sector"
                 why = "%s (his %s is not a target)" % (why, where)
 
         name = self.held
@@ -1587,6 +1727,7 @@ class CastGesture:
             dist_u=dist_u, bearing_deg=bearing,
             sector=where if thrown else "", why=why, reach=reach,
             closed=closed, payload=name,
+            speed_us=peak_us, refused=refused,
             toward=where if dist_u >= TOWARD_MIN_U else ""))
 
 
@@ -1613,6 +1754,7 @@ __all__ = [
     "CallablePayload", "CastEvent", "CastGesture", "CastState",
     "CastThresholds", "DESIGN_FPS", "HandObservation", "Payload",
     "HAND_UNIT_MM", "PALM", "PALM_DIAG_OVER_IPD", "PALM_LEN_MM",
+    "REFUSALS",
     "PALM_W_MM", "SECTORS", "TIPS",
     "NO_HEAD",
     "bearing_deg", "describe", "edge_bearing", "observe_hand", "sector",

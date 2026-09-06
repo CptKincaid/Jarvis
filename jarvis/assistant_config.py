@@ -897,6 +897,43 @@ DEFAULTS: dict = {
     # out and grab at the screen (in the air) where the camera is and then
     # gesture towards almost throwing the cast onto the HPCOMPUTER".
     #
+    # ==================================================================
+    # READ THIS BEFORE YOU SET enabled TO True. IT IS THE ONLY THING ON
+    # THIS KEY THAT MATTERS.
+    #
+    # This gesture FIRES WHEN HE IS NOT MAKING IT, and the rate is not
+    # close. MEASURED over 172 families of ordinary desk motion at his own
+    # desk geometry, 2752 synthetic sequences, same seeds across rounds
+    # (castgrid/, an independent adversarial grid):
+    #
+    #   P(fire | NOT a cast gesture)
+    #     7.5 fps   0.2362   95% CI [0.2207, 0.2524]
+    #     6.0 fps   0.2322   95% CI [0.2168, 0.2483]
+    #     3.7 fps   0.1435   95% CI [0.1309, 0.1571]
+    #
+    # THE BAR IS 0.005. That is forty-seven times over it. About a fifth of
+    # the brisk motions near that monitor that anyone could invent -- a mug
+    # carried out in a second, a thing handed to someone beside him, a hand
+    # that leaves the picture and comes back -- fire a cast, and what a
+    # cast does is put a desktop on a monitor he is using.
+    #
+    # IT CANNOT BE TUNED DOWN FROM HERE. Six families still fire and they
+    # ARE his gesture by every signal this rig has: same approach, same
+    # dwell, same grip, same speed, same exit through the same edge. The
+    # second signal is a switch and not a dial -- ``yaw_hold_deg`` at or
+    # under 25 deg vetoes nothing, over 25 deg it refuses every throw he
+    # makes, and there is nothing between. Tightening ``throw_speed_us``
+    # buys rate by cutting into his own throw: round 3 did exactly that and
+    # the gesture stopped firing when his swing was 10 mm shorter.
+    #
+    # THE ONE SIGNAL LEFT NEEDS AN ANSWER FROM HIM, NOT MORE MEASUREMENT.
+    # It is a true WIND-UP: a small backward retraction immediately before
+    # the swing. No synthetic grid can settle it -- a grid that invents a
+    # wind-up and then detects it has proved nothing -- so the question is
+    # HIS: does his own throw pull back before it goes? He has been asked
+    # and has not answered. Until he has, this stays False.
+    # ==================================================================
+    #
     # OFF by default, like every other lens key. It RIDES THE CAMERA
     # PREVIEW: the hand stage runs inside the preview's own capture, on the
     # frame it already pulled, so camera.preview must be on and the console
@@ -957,17 +994,67 @@ DEFAULTS: dict = {
                 # or a resting fist drifting into the zone becomes a grab;
                 # anchor_drift_u is how still "still" is, in hand-units
                 # (~7x the 0.05-0.09 landmark noise floor).
+                #
+                # THESE FIVE WERE RESCALED BY 0.86 IN ROUND 3 AND THIS FILE
+                # DID NOT FOLLOW, WHICH IS A DEFECT ROUND 4 FOUND. The
+                # hand-unit changed under them -- it is measured every frame
+                # and pose-corrected now -- so each bar was multiplied by
+                # 225/262 to keep the millimetres it was measured at. But
+                # ``handstage.thresholds_from_options`` applies whatever is
+                # in THIS file ON TOP of the module's defaults, so on his
+                # actual box round 3's rescale was silently put back:
+                # anchor_drift_u 0.52 -> 0.6, throw_release_u 0.86 -> 1.0,
+                # throw_exit_u 0.22 -> 0.25, throw_lost_u 0.43 -> 0.5,
+                # exit_step_u 0.30 -> 0.35. MEASURED cost on the preserved
+                # grid: about one sequence in 2752, so it was invisible --
+                # and a documented value the shipped file overrides is not
+                # a documented value. tests/test_gesture_round4.py pins
+                # that this file and jarvis/gesture.py agree, field by
+                # field, from here on.
                 "dwell_frames": 3, "open_lookback_frames": 12,
-                "open_frames_req": 1, "anchor_drift_u": 0.60,
+                "open_frames_req": 1, "anchor_drift_u": 0.52,
                 # The throw, in hand-units of travel from the anchor: opened
                 # in frame needs a full hand-width (he opens his hand
                 # hundreds of times an hour); left the picture within
-                # edge_frac of a half-field needs only 0.25 (leaving is the
-                # evidence); vanished in open space needs 0.50 AND a last
-                # step of exit_step_u. Anything less is a DROP -- the cheap,
-                # reversible outcome.
-                "throw_release_u": 1.00, "throw_exit_u": 0.25,
-                "throw_lost_u": 0.50, "exit_step_u": 0.35, "edge_frac": 0.30,
+                # edge_frac of a half-field needs only a fifth of one
+                # (leaving is the evidence); vanished in open space needs
+                # more AND a last step of exit_step_u. Anything less is a
+                # DROP -- the cheap, reversible outcome, and round 4 makes
+                # it say WHY (screens_status()["refused"]).
+                "throw_release_u": 0.86, "throw_exit_u": 0.22,
+                "throw_lost_u": 0.43, "exit_step_u": 0.30, "edge_frac": 0.30,
+                # THE FLING, and it is the bar that decides most refusals.
+                # A carry becomes a throw only if the hand was travelling
+                # at throw_speed_us within fling_window_s of the moment the
+                # throw would fire. 2.45 is in HAND-UNITS PER SECOND and
+                # is deliberately not quoted in mm/s: one hand-unit
+                # measures 112-113 mm on the synthetic hand at his working
+                # pitch, about 11% under the 127 mm it is documented as,
+                # so a millimetre figure here would be a number this rig
+                # cannot support. What it IS defended by: his own slow
+                # throw measures 2.51-3.18 u/s across the surface, so 2.45
+                # sits just below all of it and 2.65 sat inside it. 2.45 is
+                # the highest value that is at or
+                # above round 2's recall in every one of the 84 cells of
+                # the measured surface (swings 270-330 mm x end depths
+                # 420-470 mm x both directions x 5.5-8.0 fps x 0/3/5 px).
+                # Raising it cuts into his own throw; lowering it raises
+                # the false-fire rate above.
+                "throw_speed_us": 2.45, "fling_window_s": 0.55,
+                # The pose-corrected fist scalar. MEASURED and shipped as a
+                # sanity floor rather than a gate (jarvis/gesture.py says
+                # why); open_ratio_min is deliberately at a value nothing
+                # reaches. Both are here so he can tighten them from his
+                # own room, where the pose distribution is real.
+                "closed_ratio_max": 1.05, "open_ratio_min": 99.0,
+                # The second signal: his head still on the screen he
+                # grabbed. yaw_required decides what NO CLEAN FACE ROW
+                # costs, and it refuses -- watch yaw_miss_pct.
+                "yaw_hold_deg": 25.0, "yaw_required": True,
+                # Association during a carry, and the two cheap identity
+                # locks round 3 added with it.
+                "assoc_max_u": 2.15, "assoc_scale_frac": 0.45,
+                "assoc_step_u": 2.00,
                 # A carry survives lost_grace_frames of missed detection,
                 # and ends at carry_max_frames OR carry_max_s, whichever
                 # first (the seconds are the wall-clock backstop for a
