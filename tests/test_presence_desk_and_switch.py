@@ -306,17 +306,55 @@ def test_a_desk_reader_that_raises_is_unknown_not_away():
     assert probe._desk_leg() == (pv.DESK_UNKNOWN, None)
 
 
-def test_the_desk_window_is_his_own_desk_away_number():
-    """ONE NUMBER, ONE MEANING -- the same discipline the mic window
-    follows. ``presence.desk_away_after_min`` already means "how long since
-    the keyboard moved before the chair counts as empty"."""
+def test_the_desk_window_is_the_corroboration_recency_window():
+    """ONE NUMBER, ONE MEANING. A keystroke IS independent agreement, so it
+    keeps its claim exactly as long as any other agreement does."""
     probe = pres.ThreeLegProbe(fabric=fabric(), cfg=Cfg(),
                                desk=lambda: 0.0)
-    assert probe.desk_window_s == pv.DEFAULT_DESK_WINDOW_S == 1500.0
-    his = pres.ThreeLegProbe(
-        fabric=fabric(), cfg=Cfg(**{"presence.desk_away_after_min": 40}),
-        desk=lambda: 0.0)
-    assert his.desk_window_s == 2400.0
+    assert probe.desk_window_s == probe.recency_s
+    assert probe.desk_window_s == pv.DEFAULT_DESK_WINDOW_S == 900.0
+
+    moved = pres.ThreeLegProbe(fabric=fabric(), cfg=Cfg(),
+                               recency_s=1200.0, desk=lambda: 0.0)
+    assert moved.desk_window_s == 1200.0, "the two move together"
+
+
+def test_the_price_of_the_desk_leg_is_about_three_minutes_of_away_latency():
+    """THE COST, MEASURED, because a veto that never expires is a mute
+    button. He walks out at the desk; the rooms answer clear; his phone
+    stops answering. Away has to still arrive, and soon enough that a short
+    errand is greeted on his return.
+
+    WITHOUT the desk leg this box says away at ~11.8 min (the 12-minute
+    phone grace). WITH it the desk keeps vouching for him until its window
+    runs out, so away lands at ~15 min. That is the whole price, and it is
+    what the wrong reuse would have made 36.8.
+    """
+    def away_at(desk_on):
+        clock = {"t": 0.0}
+        left = 600.0
+        kw = {"desk": (lambda: clock["t"] - left)} if desk_on else {}
+        fab = rf.from_readers([("office", Reader(False)),
+                               ("kitchen", Reader(False))],
+                              poll_s=2.0, enter_hold_s=2.0)
+        probe = pres.ThreeLegProbe(
+            fabric=fab, cfg=Cfg(**{"presence.away_after_min": 12}),
+            phone=lambda ip, mac: clock["t"] < left,
+            now=lambda: clock["t"], boot_grace_s=0.0, **kw)
+        s = pres.PresenceSentinel(
+            Cfg(**{"presence.phone_ip": "10.0.0.5"}), publish=lambda e: None,
+            probe_fn=probe, now=lambda: clock["t"], poll_s=10.0)
+        while clock["t"] < left + 3600.0:
+            s.tick()
+            if s.state == "away":
+                return (clock["t"] - left) / 60.0
+            clock["t"] += 10.0
+        return None
+
+    without, with_desk = away_at(False), away_at(True)
+    assert 11.0 < without < 13.0, without
+    assert 14.0 < with_desk < 17.0, with_desk
+    assert with_desk - without < 4.0, "three minutes, not twenty-five"
 
 
 def test_the_15_28_13_line_replayed_through_the_probe(tmp_path):

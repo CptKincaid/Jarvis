@@ -187,20 +187,28 @@ RECENCY_S_PROVENANCE = (
 # spoken turn go on proving he is in the flat. One number, one meaning.
 DEFAULT_MIC_WINDOW_S = 10 * 60.0
 
-# The desk window is NOT a new number either. ``presence.desk_away_after_min``
-# (25 minutes) is deskpresence.py's own threshold and already means exactly
-# this: how long since the keyboard or mouse moved before the chair counts as
-# empty. CHOSEN BY REUSE, NOT MEASURED -- nobody has timed how long he sits
-# still at that desk, and the honest thing is to say so and to point at the
-# one key that changes it rather than to invent a second number that means
-# almost the same thing and then drifts.
+# The desk window is NOT a new number either, and picking the RIGHT existing
+# one mattered more than it looked. It is the CORROBORATION RECENCY window
+# (``presence.corroboration_recency_min``, 15 min on his box), because that
+# is the number that already means "how fresh does independent agreement
+# have to be to keep saying he is here" -- and a keystroke is exactly
+# independent agreement.
 #
-# It is deliberately LONGER than the mic's 10 minutes. Silence is cheap --
-# he can sit reading for half an hour -- so the mic's window is short to keep
-# it honest about "recently spoke". The desk answers a different question
-# with a harder signal: a keypress at his machine is a body at his machine,
-# and 25 minutes of it is his own existing tolerance.
-DEFAULT_DESK_WINDOW_S = 25 * 60.0
+# THE ONE I REJECTED, AND WHY, MEASURED. The obvious reuse was
+# ``presence.desk_away_after_min`` (25 min), deskpresence.py's own
+# threshold. It is the wrong question -- it asks "is the CHAIR empty", not
+# "is he in the FLAT" -- and the cost of the mismatch was measured on a fake
+# clock, rooms clear and his phone gone: away landed 36.8 minutes after he
+# walked out instead of 11.8. Every errand shorter than about forty minutes
+# would have earned silence on his return. At the recency window it lands at
+# ~15 min, which is three minutes past the phone's own 12-minute grace, and
+# THAT is the real price of this leg: about three minutes of extra latency
+# on "away" in exchange for the two false aways of 2026-09-06.
+#
+# CHOSEN, NOT MEASURED: nobody has timed how long he sits still at that
+# desk. One edit moves it, and it moves the corroboration window with it,
+# which is coherent because they are the same claim.
+DEFAULT_DESK_WINDOW_S = DEFAULT_RECENCY_S
 
 # --------------------------------------------------------- the verdicts
 HOME = "home"
@@ -222,6 +230,18 @@ class Verdict:
     reason: str = ""
     cell: int = 0
     hold: bool = False           # keep the previous verdict; this is not news
+    # HOW LONG AGO THE EVIDENCE FOR THIS VERDICT ACTUALLY LANDED, when it
+    # is not "now". Set only by the witness veto below, and read only by
+    # PresenceSentinel.tick, which stamps ``last_seen`` at that moment
+    # rather than at this poll.
+    #
+    # WITHOUT IT THE TWO CLOCKS STACK, measured: rooms clear, his phone
+    # gone, the desk vouching for him from a keystroke 11 minutes old. The
+    # veto answers HOME, the sentinel reads HOME as "seen NOW", and its own
+    # 12-minute away grace restarts -- so "away" landed 26.8 minutes after
+    # he walked out instead of the 15 the window costs. He was last seen
+    # eleven minutes ago; saying so is both truer and cheaper.
+    witness_s_ago: Optional[float] = None
 
     @property
     def home(self) -> bool:
@@ -575,7 +595,8 @@ def _witness(*, mic: str = MIC_UNKNOWN, mic_s_ago=None,
              desk: str = DESK_UNKNOWN, desk_s_ago=None) -> Optional[tuple]:
     """THE ONE PLACE that asks "has anything actually had him IN THE FLAT?"
 
-    Returns ``(phrase, kind)`` or None. Two legs can answer it and they are
+    Returns ``(phrase, kind, seconds_ago)`` or None. Two legs can answer it
+    and they are
     twins: a spoken turn inside the mic window, and a keyboard or mouse
     event inside the desk window. Neither can be faked by the two legs that
     go wrong -- a radar can latch and a radio can nap, but a microphone
@@ -594,9 +615,10 @@ def _witness(*, mic: str = MIC_UNKNOWN, mic_s_ago=None,
     an empty flat. Only "something had him here" ever comes out.
     """
     if mic == MIC_HEARD:
-        return ("the mic heard him %s" % _ago(mic_s_ago), "mic")
+        return ("the mic heard him %s" % _ago(mic_s_ago), "mic", mic_s_ago)
     if desk == DESK_AT:
-        return ("his keyboard or mouse moved %s" % _ago(desk_s_ago), "desk")
+        return ("his keyboard or mouse moved %s" % _ago(desk_s_ago), "desk",
+                desk_s_ago)
     return None
 
 
@@ -696,9 +718,8 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
     seen = _witness(mic=mic, mic_s_ago=mic_s_ago,
                     desk=desk, desk_s_ago=desk_s_ago)
     if seen is not None:
-        phrase, _kind = seen
         return (HOME, "a room sees somebody and %s, so he is in the flat "
-                      "whatever his phone's radio is doing" % phrase)
+                      "whatever his phone's radio is doing" % seen[0])
     if pre_existing and agreed_s_ago is None:
         # A RUN THAT BEGAN BEFORE THIS PROCESS DID. The radar's latch may
         # be seconds or hours old and the box genuinely cannot tell, so
@@ -813,12 +834,13 @@ def decide(*, phone: str, camera: str, rooms: str,
             # mic-HEARD" while he was talking to it. Cell 6 had asked the
             # mic since the day the voter shipped; the other five away
             # cells never did, and the one he hit was cell 24.
-            phrase, _kind = seen
+            phrase, _kind, ago = seen
             return Verdict(HOME, "%s, so he is in the flat. Cell %d read "
                                  "away -- %s -- but a leg that has him HERE "
                                  "outvotes legs that merely failed to find "
                                  "him" % (phrase[0].upper() + phrase[1:],
-                                          cell, reason), cell)
+                                          cell, reason), cell,
+                           witness_s_ago=ago)
         if sensing_off:
             # 15:10:57 again, the other half: "camera off for ten minutes"
             # switched the room radars off with the lens, the rooms leg
@@ -876,7 +898,8 @@ def decide_rooms_only(*, rooms: str, camera: str = CAM_BLIND,
         if seen is not None:
             return Verdict(HOME, "%s, so he is in the flat -- every room "
                                  "answered clear, and none of them can see "
-                                 "the bedroom" % seen[0], 0)
+                                 "the bedroom" % seen[0], 0,
+                           witness_s_ago=seen[2])
         if sensing_off:
             return Verdict(UNKNOWN, "every room answered clear, but sensing "
                                     "is switched off; a leg he switched off "

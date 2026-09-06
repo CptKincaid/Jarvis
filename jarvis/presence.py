@@ -510,14 +510,18 @@ class ThreeLegProbe:
         self.recency_s = _seconds(recency_s, pv.DEFAULT_RECENCY_S)
         self.mic_window_s = _seconds(mic_window_s, pv.DEFAULT_MIC_WINDOW_S)
         # ONE NUMBER, ONE MEANING -- the same discipline the mic window
-        # follows. ``presence.desk_away_after_min`` is deskpresence.py's
-        # own threshold and already means "how long since the keyboard
-        # moved before the chair counts as empty"; re-deriving a second
-        # number here is how two clocks drift apart. CHOSEN BY REUSE, NOT
-        # MEASURED: nobody has timed how long he sits still at that desk.
+        # follows. The desk window IS the corroboration recency window: a
+        # keystroke is independent agreement, and that key already means
+        # "how fresh does agreement have to be to keep saying he is here".
+        #
+        # NOT ``presence.desk_away_after_min``, which was the first choice
+        # and is the wrong question -- it asks whether the CHAIR is empty.
+        # Measured on a fake clock, rooms clear and his phone gone: at 25
+        # min "away" landed 36.8 minutes after he walked out instead of
+        # 11.8, so every errand under forty minutes would have earned
+        # silence on his return. At the recency window it lands at ~15.
         self.desk_window_s = _seconds(
-            desk_window_s if desk_window_s is not None
-            else _minutes(_cfg_get(cfg, "presence.desk_away_after_min", None)),
+            desk_window_s if desk_window_s is not None else self.recency_s,
             pv.DEFAULT_DESK_WINDOW_S)
         self.verdict = None
         self.legs: dict = {}
@@ -527,6 +531,10 @@ class ThreeLegProbe:
         # sentinel reads it so the two graces cannot STACK -- see
         # PresenceSentinel.tick.
         self.grace_running = False
+        # How long ago the evidence behind the last HOME actually landed.
+        # Zero unless a witness veto is holding the away off -- see
+        # ``__call__`` and PresenceSentinel.tick.
+        self.seen_s_ago = 0.0
         self._now = now
         self._started = None       # first call, on the monotonic clock
         self._last_yes = None      # the last tick the phone actually answered
@@ -914,6 +922,15 @@ class ThreeLegProbe:
         self.legs = {"phone": phone, "camera": camera, "rooms": rooms,
                      "mic": mic, "desk": desk}
         self._log(verdict)
+        # WHEN THE EVIDENCE ACTUALLY LANDED, for the sentinel's away clock.
+        # 0.0 -- "now" -- for every ordinary verdict; the witness's own age
+        # when a stale keystroke or turn is what withheld an away. See
+        # presencevote.Verdict.witness_s_ago for the 26.8 minutes this
+        # saves.
+        try:
+            self.seen_s_ago = max(0.0, float(verdict.witness_s_ago or 0.0))
+        except (TypeError, ValueError):
+            self.seen_s_ago = 0.0
         if verdict.state == pv.UNKNOWN:
             return None
         return verdict.state != pv.AWAY
@@ -1210,7 +1227,20 @@ class PresenceSentinel:
                 self._started_at = now
                 self.last_seen = now if present else None
             if present:
-                self.last_seen = now
+                # STAMPED WHEN HE WAS ACTUALLY SEEN, not when we polled. It
+                # is "now" for every ordinary answer; a witness veto -- a
+                # keystroke or a turn that is minutes old and is all that
+                # is holding an away off -- says how old, and stamping THAT
+                # is what stops its window and this grace from stacking.
+                # MEASURED: rooms clear, phone gone, a keystroke 11 min
+                # old -> away at ~15 min instead of 26.8.
+                seen_ago = 0.0
+                try:
+                    seen_ago = max(0.0, float(
+                        getattr(self._probe, "seen_s_ago", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    seen_ago = 0.0
+                self.last_seen = now - seen_ago
                 if self.home is not True:
                     returned = self.home is False
                     self.home, self.since = True, now
