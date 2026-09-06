@@ -66,6 +66,7 @@ sir") read that.
 """
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import threading
@@ -110,9 +111,103 @@ def _run_default(argv, timeout):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
+def default_gateway(run: Callable = _run_default) -> str:
+    """The default route's next hop, or "". Used only as a canary."""
+    try:
+        res = run(["ip", "-4", "route", "show", "default"], timeout=PING_TIMEOUT_S)
+        toks = (getattr(res, "stdout", "") or "").split()
+        return toks[toks.index("via") + 1] if "via" in toks else ""
+    except Exception:  # noqa: BLE001 - a canary may not cost the leg
+        log.debug("presence: default route lookup failed", exc_info=True)
+        return ""
+
+
+def probe_state(ip: str = "", mac: str = "",
+                run: Callable = _run_default) -> Optional[bool]:
+    """UNKNOWN, NEVER AWAY. ``True`` / ``False`` / ``None``.
+
+    ``probe()`` below cannot say "I could not ask" -- it returns a plain
+    bool, and its own comment about ip(8) ("a missing/timed-out ip(8) is
+    'unknown'") is contradicted by the line under it, which falls through
+    to the ping and returns False on any exception. False means AWAY, so
+    every one of these reads as "he left the flat": the Spark's own Wi-Fi
+    drops, the router reboots, ip(8) or ping is missing from PATH, the
+    subnet changes. That is a confident false away, which is the worse of
+    the two failures -- it mutes him while he is sitting in the room.
+
+    THE RULE HERE: distinguish the two failures concretely.
+
+      * the ping SUBPROCESS ran and got no reply -> ``False``. A real
+        "asked, and no answer".
+      * it raised, timed out, or could not be launched at all -> ``None``.
+      * ``ip -4 neigh`` itself failed -> ``None``, before anything else.
+      * no address configured at all -> ``None``. An unconfigured leg says
+        nothing about where he is; the old ``probe`` answered False here,
+        which is a leg voting on a question it was never wired to see.
+
+    THE GATEWAY CANARY, and it costs a packet only on the negative path.
+    His default gateway is the neighbour that answers; if the GATEWAY does
+    not reply either, the network is down, not the man, and the leg is
+    ``None`` regardless of what the phone did. Measured on his box
+    2026-09-05: 6 neighbour rows, states REACHABLE and STALE only, the
+    gateway REACHABLE. (The brief said the gateway was the ONLY REACHABLE
+    row; it is one of three. The canary does not depend on that.)
+
+    ``PresenceSentinel.tick`` already handles a None correctly -- it holds
+    everything, including the boot grace clock, and counts nothing towards
+    the away grace. The plumbing to receive an honest unknown was already
+    there; only the leg refused to send one.
+    """
+    ip, mac = (ip or "").strip(), (mac or "").strip().lower()
+    if not ip and not mac:
+        return None
+    try:
+        res = run(["ip", "-4", "neigh"], timeout=PING_TIMEOUT_S)
+        rows = parse_neigh(getattr(res, "stdout", "") or "")
+    except Exception:  # noqa: BLE001 - could not ask, so do not answer
+        log.debug("presence: ip neigh failed", exc_info=True)
+        return None
+    for row in rows:
+        if (ip and row["ip"] == ip) or (mac and row["mac"] == mac):
+            if row["state"] in PRESENT_STATES:
+                return True
+            if not ip:
+                ip = row["ip"]                  # MAC-only config: ping what ARP knows
+    if not ip:
+        # A MAC that ARP has never seen. There is nothing to ping, and
+        # "no address to ping" is not evidence that he is out.
+        return None
+    try:
+        res = run(["ping", "-c", "1", "-W", "1", ip], timeout=PING_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - TimeoutExpired, FileNotFoundError...
+        log.debug("presence: ping %s could not run", ip, exc_info=True)
+        return None
+    if getattr(res, "returncode", 1) == 0:
+        return True
+    gateway = default_gateway(run)
+    if not gateway:
+        return None
+    try:
+        res = run(["ping", "-c", "1", "-W", "1", gateway], timeout=PING_TIMEOUT_S)
+    except Exception:  # noqa: BLE001
+        return None
+    if getattr(res, "returncode", 1) != 0:
+        log.info("presence: the phone did not answer and neither did the "
+                 "gateway; the network is down, not him")
+        return None
+    return False
+
+
 def probe(ip: str = "", mac: str = "", run: Callable = _run_default) -> bool:
     """True when the phone answers. ``run(argv, timeout=)`` is the seam
-    (tests pass a fake that returns an object with returncode/stdout)."""
+    (tests pass a fake that returns an object with returncode/stdout).
+
+    KEPT AS A BOOL for every existing caller. It flattens the honest
+    unknown that ``probe_state`` can now express -- deliberately, because
+    changing this function's type would change what "away" means for the
+    single-leg path that is live on other boxes. The three-leg path uses
+    ``probe_state``.
+    """
     ip, mac = (ip or "").strip(), (mac or "").strip().lower()
     if not ip and not mac:
         return False
@@ -147,6 +242,27 @@ def _cfg_get(cfg, key, default=None):
         except Exception:  # noqa: BLE001
             log.debug("presence: cfg.get(%s) failed", key, exc_info=True)
     return default
+
+
+def _seconds(value, default: float, floor_s: float = 60.0) -> float:
+    """A window in seconds from a number, or ``default``. NaN, zero and
+    negatives are nonsense and fall back; a window is floored at a minute,
+    the same floor ``away_after_s`` and ``arrival.mic_silence_s`` apply."""
+    try:
+        s = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(s) or s <= 0.0:
+        return float(default)
+    return max(floor_s, s)
+
+
+def _minutes(value):
+    """Minutes -> seconds, or None for anything that is not a number."""
+    try:
+        return float(value) * 60.0
+    except (TypeError, ValueError):
+        return None
 
 
 def _make_sensor(cfg, policy=None):
@@ -251,8 +367,259 @@ class RoomOrPhone:
         if seen:
             return True
         if ip or mac:
-            return bool(self.phone(ip, mac))
+            # NOT bool(): a phone leg that can say "I could not ask" must
+            # be able to say it through here. ``bool()`` flattened a None
+            # to False at the last line, which is the confident false away
+            # this whole composition exists to avoid. A leg that still
+            # returns a plain bool is unaffected.
+            answer = self.phone(ip, mac)
+            return None if answer is None else bool(answer)
         return False if seen is False else None
+
+
+class ThreeLegProbe:
+    """HIS three-leg voter, wearing the sentinel's probe shape.
+
+    ``(ip, mac) -> True | False | None`` exactly like ``RoomOrPhone``, so it
+    drops into ``PresenceSentinel`` at the seam that was always there and
+    the sentinel's thread, cadence, hysteresis and event publishing are
+    untouched. The mapping is the whole interface:
+
+        HOME, BED   -> True    he is in the flat (BED is a HOME sub-state)
+        AWAY        -> False   established out
+        UNKNOWN     -> None    the sentinel HOLDS: it does not count a None
+                               towards the away grace, and it does not
+                               start the boot grace clock on one
+
+    THE GRACE IS THE SENTINEL'S, NOT THE VOTER'S. ``phone_leg`` is called
+    with ``grace_s=0.0`` on purpose. ``away_after_min`` (12 min) is applied
+    once, by ``PresenceSentinel.tick``, against ``last_seen``; if the voter
+    ALSO held a grace they would stack and "away" would take 24 minutes --
+    twelve of which he would spend standing in his hallway un-greeted. So
+    the voter answers "right now", and the sentinel decides how long a
+    "no" has to persist before it means anything. ``grace_s`` is exposed
+    so a test can pin that.
+
+    WHY THE PHONE IS ASKED EVERY TICK NOW, and this is the fix for the
+    proximate cause of 2026-09-05. ``RoomOrPhone.__call__`` opens with
+    ``if seen: return True`` -- while ANY room reads occupied the phone is
+    never probed at all. So the latched office did not merely outvote the
+    phone, it PREVENTED THE PHONE FROM VOTING. Had the phone been asked it
+    would have said "no answer", the grace would have expired at ~20:35:10
+    and the sentinel would have been strictly away when he opened the door
+    at 20:43:13. Here all three legs are read on every tick and the vote is
+    taken over all three. The cost is one ARP read plus at most one ping
+    per poll -- 60 s while he is home.
+
+    THE FOURTH INPUT, for cell 6 only. ``mic()`` returns SECONDS SINCE THE
+    MICROPHONE LAST COMPLETED A TURN -- ``TurnLedger.idle_s()``, the number
+    ``arrival.departure_ready`` already vetoes on -- or None. It is a
+    number, never audio, and ``_mic_leg`` below is pinned to stay that way.
+    ``recency_s`` is how fresh an agreement with an occupied run has to be
+    for that run to still count as him (``presence.corroboration_recency_min``);
+    ``mic_window_s`` is how long a turn goes on proving he is in the flat
+    (``presence.departure_mic_silence_min`` -- the departure veto's own
+    number, reused rather than re-invented).
+    """
+
+    def __init__(self, fabric=None, cfg=None, stuck=None,
+                 phone: Callable = probe_state, eye: Optional[Callable] = None,
+                 mic: Optional[Callable] = None,
+                 door_room: str = "kitchen", desk_room: str = "office",
+                 recency_s: Optional[float] = None,
+                 mic_window_s: Optional[float] = None):
+        from jarvis import presencevote as pv
+        self.fabric = fabric
+        self._cfg = cfg
+        self.stuck = stuck
+        self.phone = phone
+        self.eye = eye
+        self.mic = mic
+        self.door_room = door_room
+        self.desk_room = desk_room
+        self.grace_s = 0.0
+        self.recency_s = _seconds(recency_s, pv.DEFAULT_RECENCY_S)
+        self.mic_window_s = _seconds(mic_window_s, pv.DEFAULT_MIC_WINDOW_S)
+        self.verdict = None
+        self.legs: dict = {}
+        self._said = ""
+
+    # ------------------------------------------------------- the legs
+    def _rooms_leg(self):
+        """(leg, last_room, age). Never raises."""
+        from jarvis import presencevote as pv
+        if self.fabric is None:
+            return pv.ROOMS_UNREACHABLE, "", None
+        try:
+            # The same rule ``HouseView.read`` follows, and for the same
+            # reason: when the fabric's own 2 s thread is running we read
+            # what it last saw rather than polling every ESP32 a second
+            # time on the sentinel's thread. With no thread (a test, or a
+            # build that only wants the presence leg) we tick it ourselves
+            # -- without this the readings are whatever the last tick left,
+            # which on a never-ticked fabric is None for every room.
+            if not getattr(self.fabric, "running", False):
+                self.fabric.tick()
+            readings = self.fabric.readings()
+            faulted = set(self.fabric.stuck_rooms())
+        except Exception:  # noqa: BLE001 - a broken fabric is not a verdict
+            log.debug("presence: the fabric could not be read", exc_info=True)
+            return pv.ROOMS_UNREACHABLE, "", None
+        if self.stuck is not None:
+            try:
+                for room, value in readings.items():
+                    self.stuck.observe(room, value)
+                faulted |= set(self.stuck.faulted())
+            except Exception:  # noqa: BLE001
+                log.debug("presence: the stuck detector failed", exc_info=True)
+        try:
+            last_room, age = self.fabric.last_seen_room()
+        except Exception:  # noqa: BLE001
+            last_room, age = "", None
+        return pv.rooms_leg(readings, faulted=faulted), last_room, age
+
+    def _camera_leg(self):
+        """A NAME AND A COUNT, never a frame.
+
+        ``eye()`` returns ``(identity, faces, live)``. No eye at all -- and
+        that is his box today, because nothing in the tree ever assigns
+        ``services.camera_feed`` -- is BLIND, which is "could not look" and
+        never "looked and saw nobody".
+        """
+        from jarvis import presencevote as pv
+        if self.eye is None:
+            return pv.CAM_BLIND
+        try:
+            identity, faces, live = self.eye()
+        except Exception:  # noqa: BLE001 - a broken eye is not a verdict
+            log.debug("presence: the eye could not be asked", exc_info=True)
+            return pv.CAM_BLIND
+        return pv.camera_leg(identity=identity, faces=faces, live=live)
+
+    def _mic_leg(self):
+        """(leg, seconds ago). ONE NUMBER OFF THE TURN LEDGER, never audio.
+
+        ``mic()`` is ``TurnLedger.idle_s`` on the live box: seconds since
+        the microphone last completed a turn, or None if it never has. No
+        reader at all -- any box where the app has not wired the ledger in
+        -- is UNKNOWN, which never votes; a reader that raises is the same.
+        Nothing here opens a device or touches a sample.
+        """
+        from jarvis import presencevote as pv
+        if self.mic is None:
+            return pv.MIC_UNKNOWN, None
+        try:
+            s_ago = self.mic()
+        except Exception:  # noqa: BLE001 - a broken ledger is not a verdict
+            log.debug("presence: the mic ledger could not be read", exc_info=True)
+            return pv.MIC_UNKNOWN, None
+        leg = pv.mic_leg(s_ago=s_ago, window_s=self.mic_window_s)
+        return leg, (float(s_ago) if leg != pv.MIC_UNKNOWN else None)
+
+    def _agreed_s_ago(self):
+        """Seconds since anything independent last agreed with an OPEN
+        occupied run -- the freshest across rooms -- or None with no run on
+        the books.
+
+        A run nothing has agreed with YET is aged from its start: a man who
+        just sat down has a young run and his phone has not woken, and that
+        is not a fault. What this must never do is answer "ever": the first
+        cut asked ``corroborated_s_ago is not None`` here, which stays true
+        for the rest of the run after one phone hit, so a radar that saw him
+        and then latched kept him "home" for as long as it took the
+        45-minute stuck fault to drop the room. Measured: a trip of an hour
+        was not greeted. The window is applied in ``presencevote.cell6``.
+        """
+        if self.stuck is None:
+            return None
+        try:
+            ages = []
+            for row in self.stuck.status().values():
+                if not row.get("run_s"):
+                    continue
+                since = row.get("corroborated_s_ago")
+                ages.append(float(row["run_s"] if since is None else since))
+            return min(ages) if ages else None
+        except Exception:  # noqa: BLE001 - unreadable history is not a fault
+            log.debug("presence: the run history could not be read", exc_info=True)
+            return None
+
+    # -------------------------------------------------------- the vote
+    def __call__(self, ip: str = "", mac: str = "") -> Optional[bool]:
+        from jarvis import presencevote as pv
+        rooms, last_room, age = self._rooms_leg()
+        camera = self._camera_leg()
+        mic, mic_s_ago = self._mic_leg()
+        try:
+            answer = self.phone(ip, mac) if (ip or mac) else None
+        except Exception:  # noqa: BLE001 - the phone must not break the vote
+            log.debug("presence: the phone probe failed", exc_info=True)
+            answer = None
+        phone = pv.phone_leg(answer=answer, unseen_s=0.0, grace_s=self.grace_s)
+
+        if self.stuck is not None:
+            # Corroboration: something independent agreed that somebody is
+            # here. House-level and conservative -- see jarvis/stuckroom.py.
+            try:
+                if phone == pv.PHONE_YES:
+                    self.stuck.corroborate("phone")
+                if camera == pv.CAM_SAW:
+                    self.stuck.corroborate("camera")
+                if mic == pv.MIC_HEARD and mic_s_ago is not None:
+                    # Stamped AT THE TURN, not at this poll -- a turn nine
+                    # minutes ago is not an agreement now. The app stamps
+                    # each wake as it happens too; this is the same fact
+                    # from the other side of a restart, and an older stamp
+                    # is ignored, so the two never double-count. Without it
+                    # the 45-minute fault dropped a room the mic was
+                    # vouching for and cell 15 called him away at the desk.
+                    self.stuck.corroborate("mic", ago=mic_s_ago)
+            except Exception:  # noqa: BLE001
+                log.debug("presence: corroboration failed", exc_info=True)
+
+        # Cell 6 needs to know how RECENTLY any occupied room's run was
+        # agreed with -- not whether it ever was. Read only when a room is
+        # on; the other 26 cells never see it.
+        agreed_s_ago = self._agreed_s_ago() if rooms == pv.ROOMS_ON else None
+
+        if not (ip or mac):
+            # No phone leg configured AT ALL -- a sensor-only install, not
+            # his box. See presencevote.decide_rooms_only for why P2 has
+            # to yield when there is nothing to outvote the radar with.
+            verdict = pv.decide_rooms_only(rooms=rooms, camera=camera)
+        else:
+            verdict = pv.decide(phone=phone, camera=camera, rooms=rooms,
+                                agreed_s_ago=agreed_s_ago,
+                                recency_s=self.recency_s,
+                                mic=mic, mic_s_ago=mic_s_ago,
+                                last_room=last_room, last_room_age_s=age,
+                                door_room=self.door_room,
+                                desk_room=self.desk_room)
+        self.verdict = verdict
+        self.legs = {"phone": phone, "camera": camera, "rooms": rooms,
+                     "mic": mic}
+        self._log(verdict)
+        if verdict.state == pv.UNKNOWN:
+            return None
+        return verdict.state != pv.AWAY
+
+    def _log(self, verdict) -> None:
+        """The reason, at INFO, once per change.
+
+        This is the line that did not exist on 2026-09-05. The whole day's
+        log held seven "presence: home" lines, zero "away" lines and no
+        word about why the door did not open -- so "why did he not greet
+        me" had no answer anywhere on disk.
+        """
+        key = "%s/%s" % (verdict.cell, verdict.state)
+        if self._said == key:
+            return
+        self._said = key
+        log.info("presence: %s (cell %d) -- %s [phone %s, camera %s, rooms %s, "
+                 "mic %s]",
+                 verdict.state, verdict.cell, verdict.reason,
+                 self.legs.get("phone"), self.legs.get("camera"),
+                 self.legs.get("rooms"), self.legs.get("mic"))
 
 
 def make_probe(sensor, phone: Callable = probe) -> Callable:
@@ -286,7 +653,22 @@ class PresenceSentinel:
         self.fabric = _make_fabric(cfg, policy)
         self.sensor = (self.fabric.house_view() if self.fabric is not None
                        else _make_sensor(cfg, policy))
-        self._probe = probe_fn if probe_fn is not None else make_probe(self.sensor)
+        # HIS THREE-LEG VOTER, when there is a fabric to read rooms from.
+        # ``presence.three_legs`` is OFF BY DEFAULT. Turning it on makes the
+        # camera, then the phone, then the room sensors vote on "away" in
+        # his order, so a room reading occupied no longer stops the phone
+        # being asked and a latched radar cannot cost him the greeting.
+        # Off, the 2026-09-05 composition (RoomOrPhone) runs byte for byte.
+        # It ships off because it changes what "away" means on a live box,
+        # and a merge plus a restart must not decide that for him.
+        self.stuck = None
+        self.legs = None
+        if self.fabric is not None and \
+                bool(_cfg_get(cfg, "presence.three_legs", False)):
+            self.legs = self._build_legs(cfg)
+        self._probe = (probe_fn if probe_fn is not None
+                       else (self.legs if self.legs is not None
+                             else make_probe(self.sensor)))
         self._now = now
         self._poll_s = poll_s
         self.home: Optional[bool] = None
@@ -296,6 +678,73 @@ class PresenceSentinel:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _build_legs(self, cfg):
+        """The three-leg probe, or None. Never raises: a broken voter must
+        cost the FEATURE, not the presence leg the box already had."""
+        try:
+            from jarvis import stuckroom
+            self.stuck = stuckroom.StuckRooms(publish=bus.publish)
+        except Exception:  # noqa: BLE001 - the fault board is optional
+            log.exception("presence: the stuck-room detector could not be "
+                          "built; the voter runs without corroboration")
+            self.stuck = None
+        from jarvis import presencevote as pv
+        # ONE EDIT: presence.corroboration_recency_min, in minutes. The
+        # default is derived, not measured -- pv.RECENCY_S_PROVENANCE says
+        # from what -- and his own short-trip length is the right value.
+        recency_s = _seconds(
+            _minutes(_cfg_get(cfg, "presence.corroboration_recency_min", None)),
+            pv.DEFAULT_RECENCY_S)
+        # The mic window is the departure veto's own number
+        # (presence.departure_mic_silence_min), read through arrival's own
+        # reader so the two can never drift apart.
+        try:
+            from jarvis import arrival
+            mic_window_s = arrival.mic_silence_s(
+                lambda key, default=None: _cfg_get(cfg, key, default))
+        except Exception:  # noqa: BLE001 - the default is the same number
+            mic_window_s = None
+        try:
+            legs = ThreeLegProbe(
+                fabric=self.fabric, cfg=cfg, stuck=self.stuck,
+                door_room=str(_cfg_get(cfg, "presence.door_room", "kitchen")),
+                # ``presence.desk_room``, NOT ``presence.desk``.
+                # ``presence.desk`` is deskpresence.py's BOOLEAN switch and
+                # it is True on his box, so reading it here gave the room
+                # name "True" and the bedroom split lost its office branch
+                # outright. tests/test_presence_desk_key.py pins it.
+                desk_room=str(_cfg_get(cfg, "presence.desk_room", "office")),
+                recency_s=recency_s, mic_window_s=mic_window_s)
+        except Exception:  # noqa: BLE001
+            log.exception("presence: the three-leg voter could not be built; "
+                          "falling back to the room-or-phone composition")
+            return None
+        log.info("presence: three-leg voter active (camera, phone, rooms; "
+                 "the mic breaks cell 6) -- an agreement counts for %d min, "
+                 "a turn for %d min; set presence.three_legs false to go back",
+                 int(legs.recency_s // 60), int(legs.mic_window_s // 60))
+        return legs
+
+    @property
+    def verdict(self):
+        """The last three-leg verdict, or None on the old path. Carries the
+        reason, so a consumer can say WHY rather than only what."""
+        return getattr(self.legs, "verdict", None)
+
+    def corroborate(self, source: str = "") -> None:
+        """The mic heard him (or any other independent leg agreed).
+
+        The app feeds the turn ledger in here. It is the third
+        corroboration source in jarvis/stuckroom.py and the one neither the
+        phone nor the camera can supply.
+        """
+        if self.stuck is None:
+            return
+        try:
+            self.stuck.corroborate(source or "mic")
+        except Exception:  # noqa: BLE001
+            log.debug("presence: corroborate failed", exc_info=True)
 
     # ------------------------------------------------------------ config
     @property

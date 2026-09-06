@@ -5109,3 +5109,55 @@ That is the path your first Knightfall test takes. The rows carry a turn
 stamp and the card folds them back into **one turn**, so "turns the gate
 judged" means turns; the raw count appears under *Detail* as *verdicts
 recorded*.
+
+## 88. The three-leg presence vote (off by default)
+
+On 2026-09-05 he came home at 20:43 and Jarvis said nothing. The office radar
+had latched on with the flat empty, and the composition that shipped asks the
+phone only when **no** room reads occupied — `if seen: return True` — so the
+phone was never asked at all. His ruling, verbatim: *"The camera should be the
+number one understanding for if I'm in. Followed by phone connection then
+sensor."*
+
+`presence.three_legs: true` turns on that voter (`jarvis/presencevote.py`):
+every poll reads all three legs and votes over all three; a camera that
+**names** him ends the vote; a room reading occupied never carries "home" on
+its own; a leg that cannot answer votes unknown, never "no"; and every verdict
+reaches the log with its reason and its cell number.
+
+**It ships OFF.** Turning it on changes what "away" means on a live box, so a
+merge and a restart cannot change your presence behaviour until you set it.
+
+```jsonc
+"presence": {
+  "three_legs": false,                 // true: the voter above
+  "corroboration_recency_min": 15      // see below
+}
+```
+
+The one cell the three legs cannot settle is *radar on, phone silent past the
+grace, camera unable to look*. It reads identically for a latched radar with
+you out and for you sitting still at your desk with your phone asleep. It is
+decided by **recency**: has anything independent — the phone, the camera, or a
+spoken turn — agreed with that radar inside `corroboration_recency_min`? A turn
+on the microphone inside `presence.departure_mic_silence_min` (the departure
+veto's own number, reused) keeps you home on its own. Away needs *both* clocks
+run out; home needs only one.
+
+The 15-minute default is **derived, not measured**: it is floored on
+`away_after_min` (a shorter window would call a napping phone stale faster
+than the sentinel will call it absent) plus a poll of slack. The right value
+is how long your short trips are. Measured end to end on the sentinel
+(`scripts/presence_cliff.py`), with the 12-minute grace:
+
+| | before | after (15 min) |
+|---|---|---|
+| shortest trip that is greeted on return | 56 min | 26 min |
+| desk, phone asleep, camera dark, no turn: false away at | 13 min (unstamped run) / 56 (stamped) | 26 min |
+| desk, a turn every 10 min | never | never |
+
+So a shop run is greeted where it was not, and the residual is a silent
+26 minutes at the desk with the phone asleep and the camera dark — closed by
+any turn inside that time, and by the camera going live (rule 1). Nothing in
+the voter reads a frame or opens the microphone: the camera leg is a name and
+a count, the mic leg is seconds since a turn off the ledger.
