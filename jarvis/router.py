@@ -38,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from jarvis.endpoint import strip_fillers
 from jarvis.logs import get_logger
 
 log = get_logger("router")
@@ -1235,7 +1236,14 @@ _ANSWER_LOCAL_RX = re.compile(
 
 
 def answer_kind(text: str) -> Optional[str]:
-    t = normalise(text).lower()
+    # Both grammars are end-anchored on the answer word, so the filled
+    # pause a man puts in front of one ("uh, yes") used to leave the
+    # question standing and route the answer as a fresh task. It comes off
+    # first, from the one list (jarvis.endpoint.FILLER_WORDS); a filler
+    # that is the WHOLE reply strips to "" and answers nothing.
+    t = normalise(strip_fillers(text)).lower()
+    if not t:
+        return None
     if _ANSWER_CLAUDE_RX.match(t):
         return "claude"
     if _ANSWER_LOCAL_RX.match(t):

@@ -104,6 +104,7 @@ from jarvis.commander import (BRIEFING_OFFER_TTL_S, COURTESY_BY_REGISTER,
                               CommandResult, Commander, parse_yes_no,
                               strip_jarvis_prefix)
 from jarvis.context import ContextEngine, _git
+from jarvis.endpoint import strip_fillers
 from jarvis.history import TypedHistory
 from jarvis.relaunch import format_code_status  # noqa: F401 - the drawer's line, re-exported
 from jarvis.hotword import Hotword
@@ -411,7 +412,13 @@ def _same_clause(a: str, b: str) -> bool:
 def yes_no(text: str):
     """True / False for an approval answer, None when the text is neither
     ("yes", "allow it", "no thanks", "deny"). Used for Discord replies to a
-    pending permission question (spec 8.2)."""
+    pending permission question (spec 8.2).
+
+    A filled pause comes off first (jarvis.endpoint.strip_fillers): the
+    four-word cap below is there to refuse a sentence, and "uh" is not a
+    word of the answer -- padding the count with one turned a four-word
+    yes into no answer at all."""
+    text = strip_fillers(text)
     t = re.sub(r"[^a-z' ]+", " ", (text or "").lower()).strip()
     if not t:
         return None
@@ -4513,7 +4520,7 @@ class JarvisApp:
             return None
         commander = getattr(self, "commander", None)
         try:
-            addressed = strip_jarvis_prefix(text) is not None or \
+            addressed = strip_jarvis_prefix(strip_fillers(text)) is not None or \
                 bool(commander and commander._match_assistant(text))
         except Exception:  # noqa: BLE001 - a matcher failure must not eat the turn
             addressed = False

@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
+from jarvis.endpoint import strip_fillers
 from jarvis.logs import get_logger
 
 log = get_logger("dialogue")
@@ -67,7 +68,7 @@ _ENOUGH_RX = re.compile(
     r"enough(?: for now| for today)?|"
     r"we(?:'re| are)?\s+done(?: for now)?|"
     r"leave it (?:there|at that))"
-    r"(?:[,]?\s*(?:please|sir|jarvis|thanks|thank you))*[.!\s]*$", re.I)
+    r"(?:[,]?\s*(?:please|sir|jarvis|thanks|thank you))*[?.!…\s]*$", re.I)
 
 
 def enough_kind(text: str) -> bool:
@@ -196,7 +197,7 @@ _YES_RX = re.compile(
 _SKIP_RX = re.compile(
     r"^(?:no|nope|nah|skip(?: (?:it|that|this one))?|leave (?:it|that)|"
     r"drop (?:it|that)|not (?:that|this week)|pass)"
-    r"(?:[,]?\s*(?:please|sir|jarvis))?[.!\s]*$", re.I)
+    r"(?:[,]?\s*(?:please|sir|jarvis))?[?.!\u2026\s]*$", re.I)
 _MOVE_RX = re.compile(
     r"\b(?:move|push|shift|make|put)\b.*", re.I)
 
@@ -383,7 +384,12 @@ class WeekPlanner(Session):
                 f"{hour_words(self.proposal.hour)}?")
 
     def settle(self, text: str) -> Optional[str]:
-        t = (text or "").strip().rstrip(".!?")
+        # The filled pause first (jarvis.endpoint.strip_fillers, one list
+        # with the recorder's filler hold): _YES_RX / _SKIP_RX are anchored
+        # on the answer word, so "uh, yes" used to drop the whole walk and
+        # route as a command. A reply that is only a filler strips to ""
+        # and settles nothing -- the question stays on the table.
+        t = strip_fillers(text or "").strip().rstrip(".!?")
         if not t or self.current is None:
             return None
         if _SKIP_RX.match(t):

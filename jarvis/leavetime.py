@@ -178,7 +178,13 @@ def parse_minutes(text: str) -> Optional[int]:
 _ANSWER_FILLER = ("it's", "its", "it is", "about", "around", "maybe",
                   "roughly", "probably", "takes", "it takes", "i need",
                   "i'd need", "i would need", "call it", "say", "like",
-                  "oh", "uh", "um", "a good")
+                  "oh", "a good")
+# No "uh" / "um" here any more (09-06): the filled pause is one
+# vocabulary, jarvis.endpoint.FILLER_WORDS, and it comes off at the rung
+# (Commander._try_leave_answer) before this list sees the words. The two
+# entries this list kept were a second list, and a second list drifts --
+# it had two of the thirteen spellings and needed "uh " with a space
+# where Whisper writes "Uh, fifteen."
 _ANSWER_TAIL = ("or so", "or so sir", "sir", "walk", "away", "from here",
                 "on foot", "there", "to get there", "each way", "please")
 ANSWER_MAX_WORDS = 4
@@ -188,7 +194,7 @@ def answer_minutes(text: str) -> Optional[int]:
     """A duration ANSWER, or None. Fillers and trailing courtesies come
     off; what is left must be short and must parse, so a command that
     merely contains minutes never counts as an answer."""
-    s = " ".join(str(text or "").split()).lower().strip(" .!?,")
+    s = " ".join(str(text or "").split()).lower().strip(" .!?,…")
     s = s.replace("quarter of an hour", "15 minutes").replace(
         "quarter an hour", "15 minutes").replace("half an hour", "30 minutes")
     changed = True
@@ -199,7 +205,7 @@ def answer_minutes(text: str) -> Optional[int]:
                 s, changed = s[len(word) + 1:].strip(), True
         for tail in _ANSWER_TAIL:
             if s.endswith(" " + tail):
-                s, changed = s[:-len(tail) - 1].strip(" .,"), True
+                s, changed = s[:-len(tail) - 1].strip(" .,…"), True
     if not s or len(s.split()) > ANSWER_MAX_WORDS:
         return None
     return parse_minutes(s)
