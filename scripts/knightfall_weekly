@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# The weekly Knightfall code lane from a shell (jarvis/knightfall_weekly.py):
+#   knightfall_weekly --rehearse      make + hash a code, push nothing, print length + hash prefix
+#   knightfall_weekly --probe         one ssh ping to Oracle's gate, write nothing
+#   knightfall_weekly --status        the caption the drawer shows
+#   knightfall_weekly push [--force]  what the Sunday 07:30 UTC timer runs
+#   knightfall_weekly pull            what the Sun..Wed 09:30 UTC timer runs
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+PY="${JARVIS_PYTHON:-$HOME/vss_env/bin/python}"
+[ -x "$PY" ] || PY=python3
+cd "$HERE"
+exec "$PY" -m jarvis.knightfall_weekly "$@"

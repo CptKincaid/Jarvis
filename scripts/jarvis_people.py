@@ -76,6 +76,19 @@ def _keyboard_only(what: str) -> str:
     return ""
 
 
+def _save(reg: Registry) -> bool:
+    """Every write here lands through ``Registry.save_checked``: this tool
+    loads the file, asks questions at a prompt, and saves minutes later,
+    and since 2026-09-06 the app and the weekly Knightfall issuer may
+    have written in between. A save that finds the file changed refuses
+    and says so rather than writing this process's memory over theirs;
+    the command is simply run again."""
+    ok, why = reg.save_checked()
+    if not ok:
+        say("REFUSED: %s" % why)
+    return ok
+
+
 # ------------------------------------------------------- who is asking
 def _authorise(reg: Registry) -> tuple:
     """``(ok, why)`` -- may whoever is at this keyboard administer the gate?
@@ -215,8 +228,7 @@ def do_add(reg: Registry, cfg, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("enrolled %s as %s (addressed as %s, consent: %s)"
         % (label, role, hon or "no form of address", how))
@@ -258,8 +270,7 @@ def do_set_honorific(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is addressed as %s" % (args.label, hon or "no form of address"))
     return 0
@@ -271,8 +282,7 @@ def do_set_role(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is now %s" % (args.label, args.role))
     return 0
@@ -283,8 +293,7 @@ def do_forget(reg: Registry, args) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     say("%s is forgotten. Their face stays in the gallery; "
         "scripts/face_enrol.py --forget removes that." % args.label)
@@ -330,8 +339,7 @@ def do_secret(reg: Registry, cfg, args, which: str) -> int:
     if not ok:
         say("REFUSED: %s" % why)
         return 2
-    if not reg.save():
-        say("REFUSED: the registry could not be written")
+    if not _save(reg):
         return 1
     # Never printed back, never logged, never echoed.
     say("set. It is stored salted-hashed; nothing here can read it back.")

@@ -1,0 +1,18 @@
+[Unit]
+Description=Jarvis weekly Knightfall code: hand this week's code to Oracle
+Documentation=file:%h/Jarvis/jarvis/knightfall_weekly.py
+
+[Timer]
+# 07:30 UTC is 02:30 CDT (01:30 CST after Nov 1): one hour BEFORE Oracle's
+# own knightfall-backup.timer composes the backup email at 08:30 UTC.
+# Written in UTC on purpose. Oracle's zone is fixed ("GMT"); a local-time
+# timer would move to 08:30 UTC on Nov 1 and land on top of the compose.
+OnCalendar=Sun *-*-* 07:30:00 UTC
+# A push missed while the Spark was off fires at boot. The script refuses
+# outside Sat 20:00 .. Sun 08:15 UTC (a spool made after the compose is
+# stale by the next Sunday) and the drawer caption says so.
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

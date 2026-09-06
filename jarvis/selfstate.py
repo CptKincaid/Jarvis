@@ -165,6 +165,11 @@ def diagnostics_line(state) -> str:
     # a finished sentence from app.open_modes_line().
     if state.get("modes"):
         parts.append(str(state["modes"]))
+    # The weekly Knightfall lane's one sentence (jarvis/knightfall_weekly),
+    # already finished. Only the plain sheet carries it: the film register
+    # below never reads the key, so it is never spoken.
+    if state.get("knightfall_weekly"):
+        parts.append(str(state["knightfall_weekly"]))
     return " ".join(parts)
 
 
