@@ -45,6 +45,31 @@ its guard, from an atomic claim to a mere question, used to pass everywhere
 except the four rows in MUST_BE_CLAIMED.  The guard KIND is pinned on every
 row now, so any downgrade anywhere fails.
 
+WHY ROUND 6 INVERTED IT, and this is the part that matters most.  The
+rebuilt census above was walked past SEVEN more ways, every one leaving the
+count frozen at 75 -- a dead ignore entry (`raw.replace`) that measured
+100000 bytes of his down to 4 while eleven census tests stayed green; a bare
+`replace`; `self._my_stages.discard`; a module-level alias `_rm = os.remove`;
+`getattr(os, "remove")(p)`; `OPS["rm"](p)`; `(a or b).replace(c)`.  Plus one
+structural hole: the walk covered TWO modules and jarvis/tools/filepick.py
+was imported AND CALLED by both of them and censused by neither.
+
+Three rounds blocked on the same instrument is a design that cannot win, not
+a fixer who keeps missing things.  Rounds 4 and 5 asked "is this one of the
+writes I know?" and SKIPPED the rest, and Python has unboundedly many ways
+to spell a callee.  Every one of the ten defeats is a SKIP.  So the DEFAULT
+IS INVERTED: the census now reports every call it cannot PROVE harmless, and
+an unresolvable callee is a row that has to be EXPLAINED rather than a
+silence.  tests/write_census.py states the four rules and why a chokepoint
+rewrite was judged the wrong answer to this particular question.
+tests/test_census_fails_closed.py plants ten routes -- seven of which nobody
+had listed -- and none of them needed a per-pattern entry.
+
+What that costs is visible right here: KNOWN grew from 75 lines to 90,
+because fifteen calls this lane always made are now SAID rather than
+skipped.  Four of them are subprocess.Popen -- the seam every remote write
+in this lane actually goes through, which the census had no word for.
+
 If this test fails, do not edit KNOWN to make it green.  Read the failure:
 it is telling you that a write appeared, or moved, or lost its guard.
 
@@ -61,6 +86,66 @@ from tests.write_census import census, kind, table
 # (module, scope, write primitive, which occurrence) -> (guard kind, what can
 # be at that name, in a line).
 KNOWN = {
+    # -------------------- jarvis/foldersync.py
+    # ---- ROWS THAT ARE NOT WRITES.  Round 6 inverted the census default
+    # from SKIP to REPORT, so a call it cannot follow to a name is a row
+    # that has to be EXPLAINED rather than a silence.  Every line below is
+    # a call round 5 skipped -- three of them by a SPELLING-matched ignore
+    # list, whose dead `raw.replace` entry let a 100000-byte file of his be
+    # destroyed with the census green.
+    ("jarvis/foldersync.py", "<module>", "?uncensused", 1):
+        ("none",
+         "get_logger('foldersync') into jarvis.logs, which this census "
+         "does not walk; sets up a logger, names no file of his"),
+    ("jarvis/tools/remote.py", "<module>", "?uncensused", 1):
+        ("none",
+         'the same get_logger; jarvis.logs is out of the walked set'),
+    ("jarvis/tools/filepick.py", "<module>", "?uncensused", 1):
+        ("none",
+         'the same get_logger; jarvis.logs is out of the walked set'),
+    ("jarvis/foldersync.py", "Syncer._close_stage", "discard", 1):
+        ("none",
+         "set.discard on self._my_stages -- OUR OWN bookkeeping, not the "
+         "transport's discard.  Round 5 waved this through by dotted name "
+         "and the same free pass covered any variable spelled that way"),
+    ("jarvis/foldersync.py", "Syncer._remove_broken_copy", "discard", 1):
+        ("none",
+         'set.discard on self._claimed_here; bookkeeping, no name on disk'),
+    ("jarvis/foldersync.py", "Syncer._sweep_my_stages", "discard", 1):
+        ("none",
+         'set.discard on self._my_stages; bookkeeping, no name on disk'),
+    ("jarvis/foldersync.py", "Syncer._half", "?unresolved", 1):
+        ("none",
+         'fn(now): the INJECTED half of a pass -- push or pull, passed in'),
+    ("jarvis/foldersync.py", "Syncer.loop", "?unresolved", 1):
+        ("none",
+         'sleep(...): the injected clock seam, so tests never really wait'),
+    ("jarvis/foldersync.py", "is_quiescent", "?unresolved", 1):
+        ("check",
+         'now(): the injected clock seam; reads a number, writes nothing'),
+    ("jarvis/foldersync.py", "is_quiescent", "?unresolved", 2):
+        ("check",
+         'sleep(...): the injected clock seam between two stat samples'),
+    ("jarvis/tools/remote.py", "_cfg_get", "?unresolved", 1):
+        ("none",
+         "get(dotted, default) where get = getattr(cfg, 'get', None) -- a "
+         "callable resolved at RUN TIME.  Exactly the shape the census "
+         "cannot follow, and now it says so instead of skipping it"),
+    ("jarvis/tools/remote.py", "run_ssh", "Popen", 1):
+        ("none",
+         "THE SEAM UNDER EVERYTHING: subprocess.Popen is what actually "
+         "runs ssh.  Round 5 censused run_ssh and not the Popen beneath "
+         "it; argv is built by ssh_argv, never by a shell string"),
+    ("jarvis/tools/remote.py", "run_copy", "Popen", 1):
+        ("none",
+         'the scp process; argv from scp_argv, no shell'),
+    ("jarvis/tools/remote.py", "run_sftp", "Popen", 1):
+        ("none",
+         'the sftp batch process; argv from sftp_argv, no shell'),
+    ("jarvis/tools/remote.py", "tailnet_state", "Popen", 1):
+        ("none",
+         '`tailscale status --json`, a read-only local query'),
+
     # -------------------- jarvis/foldersync.py
     ("jarvis/foldersync.py", "Ledger.save", "mkdir", 1):
         ("none",

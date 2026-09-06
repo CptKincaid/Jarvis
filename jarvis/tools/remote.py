@@ -1007,13 +1007,28 @@ def _ours_over_there(path: str) -> bool:
 # with `rename -l`, and rmdir the empty shell.  Two extra round trips per
 # transfer; nothing else on this link can refuse a write.
 #
-# HONESTLY MODELLED, NOT MEASURED: the far side is OpenSSH for Windows and
-# no probe of it is allowed from here.  The POSIX numbers above are real;
-# the Windows behaviour is inferred from the protocol (SSH_FXP_MKDIR over
-# CreateDirectory, which fails with ERROR_ALREADY_EXISTS).  If Windows were
-# to allow mkdir over an existing directory, this degrades to exactly
-# today's behaviour and no further -- the inner name is still ours by
-# shape -- so the change cannot be worse than what it replaces.
+# HONESTLY MODELLED THROUGH FIVE ROUNDS, AND NO LONGER.  The far side is
+# OpenSSH for Windows and no probe of it is allowed from here, so the POSIX
+# numbers above are real and the Windows behaviour used to be inferred from
+# the protocol (SSH_FXP_MKDIR over CreateDirectory, which fails with
+# ERROR_ALREADY_EXISTS).
+#
+# CONFIRMED BY HIM, 2026-09-05.  He was asked directly whether creating a
+# folder on HPCOMPUTER fails when that name is already taken, and he
+# answered YES.  So the one property this lane's whole safety argument
+# stands on is now his statement about his own machine, not a model of it.
+#
+# THAT IS NOT A LOCAL MEASUREMENT and must never be written up as one.  It
+# is stronger than the inference it replaces and weaker than the sftp-server
+# numbers above, which were run here.  Three provenances, three different
+# words, and the difference is the point: this lane has twice been damaged
+# by a confident number with no source.
+#
+# The old degradation argument is kept, because it is what made this
+# shippable while it was still only modelled: if Windows were to allow mkdir
+# over an existing directory, this degrades to exactly today's behaviour and
+# no further -- the inner name is still ours by shape -- so the change
+# cannot be worse than what it replaces.
 
 
 def sftp_rename(conf: RemoteConfig, src: str, dst: str) -> SshResult:

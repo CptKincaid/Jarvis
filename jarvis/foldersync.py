@@ -194,6 +194,39 @@ SKIP_SUFFIXES = (".part", ".partial", ".crdownload", ".download", ".tmp",
                  ".swp", NOTE_SUFFIX)
 SKIP_PREFIXES = (".", "~$", PART_PREFIX)
 
+
+def skip_reason(name: str) -> str:
+    """WHY this lane is passing over ``name``, in the words of the rule that
+    actually fired.  "" when no rule fires.
+
+    Round 5 put a reason in status.txt and hardcoded two of them -- ends
+    ".tmp", or starts with a dot -- while ten rules can fire.  MEASURED 3 of
+    3 wrong: movie.crdownload and draft.swp were both reported as "name ends
+    .tmp", and ~$report.docx as "name starts with a dot".  The count and the
+    filename were right and the REASON was invented, which is worse than
+    saying nothing: he reads that clause to decide what to rename.
+
+    So the sentence is DERIVED from the tuples rather than written beside
+    them.  Add an eighth suffix and this returns a true clause for it
+    without being edited; tests/test_skip_reason_is_true.py walks both
+    tuples and fails on any member that cannot produce one.
+
+    LONGEST MATCH WINS.  ``.jarvis-part-x.txt`` starts with "." AND with
+    PART_PREFIX, and the specific rule is the useful thing to tell him.
+    """
+    if name.endswith(NOTE_SUFFIX):
+        # Not his file at all: a note this lane wrote.  It is filtered out
+        # of the count before the sentence is built, so he is never shown
+        # this one -- but the rule still has to have a true word.
+        return "it is a note I wrote, not a file of yours"
+    hits = [p for p in SKIP_PREFIXES if name.startswith(p)]
+    if hits:
+        return f'name starts with "{max(hits, key=len)}"'
+    hits = [x for x in SKIP_SUFFIXES if name.endswith(x)]
+    if hits:
+        return f'name ends "{max(hits, key=len)}"'
+    return ""
+
 # A send or a fetch that came back with one of these has told us about the
 # FILE, and nothing it says bears on whether HPCOMPUTER is answering.  Every
 # OTHER reason -- including the "failed" that classify_error falls back to
@@ -2446,9 +2479,10 @@ class Syncer:
         if len(waiting) > 10:
             lines.append(f"            ... and {len(waiting) - 10} more")
         if self._skipped_outbox:
-            why = ("name ends .tmp"
-                   if self._skipped_outbox[0].endswith(SKIP_SUFFIXES)
-                   else "name starts with a dot")
+            # The rule that ACTUALLY fired, not one of two guesses.  See
+            # skip_reason: round 5's two hardcoded clauses were measured
+            # wrong on 3 of 3 real names.
+            why = skip_reason(self._skipped_outbox[0])
             lines.append(f"note      {len(self._skipped_outbox)} file(s) in "
                          f"your Outbox I am not sending")
             lines.append(f"          (e.g. {self._skipped_outbox[0]} -- "
