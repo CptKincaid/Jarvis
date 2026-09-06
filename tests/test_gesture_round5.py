@@ -416,7 +416,7 @@ class TestTheShippedNumbersAreThisRounds:
         for token in ("0.4986", "0.2362", "0.005", "wind-up", "0.000",
                       "--windup"):
             assert token in block, token
-        print("\n  the config carries 0.4986 (226 families), 0.2362 (the")
+        print("\n  the config carries 0.4986 (262 families), 0.2362 (the")
         print("  preserved 172), the 0.005 bar, and the instrument he runs")
 
     def test_the_module_docstring_carries_the_same_numbers(self):

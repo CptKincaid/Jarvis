@@ -653,10 +653,17 @@ def _report_run(report, args, run, thresholds, say, *, synthetic,
 
 
 # One hand-unit in millimetres, for the ONE conversion this instrument
-# prints. It is GUESSED ANTHROPOMETRY -- standard adult palm length, never
-# measured on him -- and the pose-corrected unit reads about 112 mm on the
-# synthetic hand at his working pitch, some 11% under it. Both numbers are
-# printed so he can see the spread rather than trust one.
+# prints. BOTH NUMBERS ARE GUESSED, AND NEITHER IS HIS. 127.0 is standard
+# adult anthropometry, hypot(107 mm palm length, 68.2 mm knuckle breadth),
+# never measured on him. 112.2 is what the pose-corrected unit reads on
+# the SYNTHETIC hand at 425 mm and his working pitch
+# (castgrid/r4recall.py mm_per_unit(425.0)): measured on a drawn hand
+# built from that same anthropometry, so it is the guess seen through the
+# lens model, about 11% under the documented figure, not a second source.
+# Both are printed so he can see the spread rather than trust one. THE
+# MEASUREMENT EACH WANTS is one ruler reading of his own hand: palm length
+# (wrist crease to the middle knuckle) and knuckle breadth (index to
+# little-finger knuckle), in millimetres; hypot of those replaces both.
 HAND_UNIT_MM_DOC = 127.0
 HAND_UNIT_MM_MEASURED = 112.2
 

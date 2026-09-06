@@ -905,7 +905,7 @@ DEFAULTS: dict = {
     # close. MEASURED at his own desk geometry on an independent
     # adversarial grid (castgrid/), same seeds across every round:
     #
-    #   P(fire | NOT a cast gesture), 226 families, 4192 sequences
+    #   P(fire | NOT a cast gesture), 262 families, 4192 sequences
     #     7.5 fps   0.4986   95% CI [0.4834, 0.5137]
     #     6.0 fps   0.4945   95% CI [0.4794, 0.5096]
     #   ...of which the preserved 172-family grid alone, 2752 sequences,
@@ -941,7 +941,16 @@ DEFAULTS: dict = {
     # direction are UNKNOWN; the instrument is
     #   ~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30 \
     #       --windup
-    # and NOTHING it reports would change this switch. Leave it False.
+    # and NOTHING it reports would change this switch.
+    #
+    # SO THIS SWITCH STAYS OFF, AND HERE IS THE WHOLE OF WHY. Three
+    # signals were tried: speed, head yaw, and the wind-up he confirmed
+    # his throw has. The best any of them reaches is 0.1054 against a bar
+    # of 0.005. The wind-up is real, but an ordinary carry pulls back by
+    # the same amount -- slightly more -- and pulled straight toward his
+    # body it cannot be seen at all. It stays off until a signal nobody
+    # has thought of yet exists. The spoken cast does everything the
+    # gesture would have, in both directions; that is the product.
     # ==================================================================
     #
     # OFF by default, like every other lens key. It RIDES THE CAMERA

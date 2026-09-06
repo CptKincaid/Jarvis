@@ -192,12 +192,12 @@ AND IT DOES NOT SEPARATE, for two independent reasons.
     0.05 u takes P(fire | NOT a cast gesture) from 0.2362 to 0.0000, which
     looks like a solution and IS AN ARTEFACT: that grid was built to
     attack speed and distance and contains no retractions at all. Round 5
-    added 54 families that DO retract, invented adversarially and swept to
+    added 90 families that DO retract, invented adversarially and swept to
     the same amplitudes his throw is -- pulling a mug toward himself
     before lifting it away, drawing back to get a run at something heavy,
     a hand that hesitates, settling a grip. They measure the SAME wind-up
     his throw does: at 40 mm, his throw 0.218 u against a carry's 0.239.
-    On the honest 226-family grid, 4192 sequences, same seeds:
+    On the honest 262-family grid, 4192 sequences, same seeds:
 
         P(fire | NOT a cast gesture), by wind-up bar, 7.5 fps
           bar 0.00 u   0.4986  95% CI [0.4834, 0.5137]   recall needs 0 mm
@@ -228,10 +228,17 @@ stays ``enabled: False`` in jarvis/assistant_config.py. The second signal
 cannot help either and cannot be tuned into helping: ``yaw_hold_deg`` is a
 switch, not a dial -- at or under 25 deg of head movement it vetoes
 nothing and the rate is unchanged, over 25 deg it refuses every throw he
-makes, and there is no setting between. Three independent signals have now
-been measured against this grid and none of them separates his throw from
-his desk. THE SPOKEN CAST IS NOT BEHIND THIS SWITCH and is where the work
-belongs.
+makes, and there is no setting between.
+
+THE GESTURE IS PARKED, AND THIS IS THE WHOLE OF WHY. Three signals were
+tried -- speed, head yaw, and the wind-up he confirmed his throw has --
+and the best any of them reaches is 0.1054 against a bar of 0.005. The
+wind-up is real, but an ordinary carry pulls back by the same amount,
+slightly more, and pulled straight toward his body it is invisible in the
+image plane at every amplitude up to 120 mm. This switch stays off until a
+signal nobody has thought of yet exists. The spoken cast does everything
+the gesture would have, in both directions; that is the product, and it
+is where the work went.
 
 EVERY THRESHOLD BELOW IS A CALIBRATED STARTING POINT, NOT A VALIDATED VALUE.
 They come from arithmetic over a synthetic hand whose proportions match the
@@ -856,7 +863,7 @@ class CastThresholds:
     #
     # AND THE BAR SHIPS AT 0.0, WHICH IS INERT, BECAUSE THE MEASUREMENT
     # SAYS IT DOES NOT SEPARATE. castgrid/test_r5_windup.py sweeps the bar
-    # against the preserved 172-family grid PLUS 40 new families invented
+    # against the preserved 172-family grid PLUS 90 families invented
     # adversarially to contain a retraction of their own -- pulling a mug
     # toward himself before lifting it away, drawing back to get a run at
     # something heavy, a hand that hesitates before it leaves. Those

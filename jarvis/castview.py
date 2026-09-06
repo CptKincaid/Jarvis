@@ -166,7 +166,14 @@ HELPER_ALIVE_S = 60.0
 # parked in a 25 s long poll almost all of the time, so the round trip is
 # its wake plus one Start-Process; 2 s is generous for a LAN and short
 # enough to say out loud. GUESSED -- nothing here has been run against
-# the real helper.
+# the real helper -- AND SINCE ROUND 5 THE STOP BLOCKS ON IT TOO: a helper
+# that takes longer than this to wake and kill the viewer turns a stop
+# that WORKED into "HPCOMPUTER didn't come back for that, sir", with the
+# window gone and the deck held until the second look notices. The
+# measurement it wants is the real wake-to-receipt gap: the clock between
+# ``set_verb`` parking a verb and the poll that quotes its sequence back,
+# over a handful of real casts, with the value set from the slowest of
+# those plus headroom. Nothing here has that number yet.
 HELPER_ACK_S = 2.0
 # How long after launching the Spark's own viewer before asking whether it
 # is still there. A viewer that cannot start (no display, a bad binary, a
@@ -781,8 +788,8 @@ class _ViewSink:
         THE DECK IS NOT GIVEN BACK BY A STOP THAT DID NOT HAPPEN. The deck
         is the record of what is on his screens; releasing it for a viewer
         that is still up is precisely what made the second ask unanswerable.
-        A stop that failed leaves the cast live, says why, and can be asked
-        again.
+        A stop that failed leaves the cast live, says why, KEEPS WATCHING
+        IT, and can be asked again.
         """
         if self.state.live != self.name:
             return StopReport(False, False, NOTHING_UP_LINE,
@@ -791,6 +798,21 @@ class _ViewSink:
         if not ok:
             log.warning("castview: %s would not stop (%s); the deck stays "
                         "held", self.name, why)
+            # ROUND 6, AND IT IS ONE CALL. ``_stop`` cancelled the watchdog
+            # and moved the generation on, as it must for every end of a
+            # cast -- but this cast did NOT end. Keeping the deck for a
+            # viewer that is still up is right; keeping it with nothing
+            # watching is how Jarvis's last word stayed "there's a viewer
+            # still up that I couldn't close" for ever. MEASURED, both
+            # directions: watchdogs armed 1, live 0, cancelled 1; he closes
+            # the window himself, and 3000 s later retractions 0, deck
+            # held, every "cast my screen" refused as busy. So the second
+            # look is re-armed here, in the generation ``_stop`` just moved
+            # to, and it is what takes the sentence back when the cast
+            # ends by any route other than a stop that works.
+            if not self._arm_confirm():
+                log.warning("castview: %s is still up and can no longer be "
+                            "watched", self.name)
             return StopReport(False, True, line or STOP_FAILED_LINE, why)
         self.state.release()
         return StopReport(True, True, STOPPED_LINE, "")

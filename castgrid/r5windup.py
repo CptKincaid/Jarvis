@@ -33,7 +33,7 @@ A WIND-UP AND THEN DETECTS IT HAS PROVED NOTHING. So:
     is the wind-up he makes, the signal is not weak, it is ABSENT, and any
     bar above 0.02 refuses every throw he makes.
   * EVERY NON-GESTURE FAMILY IS RE-EXAMINED FOR MOTIONS THAT ALSO RETRACT.
-    ``retraction_grid()`` below is 54 families invented adversarially for
+    ``retraction_grid()`` below is 90 families invented adversarially for
     exactly that: pulling a mug toward himself before lifting it away,
     drawing back to get a run at something heavy, a hand that hesitates,
     settling a grip, handing a thing over, and a slow retract-and-leave.

@@ -26,7 +26,7 @@ A TABLE TO GET IT:
   preserved 172-family grid alone a bar of 0.05 u takes the false-fire rate
   from 0.2362 to 0.0000 -- which looks like a complete solution and IS AN
   ARTEFACT: that grid was built to attack speed and distance and contains
-  no retractions at all. Add 54 families that DO retract -- pulling a mug
+  no retractions at all. Add 90 families that DO retract -- pulling a mug
   toward himself before lifting it away, drawing back to get a run at
   something heavy, a hand that hesitates, all ordinary desk motions -- and
   the best bar in the sweep leaves P(fire | NOT a cast gesture) at 0.1054,
