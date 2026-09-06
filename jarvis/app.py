@@ -6014,6 +6014,27 @@ class JarvisApp:
         but the arbiter is a depth counter rather than a mutex, so without the
         wait we would happily record Jarvis asking the question.
         """
+        # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens. The
+        # arbiter cannot do this: it is a re-entrant DEPTH COUNTER whose only
+        # job is pausing the hotword, so two consumers on two threads both
+        # get their context manager and both proceed, and record_fixed's own
+        # `self.recording` guard is a flag it never sets. Found by the
+        # verdict that cleared the enrolment lane, 2026-09-05: the new
+        # exclusion covered the two enrolment runs and `runs_live` appeared
+        # nowhere in this file, so the other two doors were never taught to
+        # ask. Pinned by tests/test_mic_one_consumer_everywhere.py, whose
+        # census fails on any new caller of record_fixed that does not ask.
+        try:
+            from jarvis.voicerun import runs_live
+            live = runs_live(getattr(self, "services", None))
+        except Exception:      # noqa: BLE001 - an unreadable seam is not a yes
+            log.debug("mic: could not ask which enrolments are live",
+                      exc_info=True)
+            live = ("unknown",)
+        if live:
+            log.info("uncertain: not asking aloud -- a %s enrolment is "
+                     "running and it owns the microphone", "/".join(live))
+            return
         try:
             if CONFIG.talkback:
                 self.tts.speak("Was that for me?", block=True)
@@ -6618,6 +6639,28 @@ class JarvisApp:
         return False, self.ENROLL_SPEAKER_GONE
 
     def train_wakeword(self):
+        # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens. The
+        # arbiter cannot do this: it is a re-entrant DEPTH COUNTER whose only
+        # job is pausing the hotword, so two consumers on two threads both
+        # get their context manager and both proceed, and record_fixed's own
+        # `self.recording` guard is a flag it never sets. Found by the
+        # verdict that cleared the enrolment lane, 2026-09-05: the new
+        # exclusion covered the two enrolment runs and `runs_live` appeared
+        # nowhere in this file, so the other two doors were never taught to
+        # ask. Pinned by tests/test_mic_one_consumer_everywhere.py, whose
+        # census fails on any new caller of record_fixed that does not ask.
+        try:
+            from jarvis.voicerun import runs_live
+            live = runs_live(getattr(self, "services", None))
+        except Exception:      # noqa: BLE001 - an unreadable seam is not a yes
+            log.debug("mic: could not ask which enrolments are live",
+                      exc_info=True)
+            live = ("unknown",)
+        if live:
+            bus.publish(Status(
+                text="Finish the %s enrolment first" % "/".join(live),
+                kind="error"))
+            return
         from jarvis.hotword import train_verifier
         samples = []
         for _ in range(3):
