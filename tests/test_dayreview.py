@@ -14,9 +14,36 @@ import jarvis.app as app_mod
 import jarvis.dayreview as dr
 from jarvis.commander import _DAYREVIEW_RX, _h_dayreview
 
-TODAY = date.today()
+# 2026-09-05: TODAY was `date.today()`, captured AT IMPORT and asserted
+# against minutes later, while the product read its own clock when the
+# assertion ran. A suite started at 23:59 -- or on 31 August, or 31
+# December -- therefore went red on two tests here, because the day turned
+# over in between. (Reproduced deterministically by waiting for the
+# boundary after collection: "filed == [09-05, 09-04, 09-03]" while the
+# module's TODAY still said 09-05.)
+#
+# Nothing in this file is about what today actually is: the log slices,
+# the ledger epochs and the filing rule are all relative. So the day is
+# fixed, and DayReviewer is given the matching clock through the `now=`
+# seam it already has. The file now reads the wall clock nowhere.
+TODAY = date(2026, 9, 14)                 # an ordinary Monday
 YESTERDAY = TODAY - timedelta(days=1)
 LONG_AGO = TODAY - timedelta(days=5)
+NOON = datetime(TODAY.year, TODAY.month, TODAY.day, 12, 0)
+
+
+def _at_noon():
+    """The clock the product should read: noon on the fixed TODAY."""
+    return NOON
+
+
+class _FixedNow(datetime):
+    """datetime with now() pinned to NOON, for the one place the product
+    reads its own clock with no seam to inject (app.day_review_text)."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOON if tz is None else NOON.astimezone(tz)
 
 
 def _ts(day, h, m, s):
@@ -202,6 +229,7 @@ def test_the_table_has_every_row(files):
 def test_the_reviewer_files_yesterday_once_and_hands_it_on(files):
     posted = []
     r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews",
+                       now=_at_noon,
                        on_filed=lambda day, d: posted.append((day, d["turns"])))
     filed = r.tick()
     assert YESTERDAY in filed and TODAY not in filed
@@ -220,7 +248,8 @@ def test_the_reviewer_files_yesterday_once_and_hands_it_on(files):
 def test_a_failing_hook_does_not_stop_the_filing(files):
     def boom(day, d):
         raise RuntimeError("discord down")
-    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews", on_filed=boom)
+    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews",
+                       now=_at_noon, on_filed=boom)
     assert YESTERDAY in r.tick()
 
 
@@ -236,7 +265,8 @@ def test_old_reviews_are_pruned(tmp_path):
 def test_the_thread_starts_and_stops(files, monkeypatch):
     monkeypatch.setattr(dr, "FIRST_TICK_S", 0.01)
     monkeypatch.setattr(dr, "TICK_S", 0.01)
-    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews")
+    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews",
+                       now=_at_noon)
     r.start()
     done = threading.Event()
     deadline = datetime.now() + timedelta(seconds=3)
@@ -281,7 +311,8 @@ def test_the_first_wake_briefing_no_longer_reads_the_review_out(monkeypatch, tmp
     assert a.said == ["Your briefing for today, sir."]
     assert "speaker gate" in a.day_review_text("yesterday"), \
         "the digest must still be one question away"
-    assert len(a.chats) == 1 and a.chats[0][1] == {"force_tool": "get_briefing"}
+    assert len(a.chats) == 1 and a.chats[0][1] == {
+        "force_tool": "get_briefing", "addressee": ("", "sir")}
 
 
 def test_first_wake_says_nothing_about_a_day_with_no_data(monkeypatch, tmp_path):
@@ -312,6 +343,11 @@ def test_day_review_text_on_demand(monkeypatch, tmp_path, files):
     from jarvis.config import PATHS
     monkeypatch.setattr(PATHS, "LOG_DIR", files.dir)
     a = _app(monkeypatch, tmp_path, {"has_data": False})
+    # app.day_review_text reads its own clock to decide which day "today"
+    # is. Pin it to the fixture's day so this test is about the ROUTING it
+    # is named for -- today comes from the live log, never a filed digest --
+    # and not about the date the suite happens to run on.
+    monkeypatch.setattr(app_mod, "datetime", _FixedNow)
     assert a.day_review_text("yesterday").startswith("I have no record of yesterday")
     a.dayreviewer = SimpleNamespace(review=lambda day: {"has_data": True, "turns": 2})
     assert a.day_review_text("yesterday") == \
@@ -366,7 +402,8 @@ def test_the_reviewer_thread_is_joinable_and_restartable(files):
     """stop() used to be a bare Event.set(): a tick in flight (a Discord
     post) outlived stop_assistant into the teardown, and a stopped
     reviewer could never be started again."""
-    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews")
+    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews",
+                       now=_at_noon)
     r.start()
     t1 = r._thread
     assert t1 is not None and t1.is_alive()

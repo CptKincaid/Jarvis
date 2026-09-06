@@ -447,42 +447,49 @@ class _FakeCv2:
         return cap
 
 
-def test_open_capture_asks_for_one_buffer_and_logs_the_granted_mode(
+def test_open_capture_leaves_the_buffer_queue_alone_and_drains_it_instead(
         monkeypatch, caplog):
-    """ONE buffer is requested, and the history of that number is on
-    camera.CAPTURE_BUFFERS: set to 1 to keep a slow consumer off a frame
-    up to three intervals old; measured in the PROBE to cost exactly half
-    the rate (c228a01: 2.00x on eight rows of eight, so it was set to
-    None); put back the same evening because the APP gained nothing from
-    the driver's buffers -- 7.6 fps / 132 ms on its own rate line -- and
-    he saw the staleness at once (9ba1c56). An earlier version of this
-    test was named for c228a01's world and asserted 9ba1c56's.
+    """THE BUFFERS COME BACK, because the drain is what makes that safe.
 
-    The log line says "requested", not "driver": cv2's read-back of
-    CAP_PROP_BUFFERSIZE is OpenCV's own stored request, and the count the
-    driver allocated is not observable through it (P12).
+    The history of that number is on camera.CAPTURE_BUFFERS. It was set to 1
+    to keep a slow consumer off a frame up to three intervals old; measured
+    in the PROBE to cost exactly half the rate (c228a01: a clean 2.00x on
+    eight rows of eight); put back to 1 the same evening because the APP
+    gained nothing from the driver's buffers and he saw the staleness at
+    once (9ba1c56). What 9ba1c56 restored was a NAKED buffer count with no
+    drain under it, and that is the thing this replaces -- not the staleness
+    verdict, which stands. ``DrainingCapture`` keeps the driver's four
+    buffers AND discards the stale ones before retrieving, so the two go
+    together: the property is never written, and the handle that comes back
+    wraps the VideoCapture rather than being it.
 
-    The granted mode is still LOGGED, because the running app never read it
-    back and a night was spent guessing that MJPG had been declined (it had
-    not; the probe showed it granted in either set order, twice). FOURCC
-    still goes before the size."""
+    The log line therefore says "driver buffer(s)" rather than "requested":
+    nothing is requested any more, so the number printed is only ever the
+    read-back. The device underneath is still asked for exactly the same
+    mode in exactly the same order, and the granted mode is still LOGGED,
+    because the running app never read it back and a night was spent
+    guessing that MJPG had been declined (it had not; the probe showed it
+    granted in either set order, twice). FOURCC still goes before the
+    size."""
     fake = _FakeCv2()
     monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
     with caplog.at_level(logging.INFO, logger="jarvis.camera"):
         cap = cam.open_capture("", 1280, 720, "MJPG")
-    props = [p for p, _ in cap.sets]
+    raw = cap.raw
+    props = [p for p, _ in raw.sets]
     assert props.index(fake.CAP_PROP_FOURCC) < props.index(
         fake.CAP_PROP_FRAME_WIDTH)
-    assert cam.CAPTURE_BUFFERS == 1
-    assert cap.props[fake.CAP_PROP_BUFFERSIZE] == 1.0
-    assert cap.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
+    assert cam.CAPTURE_BUFFERS is None
+    # the whole point: the property is never written, at all
+    assert fake.CAP_PROP_BUFFERSIZE not in props
+    assert raw.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
     lines = [r.getMessage() for r in caplog.records
              if r.name == "jarvis.camera"]
     assert any("asked 1280x720 MJPG" in m and "granted 1280x720 MJPG" in m
                for m in lines), lines
-    assert any("1 buffer(s) requested" in m for m in lines), lines
-    assert not any("driver buffer" in m for m in lines), lines
-    assert cap.released == 0
+    assert any("driver buffer(s)" in m for m in lines), lines
+    assert not any("requested" in m for m in lines), lines
+    assert raw.released == 0
 
 
 def test_open_capture_raises_when_the_device_will_not_open(monkeypatch):
@@ -823,6 +830,7 @@ def test_every_open_logs_the_exposure_controls_beside_the_granted_mode(
     monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
     with caplog.at_level(logging.INFO, logger="jarvis.camera"):
         cap = cam.open_capture("", 1280, 720, "MJPG")
+    raw = cap.raw
     lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.camera"]
     granted = [i for i, m in enumerate(lines) if "granted 1280x720" in m]
     controls = [i for i, m in enumerate(lines) if "controls at open" in m]
@@ -833,7 +841,7 @@ def test_every_open_logs_the_exposure_controls_beside_the_granted_mode(
     assert "cached manual value" in line
     # and by default NOTHING about exposure was written to the driver
     assert not any(p in (fake.CAP_PROP_AUTO_EXPOSURE, fake.CAP_PROP_EXPOSURE)
-                   for p, _ in cap.sets)
+                   for p, _ in raw.sets)
 
 
 def test_a_manual_control_is_logged_as_manual(monkeypatch, caplog):
@@ -858,15 +866,16 @@ def test_camera_exposure_pins_manual_exposure_at_open_and_reads_it_back(
     monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
     with caplog.at_level(logging.INFO, logger="jarvis.camera"):
         cap = cam.open_capture("", 1280, 720, "MJPG", exposure=156)
-    props = [p for p, _ in cap.sets]
+    props = [p for p, _ in cap.raw.sets]
     assert fake.CAP_PROP_AUTO_EXPOSURE in props and fake.CAP_PROP_EXPOSURE in props
     assert props.index(fake.CAP_PROP_AUTO_EXPOSURE) < props.index(
         fake.CAP_PROP_EXPOSURE)
     # and both AFTER the mode: the format negotiation comes first
     assert props.index(fake.CAP_PROP_FRAME_HEIGHT) < props.index(
         fake.CAP_PROP_AUTO_EXPOSURE)
-    assert cap.props[fake.CAP_PROP_AUTO_EXPOSURE] == float(cam.EXPOSURE_MANUAL)
-    assert cap.props[fake.CAP_PROP_EXPOSURE] == 156.0
+    assert cap.raw.props[fake.CAP_PROP_AUTO_EXPOSURE] == float(
+        cam.EXPOSURE_MANUAL)
+    assert cap.raw.props[fake.CAP_PROP_EXPOSURE] == 156.0
     lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.camera"]
     assert any("exposure pinned manual 156 -> accepted; driver reads back "
                "auto_exposure 1  exposure 156  gain -1" in m for m in lines), \
@@ -933,3 +942,652 @@ def test_the_shipped_config_leaves_exposure_on_auto():
     his to read off the log, not this file's to decide."""
     from jarvis.assistant_config import DEFAULTS
     assert DEFAULTS["camera"]["exposure"] == 0
+
+
+# ===================================================== draining the queue
+# CAP_PROP_BUFFERSIZE was set to 1 to stop a slow consumer being handed a
+# frame that had waited in the driver's queue. It cost half the frame rate
+# (measured 2026-09-03, 8 rows of 8, scripts/camera_mode_probe.py), so the
+# setting went and the staleness came back. ``DrainingCapture`` is the
+# proper fix: keep the driver's buffers and DISCARD the stale ones before
+# retrieving, so a slow consumer still gets the newest frame.
+#
+# NOTHING HERE IS A PICTURE. The double's "frame" is the INTEGER ORDINAL of
+# the frame the modelled device produced, so every assertion below is about
+# WHICH frame came back -- the newest or an old one -- and no pixel exists
+# anywhere in this file.
+class VirtualClock:
+    """A clock the model moves. The queue advances it exactly where real
+    time would have been spent: inside a grab that had to wait."""
+
+    def __init__(self, t: float = 1000.0):
+        self.t = float(t)
+
+    def now(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += max(0.0, float(dt))
+
+
+class QueuedCapture:
+    """A V4L2-SHAPED capture double: a fixed-depth queue the device fills on
+    a fixed interval, ``grab()`` that pops the oldest or WAITS for the next
+    one, and ``retrieve()`` that hands back the last buffer grabbed.
+
+    This is the shape the whole problem lives in. OpenCV's V4L2 backend
+    queues four driver buffers, so a consumer slower than the device is
+    handed whatever has been sitting at the head of that queue; and a grab
+    that finds the queue EMPTY blocks until the device delivers, which is
+    the cost the drain must not pay more than once.
+    """
+
+    def __init__(self, clock, interval_s: float = 1.0 / 15.0,
+                 depth: int = 4, grab_cost_s: float = 0.0001,
+                 fail_after=None, raise_after=None):
+        self.clock = clock
+        self.interval = float(interval_s)
+        self.depth = int(depth)
+        self.grab_cost = float(grab_cost_s)
+        self.fail_after = fail_after
+        self.raise_after = raise_after
+        self.next_at = clock.now() + self.interval
+        self.queue = []
+        self.produced = 0
+        self.overrun = 0          # frames the DRIVER threw away: queue full
+        self.grabs = 0
+        self.retrieves = 0
+        self.held = None
+        self.released = 0
+
+    def _fill(self) -> None:
+        while self.clock.now() >= self.next_at:
+            self.produced += 1
+            self.queue.append(self.produced)
+            if len(self.queue) > self.depth:
+                self.queue.pop(0)
+                self.overrun += 1
+            self.next_at += self.interval
+
+    def grab(self) -> bool:
+        self.grabs += 1
+        if self.raise_after is not None and self.grabs > self.raise_after:
+            raise OSError("the device stopped answering")
+        self._fill()
+        if not self.queue:
+            self.clock.advance(max(0.0, self.next_at - self.clock.now()))
+            self._fill()
+        self.clock.advance(self.grab_cost)
+        if self.fail_after is not None and self.grabs > self.fail_after:
+            return False
+        if not self.queue:
+            return False
+        self.held = self.queue.pop(0)
+        return True
+
+    def retrieve(self, *_a):
+        self.retrieves += 1
+        if self.held is None:
+            return False, None
+        return True, self.held
+
+    def release(self) -> None:
+        self.released += 1
+
+
+class FloodCapture:
+    """A queue that never empties and a grab that never waits -- the case
+    the bound exists for."""
+
+    def __init__(self, clock=None, cost_s: float = 0.0):
+        self.clock = clock
+        self.cost = float(cost_s)
+        self.grabs = 0
+        self.retrieves = 0
+
+    def grab(self) -> bool:
+        self.grabs += 1
+        if self.clock is not None:
+            self.clock.advance(self.cost)
+        return True
+
+    def retrieve(self, *_a):
+        self.retrieves += 1
+        return True, self.grabs
+
+    def release(self) -> None:
+        pass
+
+
+def _drain(cap, clock, **kw):
+    return cam.DrainingCapture(cap, now=clock.now, **kw)
+
+
+# --------------------------------------------- it must help only when it helps
+def test_a_consumer_at_the_device_rate_drains_nothing():
+    """The half of the claim that is easy to get wrong. A consumer keeping
+    pace has an EMPTY queue when it arrives, so the first grab is the one
+    that waits for the device -- and the drain must stop there and cost
+    exactly what an undrained read costs: one grab, one retrieve."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0)
+    drain = _drain(cap, clock)
+    got = []
+    for _ in range(30):
+        ok, frame = drain.read()
+        assert ok
+        got.append(frame)
+    assert drain.dropped == 0
+    assert cap.grabs == 30 and cap.retrieves == 30
+    assert got == list(range(1, 31))      # every frame, none skipped
+    assert cap.overrun == 0               # and the driver never had to
+
+
+def test_a_slow_consumer_is_handed_the_newest_frame_not_the_oldest():
+    """The other half, and the A/B that proves the drain does something.
+
+    Three frames wait in the queue. Undrained, the read is handed the one
+    that has been sitting there longest -- three intervals old, which at
+    the 15.0 fps his LifeCam delivers is 200 ms of visible lag. Drained,
+    the same queue yields the newest ordinal the device has produced."""
+    def run(max_drops):
+        clock = VirtualClock()
+        cap = QueuedCapture(clock, interval_s=1.0 / 15.0, depth=4)
+        drain = _drain(cap, clock, max_drops=max_drops)
+        clock.advance(3.5 / 15.0)          # nobody read for 3.5 intervals
+        ok, frame = drain.read()
+        return ok, frame, cap, drain
+
+    ok, frame, cap, drain = run(0)         # max_drops 0 == today's read()
+    assert ok and frame == 1               # the OLDEST: three intervals stale
+    assert drain.dropped == 0
+
+    ok, frame, cap, drain = run(cam.DRAIN_MAX_DROPS)
+    assert ok and frame == cap.produced    # the NEWEST the device has made
+    assert drain.dropped == 3
+    assert cap.retrieves == 1              # one retrieve either way
+
+
+def test_the_drain_never_waits_for_more_than_one_frame_interval():
+    """It must not block. A drain that waits for the queue to run dry waits
+    at exactly the rate the device delivers; this one stops at the FIRST
+    grab that had to wait, so a drained read costs one frame interval at
+    worst -- the same wait an undrained read pays when the queue is empty."""
+    interval = 1.0 / 15.0
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=interval, depth=4)
+    drain = _drain(cap, clock)
+    clock.advance(3.5 * interval)
+    t0 = clock.now()
+    drain.read()
+    assert drain.dropped == 3                  # it did drain, and then
+    assert (clock.now() - t0) <= interval * 1.05
+
+    # and at the device rate the two cost the same wait
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=interval)
+    drained = _drain(cap, clock)
+    t0 = clock.now()
+    drained.read()
+    cost_drained = clock.now() - t0
+    clock2 = VirtualClock()
+    cap2 = QueuedCapture(clock2, interval_s=interval)
+    plain = _drain(cap2, clock2, max_drops=0)
+    t0 = clock2.now()
+    plain.read()
+    assert abs((clock2.now() - t0) - cost_drained) < 1e-9
+
+
+def test_the_drain_is_bounded_by_the_max_drops_backstop():
+    """A driver that reports a queue deeper than OpenCV asks for would let
+    the depth bound run away, so ``DRAIN_MAX_DROPS`` sits above it. A device
+    whose queue never empties -- 99 buffers deep, and a consumer a whole
+    second behind -- stops at the backstop, and stopping short of what the
+    ledger counted is what ``bounded`` means."""
+    clock = VirtualClock()
+    flood = FloodCapture(clock)
+    drain = _drain(flood, clock, depth=99)
+    clock.advance(1.0)                      # a second away: ~30 arrivals
+    ok, _frame = drain.read()
+    assert ok
+    assert flood.grabs == cam.DRAIN_MAX_DROPS + 1
+    assert drain.dropped == cam.DRAIN_MAX_DROPS
+    assert drain.bounded == 1
+
+
+def test_the_drain_is_bounded_by_a_clock_too():
+    """The count alone assumes the drops are cheap, and MEASURED at his
+    camera they are not always: one busy Python thread in the process turns
+    a 2 us dequeue into a 5.2 ms round trip. Nine of those would be 47 ms
+    inside one read; the budget stops the chain at 30 ms, comfortably inside
+    one 67.8 ms frame interval."""
+    clock = VirtualClock()
+    started = clock.now()
+    flood = FloodCapture(clock, cost_s=MEASURED_DEQUEUE_S)
+    drain = _drain(flood, clock, depth=99)
+    clock.advance(1.0)
+    drain.read()
+    assert flood.grabs < cam.DRAIN_MAX_DROPS + 1
+    assert drain.bounded == 1
+    assert (clock.now() - started) <= 1.0 + cam.DRAIN_BUDGET_S \
+        + MEASURED_DEQUEUE_S
+
+
+# ------------------------------------------------ it must not drop the only one
+def test_a_grab_that_fails_mid_drain_still_yields_the_last_good_frame():
+    """The frame already in hand must survive. If the (n+1)th grab never
+    arrives, the consumer gets the nth -- not nothing."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0, depth=4, fail_after=2)
+    drain = _drain(cap, clock)
+    clock.advance(3.5 / 15.0)
+    ok, frame = drain.read()
+    assert ok and frame == 2               # the last one actually grabbed
+    assert cap.retrieves == 1
+
+
+def test_a_first_grab_that_fails_is_no_frame_rather_than_a_stale_one():
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0, fail_after=0)
+    drain = _drain(cap, clock)
+    assert drain.read() == (False, None)
+    assert cap.retrieves == 0               # nothing to retrieve, so it did not
+
+
+def test_a_grab_that_raises_is_no_opinion_not_a_crash():
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0, raise_after=0)
+    assert _drain(cap, clock).read() == (False, None)
+
+
+def test_a_retrieve_that_raises_is_no_opinion_not_a_crash():
+    clock = VirtualClock()
+
+    class Broken(FloodCapture):
+        def retrieve(self, *_a):
+            raise OSError("decode failed")
+
+    assert _drain(Broken(clock), clock).read() == (False, None)
+
+
+def test_a_device_that_cannot_grab_is_read_straight_through():
+    """A fake with only ``read()`` -- every device double in this file, and
+    any backend without grab/retrieve -- must behave exactly as before."""
+    dev = FakeDevice()
+    drain = cam.DrainingCapture(dev)
+    ok, frame = drain.read()
+    assert ok and frame is not None
+    assert dev.reads == 1
+    assert drain.dropped == 0
+    assert drain.drains == 0                # the loop never ran
+
+
+def test_a_device_far_faster_than_the_consumer_is_drained_not_given_up_on():
+    """A 1000 fps device used to switch the drain OFF: its frame interval
+    was shorter than the 2 ms a grab had to beat to count as a dequeue, so
+    the old rule could not tell a wait from one and refused to judge. There
+    is nothing to judge now. A consumer 100 frames behind such a device
+    finds the queue FULL, which is exactly when draining it matters, and the
+    count comes off the depth."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=0.001, depth=4)   # 1000 fps
+    drain = _drain(cap, clock, nominal_fps=1000.0)
+    got = []
+    for _ in range(6):
+        clock.advance(0.1)                  # 100 frames behind, every read
+        ok, frame = drain.read()
+        assert ok
+        got.append(cap.produced - frame)
+    assert drain.draining is True
+    assert drain.dropped == 6 * 3           # depth - 1 every read
+    # ...and the newest there was. At 1000 fps another frame can land
+    # DURING the four dequeues, which is a frame this read never had.
+    assert max(got) <= 1
+
+
+# ------------------------------------- the numbers measured at HIS hardware
+# 2026-09-03, device free (Jarvis stopped), 1280x720 MJPG, the queue backed
+# up and then grabbed until the first blocking grab. grab() only -- nothing
+# retrieved, decoded, shown or saved. Written up in
+# scratch-0903/drain/MEASURED-dequeue.md:
+#
+#   condition           n     p50        p90     p99     max        >= 2.0 ms
+#   idle box           135    0.001 ms   0.035   0.036   0.037 ms     0.00%
+#   1 busy Py thread   135    5.222 ms   5.460   5.545   5.605 ms    89.63%
+#   4 busy Py threads  120    0.004 ms   0.118   5.357   15.987 ms    9.17%
+#
+#   grabs that WAITED for the device: p50 67.8 ms, n=397
+#
+# A real dequeue costs 2 MICROSECONDS. What the drain can time is the whole
+# round trip, and grab() releases the GIL for the ioctl and has to take it
+# back to return -- so one competing Python thread turns that 2 us into
+# 5.2 ms. Jarvis is never an idle box.
+MEASURED_DEQUEUE_S = 0.00522        # p50 under ONE busy Python thread
+MEASURED_WORST_DEQUEUE_S = 0.01599  # max under four
+MEASURED_INTERVAL_S = 0.0678        # p50 of the grabs that waited
+
+
+def test_a_busy_process_does_not_turn_every_dequeue_into_a_wait():
+    """THE BUG THIS DRAIN SHIPPED WITH. The staleness test was "did this
+    grab take less than 2 ms", and 2 ms is 8x BELOW the noise floor of the
+    process it runs in: with one busy Python thread 89.63% of dequeues took
+    longer than that (measured, table above). So the drain stopped at the
+    FIRST queued buffer, handed back the OLDEST frame -- the exact lag it
+    exists to remove -- and reported dropped 0, which the numbers line says
+    means healthy.
+
+    The queue is full and every dequeue costs the measured 5.2 ms -- 2.6x
+    the threshold that used to mean "this one waited for the device". The
+    drain must still empty it and reach the newest frame."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=MEASURED_INTERVAL_S, depth=4,
+                        grab_cost_s=MEASURED_DEQUEUE_S)
+    drain = _drain(cap, clock)
+    for _ in range(3):                      # learn the delivered rate
+        clock.advance(MEASURED_INTERVAL_S)
+        drain.read()
+    before = drain.dropped
+    clock.advance(4.5 * MEASURED_INTERVAL_S)     # the queue fills to depth
+    ok, frame = drain.read()
+    assert ok
+    assert frame == cap.produced            # the NEWEST, not the oldest
+    assert drain.dropped - before == 3      # depth - 1, all of them stale
+    assert drain.draining is True
+
+
+def test_the_drain_is_counted_off_the_drivers_own_queue_depth():
+    """How many buffers can be stale is not a guess: the driver's queue is
+    ``CAP_PROP_BUFFERSIZE`` deep and readable, so at most depth - 1 can be
+    waiting behind the newest one. That number is the bound -- not eight,
+    which was twice a four-deep queue with no reason for the factor."""
+    clock = VirtualClock()
+    flood = FloodCapture(clock, cost_s=MEASURED_DEQUEUE_S)
+    drain = _drain(flood, clock, depth=4)
+    clock.advance(1.0)                      # a second away: ~30 arrivals
+    drain.read()
+    assert drain.dropped == 3               # depth - 1, and not 8
+    assert flood.grabs == 4
+
+
+def _work_paced(max_drops, work_s, cycles=30,
+                interval_s=MEASURED_INTERVAL_S,
+                grab_cost_s=0.0001):
+    """A consumer slowed by its OWN WORK rather than by a sleep it can
+    shorten. Every drain test before this one paced with a compensating
+    sleep -- ``sleep(period - elapsed)`` -- which ABSORBS whatever the drain
+    costs and hides it. Real work does not: the drain's cost lands on top of
+    it, cycle after cycle."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=interval_s, depth=4,
+                        grab_cost_s=grab_cost_s)
+    drain = _drain(cap, clock, max_drops=max_drops)
+    started = clock.now()
+    ages = []
+    for _ in range(cycles):
+        clock.advance(work_s)               # decode, detect, draw
+        ok, frame = drain.read()
+        assert ok
+        ages.append(cap.produced - frame)   # frames behind the newest
+    elapsed = clock.now() - started
+    return {"fps": cycles / elapsed, "age": sum(ages) / len(ages),
+            "cycle_s": elapsed / cycles, "dropped": drain.dropped}
+
+
+def test_a_consumer_slowed_by_its_own_work_keeps_its_frame_rate():
+    """80 ms of work against a 67.8 ms device: the queue always has a buffer
+    waiting, so a read that INSISTS on a frame newer than the one in hand
+    has to wait for the next one -- and pays that wait on top of its own
+    80 ms, every cycle. Measured at 38% of the frame rate before this test
+    existed. The drain may not cost frame rate, so it takes the newest
+    buffer ALREADY QUEUED and does not wait for a newer one."""
+    for cost in (0.0001, MEASURED_DEQUEUE_S):
+        drained = _work_paced(cam.DRAIN_MAX_DROPS, 0.080, grab_cost_s=cost)
+        plain = _work_paced(0, 0.080, grab_cost_s=cost)
+        assert drained["fps"] >= plain["fps"] * 0.95, cost
+        assert drained["age"] <= plain["age"], cost
+
+
+def test_a_consumer_far_slower_than_the_device_still_gets_the_newest():
+    """The other end of the same axis: 300 ms of work per cycle against the
+    same device fills the four-deep queue between reads, and the drain has
+    to empty it rather than hand back the oldest."""
+    for cost in (0.0001, MEASURED_DEQUEUE_S):
+        drained = _work_paced(cam.DRAIN_MAX_DROPS, 0.300, grab_cost_s=cost)
+        plain = _work_paced(0, 0.300, grab_cost_s=cost)
+        assert drained["age"] <= 0.5, cost   # essentially always the newest
+        assert plain["age"] >= 2.0, cost     # the lag the drain exists for
+        # The only thing a drained cycle can cost over an undrained one is
+        # the dequeues themselves, and the budget is the ceiling on those.
+        assert drained["cycle_s"] <= plain["cycle_s"] + cam.DRAIN_BUDGET_S
+
+
+# --------------------------------- the queue that refills while it is drained
+def test_a_queue_that_fills_mid_drain_is_counted_and_still_terminates():
+    """THE LEDGER IS NOT READ ONCE AND ACTED ON. The device does not stop
+    producing while the drain is discarding, so a drain that decided how
+    many to take on the way in would hand back a buffer that was already
+    stale by the time it stopped. ``_arrivals`` therefore runs again after
+    every grab, counting the grab's OWN wall clock as time the device spent
+    working.
+
+    3.5 intervals pass, so buffers 1, 2 and 3 exist when the read begins and
+    buffer 4 DOES NOT. Four dequeues at 4 ms each carry the clock past the
+    fifth interval boundary, buffer 4 lands mid-drain, and the drain takes
+    it -- one more buffer than the queue held when it started. It still
+    terminates: the depth bound stops it at four grabs with the newest frame
+    in hand."""
+    interval, dequeue = 0.010, 0.004
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=interval, depth=4,
+                        grab_cost_s=dequeue)
+    drain = _drain(cap, clock, nominal_fps=1.0 / interval)
+    clock.advance(3.5 * interval)
+    ok, frame = drain.read()
+    assert ok
+    assert cap.grabs == 4                  # one more than were queued
+    assert frame > 3                       # a buffer that did not yet exist
+    assert frame == cap.produced           # ...and the newest there is
+    assert drain.dropped == 3
+    assert drain.bounded == 1              # the depth bound, not a runaway
+    assert cap.retrieves == 1
+
+    # ...against the undrained arm on the identical queue: it takes the one
+    # that has been waiting longest and never learns the others exist.
+    clock2 = VirtualClock()
+    cap2 = QueuedCapture(clock2, interval_s=interval, depth=4,
+                         grab_cost_s=dequeue)
+    plain = _drain(cap2, clock2, max_drops=0, nominal_fps=1.0 / interval)
+    clock2.advance(3.5 * interval)
+    ok, stale = plain.read()
+    assert ok and stale == 1
+    assert cap2.produced - stale == 2       # two intervals behind already
+
+
+# ------------------------------------------------- the device that goes away
+def test_a_device_that_disappears_mid_stream_is_no_opinion_from_then_on():
+    """An unplugged camera is not an exception the app may raise. The read
+    in flight keeps the last buffer that DID arrive, and every read after it
+    is (False, None) -- which is what ``CameraFeed.capture`` already reads as
+    no opinion -- rather than a crash on the preview thread or a stale frame
+    served forever."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0, depth=4, raise_after=2)
+    drain = _drain(cap, clock)
+    clock.advance(3.5 / 15.0)
+    ok, frame = drain.read()
+    assert ok and frame == 2               # the last one that did arrive
+    assert drain.failures == 1
+    for _ in range(3):
+        assert drain.read() == (False, None)
+    assert drain.failures == 4
+    assert cap.retrieves == 1              # never retrieved off a dead device
+    assert drain.status()["failures"] == 4
+
+
+# ------------------------------------------------------------ the rate window
+def test_the_rate_window_averages_the_last_few_buffers_and_no_more():
+    """``interval_s`` is what the whole ledger divides by, so how it is
+    measured decides everything. It is the MEAN SPACING over the last
+    ``DRAIN_RATE_WINDOW`` buffers -- long enough that one slow grab cannot
+    move it, short enough to follow a device that changes its own rate, and
+    his LifeCam changes its own rate with the light (measured 2026-09-03).
+
+    A window that long has an exact signature and this pins it: after the
+    device halves its interval, the estimate is dragged by the old gaps for
+    exactly ``DRAIN_RATE_WINDOW - 1`` buffers and then reads the new rate
+    with none of the old left in it."""
+    clock = VirtualClock()
+    flood = FloodCapture(clock)
+    drain = _drain(flood, clock, max_drops=0, nominal_fps=1000.0)
+    # Before there are two buffers there is no spacing to report, and the
+    # nominal stands in -- which a driver can only overstate.
+    assert drain.spacing_s == 0.0
+    assert drain.interval_s == pytest.approx(0.001)
+
+    slow, fast = 0.100, 0.040
+    for _ in range(cam.DRAIN_RATE_WINDOW * 2):
+        clock.advance(slow)
+        drain.read()
+    assert drain.spacing_s == pytest.approx(slow)
+    assert drain.interval_s == pytest.approx(slow)
+    assert drain.bounded == 0              # an inert arm reports no bound
+
+    gaps = cam.DRAIN_RATE_WINDOW - 1       # N stamps hold N-1 gaps
+    clock.advance(fast)
+    drain.read()
+    assert drain.spacing_s == pytest.approx(
+        ((gaps - 1) * slow + fast) / gaps)
+    for _ in range(gaps - 1):
+        clock.advance(fast)
+        drain.read()
+    assert drain.spacing_s == pytest.approx(fast)   # nothing old left
+    assert drain.interval_s == pytest.approx(fast)
+
+
+# ------------------------------------------------ what reaches the feed
+def test_the_feed_carries_the_drains_own_state_not_only_its_count(tmp_path):
+    """An INERT drain has to be visible. ``draining``, the interval it
+    learned and the times a bound stopped it never left the object, so a
+    drain switched off by its own guard looked exactly like a drain with
+    nothing to do: drop 0.0/s either way."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=MEASURED_INTERVAL_S, depth=4)
+    drain = cam.DrainingCapture(cap, now=clock.now)
+    feed, _p, _o = _feed(tmp_path, opener=lambda: drain)
+    for _ in range(8):
+        assert feed.capture() is not None
+    state = feed.status()["drain"]
+    assert state["on"] is True
+    assert state["depth"] == 4
+    # the DELIVERED interval it measured, not the nominal it started from
+    assert state["interval_ms"] == pytest.approx(
+        MEASURED_INTERVAL_S * 1000.0, abs=1.0)
+    assert state["interval_ms"] > 1000.0 / cam.DRAIN_NOMINAL_FPS
+    assert state["bounded"] >= 0
+
+
+def test_a_feed_with_no_drain_under_it_says_so_rather_than_raising(tmp_path):
+    feed, _p, _o = _feed(tmp_path)
+    assert feed.capture() is not None
+    assert feed.status()["drain"]["on"] is False
+
+
+# ------------------------------------------------------- through the real seam
+def test_open_capture_wraps_the_device_in_the_drain_and_still_reads_it_back(
+        monkeypatch, caplog):
+    """``open_capture`` is where the buffer decision lives, so it is where
+    the drain is attached. The wrapper still answers ``get``/``set``, which
+    is what ``capture_mode`` and ``focus_probe`` ask it -- and what
+    scripts/vision_selfcheck.py calls on the gate's own device."""
+    fake = _FakeCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cap = cam.open_capture("", 1280, 720, "MJPG")
+    assert isinstance(cap, cam.DrainingCapture)
+    assert cap.raw is fake.caps[0]
+    mode = cam.capture_mode(cap)            # through the wrapper
+    assert mode["width"] == 1280.0 and mode["fourcc"] == "MJPG"
+    cap.release()
+    assert fake.caps[0].released == 1
+
+
+def test_the_drains_two_inputs_come_from_the_driver_not_from_a_constant(
+        monkeypatch):
+    """How deep the queue is and how fast the device claims to run are the
+    two numbers the whole ledger is built on, and both are READ BACK at the
+    open rather than assumed. A driver that answers 0 or -1 leaves the
+    module fallbacks in place -- a queue of no depth would switch the drain
+    off silently, which is the failure the ``draining`` flag exists for."""
+    fake = _FakeCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+
+    def granted(**kw):
+        base = {"width": 1280.0, "height": 720.0, "fps": 30.0,
+                "buffersize": 4.0, "convert_rgb": 1.0, "fourcc": "MJPG"}
+        base.update(kw)
+        monkeypatch.setattr(cam, "capture_mode", lambda _c: base)
+        return cam.open_capture("", 1280, 720, "MJPG")
+
+    cap = granted(buffersize=6.0, fps=25.0)
+    assert cap.depth == 6                    # the driver's, not DRAIN_DEPTH
+    assert cap.interval_s == pytest.approx(1.0 / 25.0)
+    cap = granted(buffersize=-1.0, fps=0.0)
+    assert cap.depth == cam.DRAIN_DEPTH
+    assert cap.interval_s == pytest.approx(1.0 / cam.DRAIN_NOMINAL_FPS)
+
+
+def test_the_feed_counts_the_frames_the_drain_threw_away(tmp_path):
+    """The count has to reach the preview, and the only path from the device
+    to the preview is the feed. A drain silently eating half the stream must
+    be findable by grep, not by a night of guessing."""
+    clock = VirtualClock()
+    cap = QueuedCapture(clock, interval_s=1.0 / 15.0, depth=4)
+    drain = cam.DrainingCapture(cap, now=clock.now)
+    clock.advance(3.5 / 15.0)
+    feed, _p, _o = _feed(tmp_path, opener=lambda: drain)
+    assert feed.capture() == cap.produced
+    assert feed.stale_dropped == 3
+    assert feed.status()["stale_dropped"] == 3
+    assert feed.capture() is not None
+    assert feed.stale_dropped == drain.dropped
+
+
+def test_a_device_with_no_drain_leaves_the_count_at_zero(tmp_path):
+    """Not every opener returns a draining capture -- the suite's do not,
+    and neither does a future backend. The count degrades to 0, not to an
+    AttributeError inside a read."""
+    feed, _p, _o = _feed(tmp_path)
+    assert feed.capture() is not None
+    assert feed.stale_dropped == 0
+    assert feed.status()["stale_dropped"] == 0
+
+
+def test_a_reopened_device_does_not_double_count_the_drops(tmp_path):
+    """The drop baseline is PER WRAPPER. ``_GatedDevice`` is made fresh at
+    every open, so a device re-opened after a curfew edge starts from its
+    own cumulative count and the feed's total climbs by what the new device
+    actually dropped -- not by the whole of its history a second time."""
+    clock = VirtualClock()
+    # Both devices are built NOW, so both queues have been filling since
+    # before either open -- a lazily built one starts its own clock at the
+    # open and would have nothing to drain.
+    ready = [cam.DrainingCapture(
+        QueuedCapture(clock, interval_s=1.0 / 15.0, depth=4), now=clock.now)
+        for _ in range(2)]
+    made = []
+
+    def opener():
+        made.append(ready[len(made)])
+        return made[-1]
+
+    feed, _p, _o = _feed(tmp_path, opener=opener)
+    clock.advance(3.5 / 15.0)
+    assert feed.capture() is not None
+    assert feed.stale_dropped == 3
+    assert made[0].dropped == 3
+    feed.close()                              # the curfew edge, say
+    clock.advance(3.5 / 15.0)
+    assert feed.capture() is not None
+    assert len(made) == 2                     # a second device, fresh counts
+    assert made[1].dropped == 3               # its OWN three, from zero
+    assert feed.stale_dropped == 6            # 3 + 3, not 3 + 3 + 3

@@ -293,3 +293,92 @@ def test_main_refuses_a_live_display_before_starting_anything(rig, tmp_path,
     assert touched == []
     assert "refuse_live_display(display)" in open(rig.__file__).read() \
         or "refuse_live_display(args.display)" in open(rig.__file__).read()
+
+
+# ------------------------------------------- the sensor-setup state (29)
+def test_the_setup_state_photographs_an_invented_profile_never_his(rig, source):
+    """State 29 opens the setup sheet, which reads a room-sensor profile --
+    the file that holds his Wi-Fi PSK and the device's OTA password.
+
+    TWO INDEPENDENT GUARANTEES, and both are asserted here. (a) The rig
+    writes its OWN profile with invented values: an invented SSID, a
+    TEST-NET-1 address, and two secrets that are literal constants in this
+    file. (b) It writes them through jarvis.sensorprofile, whose directory
+    derives from PATHS.ASSISTANT_CONFIG -- which _firewall_env has already
+    redirected into the shot directory -- so the write lands in the
+    throwaway tree and the real profiles are never opened.
+
+    And the sheet renders "set" / "not set" for a secret and never the
+    value (tests/test_ui_sensor_setup.py measures that over the whole widget
+    tree), so even a real profile would photograph nothing.
+    """
+    assert ("29", "sensor-setup") in [(n, s) for n, s, _w in rig.STATES]
+    assert rig.RIG_SSID and rig.RIG_PSK and rig.RIG_OTA
+    for value in (rig.RIG_PSK, rig.RIG_OTA):
+        assert "invented" in value
+    assert "sensorprofile.write" in source
+    assert source.index("_firewall_env") < source.index("RIG_PSK")
+    # the profile's address is a documentation literal, like the two rooms
+    assert rig.RIG_IP.startswith("192.0.2.")
+
+
+def test_the_setup_state_is_skipped_in_classic_and_says_why(source):
+    """The SETUP button is holo's: classic is pixel-frozen at the jarvis-v3
+    tip, so it has no such control and photographing the state there would
+    produce a second copy of frame 26 under a name that claims otherwise."""
+    assert 'self.skip("29", "sensor-setup"' in source
+    assert "restyled()" in source
+
+
+def test_the_users_frames_photograph_the_locked_state_and_an_invented_book(
+        rig, source):
+    """His own people book is never opened, and the three frames show the
+    state he is actually in: an owner with an override code set.
+
+    RigPeople answers Services.people_snapshot from three invented rows;
+    nothing in the script names PATHS.OWNER_REGISTRY or builds a Registry.
+    The two "hashes" are booleans in redacted() shape, so there is nothing
+    here a hash could be.
+    """
+    from jarvis import gate as gt
+    book = rig.RigPeople()
+    snap = book.snapshot()
+    assert snap["admin"] == gt.ADMIN_CODE, "the frame must open LOCKED"
+    assert [p["label"] for p in snap["people"]] == \
+        ["alderman", "pemberton", "marchbanks"]
+    for person in snap["people"]:
+        assert isinstance(person["has_code"], bool)
+        assert isinstance(person["has_phrase"], bool)
+        assert "hash" not in "".join(str(v) for v in person.values()).lower()
+    assert "/home/example/" in book.PATH
+    # STRUCTURALLY, not by grep: the script's PROSE names PATHS.OWNER_REGISTRY
+    # to say it never touches it, so a substring test would read the promise
+    # as the breach. Parse it and look for the access itself.
+    import ast
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            assert node.attr != "OWNER_REGISTRY", "the rig reached for his book"
+        if isinstance(node, ast.Name):
+            assert node.id != "Registry", "the rig built a Registry"
+    assert ("30", "users") in [(n, s) for n, s, _w in rig.STATES]
+
+
+def test_the_rig_carries_the_apps_dwell_so_a_frame_cannot_show_a_refusal(rig):
+    """THE PAGE'S Lock IS A MIRROR of the app's dwell, re-seeded every
+    second by the tick. A rig that offered people_admin_state but no dwell
+    of its own would relock the page one tick after users_forget unlocked
+    it, and 31-users-forget would photograph "your override code is
+    needed" instead of the confirmation."""
+    from jarvis import gate as gt
+    book = rig.RigPeople()
+    assert book.admin_state()["unlocked_s"] == 0.0
+    assert book.unlock("zzz-invented-zzz")[0] is True
+    assert book.admin_state()["unlocked_s"] > 0
+    assert book.admin_state()["admin"] == gt.ADMIN_CODE
+    book.relock()
+    assert book.admin_state()["unlocked_s"] == 0.0
+    svc = rig.build_services(people=book)
+    # == not is: a bound method is a fresh object on every attribute read.
+    assert svc.people_admin_state == book.admin_state
+    assert svc.people_relock == book.relock

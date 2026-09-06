@@ -242,8 +242,10 @@ def test_get_briefing_when_tomorrow_parks_the_offer(tmp_path):
     (spec,) = br.make_tools(cfg(verbosity="brief"), svc)
     assert spec.handler(when="tomorrow").max_sentences == 2
     # no offer -> nothing parked (a stale offer must not linger)
-    tk = TK([Item("alarm", (datetime.now().astimezone() + timedelta(days=1)).replace(
-        hour=6, minute=0).timestamp())])
+    # naive arithmetic, zone attached LAST: .astimezone() first would carry
+    # today's UTC offset onto tomorrow and be an hour out across a DST change
+    tk = TK([Item("alarm", (datetime.now() + timedelta(days=1)).replace(
+        hour=6, minute=0).astimezone().timestamp())])
     svc = services(reg, Notes(), tk, tmp_path=tmp_path)
     (spec,) = br.make_tools(cfg(), svc)
     spec.handler(when="tomorrow")

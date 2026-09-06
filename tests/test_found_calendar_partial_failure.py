@@ -27,17 +27,28 @@ FIXED 2026-08-31: CalendarSource tracks a failing source in ``_failures``
 out, and get_calendar takes back the "; nothing else." claim and names the
 feed.  The xfail marker is gone: this is now a regression test.
 """
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 from jarvis.assistant_config import AssistantConfig
 from jarvis.tools.calendar import CalendarSource, make_tools
 from jarvis.tools.registry import ToolRegistry
 
-# The event must fall on the day the test runs: it was written with the date
-# hard-coded, so it silently stopped exercising the bug (and XPASSed strict)
-# at the first midnight after it was written.
-_TODAY = date.today().strftime("%Y%m%d")
+# The event must fall on the day the tool thinks it is. It was first written
+# with the date hard-coded, so it silently stopped exercising the bug (and
+# XPASSed strict) at the first midnight after it was written; the fix for
+# that was date.today() AT IMPORT, which put the bug back in a subtler
+# place -- the module captured the day, the tool read its own clock when
+# the assertion ran, and a run that crossed midnight got "Nothing on today
+# in the calendars I can reach". Measured red 2026-09-05 by holding a run
+# open across the boundary.
+#
+# So both clocks are pinned to one fixed day instead: the ICS is built for
+# it, and jarvis/tools/calendar.now_local -- which the module documents as
+# "one module-level seam. Tests freeze this" -- is frozen to it too. The
+# event still lands on the tool's today, which is all the test ever needed.
+_DAY = date(2026, 9, 14)                  # an ordinary Monday
+_TODAY = _DAY.strftime("%Y%m%d")
 GOOD_ICS = (b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nX-WR-CALNAME:Work\r\n"
             b"BEGIN:VEVENT\r\nUID:g1\r\nDTSTART:" + _TODAY.encode() +
             b"T230000\r\nDTEND:" + _TODAY.encode() +
@@ -47,7 +58,11 @@ SIGN_IN_HTML = (b"<!DOCTYPE html><html><head><title>Sign in - Google Accounts"
                 b"</title></head><body>...</body></html>")
 
 
-def test_a_broken_calendar_is_not_answered_as_if_it_were_empty(tmp_path):
+def test_a_broken_calendar_is_not_answered_as_if_it_were_empty(tmp_path, monkeypatch):
+    import jarvis.tools.calendar as cal_mod
+    monkeypatch.setattr(cal_mod, "now_local",
+                        lambda tz=None: datetime(_DAY.year, _DAY.month, _DAY.day,
+                                                 12, 0, tzinfo=tz or cal_mod.system_tz()))
     cfg = AssistantConfig({"google_ical_urls": ["https://good.test/a.ics",
                                                 "https://revoked.test/b.ics"]})
 

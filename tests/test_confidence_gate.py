@@ -58,8 +58,11 @@ def _feed(app, monkeypatch, text: str, conf: float):   # noqa: F811
     dispatched: list[tuple] = []
     spoken: list[str] = []
     monkeypatch.setattr(CONFIG, "speaker_verify", False)
+    # ``**kw``: _process_audio carries the turn's addressee into _dispatch
+    # (round-3, 09-05 -- jarvis/scope.py), and a stand-in that refuses it
+    # raises inside _process_audio's try, which silently loses the turn.
     monkeypatch.setattr(app, "_dispatch",
-                        lambda t, source, confidence=None:
+                        lambda t, source, confidence=None, **kw:
                         dispatched.append((t, source, confidence)))
     monkeypatch.setattr(app, "_say", lambda text, **kw: spoken.append(text))
     monkeypatch.setattr(app.transcriber, "transcribe",

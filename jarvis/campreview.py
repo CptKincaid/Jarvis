@@ -131,8 +131,14 @@ NOT THE DEVICE'S CEILING -- the ceiling is 30 fps, reached at manual
 exposure 156 with the default buffers. And the app gained nothing from
 the default buffers when it was tried: 7.6 fps / 132 ms on its own rate
 line either way, with the staleness he saw at once, so the single buffer
-stayed (9ba1c56) and camera-drain is the dropped branch that argued
-about it.
+stayed (9ba1c56). WHAT 9ba1c56 REVERTED WAS A NAKED BUFFER COUNT, with
+nothing to discard the stale frames the buffers then held; the staleness
+it names is real and that revert stands on its own terms. The buffers are
+back now because ``jarvis.camera.DrainingCapture`` grabs the stale ones
+away before retrieving, which is the fix that revert was waiting for --
+and whether the APP finally gets the 15.0 is still unmeasured at the
+device. That is one command with Jarvis stopped:
+scripts/camera_drain_probe.py, no --model.
 
 THE THREE RATES ARE NOT ONE RATE, and separating them is what keeps the pane
 cheap whatever the device delivers. Hunter, 2026-09-03: *"looks good but it
@@ -157,7 +163,22 @@ must not:
   not a spin) and it is not a privacy problem (``stop()`` is synchronous and
   a frame that returns after it is dropped), but it does mean a request
   above the delivered rate is a request the device ignores. Below it,
-  pictures are thrown away.
+  pictures are thrown away -- and WHICH pictures matters. Below the
+  delivered rate the driver's four-buffer queue backs up, so the picture a
+  slow reader is handed is the OLDEST one waiting, up to three intervals
+  stale. ``jarvis.camera.DrainingCapture`` discards those before
+  retrieving, so a request WELL below the delivered rate now costs pictures
+  but not freshness, and the ones it cost are counted: ``drop N/s`` on the
+  numbers line below, beside the rate. A drop rate near the delivered rate
+  says the consumer is far behind the device; a drop rate of zero at a
+  healthy picture rate says the drain is costing nothing, which is the case
+  it has to cost nothing in -- and next to it ``drain on|off`` says whether
+  there is a drain there at all, because an inert one reports the same
+  0.0/s. A consumer only a SHADE slower than the device is the case the
+  drain deliberately leaves alone: clearing that queue means waiting for a
+  frame that may not have arrived, which costs frame rate, so up to a
+  couple of intervals of lag survive there (jarvis/camera.py,
+  DrainingCapture).
 * BOXES -- ``DETECT_FPS`` = 8, a constant rather than a knob, applied as
   EVERY Nth PICTURE with ``N = max(1, round(picture_fps / DETECT_FPS))``
   against the MEASURED picture interval (``detect_stride``). Not a
@@ -627,6 +648,23 @@ class PreviewShot:
     at: float = 0.0
     fps: float = 0.0                 # measured delivery rate, not the target
     grab_ms: float = 0.0             # the WHOLE cycle's cost, grab to shrink
+    # STALE frames the drain threw away on the way to the newest one --
+    # cumulative since the feed was built, and the same count as a rate.
+    # It sits beside ``fps`` deliberately: a drop rate near the DELIVERED
+    # rate says the consumer is running far behind the device, and a drop
+    # rate of zero at a healthy picture rate says the drain is costing
+    # nothing, which is the case it has to cost nothing in.
+    dropped: int = 0
+    drop_fps: float = 0.0
+    # ...and whether the drain is DOING anything, which the count cannot
+    # say: an inert drain reports drop 0.0/s and so does a healthy one with
+    # nothing to discard. ``drain_ms`` is the delivered frame interval the
+    # drain measured at the device -- the number its whole arithmetic
+    # divides by -- and ``drain_bounded`` how many reads stopped on a limit
+    # with stale buffers still in the queue.
+    drain_on: bool = False
+    drain_ms: float = 0.0
+    drain_bounded: int = 0
     # This cycle's per-stage cost in ms, ``{stage: ms}`` over the names in
     # STAGES that ran -- floats keyed by short strings, nothing else. The
     # worker folds these into its minute p50s (StageStats); the pane never
@@ -667,6 +705,9 @@ class PreviewShot:
                 "cap_h": self.cap_h, "reason": self.reason,
                 "detail": self.detail, "seq": self.seq, "fps": self.fps,
                 "grab_ms": self.grab_ms, "live": self.live,
+                "dropped": self.dropped, "drop_fps": self.drop_fps,
+                "drain_on": self.drain_on, "drain_ms": self.drain_ms,
+                "drain_bounded": self.drain_bounded,
                 "face": self.primary.as_dict() if self.primary else {},
                 "hand": self.hand.as_dict() if self.hand is not None else {},
                 "stage_ms": {str(k): float(v)
@@ -1166,6 +1207,21 @@ class PreviewPipeline:
         # The stage costs of the cycle in progress, reset at the top of
         # grab() and handed over on the shot as ``stage_ms``. Floats only.
         self._cycle_ms: dict = {}
+        # The drain's count, carried up from the feed and turned into a
+        # rate here. Cumulative on the feed side because a counter that
+        # resets cannot be differenced; a RATE here because "9 a second
+        # against 15 delivered" is the sentence that means something, and
+        # 4,312 does not.
+        self.dropped = 0
+        self.drop_fps = 0.0
+        self._last_drop: Optional[int] = None
+        self._last_drop_at: Optional[float] = None
+        # The drain's own state, straight from the feed. Not a rate: these
+        # are what it currently believes, and the interval is the one it
+        # measured at the device.
+        self.drain_on = False
+        self.drain_ms = 0.0
+        self.drain_bounded = 0
 
     def _stage(self, name: str, since: float) -> None:
         """Record one stage's cost, measured from ``since`` to now."""
@@ -1452,6 +1508,8 @@ class PreviewPipeline:
             log.debug("campreview: the feed raised", exc_info=True)
             frame = None
         self._stage("grab", t0)
+        self._count_drops(self._now())
+        self._count_drain()
         if frame is None:
             self.misses += 1
             return blank(REASON_NO_FRAME, seq=seq, at=time.time())
@@ -1516,7 +1574,49 @@ class PreviewPipeline:
                            cap_h=frame_h, reason=REASON_LIVE, detail=detail,
                            seq=seq, at=time.time(),
                            grab_ms=(self._now() - t0) * 1000.0, hand=hand,
-                           stage_ms=dict(self._cycle_ms))
+                           stage_ms=dict(self._cycle_ms),
+                           dropped=self.dropped, drop_fps=self.drop_fps,
+                           drain_on=self.drain_on, drain_ms=self.drain_ms,
+                           drain_bounded=self.drain_bounded)
+
+    def _count_drops(self, at: float) -> None:
+        """Read the feed's cumulative drop count and difference it.
+
+        A feed with no drain under it -- every stub in the suite, any
+        backend without grab/retrieve -- has no such attribute, and that is
+        0 rather than an AttributeError inside the one call on this thread
+        that must never raise. The FIRST reading only sets the baseline: a
+        rate needs two samples, and inventing one from a cumulative total
+        would report every frame dropped since the feed was built as though
+        they had all been dropped in the last second.
+        """
+        try:
+            total = int(getattr(self.feed, "stale_dropped", 0) or 0)
+        except (TypeError, ValueError):            # a feed with a strange attr
+            return
+        self.dropped = total
+        last, last_at = self._last_drop, self._last_drop_at
+        self._last_drop, self._last_drop_at = total, at
+        if last is None or last_at is None:
+            return
+        gap = at - last_at
+        if not (0.0 < gap < 60.0):
+            return
+        self.drop_fps = max(0, total - last) / gap
+
+    def _count_drain(self) -> None:
+        """The drain's state, as the feed last saw it. A feed with no drain
+        under it has an empty dict and reads "off", which is the honest
+        answer and not the same as a healthy zero."""
+        state = getattr(self.feed, "drain", None)
+        if not isinstance(state, dict):
+            return
+        try:
+            self.drain_on = bool(state.get("on", False))
+            self.drain_ms = float(state.get("interval_ms", 0.0) or 0.0)
+            self.drain_bounded = int(state.get("bounded", 0) or 0)
+        except (TypeError, ValueError):        # a feed with a strange dict
+            return
 
     def _track(self, frame, frame_w: int, frame_h: int,
                at: float) -> tuple:
@@ -2159,10 +2259,21 @@ class PreviewWorker:
         # stage figures after it are the minute's p50s; ``grab`` there IS the
         # device read (plus decode), and ``draw`` is the Tk thread's.
         cycles, self._stage_cycles = self._stage_cycles, 0
-        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  cycle %.0f ms%s"
-                 "  %s",
+        # WHAT THE DRAIN IS DOING, beside what it threw away. "off" is a
+        # real answer -- a device without grab/retrieve, or a drain built
+        # with no drops allowed -- and it is the one the count could never
+        # give, because an inert drain and an idle one both report 0.0/s.
+        if data["drain_on"]:
+            drain = "on %.1f ms" % data["drain_ms"]
+            if data["drain_bounded"]:
+                drain += " %d bounded" % data["drain_bounded"]
+        else:
+            drain = "off"
+        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  drop %.1f/s  "
+                 "drain %s  cycle %.0f ms%s  %s",
                  data["reason"] or "live", data["faces"], data["cap_w"],
-                 data["cap_h"], data["fps"], data["grab_ms"], who,
+                 data["cap_h"], data["fps"], data["drop_fps"], drain,
+                 data["grab_ms"], who,
                  stage_line(self.stages.p50s(reset=True), cycles))
 
     def _sensing_state(self):
@@ -2309,7 +2420,12 @@ class PreviewWorker:
                                seq=shot.seq, at=shot.at,
                                fps=self._measure_fps(self._now()),
                                grab_ms=shot.grab_ms, hand=shot.hand,
-                               stage_ms=shot.stage_ms)
+                               stage_ms=shot.stage_ms,
+                               dropped=shot.dropped,
+                               drop_fps=shot.drop_fps,
+                               drain_on=shot.drain_on,
+                               drain_ms=shot.drain_ms,
+                               drain_bounded=shot.drain_bounded)
         self._publish(shot, stop)
         return shot
 

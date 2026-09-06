@@ -77,7 +77,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 from jarvis import address
 from jarvis import arc as arc_mod
@@ -95,6 +95,8 @@ from jarvis import outbox
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
+from jarvis import scope as scope_mod
+from jarvis.honorific import ADDRESSEE_TTL
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.endpoint import FILLER_WORDS  # noqa: F401 - one list; see endpoint.py
@@ -1561,6 +1563,15 @@ def _h_quiet(c, t, m):
                          status="Quiet")
 
 
+# How old the owner's last answer may be and still be replayable. Round 3
+# named the absence of ANY bound here: "say that again" would hand back a
+# line from hours ago. His own line to himself is not a disclosure, so this
+# is a quality bound, not the security one -- the security bound is
+# Commander._repeat_for_known, which is default-deny.
+REPEAT_MAX_AGE_S = 600.0
+REPEAT_STALE_LINE = "That was a while ago, sir -- ask me again."
+
+
 def _h_repeat(c, t, m):
     tts = c._svc("tts")
     last = getattr(tts, "last_text", "") if tts is not None else ""
@@ -1568,6 +1579,10 @@ def _h_repeat(c, t, m):
         return CommandResult(handled=True,
                              reply="I haven't said anything yet, sir.",
                              speak=True, status="Nothing to repeat")
+    said_at = getattr(c, "_owner_said_at", None)
+    if said_at is not None and (time.monotonic() - said_at) > REPEAT_MAX_AGE_S:
+        return CommandResult(handled=True, reply=REPEAT_STALE_LINE,
+                             speak=True, status="Nothing to repeat (stale)")
     if _talkback():
         try:
             tts.repeat_last()
@@ -5568,14 +5583,22 @@ _SEND_VERB = r"(?:e-?mail|send|share|forward on|shoot|fire)"
 # B is the loose one -- "send me the weather" fits it perfectly -- so its
 # handler refuses to act unless the recipient RESOLVES to a real address in
 # the people book or the contacts map. A is anchored by an explicit "to".
+# The SPOKEN SUBJECT. outbox.prepare() has accepted subject= all along,
+# but before this there were ZERO call sites passing it (measured with
+# git grep on jarvis-v3), so a subject he said aloud reached nothing and
+# every message went out with the default. Accepted on either side of the
+# account hint because he says it both ways.
+_SUBJECT_CUE = r"(?:with\s+(?:the\s+)?subject|subject(?:\s+line)?)"
 _SEND_FILE_RX = re.compile(
     _SEND_OPENER + _SEND_VERB + r"\s+"
     r"(?:(?P<file_a>\S.*?)\s+(?:to|over to|across to|with)\s+(?P<who_a>\S.*?)"
     r"|(?P<who_b>[a-z][\w'.\-]*(?:\s+[a-z][\w'.\-]*)?)\s+"
     r"(?P<file_b>(?:the|my|that|this|a|an)\s+\S.*?))"
+    r"(?:\s*,?\s+" + _SUBJECT_CUE + r"\s*:?\s+(?P<subj>\S.*?))?"
     r"(?:\s+(?:from|using|via|out of|off)\s+(?:my\s+|the\s+)?"
     r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+"
     r"(?:account|address|mailbox|e-?mail))?"
+    r"(?:\s*,?\s+" + _SUBJECT_CUE + r"\s*:?\s+(?P<subj2>\S.*?))?"
     r"[\s,.!?]*$", re.I)
 
 # The NEGATIVE table. He says "send", "email" and "file" in ordinary
@@ -6512,6 +6535,10 @@ def _send_file_pieces(c, t, m=None):
     said_file = (rm.group("file_a") or rm.group("file_b") or "").strip()
     who = (rm.group("who_a") or rm.group("who_b") or "").strip()
     hint = (rm.group("acct") or "").strip()
+    # From the ORIGINAL casing, like the file name: a subject is read back
+    # verbatim and "Week Nine" is not "week nine" to his eye.
+    subject = outbox.clean_subject(
+        rm.group("subj") or rm.group("subj2") or "")
     memory = c._svc("memory")
     res = outbox.resolve(cfg, memory, who)
     addr = res.addr
@@ -6527,7 +6554,7 @@ def _send_file_pieces(c, t, m=None):
             log.info("send-file: %r names neither a file nor a correspondent",
                      outbox.mask_addresses(t[:60]))
             return None
-    return said_file, who, hint, addr
+    return said_file, who, hint, addr, subject
 
 
 def _send_file_offer(c, prep, who: str, hint: str):
@@ -6630,7 +6657,7 @@ def _h_send_file(c, t, m):
         log.info("send-file: %r is not a send-a-file request",
                  outbox.mask_addresses(t))
         return None
-    said_file, who, hint, _addr = pieces
+    said_file, who, hint, _addr, subject = pieces
     # ONE read-back at a time. Every ordinary path spends _pending_send in
     # _try_send_confirm before a second send can arm, so this is reached
     # only inside a single turn -- the compound "email A to Heather and
@@ -6642,8 +6669,35 @@ def _h_send_file(c, t, m):
                              reply="There's one waiting on your yes already, "
                                    "sir; that one first.")
     prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
-                          who, account_hint=hint)
+                          who, account_hint=hint, subject=subject)
     return _send_file_finish(c, prep, said_file, who, hint)
+
+
+# The day's sends, read off the append-only audit (outbox.SENT_LOG).
+# Deliberately narrow, because "what did I email" must not claim "what did
+# I email you about the deposit" -- that is a question for the model.
+_SENT_TODAY_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:what(?:'?s| did| have)?\s+(?:i|you|we)?\s*"
+    r"(?:e-?mail(?:ed)?|sent?)\s*(?:out)?"
+    r"|what\s+files?\s+(?:did|have)\s+(?:i|you|we)\s+"
+    r"(?:e-?mail(?:ed)?|sent?)"
+    r"|(?:show|read)\s+me\s+(?:my\s+)?sent\s+files?)"
+    r"(?:\s+(?:today|so far|this morning|this afternoon))?"
+    r"[\s,.!?]*$", re.I)
+
+
+def _h_sent_today(c, t, m):
+    """The day's sends, off the append-only audit. Reads nothing else.
+
+    The addresses are already masked ON DISK by outbox.record_sent, so
+    there is nothing here that could say one in full -- and
+    outbox.sent_today_line puts what is left through spoken_recipient, so
+    there is nothing here that can say an "@" out loud either. The two
+    are different jobs and the audit needs both.
+    """
+    return CommandResult(handled=True, speak=True, status="Sent today",
+                         reply=outbox.sent_today_line())
 
 
 def _h_network(c, t, m):                                   # 3267-3279
@@ -9403,6 +9457,10 @@ REGISTRY: list[Command] = [
     # table catches, so an ordinary sentence with "send" in it falls
     # through to the router exactly as it did before.
     Command("send file", _SEND_FILE_RX.match, _h_send_file),
+    # A QUESTION about sending, never an order to send. Its regex is
+    # anchored and narrow, and _SEND_NOT_RX already refuses the same
+    # shape for the send lane, so the order here decides nothing.
+    Command("sent files", _SENT_TODAY_RX.match, _h_sent_today),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
@@ -9532,6 +9590,11 @@ ASSISTANT_TIER1: list[Command] = [
                     # the registry pass never runs on it and the intent
                     # gate calls it background chat.
                     "send file",
+                    # "what did I email today" arrives the same way. It is
+                    # the ONLY way to read the audit, and the audit is what
+                    # replaces an undo -- a record he cannot ask for out
+                    # loud is a record he will never look at.
+                    "sent files",
                     # "what's my next class" arrives with the wake word
                     # already eaten, like every other question at the desk
                     "next class",
@@ -9672,6 +9735,24 @@ ASSISTANT_TIER1 = [
     else Command(cmd.name, _tier1_send_file, cmd.handler, cmd.needs)
     for cmd in ASSISTANT_TIER1
 ]
+
+# What a KNOWN person's turn may run from REGISTRY, by name. DEFAULT-DENY,
+# the mirror of brain.KNOWN_TOOLS: an entry not named here is his, and her
+# words matching it are answered with scope.HIS_LINE and no handler. The
+# clock and arithmetic read nothing of his. The courtesies, greetings,
+# "quiet" and "say again" are answered inline in Commander._handle_known
+# without their owner handlers (which wake his scene, start his wind-down,
+# cancel his Claude task). Music is NOT here: "music resume" and "liked
+# songs" force spotify tools the model is not offered on her turn, so the
+# table would only hand her a second refusal.
+KNOWN_TIER1 = frozenset({"clock", "math"})
+# Entries whose MATCHER accepts any sentence and whose handler decides
+# (workflow: `workflows.get(t)` is None for anything that is not one of
+# his). Skipped by the known person's probe, which asks whether the WORDS
+# claimed something of his; tests/test_known_tier1.py pins that this is
+# the only such entry, so a new catch-all cannot silently hand a guest's
+# every sentence the refusal.
+CATCH_ALL_COMMANDS = frozenset({"workflow"})
 
 
 def _call_manager(fn, args: dict):
@@ -10369,9 +10450,34 @@ class Commander:
         if tts is None:
             return
         try:
-            tts.speak(text)
+            tts.speak(self._for_addressee(text))
         except Exception:
             log.exception("tts speak failed")
+
+    def _for_addressee(self, text: str) -> str:
+        """The line as WHOEVER IS BEING ADDRESSED should hear it.
+
+        The second and last call site of ``address.swap_addresses``.
+        ``_speak`` is the one path that bypasses ``JarvisApp._say``, so
+        without this a compound answer would still say "sir" to a woman
+        while every other line had been swapped.
+
+        ``services.honorific`` is a CALLABLE resolved at speak time; a
+        value captured at build time would be the owner's for the life of
+        the process. Absent (an old stand-in, a test namespace) means the
+        owner, which returns the input object unchanged.
+
+        ``jarvis/reader.py`` is deliberately NOT wired: it reads documents
+        aloud, its words are not Jarvis's, and rewriting a word inside
+        somebody's file is the one thing this pass must never do.
+        """
+        try:
+            fn = self._svc("honorific")
+            value = fn() if callable(fn) else address.SIR
+            return address.swap_addresses(text, value)
+        except Exception:
+            log.exception("honorific: the swap failed; speaking as written")
+            return text
 
     # None = speak now; a list = a compound is running, park the lines
     # (see _speak / _try_multi).
@@ -10386,17 +10492,46 @@ class Commander:
 
     # -- public entry --------------------------------------------------
     def handle(self, text: str, source: str = "voice",
-               confidence: Optional[float] = None) -> CommandResult:
+               confidence: Optional[float] = None,
+               addressee: Optional[Tuple[str, str]] = None) -> CommandResult:
         """Route one utterance. ``confidence`` is the transcript's Whisper
         avg_logprob when the app has one (voice); every other caller
-        leaves it unset."""
+        leaves it unset.
+
+        ``addressee`` is WHOSE TURN THIS IS, taken by the caller at the
+        instant it attributed the turn (``app._dispatch``) and carried
+        here as a value. Round 3 (09-05) measured why that argument has to
+        exist: the reading used to be looked up from module state INSIDE
+        ``self._turn_lock``, i.e. after an unbounded wait, while the
+        writers ran outside it. With a third turn holding the lock 5 ms,
+        200/200 trials answered a guest from his notes and 198/200 refused
+        him his own; the control with no scope flip leaked 0/200. A caller
+        that passes nothing still gets the ambient reading -- but taken
+        ABOVE the lock, so even that caller no longer reads after a wait.
+        """
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
-        self._cast_spoken_over(text)
+        # ONE reading of whose turn this is (jarvis/scope.py), taken HERE
+        # -- above the lock, from the value the attributor passed down --
+        # and carried for the whole turn. A known person who is not the
+        # owner gets the narrow path and nothing below it: not the pending
+        # yes/no rungs (his read-backs are his to answer), not the sticky
+        # modes, not the Tier-1 table that reads his calendar, notes,
+        # memory and held lines with no model and, until 09-04, no scope.
+        who, hon = scope_mod.reading(addressee)
+        if not who:
+            # A sentence outranks a gesture -- HIS sentence. This sat
+            # ABOVE the scope read until round 3 measured a guest's
+            # refused question putting his live carry down
+            # (svc.gesture.spoken_over.called == True): a write to his
+            # state on a turn that was refused for reading anything.
+            self._cast_spoken_over(text)
         with self._turn_lock:
             self._confidence = confidence
             self._turn_source = source
+            if who:
+                return self._handle_known(text, source, who, hon)
             armed = (getattr(self, "_pending_send", None),
                      getattr(self, "_pending_filepick", None),
                      getattr(self, "_pending_destructive", None),
@@ -10422,7 +10557,189 @@ class Commander:
             undo = getattr(result, "undo", None)
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
+            # WHEN he was last answered aloud, so "say that again" can be
+            # bounded (round-3: the rung had no age limit at all, for
+            # anybody). A repeat must not refresh its own age or the line
+            # never expires.
+            if getattr(result, "reply", "") and \
+                    getattr(result, "speak", False) and not repeat_kind(text):
+                self._owner_said_at = time.monotonic()
         return result
+
+    # -- a known person's turn ------------------------------------------
+    def _refused(self, what: str, who: str) -> CommandResult:
+        """The authored refusal, through the one scope function."""
+        line = scope_mod.owner_only(what, who=who)
+        return self._said_to(who, CommandResult(
+            handled=True, reply=line, speak=True, status="Not %s's" % who))
+
+    # The only line a known person may hear back is one THIS COMMANDER
+    # wrote FOR HER, and only while her attribution would still be live.
+    KNOWN_NOTHING_LINE = "I haven't said anything to you, {name}."
+
+    def _said_to(self, who: str, res: CommandResult) -> CommandResult:
+        """Remember the last line spoken TO ``who``, with its age.
+
+        This is the whole provenance the repeat rung has: a line recorded
+        here was authored by the commander on that person's own turn, so
+        replaying it can disclose nothing of his. ``tts.last_text`` -- what
+        the rung used to hand back -- carries no such claim.
+        """
+        reply = getattr(res, "reply", "") or ""
+        if reply and getattr(res, "speak", False):
+            self._known_last = (who, reply, time.monotonic())
+        return res
+
+    def _repeat_for_known(self, who: str) -> CommandResult:
+        """"Say that again", asked by a known person who is not the owner.
+
+        ROUND-3 BLOCKER 4, MEASURED. This rung called ``_h_repeat``, which
+        returns ``tts.last_text`` verbatim -- a line that may have been
+        said to HIM, at any distance in the past. Five phrasings ("say
+        that again", "what was that", "repeat that", "come again",
+        "pardon") each handed a guest "Your bank balance is 412 dollars
+        and the code is 88213, sir." Nothing tied ``last_text`` to the
+        asker having been in the room when it was first said, and there
+        was no age limit for anybody.
+
+        So the guest path does not read ``tts.last_text`` at all. It
+        replays the last line the commander wrote FOR THIS PERSON, and it
+        expires with her attribution -- ``honorific.ADDRESSEE_TTL``, the
+        same one number the scope and the spoken honorific use, so there
+        is not a second bound to keep in step. DEFAULT-DENY: missing,
+        mismatched or stale is an authored line, never a fall-through.
+        """
+        last = getattr(self, "_known_last", None)
+        if last and last[0] == who and \
+                (time.monotonic() - last[2]) <= float(ADDRESSEE_TTL):
+            return CommandResult(handled=True, reply=last[1], speak=True,
+                                 status="Repeating for %s" % who)
+        log.info("scope: nothing said to %s to repeat", who)
+        return CommandResult(
+            handled=True, speak=True, status="Nothing to repeat for %s" % who,
+            reply=self.KNOWN_NOTHING_LINE.format(name=who or "there"))
+
+    def _handle_known(self, text: str, source: str, who: str,
+                      hon: str) -> CommandResult:
+        """The turn of a KNOWN person who is not the owner.
+
+        AN ALLOW-LIST, NOT A VETO -- the same reading brain.KNOWN_TOOLS
+        takes of the gate's "the time, the weather". The owner's path is
+        ~40 rungs deep and most of them read something of his: the
+        round-2 review (09-04) measured "what's my next class", "what's on
+        my to-do list", "what did I miss", "who is my doctor" and "what
+        did I say about the dentist" all answered for a known person from
+        his calendar, notes, held lines and memory, with no model and no
+        scope. Auditing every rung for a data read would be a list
+        somebody has to remember to extend; this runs only what is listed
+        here and hands everything else to the model, whose own scope
+        (brain.KNOWN_TOOLS) offers her the time and the weather.
+
+        What she gets, in order: the voice I/O words (quiet, say again);
+        the courtesies and greetings as plain lines -- never
+        ``_h_greeting`` / ``_h_courtesy``, which wake his room scene and
+        start his wind-down; the ``KNOWN_TIER1`` entries of the table by
+        NAME (the clock, arithmetic); a refusal with the authored line for
+        any other table entry her words match, whole or as a clause of a
+        compound; the background-chat gate for a voice turn; then the
+        model. Nothing here types, targets a window, answers a pending
+        question of his, or files a dictation line.
+        """
+        cmd = strip_jarvis_prefix(text)
+        t = (cmd if cmd is not None else text).strip().lower().rstrip(".!?")
+        if not t:
+            return CommandResult(handled=False, status="No speech detected")
+        # 1. Voice I/O she may work. "quiet" without the Claude cancel
+        #    that _h_quiet carries for him.
+        if quiet_kind(t):
+            _cut_speech(self)
+            return CommandResult(handled=True, reply="Very good.",
+                                 speak=False, status="Quiet")
+        if repeat_kind(t):
+            return self._repeat_for_known(who)
+        # 2. Courtesies and greetings: the line, and only the line.
+        kind = courtesy_kind(t) or greeting_kind(t)
+        if kind:
+            return self._said_to(who, CommandResult(
+                handled=True, speak=True, status="Courtesy",
+                reply=courtesy_reply(kind, register=_register_name(self))))
+        # 3. The table, by name -- the WHOLE of REGISTRY, prefixed or not,
+        #    which is stricter than his unprefixed pass (ASSISTANT_TIER1)
+        #    on purpose: a matcher of his that accepts her words is a
+        #    claim on his data whether or not the handler would have found
+        #    any. Her words, and each clause of a compound ("what time is
+        #    it and what's on my to-do list"), are probed first; one
+        #    unlisted name anywhere and the turn is refused whole rather
+        #    than half-answered.
+        names = [self._table_name(t)] + \
+            [self._table_name(part) for part in split_clauses(t)]
+        for name in names:
+            if name and name not in KNOWN_TIER1:
+                return self._refused(name, who)
+        for entry in REGISTRY:
+            if entry.name not in KNOWN_TIER1:
+                continue
+            try:
+                m = entry.matcher(t)
+            except Exception:
+                log.exception("matcher %s failed", entry.name)
+                continue
+            if not m:
+                continue
+            if any(self._svc(n) is None for n in entry.needs):
+                continue
+            try:
+                res = entry.handler(self, t, m)
+            except Exception:
+                log.exception("handler %s failed", entry.name)
+                return CommandResult(handled=True,
+                                     reply=f"Command failed: {entry.name}",
+                                     status="error")
+            if res is not None:
+                return self._said_to(who, res)
+        # 4. The background-chat gate, voice only, as for him -- but an
+        #    UNCERTAIN verdict is dropped rather than put on his screen as
+        #    a card: a YES there re-runs the words down HIS path.
+        if source == "voice" and not WEB_CUE_RX.search(text):
+            intent, conf = self.intent.classify(text)
+            if intent != IntentClassifier.YES:
+                log.info("Ignored (background chat from %s, conf=%.2f): %r",
+                         who, conf, text)
+                return CommandResult(handled=True,
+                                     status="Ignored (background chat)")
+        # 5. The model, with her scope. Not the router: no Claude session,
+        #    no web one-shot carrying his recent conversation, no forced
+        #    tool of his -- brain.chat and brain.KNOWN_TOOLS. The reading
+        #    taken at the top of handle() travels WITH the text, so the
+        #    tool loop on the worker scopes this turn to the same person
+        #    even if the attribution expires or the gate names the next
+        #    person before the worker gets to it.
+        brain = self._svc("brain")
+        if brain is None or not hasattr(brain, "chat"):
+            if brain is not None and hasattr(brain, "think"):
+                brain.think(text)
+                return CommandResult(handled=True, status="Thinking...",
+                                     done=False)
+            return CommandResult(handled=False, reply=text,
+                                 status="No route (no brain)")
+        brain.chat(strip_address(text), addressee=(who, hon))
+        return CommandResult(handled=True, status="Thinking…", done=False)
+
+    def _table_name(self, t: str) -> Optional[str]:
+        """The name of the first REGISTRY entry whose matcher accepts
+        ``t``, else None. A probe: no handler runs, no service is read.
+        ``CATCH_ALL_COMMANDS`` are skipped -- "workflow" accepts every
+        sentence and decides inside its handler -- so a match here means
+        the WORDS claimed something."""
+        for entry in REGISTRY:
+            if entry.name in CATCH_ALL_COMMANDS:
+                continue
+            try:
+                if entry.matcher(t):
+                    return entry.name
+            except Exception:
+                log.exception("matcher %s failed", entry.name)
+        return None
 
     def _drop_stranded_questions(self, armed: tuple, result,
                                  source: str = "voice") -> None:
@@ -11282,8 +11599,21 @@ class Commander:
 
         return self._route_text(text)
 
-    def resolve_uncertain(self, text: str, yes: bool) -> CommandResult:
-        """UI feedback for the 'Was this for me?' prompt."""
+    def resolve_uncertain(self, text: str, yes: bool,
+                          addressee: Optional[Tuple[str, str]] = None
+                          ) -> CommandResult:
+        """UI feedback for the 'Was this for me?' prompt.
+
+        ROUND-3, named lower and closed here: this was a THIRD path around
+        the one scope read. It takes ``self._turn_lock`` and then ran
+        ``_route_text`` -- his whole router -- whatever the scope said.
+        Measured with a guest attributed: "what's on my to-do list" came
+        back "1. buy milk. 2. call the bank about the mortgage." The
+        reading is taken HERE, above the lock, exactly as ``handle`` does.
+        """
+        who, _hon = scope_mod.reading(addressee)
+        if who:
+            return self._refused("the was-that-for-me answer", who)
         with self._turn_lock:
             return self._resolve_uncertain_locked(text, yes)
 
@@ -11690,7 +12020,8 @@ class Commander:
                 return CommandResult(
                     handled=True, speak=True, status="Confirm?",
                     reply=outbox.SELF_LINE.format(
-                        who=draft.to_name or outbox.spoken_address(draft.to_addr)))
+                        who=outbox.spoken_recipient(draft.to_name,
+                                                    draft.to_addr)))
             # A yes that carries a CORRECTION -- "yes, send it to Dana",
             # "yes, but from my work account", "yes, to her work address
             # instead" -- is neither a yes nor a change of subject (F23).
@@ -11811,10 +12142,20 @@ class Commander:
                 # Its message IS the sentence: the file moved between the
                 # read-back and the yes, and he needs to hear which.
                 line, kind, status = str(exc), "error", "Not sent"
+            except mail_mod.MailAuthFailed as exc:
+                # THE ONE SEND FAILURE HE CAN FIX. Before this it was
+                # collapsed into the generic line with everything else, so
+                # a revoked or rotated app password sounded exactly like a
+                # dead network and sent him to look at his router. The
+                # server's reply is still never spoken -- it quotes the
+                # username back -- only the account LABEL, which he said.
+                log.warning("send failed for %s: auth refused (%s)", name, exc)
+                line = outbox.auth_failed_line(draft.account_label)
+                kind, status = "error", "Password refused"
             except mail_mod.MailSendFailed as exc:
                 # A transport failure's text is a class name, never a line.
                 log.warning("send failed for %s (%s)", name, exc)
-                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+                line, kind, status = outbox.WIRE_FAILED_LINE, "error", "Send failed"
             except Exception:                          # noqa: BLE001 - source
                 log.exception("send blew up for %s", name)
                 line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
@@ -12525,49 +12866,20 @@ class Commander:
     def _start_enrol(self) -> CommandResult:
         """Build the run, park it, and start its thread.
 
-        The preflight is run AGAIN here rather than trusted from the offer.
-        Ninety seconds is long enough for the curfew to start or for him to
-        have said "offline mode" in between, and the cost of re-asking is one
-        dictionary read against opening a lens sensing has since shut.
+        THE SEQUENCE LIVES IN ``enrolrun.launch``, not here, because there are
+        two doors to this lens now -- this one and the USERS tab's button --
+        and the preflight-again, the five injected seams and the unpark on a
+        failed start have to be identical through both or the button's run
+        would behave differently from the spoken one.
         """
-        from jarvis import earcons
-        from jarvis import enrolentry as ee
         from jarvis import enrolrun as er
-        services = getattr(self, "services", None)
-        cfg = self._svc("assistant")
-        worker = getattr(services, "preview_worker", None)
-        pre = er.preflight(cfg, sensing=self._svc("sensing"), worker=worker,
-                           services=services)
-        if not pre["ok"]:
-            return CommandResult(handled=True, speak=True, reply=pre["reply"],
-                                 status="Enrolment: %s" % pre["reason"])
-        run = er.EnrolRun(
-            cfg=cfg, worker=worker, sensing=self._svc("sensing"),
-            services=services,
-            say=self._speak,
-            # DISPLAY-ONLY, which is the mechanism that keeps the card out of
-            # the plaintext journal: a JarvisReply with speak=False does not
-            # go through context.add_exchange.
-            card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
-            lease=getattr(services, "preview_lease", None),
-            # cooldown_s=0.0 on every tone: the default four-second same-tone
-            # cooldown exists to stop a false-wake tone repeating, and here it
-            # would silently swallow the second and third "kept one" ticks of
-            # a three-sample station -- the ticks he is counting.
-            earcon=lambda name: earcons.play(name, cooldown_s=0.0),
-            clipboard=ee.to_clipboard)
-        try:
-            services.enrol_run = run
-        except Exception:                # noqa: BLE001 - a slim services
-            log.debug("could not park the enrolment run", exc_info=True)
-            return CommandResult(handled=True, speak=True, reply=er.E35,
-                                 status="Enrolment: could not start")
-        if not run.start():
-            self._clear_enrol_run(run)
-            return CommandResult(handled=True, speak=True, reply=er.E35,
-                                 status="Enrolment: could not start")
-        return CommandResult(handled=True, speak=True, reply=er.E2,
-                             status="Enrolling your face")
+        ok, reply, _run = er.launch(cfg=self._svc("assistant"),
+                                    services=getattr(self, "services", None),
+                                    sensing=self._svc("sensing"),
+                                    say=self._speak)
+        return CommandResult(
+            handled=True, speak=True, reply=reply,
+            status="Enrolling your face" if ok else "Enrolment: refused")
 
     def _clear_enrol_run(self, run) -> None:
         try:

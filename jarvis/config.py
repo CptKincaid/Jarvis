@@ -61,6 +61,19 @@ class PATHS:
     # did not have on 2026-09-02. Unset in production.
     FACE_GALLERY = Path(os.environ.get("JARVIS_FACE_GALLERY") or
                         (AIWS / "face_gallery"))
+    # The MULTI-SPEAKER voice gallery (jarvis/voicegallery.py). A DIRECTORY,
+    # generational, and deliberately NOT voiceprint.npz: writing several
+    # people's vectors into that file would let any build with the old
+    # single-speaker loader pool them into one centroid and admit all of them
+    # as him (measured -- see speaker.KNOWN_VOICEPRINT_FORMATS). voiceprint.npz
+    # stays exactly where it is as the rollback; this is the new store, with
+    # its own format namespace.
+    #
+    # JARVIS_VOICE_GALLERY exists for the same reason JARVIS_VOICEPRINT does,
+    # and it was added BEFORE the store could be written to rather than after
+    # a test destroyed it: on 2026-09-02 that lesson cost him his enrolment.
+    VOICE_GALLERY = Path(os.environ.get("JARVIS_VOICE_GALLERY") or
+                         (AIWS / "voice_gallery"))
     HEY_JARVIS_VERIFIER = AIWS / "hey_jarvis_verifier.pkl"
     SPEAK_QUEUE = LOG_DIR / "speak_queue.txt"
     # Chosen by ear 2026-08-28: 35.8s built from three different Fish

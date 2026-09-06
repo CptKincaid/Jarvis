@@ -13,13 +13,24 @@ is A WAY BACK IN FOR THE OWNER, not a defence against them, and this file
 will not pretend otherwise.
 
 CONSENT IS NOT REINVENTED HERE. Enrolling somebody else takes THEIR
-agreement, and this imports ``scripts/face_enrol.consent`` rather than
-writing a second rule that could drift from the first: it already requires
-stdin AND stdout to be terminals, refuses ``--json``, refuses ``--auto``,
-and makes the person type their own name.
+agreement, and this calls ``jarvis/consent.py`` -- the one file holding the
+words and the "type your own label, exactly" rule -- rather than writing a
+second one that could drift. Its terminal taker still requires stdin AND
+stdout to be terminals, and the text it shows is the one that matches what
+this command stores: a name, a role and a face LABEL, and no measurement of
+anybody. The camera's own ceremony stays in ``scripts/face_enrol.py``.
+
+THE FORM OF ADDRESS IS TYPED, NEVER INFERRED. ``add`` REQUIRES
+``--honorific`` and has no default. There is no name list in this repo, no
+gender table, and no code path that reads a name and produces "sir" or
+"ma'am": Mara and Heather are addressed as "ma'am" because Hunter typed
+``--honorific maam``, and for no other reason. "guess and let them correct
+it" is not on offer -- it is wrong in front of a real person.
 
     jarvis_people.py list
-    jarvis_people.py add heather --name Heather --role known --face heather
+    jarvis_people.py add heather --first Heather --last Vance --role known \
+        --honorific maam --face heather --face-dim 512
+    jarvis_people.py set-honorific heather --honorific maam
     jarvis_people.py set-role heather --role known
     jarvis_people.py set-phrase          # the spoken way back in
     jarvis_people.py set-code            # the typed break-glass
@@ -31,16 +42,17 @@ import argparse
 import getpass
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from jarvis import consent                                # noqa: E402
 from jarvis import gate as gate_mod                       # noqa: E402
 from jarvis import passphrase as pp                       # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
 from jarvis.config import PATHS                           # noqa: E402
 from jarvis.identity import (ROLE_KNOWN, ROLE_OWNER, LABEL_RX,  # noqa: E402
-                             Person, Registry, owner_label, startup_line)
+                             Person, Registry, honorific_from_word,
+                             owner_label, startup_line)
 
 
 def say(text=""):
@@ -68,7 +80,14 @@ def _keyboard_only(what: str) -> str:
 def _authorise(reg: Registry) -> tuple:
     """``(ok, why)`` -- may whoever is at this keyboard administer the gate?
 
-    THREE CASES, and the first two are the ones that keep this from becoming
+    THE DECISION IS NOT MADE HERE. ``gate.admin_gate`` makes it, because
+    the users tab (jarvis/ui/users_page.py) asks the same question and two
+    implementations of "may this keyboard administer the gate" is exactly
+    how the two drift apart. This function still does its own ASKING --
+    getpass, a tty check -- and ``check_override_code`` is still the only
+    thing that checks a code.
+
+    FOUR CASES, and the first two are the ones that keep this from becoming
     a brick:
 
     * NO USABLE REGISTRY, or no owner in it. Anybody at the keyboard may
@@ -80,10 +99,16 @@ def _authorise(reg: Registry) -> tuple:
     * AN OWNER HAS SET A CODE. It is asked for, never echoed, and rate
       limited on its own counter -- burning the spoken passphrase's attempts
       must not close the break-glass.
+    * THE FILE IS THERE AND BROKEN. REFUSED, and this one is new (2026-09-05).
+      It used to fall into the first case, so `add` on a registry that failed
+      to parse wrote a fresh one-row file over the top of everyone in it.
     """
-    if not reg.usable or not reg.owners():
+    state, why = gate_mod.admin_gate(reg)
+    if state == gate_mod.ADMIN_REFUSE:
+        return False, why
+    if state == gate_mod.ADMIN_FIRST:
         return True, "first"
-    if not any(p.code_hash for p in reg.owners()):
+    if state == gate_mod.ADMIN_NOCODE:
         return True, "nocode"
     why = _keyboard_only("the override code")
     if why:
@@ -134,9 +159,13 @@ def do_list(reg: Registry, cfg) -> int:
         return 0
     for p in reg.people:
         row = p.redacted()
-        say("  %-16s %-6s voice=%-5s face=%-12s phrase=%-5s code=%-5s %s"
-            % (row["label"], row["role"], row["voice"], row["face"] or "-",
+        say("  %-16s %-6s %-6s voice=%-5s face=%-12s phrase=%-5s code=%-5s %s"
+            % (row["label"], row["role"], row["honorific"] or "none",
+               row["voice"], row["face"] or "-",
                row["has_phrase"], row["has_code"], row["consent"] or "-"))
+        full = p.full_name()
+        if full:
+            say("  %-16s %s" % ("", full))
     return 0
 
 
@@ -146,21 +175,38 @@ def do_add(reg: Registry, cfg, args) -> int:
         say("REFUSED: %r is not a label a gallery or a registry can store"
             % label)
         return 2
+    # THE FORM OF ADDRESS IS NEVER INFERRED. argparse already makes the
+    # flag required with no default; this is the second half of the same
+    # rule, refusing anything that is not one of the three typed choices.
+    hon, why = honorific_from_word(args.honorific)
+    if why:
+        say("REFUSED: add: %s. It is not inferred from a name." % why)
+        return 2
     role = ROLE_OWNER if args.role == ROLE_OWNER else ROLE_KNOWN
+    if args.voice and role != ROLE_OWNER:
+        say("REFUSED: add: --voice can only be set on the owner. There is "
+            "one voiceprint on this machine and marking a second person "
+            "voice-enrolled would make the voice leg name the wrong person.")
+        return 2
     owner = owner_label(cfg)
     if role == ROLE_KNOWN:
-        # Somebody else's biometric data. Their agreement, taken by the
-        # existing rule rather than a new one.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from face_enrol import consent as face_consent
-        shim = SimpleNamespace(json=False, auto=False, yes=False)
-        ok, how = face_consent(label, owner, PATHS.FACE_GALLERY, say, shim)
+        # Somebody else's data. Their agreement, taken by the ONE rule
+        # (jarvis/consent.py) rather than a second one -- and with the text
+        # that matches what `add` actually stores. It writes a NAME, a ROLE
+        # and a face LABEL; it captures nothing, so the face paragraph
+        # ("128 numbers per take") over-claimed here. The lens has its own
+        # ceremony in scripts/face_enrol.py and that is unchanged.
+        ok, how = consent.take_at_terminal(
+            label, what=consent.WHAT_ROW, owner=owner, say=say,
+            fields={"who": label, "root": str(PATHS.FACE_GALLERY)})
         if not ok:
             say("REFUSED: %s" % how)
             return 2
     else:
-        how = "owner"
+        how = consent.HOW_OWNER
     person = Person(label=label, name=str(args.name or "").strip(),
+                    first=str(args.first or "").strip(),
+                    last=str(args.last or "").strip(), honorific=hon,
                     role=role, voice=bool(args.voice),
                     face=str(args.face or "").strip().lower(),
                     face_dim=int(args.face_dim or 0), consent=how)
@@ -172,7 +218,50 @@ def do_add(reg: Registry, cfg, args) -> int:
     if not reg.save():
         say("REFUSED: the registry could not be written")
         return 1
-    say("enrolled %s as %s (consent: %s)" % (label, role, how))
+    say("enrolled %s as %s (addressed as %s, consent: %s)"
+        % (label, role, hon or "no form of address", how))
+    if person.face and not _gallery_has(person.face):
+        # Said out loud rather than discovered later: the row exists but
+        # the face leg has nothing to name them with until they stand in
+        # front of the camera and type their own name.
+        say("note: the face gallery has no label %r yet. The row is stored, "
+            "but the face leg will say nothing about %s until they are "
+            "enrolled at the camera: scripts/face_enrol.py --label %s"
+            % (person.face, label, person.face))
+    return 0
+
+
+def _gallery_has(face_label: str) -> bool:
+    """Is there a face under that label? A gallery that cannot be read
+    answers True, because a warning nobody can verify is just noise.
+
+    NOTHING HERE OPENS A CAMERA OR READS A FRAME. It reads the enrolled
+    LABELS -- names and counts -- which is all the warning needs.
+    """
+    try:
+        from jarvis import facegallery
+        gal = facegallery.default_gallery()
+        gal.load()
+        names = gal.labels()
+        return not names or str(face_label) in set(names)
+    except Exception:  # noqa: BLE001 - a gallery that cannot say says yes
+        return True
+
+
+def do_set_honorific(reg: Registry, args) -> int:
+    hon, why = honorific_from_word(args.honorific)
+    if why:
+        say("REFUSED: set-honorific: %s. Ask the person which they want."
+            % why)
+        return 2
+    ok, why = reg.set_honorific(args.label, hon)
+    if not ok:
+        say("REFUSED: %s" % why)
+        return 2
+    if not reg.save():
+        say("REFUSED: the registry could not be written")
+        return 1
+    say("%s is addressed as %s" % (args.label, hon or "no form of address"))
     return 0
 
 
@@ -256,6 +345,15 @@ def main(argv=None) -> int:
     a = sub.add_parser("add")
     a.add_argument("label")
     a.add_argument("--name", default="")
+    a.add_argument("--first", default="", help="first name, for the spoken "
+                                               "sign-in")
+    a.add_argument("--last", default="", help="last name, for the spoken "
+                                              "sign-in")
+    # REQUIRED, AND NO DEFAULT. A row cannot be created without somebody
+    # typing the choice; nothing in this repo infers it from a name.
+    a.add_argument("--honorific", required=True,
+                   choices=["sir", "maam", "none"],
+                   help="how they are addressed. Required: never inferred.")
     a.add_argument("--role", default=ROLE_KNOWN, choices=[ROLE_OWNER, ROLE_KNOWN])
     a.add_argument("--face", default="")
     a.add_argument("--face-dim", type=int, default=0, dest="face_dim")
@@ -266,6 +364,10 @@ def main(argv=None) -> int:
     r.add_argument("label")
     r.add_argument("--role", required=True, choices=[ROLE_OWNER, ROLE_KNOWN])
     r.add_argument("--confirm-owner", default=None, dest="confirm_owner")
+    h = sub.add_parser("set-honorific")
+    h.add_argument("label")
+    h.add_argument("--honorific", required=True,
+                   choices=["sir", "maam", "none"])
     f = sub.add_parser("forget")
     f.add_argument("label")
     for name in ("set-phrase", "set-code"):
@@ -295,6 +397,8 @@ def main(argv=None) -> int:
         return do_add(reg, cfg, args)
     if args.mode == "set-role":
         return do_set_role(reg, args)
+    if args.mode == "set-honorific":
+        return do_set_honorific(reg, args)
     if args.mode == "forget":
         return do_forget(reg, args)
     if args.mode == "set-phrase":

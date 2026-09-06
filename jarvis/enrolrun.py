@@ -141,6 +141,11 @@ E10 = "An enrolment is already running, sir. Say stop to end it."
 E11 = ("{name} has to type their own name at a terminal before I store "
        "their face, sir. That isn't one I'll take by voice. The command is "
        "on your clipboard.")
+# THE CROSS-CHECK. A voice run holds the microphone for its whole length and
+# this run's entire progress channel is SPEECH, so starting one over the other
+# reads five station prompts straight into the takes being kept.
+E13 = ("I'm recording your voice just now, sir, and I'd talk straight over "
+       "it. Stop that one first.")
 E12 = ("The camera confidence bar in your config won't make sense, sir, so "
        "I've stopped before opening anything. It's on the card.")
 
@@ -730,10 +735,24 @@ def preflight(cfg, *, sensing=None, worker=None, services=None) -> dict:
     was aborted halfway would leave "faces may be written down" switched on
     behind it with no terminal output to notice it in.
     """
-    if getattr(services, "enrol_run", None) is not None:
+    # ONE PLACE DECIDES WHO OWNS THE DEVICES -- jarvis/voicerun.runs_live --
+    # asked by both preflights, because the defect that shipped was exactly
+    # two preflights each looking only at its own slot. Imported lazily: this
+    # module is on the camera path and that one is on the microphone path,
+    # and neither should pull the other in at import time.
+    from jarvis.voicerun import runs_live       # noqa: PLC0415 - lazy
+    live = runs_live(services)
+    if "face" in live:
         return {"ok": False, "reply": E10, "reason": "a run is already live"}
     if worker is None:
         return {"ok": False, "reply": E9, "reason": "no preview worker"}
+    # AFTER the worker check on purpose: with no preview worker there is no
+    # console, so E9's "the command is on your clipboard" hand-over stays the
+    # answer for a headless box -- where a terminal face enrolment is not in
+    # the microphone's way at all. Every IN-APP door needs a worker to get
+    # this far, so no in-app run can start over a live voice run.
+    if "voice" in live:
+        return {"ok": False, "reply": E13, "reason": "a voice run is live"}
     # 1. SENSING, FIRST AND ALWAYS.
     st = {}
     if sensing is not None:
@@ -774,3 +793,62 @@ def preflight(cfg, *, sensing=None, worker=None, services=None) -> dict:
         return {"ok": False, "reply": E8,
                 "reason": "models not usable: %s" % ", ".join(missing)}
     return {"ok": True, "reply": "", "reason": ""}
+
+
+def launch(*, cfg, services, sensing=None, say, preflight_fn=None,
+           build_fn=None):
+    """Preflight, build, park and start ONE in-app face enrolment.
+
+    ``(ok, reply, run)``. ``reply`` is what to say either way; ``run`` is the
+    started run or None.
+
+    WHY IT IS HERE AND NOT IN ITS TWO CALLERS. There are two doors to this
+    lens now -- ``commander._start_enrol`` (the spoken offer, committed by one
+    typed word) and ``app.face_enrol_start`` (the button on the USERS tab) --
+    and the sequence between them is not decoration: the preflight is run
+    AGAIN at the moment of the start rather than trusted from an offer made
+    ninety seconds ago, the five injected seams have to be the same five or
+    the button's run would report differently from the voice one, and a run
+    that fails to start has to be UNPARKED or every later press answers "one
+    is already running" with nothing to stop. Two copies of that would drift,
+    and the one that drifted would be the one nobody was watching.
+
+    ``preflight_fn`` and ``build_fn`` are seams for the suite, never for a
+    caller to substitute a different policy with.
+    """
+    from jarvis import earcons
+    from jarvis import enrolentry as ee
+    from jarvis.events import JarvisReply, bus
+
+    pre = (preflight_fn or preflight)
+    worker = getattr(services, "preview_worker", None)
+    out = pre(cfg, sensing=sensing, worker=worker, services=services)
+    if not out.get("ok"):
+        return False, str(out.get("reply") or E35), None
+    run = (build_fn or EnrolRun)(
+        cfg=cfg, worker=worker, sensing=sensing, services=services,
+        say=say,
+        # DISPLAY-ONLY, which is what keeps the card out of the plaintext
+        # journal: a JarvisReply with speak=False does not go through
+        # context.add_exchange.
+        card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
+        lease=getattr(services, "preview_lease", None),
+        # cooldown_s=0.0 on every tone: the default four-second same-tone
+        # cooldown exists to stop a false-wake tone repeating, and here it
+        # would swallow the second and third "kept one" ticks of a
+        # three-sample station -- the ticks he is counting.
+        earcon=lambda name: earcons.play(name, cooldown_s=0.0),
+        clipboard=ee.to_clipboard)
+    try:
+        services.enrol_run = run
+    except Exception:                    # noqa: BLE001 - a slim services
+        log.debug("could not park the enrolment run", exc_info=True)
+        return False, E35, None
+    if not run.start():
+        try:
+            if getattr(services, "enrol_run", None) is run:
+                services.enrol_run = None
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not unpark the enrolment run", exc_info=True)
+        return False, E35, None
+    return True, E2, run
