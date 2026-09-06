@@ -17,6 +17,7 @@ REFUSE or ASK rather than the one way it sends. Four groups:
   emailing one of his correspondents.
 """
 import logging
+import re
 import smtplib
 import time
 import types
@@ -3219,3 +3220,301 @@ def test_spoken_who_leaves_a_name_alone_and_speaks_an_address():
     assert outbox.spoken_who("Mary-Jane") == "Mary-Jane"
     assert outbox.spoken_who("heather@example") == "heather at example"
     assert outbox.spoken_who("h_p@example.com") == "h underscore p at example dot com"
+
+
+# ==================================================================
+# 27. Spelled letter by letter, and the domain as ONE WORD (09-05)
+# ==================================================================
+# Hunter, 09-05: he spelled an address character by character, the
+# capture was chopped into four turns and the tail "made weirdish
+# nonsense". jarvis/spelling.py now holds the mic open across the letters
+# and folds them into a word (tests/test_spelling_hold.py is the rule and
+# the fold). THIS section drives what comes out of that through the send
+# lane to the fake transport, because the fold and the parse are worth
+# nothing unless the WIRE carries the address he spelled and nothing can
+# go without the read-back.
+#
+# Whisper wrote his domain as ONE WORD -- "at example.com", never "at
+# example dot com" -- so that is the shape every row here uses. HIS RULING
+# (B), 09-05: it counts as a domain. Before the ruling (jarvis-v3, and this
+# branch at 996408d) the one-word shape did not parse, unresolved_address
+# handed nothing back either, and the send-intent gate
+# (commander._send_names_someone) simply did not see an address: these
+# tests are RED there and GREEN here.
+
+# His fourth fragment in the exact shape whisper writes it: two spelled
+# groups, whisper's comma after each, the domain run together, a full stop.
+SPELLED_SAID = "q-z-v, k-b-w-7, at example.com."
+SPELLED_ADDR = "qzvkbw7@example.com"
+SPELLED_HEARD = outbox.spoken_address(SPELLED_ADDR)   # "qzvkbw7 at example dot com"
+
+
+def _sent_to() -> list:
+    """Every To: that reached the fake transport, in order."""
+    return [m["To"] for conn in FakeSMTP.made for m in conn.sent]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_spelled_address_with_a_one_word_domain_is_read_back_and_the_yes_goes_there(
+        cmd, source):
+    """The first sentence, whole: the letters fold, the one-word domain
+    parses, the read-back speaks the address, and ONLY the yes sends --
+    to exactly the address he spelled."""
+    res = cmd.handle(f"email the biosensors handout to {SPELLED_SAID}", source=source)
+    assert _sent_to() == [], "the read-back must not send"
+    assert res is not None and res.handled and res.speak, res
+    assert res.reply.endswith("Send it, sir?"), res.reply
+    assert SPELLED_HEARD in res.reply, res.reply
+    assert "@" not in res.reply
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == SPELLED_ADDR
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_spelled_answer_to_what_is_it_goes_on_the_wire_exactly(cmd, source):
+    """"I've no address for Dana, sir. What is it?" -- and he spells it.
+    The wire carries the address he spelled, character for character, and
+    nothing before the yes."""
+    res = cmd.handle("email the biosensors handout to Dana", source=source)
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Dana")
+    res = cmd.handle(SPELLED_SAID, source=source)
+    assert _sent_to() == []
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, res.reply
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_spelled_correction_of_a_read_back_is_read_back_again_before_anything_sends(
+        cmd, source):
+    """The send-intent gate itself (_send_names_someone): a correction
+    that names a spelled address with a one-word domain is SEEN as an
+    address now, so it is read back to the new address -- never sent to
+    the old one, never dropped in silence."""
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(f"no, send it to {SPELLED_SAID}", source=source)
+    assert _sent_to() == [], "a correction must not send to anyone"
+    assert res is not None and res.speak and res.reply.endswith("Send it, sir?"), res
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, res.reply
+    assert "heather at example dot com" not in res.reply
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR], "the yes goes to the corrected address only"
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", [
+    "z-v-k-b-w-7 at example",          # the top level lost
+    "q-z-v at example dot",            # the domain cut off
+    "at example.com",                  # the local part lost
+    "q-z-v at example.c0m",            # a digit where the top level goes
+    "q-z-v tilde k at example.com",    # a symbol word the parser does not read
+])
+def test_an_address_shape_that_will_not_parse_is_asked_about_out_loud_never_in_silence(
+        cmd, said, source):
+    """Silence is the defect. An answer with an address's SHAPE that the
+    parser cannot make an address of is a spoken re-ask every time: the
+    "I heard ..." line when the parser can hand back what it heard, the
+    plain re-ask otherwise -- never None, never a raw "@", never a send."""
+    cmd.handle("email the biosensors handout to Dana", source=source)
+    res = cmd.handle(said, source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.handled and res.speak and res.reply, (said, res)
+    assert "@" not in res.reply, (said, res.reply)
+    assert res.reply.startswith("I heard ") or res.reply == outbox.ADDRESS_REASK_LINE, \
+        (said, res.reply)
+    assert cmd._pending_send is None and cmd.question_open(), (said, res)
+    res = cmd.handle("yes", source=source)
+    assert _sent_to() == [], "a yes to a re-ask sends nothing"
+    assert res is not None and res.reply, (said, res)
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_first_sentence_whose_address_lost_its_top_level_says_what_it_heard(cmd, source):
+    """Whisper drops the ".com": the sentence still names a real file, so
+    it is his, and what he hears back names what was heard -- not silence,
+    and not a draft to a half address."""
+    res = cmd.handle("email the biosensors handout to z-v-k-b-w-7 at example",
+                     source=source)
+    assert _sent_to() == []
+    assert res is not None and res.speak and res.reply, res
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="z-v-k-b-w-7 at example"), res.reply
+    assert cmd._pending_send is None and cmd.question_open()
+    cmd.handle("yes", source=source)
+    assert _sent_to() == []
+
+
+# ---- the [1, 6] split: a KNOWN LIMIT, pinned rather than hidden ----------
+# The hold reads the live preview's newest decode, and the preview runs at
+# a 0.9 s cadence against a 0.8 s endpoint. When the decode of his first
+# letter has not landed by the time the stop is due, that letter closes a
+# capture of its own and the other six open the next one. The second
+# capture then drafts a PLAUSIBLE address missing its first letter --
+# where the baseline's four-way chop produced obvious nonsense. This is a
+# new failure shape; jarvis/spelling.py cannot see across captures and does
+# not try to. The ONLY thing that catches it is the spoken read-back.
+SPLIT_FIRST = "email the biosensors handout to q"        # capture 1: the first letter alone
+SPLIT_REST = "z-v-k-b-w-7 at example.com"                # capture 2: the other six
+SPLIT_WRONG = "zvkbw7@example.com"                       # plausible, and missing its q
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_the_one_six_split_drafts_a_plausible_wrong_address_and_he_hears_it_first(
+        cmd, source):
+    """The failure shape, driven end to end. The wrong address is READ
+    BACK before anything can happen to it, and a no sends nothing."""
+    res = cmd.handle(SPLIT_FIRST, source=source)
+    assert res is not None and res.speak and res.reply, res
+    assert cmd._pending_send is None and cmd.question_open(), "a bare letter arms no draft"
+    res = cmd.handle(SPLIT_REST, source=source)
+    assert _sent_to() == []
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert outbox.spoken_address(SPLIT_WRONG) in res.reply, res.reply   # he HEARS the missing q
+    assert "@" not in res.reply
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == SPLIT_WRONG
+    res = cmd.handle("no", source=source)
+    assert res.reply == outbox.DROPPED_LINE
+    assert _sent_to() == [] and cmd._pending_send is None
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_nothing_reassembled_goes_on_the_wire_unread(cmd, source):
+    """Both counts, pinned: zero sends before the read-back, one after the
+    yes, and the To: on the wire is the SAME address the read-back spoke
+    -- so a wrong address can only ever go out after he has heard it."""
+    cmd.handle(SPLIT_FIRST, source=source)
+    res = cmd.handle(SPLIT_REST, source=source)
+    heard = res.reply
+    assert _sent_to() == []
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPLIT_WRONG]
+    assert outbox.spoken_address(_sent_to()[0]) in heard, (heard, _sent_to())
+
+
+def test_every_draft_is_read_back_before_it_can_be_sent_by_construction():
+    """The read-back is unconditional by CONSTRUCTION, not by case: every
+    draft in the send lane is armed by one function, _send_file_finish,
+    which returns outbox.read_back for it, and outbox.send has exactly one
+    caller in the commander, behind the yes to a pending draft. A second
+    arming point or a second send call is a hole in the [1, 6] catch, and
+    this test is what makes adding one deliberate."""
+    import inspect
+    import jarvis.commander as commander_mod
+    src = inspect.getsource(commander_mod)
+    assert len(re.findall(r"\boutbox\.send\(", src)) == 1, "one call to outbox.send"
+    arms = [ln for ln in src.splitlines() if re.search(r"\.stash_send\(", ln)]
+    assert len(arms) == 1, arms
+    finish = inspect.getsource(commander_mod._send_file_finish)
+    assert ".stash_send(" in finish and "outbox.read_back(prep.draft)" in finish
+
+
+# ==================================================================
+# 28. The full stop after the last spelled character, and the tight dot
+#     (the 09-06 adversary's finding C, through the commander)
+# ==================================================================
+# Whisper writes a full stop after the LAST spelled character as often as
+# a comma: "q. z. v. k. b. w. 7. at example.com", and "q-z-v, k-b-w-7. at
+# example.com" (his 09-05 shape with "." where whisper wrote ","). The
+# comma was consumed on 09-05; the stop was not, and it left him with NO
+# re-ask -- parse "" and unresolved_address "" alike -- and "no, send it
+# to <that>" dropped the draft. These were red, typed and voice.
+FULL_STOP_SHAPES = [
+    "q. z. v. k. b. w. 7. at example.com",
+    "q-z-v, k-b-w-7. at example.com",
+]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_the_first_sentence_is_read_back_and_the_yes_goes_there(
+        cmd, said, source):
+    res = cmd.handle(f"email the biosensors handout to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert res.reply.endswith("Send it, sir?"), (said, res.reply)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == SPELLED_ADDR
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_the_answer_to_what_is_it(cmd, said, source):
+    res = cmd.handle("email the biosensors handout to Dana", source=source)
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Dana")
+    res = cmd.handle(said, source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_the_full_stop_shape_as_a_correction_keeps_the_draft_and_reads_it_back(
+        cmd, said, source):
+    """"no, send it to <that>" used to DROP the draft ("Very good, sir;
+    nothing sent."): the correction was not seen as an address."""
+    cmd.handle("email the biosensors handout to Heather", source=source)
+    res = cmd.handle(f"no, send it to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.speak and res.reply.endswith("Send it, sir?"), (said, res)
+    assert SPELLED_HEARD in res.reply and "@" not in res.reply, (said, res.reply)
+    assert "heather at example dot com" not in res.reply
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [SPELLED_ADDR]
+
+
+@pytest.mark.parametrize("said", FULL_STOP_SHAPES)
+def test_a_parsed_full_stop_shape_has_exactly_the_characters_said(said):
+    """The seventh of the seven: the fold drops whisper's punctuation and
+    nothing else, so the local part is the seven characters and the domain
+    is the domain -- no stop folded into either."""
+    assert outbox.parse_address(said) == SPELLED_ADDR
+    assert outbox.unresolved_address(said) == ""
+
+
+# ---- the tight dot, end to end: the wire carries the dots, the read-back
+# ---- speaks every one of them (default taken for him, 09-06)
+@pytest.mark.parametrize("source", ["typed", "voice"])
+@pytest.mark.parametrize("said,addr,heard", [
+    ("d.a.n at example.com", "d.a.n@example.com", "d dot a dot n at example dot com"),
+    ("j.r.smith at example.com", "j.r.smith@example.com", "j dot r dot smith at example dot com"),
+])
+def test_a_tight_dotted_local_part_goes_on_the_wire_whole_and_every_dot_is_read_back(
+        cmd, said, addr, heard, source):
+    """"d.a.n" used to draft dan@ and "j.r.smith" smith@ -- two silently
+    different mailboxes, read back almost right, sent on a yes. Now the
+    read-back says every dot, so whichever he meant, he hears exactly what
+    will be sent; and only the yes sends, to exactly that."""
+    res = cmd.handle(f"email the biosensors handout to {said}", source=source)
+    assert _sent_to() == [], (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert heard in res.reply and "@" not in res.reply, (said, res.reply)
+    assert cmd._pending_send is not None and cmd._pending_send.to_addr == addr
+    cmd.handle("yes", source=source)
+    assert _sent_to() == [addr]
+    msg = FakeSMTP.made[-1].sent[-1]
+    assert msg["To"] == addr and "." in msg["To"].split("@")[0]
+
+
+@pytest.mark.parametrize("source", ["typed", "voice"])
+def test_a_tight_dotted_answer_to_what_is_it_is_read_back_with_its_dots(cmd, source):
+    cmd.handle("email the biosensors handout to Dana", source=source)
+    res = cmd.handle("d.a.n at example.com", source=source)
+    assert _sent_to() == []
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert "d dot a dot n at example dot com" in res.reply, res.reply
+    assert "dan at example dot com" not in res.reply
+    cmd.handle("no", source=source)
+    assert _sent_to() == [] and cmd._pending_send is None
+
+
+def test_the_tight_dot_is_never_flattened_on_the_way_to_the_wire():
+    assert outbox.parse_address("d.a.n at example.com") == "d.a.n@example.com"
+    assert outbox.parse_address("j.r.smith at example.com") == "j.r.smith@example.com"
+    assert outbox.parse_address("d.a.n at example.com") != "dan@example.com"
+    assert outbox.parse_address("j.r.smith at example.com") != "smith@example.com"

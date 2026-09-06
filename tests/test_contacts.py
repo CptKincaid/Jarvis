@@ -1693,12 +1693,16 @@ def test_mask_addresses_leaves_ordinary_prose_alone(prose):
     ("dana at example dot me", "d… at example dot me"),
     ("dana at me dot com", "d… at me dot com"),
     ("look at me. In the morning", "look at me. In the morning"),
-    # ... but after a full stop it is the next sentence, so a punctuated
-    # domain has to end on a top level in use -- and "example.xyz" is
-    # left alone (a typed address has an "@" and is masked by that)
+    # ... but after a full stop WITH A SPACE it is the next sentence, so a
+    # spaced punctuated domain has to end on a top level in use
     ("I'm at home. In the morning", "I'm at home. In the morning"),
     ("I'm at home. Info for you", "I'm at home. Info for you"),
-    ("dana at example.xyz", "dana at example.xyz"),
+    # (09-05, HIS RULING B) "example.xyz" used to be left alone here,
+    # because .xyz is in no hand-written list. It is masked now, and not
+    # by adding .xyz to a list: the parser reads a TIGHT punctuated domain
+    # as a domain, so address_span DRAFTS dana@example.xyz, so the
+    # parser-consistent masker masks it. Same invariant, one more row.
+    ("dana at example.xyz", "d… at example.xyz"),
     # a website said in a sentence has the same skeleton and is masked
     # too: a lost letter in a log line is cheaper than a leaked address
     ("the site is at example dot com", "the site i… at example dot com"),
@@ -2099,11 +2103,56 @@ def v3_mask(text: str) -> str:
     return t
 
 
-def test_the_v3_oracle_is_the_branch_regex():
-    """The floor is only a floor if the oracle really is v3's rule: the
-    parser regex this branch masks WITH is byte-identical to v3's."""
-    assert _V3_SPOKEN_ADDR_RX.pattern == outbox._SPOKEN_ADDR_RX.pattern
+# Rows the FLOOR is proved on directly: whatever v3's regex finds in one
+# of these, the branch's regex must find at the same place with the same
+# local part. (The 5600-row grid and PROSE_ROWS prove the same thing
+# through the masked output; this proves it on the regex itself.)
+V3_FLOOR_ROWS = [
+    "dana at example dot com", "yes, to heather underscore smith at my dot in",
+    "look at the dot in the corner", "we stopped at noon. Then we left",
+    "meet me at 4 dot 30", "look at handout dot pdf", "at dot", "dot at",
+    "q at example dot com", "dana at my dash host dot com", "",
+]
+
+
+def test_the_v3_oracle_is_still_the_floor_after_his_ruling_b():
+    """The floor is only a floor if the oracle really is v3's rule. It
+    still is -- but the two patterns are no longer byte-identical, and
+    this test used to assert that they were.
+
+    (09-05) HIS RULING (B) widened the branch's DOMAIN half: a run-together
+    domain ("dana at example.com") is now read, and v3 could not read one
+    at all. v3's whole domain pattern is embedded VERBATIM as the second of
+    the branch's two domain alternatives. So the branch is a superset by
+    construction: an alternation only ever matches more texts, and on
+    every text v3 matches, the branch matches at the same start with the
+    same group(1), so the identical masked line comes out.
+
+    (09-06) The LOCAL half -- the only half _one_drafted replaces -- is
+    v3's with ONE more way to join two labels: a tight dot ("d.a.n",
+    "j.r.smith"), kept and read back as "dot" rather than flattened into
+    a different mailbox. It is v3's local half with `\.` added as an
+    alternative to the spoken joiner, and nothing else: an alternative
+    inside the repeat only ever matches more, and where it starts a match
+    EARLIER ("x.dana at ...": v3 masked from "dana", leaving "x." raw)
+    the line comes out more masked, never less. The floor rows below prove
+    it on the regex itself."""
+    v3, mine = _V3_SPOKEN_ADDR_RX.pattern, outbox._SPOKEN_ADDR_RX.pattern
+    assert v3 != mine                      # ruling (B) widened it on purpose
+    head, sep, v3_domain = v3.partition(r"\s+at\s+")
+    v3_joiner = r"\s+" + _V3_LOCAL_JOINER + r"\s+"
+    assert v3_joiner in head
+    head_with_tight_dot = head.replace(v3_joiner, r"(?:" + v3_joiner + r"|\.)")
+    assert mine.startswith(head_with_tight_dot + sep)    # the local half is v3's plus the tight dot
+    assert "(?:" + v3_domain[1:-1] + ")" in mine         # v3's domain, verbatim
     assert _V3_ADDR_RX.pattern == outbox._ADDR_RX.pattern
+    for row in V3_FLOOR_ROWS:
+        theirs = _V3_SPOKEN_ADDR_RX.search(row)
+        if theirs is None:
+            continue
+        mine_m = outbox._SPOKEN_ADDR_RX.search(row)
+        assert mine_m is not None and mine_m.start() == theirs.start() \
+            and mine_m.group(1) == theirs.group(1), row
 
 
 # ---- the grid: 7 locals x 20 domains x 40 top levels = 5600 rows, a

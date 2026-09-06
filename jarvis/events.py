@@ -47,6 +47,11 @@ class RecordingStopped(Event):
     # "um"/"uh" the stop waited CONFIG.filler_hold_s longer for. Reaches the
     # turn ledger line as holds=N so a week of turns can say how often it fired.
     filler_holds: int = 0
+    # Spelling holds this capture (jarvis/spelling.py): pauses between two
+    # spoken CHARACTERS the stop waited CONFIG.spell_hold_s longer for.
+    # Counted apart from filler_holds so the ledger's holds=N keeps meaning
+    # what it meant, and so a spelled address cannot eat his three ums.
+    spell_holds: int = 0
     # The session was opened without a wake word (the follow-up window).
     # The app's "did not catch that" policy stays silent on those: nothing
     # said into a follow-up window is the normal case, not a lost turn.

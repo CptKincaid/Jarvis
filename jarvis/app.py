@@ -709,6 +709,11 @@ class JarvisApp:
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
         self.commander.claim_uncertain = self._claim_uncertain
+        # The spelling hold's "an address is owed" word (jarvis/spelling.py,
+        # Recorder.note_partial): read by the recorder ONCE per capture, at
+        # start(), from the commander's own pending-question slots.
+        self.recorder.address_owed_probe = \
+            lambda: self._address_owed(self.commander)
         # ...and the count of those cards, for "clear the transcript": the
         # prompt goes into the SAME TranscriptView._approvals dict the
         # Claude approvals do, clear_all keeps it while it is unanswered,
@@ -3744,18 +3749,27 @@ class JarvisApp:
         THE FILLER HOLD (jarvis/recorder.py, CONFIG.filler_hold): every
         greedy decode here is reported to recorder.note_partial() with the
         capture second the decoded span ENDS at, so a preview ending on
-        "um" can hold the stop open. Only the greedy preview reports. The
-        speculative pass does not: its prompt never carries the filler
-        hint and its clean full decode is the one most likely to have
-        dropped the um, so letting it overrule the preview would defeat
-        the experiment scripts/filler_probe.py exists to run. LIMIT: this
-        loop's cadence (_PARTIAL_INTERVAL_S, 0.9 s) is slower than the
-        endpoint (CONFIG.endpoint_silence, 0.8 s), and the speculative
-        pass parks the preview for a full decode from 0.3 s into a pause,
-        so a filler spoken after the last snapshot may never be decoded
-        before the stop is due. The recorder does NOT decode the tail
-        itself (that would be a decode on every turn's stop): it stops as
-        before. How often that happens is a number the probe measures.
+        "um" can hold the stop open. Only the greedy preview reports a
+        FILLER. The speculative pass does not: its prompt never carries
+        the filler hint and its clean full decode is the one most likely
+        to have dropped the um, so letting it overrule the preview would
+        defeat the experiment scripts/filler_probe.py exists to run.
+        LIMIT: this loop's cadence (_PARTIAL_INTERVAL_S, 0.9 s) is slower
+        than the endpoint (CONFIG.endpoint_silence, 0.8 s), and the
+        speculative pass parks the preview for a full decode from 0.3 s
+        into a pause, so a filler spoken after the last snapshot may never
+        be decoded before the stop is due. The recorder does NOT decode
+        the tail itself (that would be a decode on every turn's stop): it
+        stops as before. How often that happens is a number the probe
+        measures.
+
+        THE SPELLING HOLD (jarvis/spelling.py) is fed by BOTH passes
+        (09-06): the greedy preview through the same note_partial, and
+        the speculative pass through recorder.note_speculative -- which
+        only ever ADDS a hold when its decode ends on a run, so the parking
+        above cannot hide the letters the hold is waiting for. Measured on
+        the recorder's real poll cadence: see Recorder.note_speculative and
+        tests/test_spelling_survival.py.
         """
         last = ""
         due = 0.0                       # next greedy preview (monotonic)
@@ -3797,6 +3811,11 @@ class JarvisApp:
                     # passes that CHANGED the card were ever visible at all.
                     seconds = len(audio) / SAMPLE_RATE
                     self.preview_probe.decoded(PATH_GREEDY)
+                    # Announce the decode BEFORE it runs (Recorder.
+                    # note_decoding): while it is running and its snapshot
+                    # holds the last burst, a stop that falls due waits
+                    # for it rather than beating it by a few tens of ms.
+                    self._note_decoding(end_s, capture)
                     try:
                         text = (self.transcriber.partial(audio) or "").strip()
                     except Exception:
@@ -3881,6 +3900,48 @@ class JarvisApp:
             note(text, end_s, capture_id)
         except Exception:
             log.debug("note_partial failed", exc_info=True)
+
+    def _note_decoding(self, end_s: float, capture_id=None) -> None:
+        """Tell the recorder a decode is starting on a snapshot that ends
+        at ``end_s`` (Recorder.note_decoding), so a stop that falls due
+        while it runs can wait for it. getattr, as _note_partial: the
+        preview-thread tests drive this loop with bare recorder fakes."""
+        note = getattr(self.recorder, "note_decoding", None)
+        if note is None:
+            return
+        try:
+            note(end_s, capture_id)
+        except Exception:
+            log.debug("note_decoding failed", exc_info=True)
+
+    def _note_speculative(self, text: str, end_s: float,
+                          capture_id=None) -> None:
+        """Hand the speculative pass's decode to the recorder's SPELLING
+        hold (Recorder.note_speculative: additive, run-only). getattr for
+        the same reason as _note_partial -- the pass is best effort and a
+        recorder fake without the seam is a recorder that hears nothing."""
+        note = getattr(self.recorder, "note_speculative", None)
+        if note is None:
+            return
+        try:
+            note(text, end_s, capture_id)
+        except Exception:
+            log.debug("note_speculative failed", exc_info=True)
+
+    def _address_owed(self, commander) -> bool:
+        """Is the commander waiting on an ADDRESS -- "What is it?" asked,
+        or a draft read back that he may correct? Read by the recorder at
+        every start() through address_owed_probe, and False on any doubt:
+        the only thing it changes is whether a bare spelled first letter
+        holds the mic (jarvis.spelling.spelling_run, address_owed)."""
+        probe = getattr(commander, "address_owed", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            log.debug("address_owed failed", exc_info=True)
+            return False
 
     # ------------------------------------------- speculative transcription
     #
@@ -4036,10 +4097,22 @@ class JarvisApp:
                 return False            # this pause was already decoded
             spec = _Speculation(key)
             self._speculation = spec
+        # BEFORE the snapshot, as _partial_loop reads it: a capture that
+        # turns over during the decode leaves this note with the old id,
+        # and the recorder drops it.
+        capture = getattr(rec, "capture_id", None)
         audio = None
+        end_s = 0.0
         try:
             audio = rec.snapshot_final()
             if audio is not None:
+                end_s = len(audio) / SAMPLE_RATE
+                # Announced BEFORE the decode (Recorder.note_decoding) and
+                # reported after it whatever it said (note_speculative,
+                # below), so the recorder can wait for this pass when the
+                # stop falls due mid-decode and never waits on one that
+                # has already returned.
+                self._note_decoding(end_s, capture)
                 spec.audio, spec.stats, spec.rejected, spec.result = \
                     self._decode_clip(audio)
         except Exception as exc:        # noqa: BLE001 - best effort by design
@@ -4052,6 +4125,18 @@ class JarvisApp:
             return False                # too short to shape: nothing ran
         result = spec.result
         text = (result.text or "").strip() if result is not None else ""
+        # THE SPELLING HOLD hears this pass (09-06): it is the decode the
+        # pause itself started, so it is the one that lands between two
+        # spelled letters on no clock. Additive only -- Recorder.
+        # note_speculative stores nothing unless the text ends on a run
+        # -- and NOT gated on `accepted`: a run of single letters is
+        # exactly where the confidence gate is least sure, and a wrong
+        # hold is 2 s once where a missed one is a lost letter. Reported
+        # UNCONDITIONALLY, an empty or rejected decode included: the
+        # report is also what tells the recorder the decode it announced
+        # has returned, and a recorder still waiting on a pass that came
+        # back empty would hold the mic for the cap.
+        self._note_speculative(text, end_s, capture)
         if text and result.accepted and rec.recording:
             # The speculative text IS the best preview there is.
             self._partial_shown = True
@@ -5670,9 +5755,18 @@ class JarvisApp:
         if ev.dead_air_s is not None:
             self.turns.mark("speech_end", at=ev.t - ev.dead_air_s)
         # holds=N only when the filler hold fired: a turn without one keeps
-        # the line it always had.
+        # the line it always had. spell=N is its own note rather than more
+        # holds=N, because a spelled turn is a DIFFERENT wait to explain --
+        # a man saying an address one character at a time, not a man
+        # thinking after an um -- and a week of turns has to be able to
+        # tell the two apart (jarvis/spelling.py, 09-05).
         holds = int(getattr(ev, "filler_holds", 0) or 0)
-        notes = {"holds": str(holds)} if holds else {}
+        spell = int(getattr(ev, "spell_holds", 0) or 0)
+        notes = {}
+        if holds:
+            notes["holds"] = str(holds)
+        if spell:
+            notes["spell"] = str(spell)
         self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason, **notes)
 
     def _turn_on_transcribed(self, ev):

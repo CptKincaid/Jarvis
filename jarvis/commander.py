@@ -10952,6 +10952,39 @@ class Commander:
             floor = -0.7
         return conf < floor
 
+    def address_owed(self) -> bool:
+        """The next thing he says may be an ADDRESS and nothing else.
+
+        True while "I've no address for Dana, sir. What is it?" is on the
+        floor (a recipient SendAsk that has not expired) or a file send has
+        been read back and not yet answered (he may correct it to a new
+        address: "no, q-z-v..."). Read by the recorder at the start of
+        every capture (Recorder.address_owed_probe, through the app) so
+        the spelling hold keeps the mic open from the FIRST spelled
+        character of a bare answer -- the question just asked is the
+        function word (jarvis.spelling.spelling_run). Nothing else reads
+        it, and it changes nothing but that hold. Narrower than
+        question_open() on purpose: a flashcard or "Which one, sir?" owes
+        a word, not an address, and a hold there is a pause for nothing.
+        """
+        ask = getattr(self, "_pending_sendask", None)
+        if ask is not None and getattr(ask, "kind", "") == "recipient":
+            try:
+                if not ask.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed slot
+                log.debug("address_owed: send ask staleness failed",
+                          exc_info=True)
+        draft = getattr(self, "_pending_send", None)
+        if draft is not None:
+            try:
+                if not draft.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed draft
+                log.debug("address_owed: send draft staleness failed",
+                          exc_info=True)
+        return False
+
     def question_open(self) -> bool:
         """Jarvis put a question and is waiting on the answer.
 
