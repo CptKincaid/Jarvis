@@ -5,8 +5,14 @@
 READ THIS FIRST.  Nine rounds in, this is what the census is for, what it
 catches, what it does not and never will, and what the safety of his files
 actually rests on.  It is written down because six adversaries in a row beat
-this instrument and every one of them beat it the same way -- which says the
-question being asked of it was the wrong question.
+this instrument -- and NOT the same way each time.  Rounds 4 through 7
+beat it with HONEST shapes (a second write in a function that already had
+one, a dead ignore entry, a fully-qualified logging.FileHandler, three
+undisguised pathlib methods) and were measuring the right thing; the
+census catches each of those shapes today BECAUSE those rounds found
+them.  What the defeats had in common was the instrument's DEFAULT --
+skip what you cannot resolve -- and that default was the wrong question,
+not the rounds.
 
 WHAT IT IS FOR.  One threat, and one only: an HONEST author -- us, next
 week, tired -- shipping a read-then-write pair without noticing.
@@ -64,11 +70,16 @@ is a mistake anyone makes by accident:
     decorator returns;
   * rewriting the module on disk after import, or monkeypatching os.
 
-Six adversarial rounds each found one of these and each one was closed;
-there will be a seventh.  That game cannot be won by a static walk, and
+Of the routes above the adversaries actually found two -- round 5's
+getattr(os, "remove") and OPS["rm"], and round 9's subclass of a writer
+-- and each was closed as a rule rather than an entry; there will be
+another.  The rest of what rounds 4 through 7 found was not dynamism at
+all: honest shapes, measured the right way, and the census catches them
+today BECAUSE those rounds did.  That game cannot be won by a static walk, and
 the product is not held hostage to it: a bypass that needs a deliberate
 subclass of logging.FileHandler is an ATTACK, and the author of this lane
-is us.  Those six rounds measured the wrong thing.
+is us.  The dynamism game measures the wrong thing; the rounds that planted
+honest mistakes measured the right one.
 
 WHAT HIS FILES ACTUALLY REST ON is not this file.  It is three properties
 of the product itself, confirmed by seven adversaries and reopened by none:
@@ -96,8 +107,11 @@ those properties are made of, so that an honest edit cannot quietly take
 one apart -- a downgraded guard, a write added beside a claimed one, a new
 helper that deletes.
 
-TODAY'S TABLE IS 502 ROWS.  Measured here on 0cfad85 and on this tip, and
-pinned by a test that DERIVES the number from the two tables in
+TODAY'S TABLE IS 510 ROWS.  502 on the round-9 tip (1039ce8); round 10
+added eight and moved none -- seven call sites of the lane's own
+destroyers (_replace_ours, _drop, _unlink_after_landing), which are in
+WRITES now, and the fdopen over _replace_ours's claimed temp.  Pinned by
+a test that DERIVES the number from the two tables in
 tests/test_write_census.py rather than typing it; the round-8 report said
 490, and that number was stale the day it was written.
 
@@ -318,6 +332,15 @@ WRITES = frozenset({
     "run_copy", "sftp_rename", "sftp_remove", "sftp_mkdir", "sftp_rmdir",
     "run_sftp", "push", "pull", "send", "claim", "discard", "fetch",
     "stage_open", "stage_close", "remove_landed", "land_beside", "save",
+    # THE LANE'S OWN DESTROYERS, round 10.  land_beside has been here since
+    # round 5; these three were not, so a NEW caller of self._drop(p) or of
+    # _unlink_after_landing(p, ...) on a verify-failed path deleted his
+    # 100000-byte Outbox file, and a new _replace_ours(...) at the note
+    # name overwrote it to a 300-byte note -- census 92/92 green all three
+    # times.  The PRODUCT suite caught each (5/5/1 tests), so this is a
+    # tightening, not a hole: every call site is a row with a sentence now,
+    # and a new caller fails HERE, before a product test has to.
+    "_replace_ours", "_drop", "_unlink_after_landing",
 })
 
 # One operation that CREATES a name and refuses if it is taken.  A write
@@ -560,12 +583,23 @@ def _assigned_in(node) -> set:
     out = set()
     body = getattr(node, "body", [])
     stack = list(body) if isinstance(body, list) else [body]
+    # ROUND 10: a PARAMETER is a name this scope binds, and the args live
+    # on the def, not in its body.  Without this a parameter named like a
+    # def of the module -- `def f(dedupe_name, p): dedupe_name(p)` -- was
+    # blessed as <lane>.dedupe_name, which is the shadowing this docstring
+    # says is opaque.  Defaults and annotations are Load-context and add
+    # nothing; a lambda in a default is SCOPED and skipped like any other.
+    args = getattr(node, "args", None)
+    if isinstance(args, ast.arguments):
+        stack.append(args)
     while stack:
         child = stack.pop()
         if isinstance(child, SCOPED):
             continue
         if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
             out.add(child.id)
+        elif isinstance(child, ast.arg):
+            out.add(child.arg)
         elif isinstance(child, ast.ExceptHandler) and child.name:
             out.add(child.name)
         stack.extend(ast.iter_child_nodes(child))

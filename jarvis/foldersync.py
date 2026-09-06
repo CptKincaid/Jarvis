@@ -160,6 +160,7 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import itertools
 import json
 import os
 import shutil
@@ -657,6 +658,11 @@ def _unlink_after_landing(source: Path, dest: Path) -> None:
                     "the original; nothing has been lost", source, dest)
 
 
+# The counter half of _replace_ours's unique temp name.  Process-wide, so
+# the ledger and status.txt cannot collide on a name even in one pass.
+_REPLACE_SEQ = itertools.count(1)
+
+
 def _replace_ours(path: Path, text: str, *, fsync: bool = False,
                   mode: Optional[int] = None) -> None:
     """Replace a file of OURS atomically.  The ONE place that dance lives.
@@ -680,17 +686,47 @@ def _replace_ours(path: Path, text: str, *, fsync: bool = False,
 
     The temp name sits beside the target, so the rename is within one
     filesystem and is therefore atomic.  It carries the target's whole name
-    plus ".tmp" rather than replacing the suffix: ``ledger.json`` and
-    ``ledger.jsonl`` would otherwise fight over ``ledger.tmp``.
+    plus ".<pid>-<n>.tmp" rather than replacing the suffix: ``ledger.json``
+    and ``ledger.jsonl`` would otherwise fight over ``ledger.tmp``.
 
-    NOT for a name of his -- there is no claim here at all, and a plain
-    replace at a name he chose is the shape that destroyed a 100000-byte
-    file in round 5.  That is ``land_beside``, which takes the name first.
+    ROUND 10: THE TEMP IS CLAIMED, NOT OPENED.  Through round 9 the name was
+    a fixed ``<target>.tmp`` and it was opened with a plain ``open(tmp,
+    "w")``, which truncates whatever is there.  MEASURED on 1039ce8: a
+    100000-byte file of his at ``~/Desktop/Jarvis/status.txt.tmp`` was
+    GONE after one pass -- truncated to our status text and renamed over
+    status.txt.  A narrow name and an undocumented one, but a name he can
+    have, and the threat model's own sentence -- "every write that could
+    land where a file already is takes one operation that creates the name
+    or refuses" -- was not true of this function.  So the temp is now
+    ``O_CREAT|O_EXCL`` at a UNIQUE name (pid + counter, the shape
+    ``_claim_part`` already uses): a taken name is REFUSED by the kernel
+    and the next one is tried, :data:`MAX_CLAIM_TRIES` times, then it
+    raises the OSError both callers already catch.  Same mode bits as the
+    ``open()`` it replaces (0o666 under the umask), so nothing about the
+    target's permissions changed.  The cost is the one land_beside states:
+    a temp OF OURS left at a unique name if the process dies between the
+    claim and the rename -- never a byte of his.
+
+    The FINAL ``os.replace`` over the target is still unclaimed, on
+    purpose: the target is a file of OURS.  NOT for a name of his -- a
+    plain replace at a name he chose is the shape that destroyed a
+    100000-byte file in round 5.  That is ``land_beside``, which takes the
+    name first.
     """
     path.parent.mkdir(parents=True, exist_ok=True,
                       **({"mode": mode} if mode is not None else {}))
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
+    for _try in range(MAX_CLAIM_TRIES):
+        tmp = path.with_name(f"{path.name}.{os.getpid()}-"
+                             f"{next(_REPLACE_SEQ)}.tmp")
+        try:
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            continue                      # taken, by the kernel's word
+        break
+    else:
+        raise OSError(errno.EEXIST, "every temp name beside the target is "
+                      "taken; nothing was written", str(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(text)
         if fsync:
             fh.flush()

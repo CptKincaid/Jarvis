@@ -147,34 +147,56 @@ KNOWN = {
          '`tailscale status --json`, a read-only local query'),
 
     # -------------------- jarvis/foldersync.py
-    # THE CHOKEPOINT for a file of OURS, round 7.  These five rows used to
-    # be TEN: the same mkdir + temp + replace dance written out once in
+    # THE CHOKEPOINT for a file of OURS, round 7.  These rows used to be
+    # TEN: the same mkdir + temp + replace dance written out once in
     # Ledger.save (with an fsync) and once in Syncer.write_status (without
     # one).  Both go through _replace_ours now, and the fsync is a named
     # argument rather than a thing one copy remembered.  See
     # tests/test_write_chokepoint.py, which pins the audited-writer set --
     # and which records that this consolidation removed FOUR of 487 rows.
+    #
+    # ROUND 10: THE TEMP IS CLAIMED.  Through round 9 the temp was a fixed
+    # "<name>.tmp" opened with a plain open(tmp, "w"), and every row below
+    # honestly said NOTHING.  MEASURED on 1039ce8: a 100000-byte file of his
+    # at ~/Desktop/Jarvis/status.txt.tmp was GONE after one pass.  The temp
+    # is O_CREAT|O_EXCL at "<name>.<pid>-<n>.tmp" now, so the open row
+    # earns claim:excl-open and every row after it in the scope inherits
+    # that guard -- five kinds went none -> claim (stronger, and this is the
+    # why), and fdopen on the claimed descriptor is a new sixth row.
     ("jarvis/foldersync.py", "_replace_ours", "mkdir", 1):
         ("none",
          "the parent of a file of OURS -- ~/.local/state/jarvis for the "
          "ledger, ~/Desktop/Jarvis for status.txt; exist_ok"),
     ("jarvis/foldersync.py", "_replace_ours", "open", 1):
-        ("none",
-         'our own "<name>.tmp" beside the target, in the same directory so '
-         "the rename that follows is atomic"),
+        ("claim",
+         'CLAIM: O_CREAT|O_EXCL at our own "<name>.<pid>-<n>.tmp" beside the '
+         "target, in the same directory so the rename that follows is "
+         "atomic; a taken name is refused by the kernel and the next tried"),
+    ("jarvis/foldersync.py", "_replace_ours", "fdopen", 1):
+        ("claim",
+         "a text handle over the descriptor the O_EXCL claim just returned; "
+         "opens no name of its own"),
     ("jarvis/foldersync.py", "_replace_ours", "open", 2):
-        ("none",
+        ("claim",
          "the DIRECTORY of the target, O_RDONLY for the fsync; writes no "
          "bytes and only happens when fsync=True"),
     ("jarvis/foldersync.py", "_replace_ours", "replace", 1):
-        ("none",
-         "tmp -> the target.  A file of OURS only: there is no claim here, "
-         "and a plain replace at a name HE chose is what destroyed a "
-         "100000-byte file in round 5.  That case is land_beside"),
+        ("claim",
+         "our claimed tmp -> the target.  A file of OURS only: the TARGET "
+         "is not claimed, on purpose, and a plain replace at a name HE "
+         "chose is what destroyed a 100000-byte file in round 5.  That case "
+         "is land_beside"),
     ("jarvis/foldersync.py", "_replace_ours", "write", 1):
+        ("claim",
+         "fh.write into our own claimed tmp, on the fd just opened; nothing "
+         "of his can be at that name"),
+    # THE LANE'S OWN DESTROYERS, round 10: a caller of _replace_ours, _drop
+    # or _unlink_after_landing is a row now, so a NEW caller fails the pin
+    # here before it fails a product test.
+    ("jarvis/foldersync.py", "Ledger.save", "_replace_ours", 1):
         ("none",
-         "fh.write into our own .tmp, on the fd just opened; nothing of "
-         "his can be at that name"),
+         "the ledger, a file of OURS at ~/.local/state/jarvis, fsync=True; "
+         "the target needs no claim because nothing of his lives there"),
     ("jarvis/foldersync.py", "SshTransport.claim", "sftp_rename", 1):
         ("claim",
          'CLAIM: rename -l, kernel refuses a held name; window ZERO'),
@@ -284,6 +306,19 @@ KNOWN = {
         ("claim",
          "ROW 14: on the fd whose marker was read through this same "
          "descriptor"),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "_drop", 1):
+        ("claim",
+         "the part file _claim_part took with O_EXCL, after a fetch that "
+         "failed; OUR name, pid + counter, never his"),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "_drop", 2):
+        ("claim",
+         "the same part file, after a size that did not verify; ours"),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "_drop", 3):
+        ("claim",
+         "the same part file, when land_beside raised (denied); ours"),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "_drop", 4):
+        ("claim",
+         "the same part file, when land_beside ran out of names; ours"),
     ("jarvis/foldersync.py", "Syncer.pull_once", "fetch", 1):
         ("claim",
          'ROW 5: into the part file _claim_part took with O_EXCL'),
@@ -296,6 +331,10 @@ KNOWN = {
     ("jarvis/foldersync.py", "Syncer.pull_once", "save", 1):
         ("claim",
          'the ledger, ours'),
+    ("jarvis/foldersync.py", "Syncer.write_status", "_replace_ours", 1):
+        ("none",
+         "status.txt, a file of OURS in ~/Desktop/Jarvis, no fsync; the "
+         "target needs no claim, and the temp beside it is claimed inside"),
     ("jarvis/foldersync.py", "Syncer.record", "mkdir", 1):
         ("none",
          '~/.local/state/jarvis, ours'),
@@ -331,6 +370,10 @@ KNOWN = {
     ("jarvis/foldersync.py", "_unlink_if_ours", "unlink", 1):
         ("none",
          'ROW 14: only a note carrying our marker; sub-ms TOCTOU, stated'),
+    ("jarvis/foldersync.py", "land_beside", "_unlink_after_landing", 1):
+        ("claim",
+         "the SOURCE, only after os.link has already put the same inode at "
+         "the claimed dest; failure leaves it in both places"),
     ("jarvis/foldersync.py", "land_beside", "link", 1):
         ("claim",
          'the atomic claim; EEXIST is the answer, not an error'),
@@ -578,8 +621,9 @@ UNTYPED = {
                "containment check in this lane is built on it; it reads",
     "relative_to": "Path.relative_to, pure string arithmetic on two already "
                    "resolved paths; raises if outside, writes nothing",
-    "with_name": "Path.with_name building the '<name>.tmp' sibling inside "
-                 "_replace_ours; names a path, creates nothing",
+    "with_name": "Path.with_name building the '<name>.<pid>-<n>.tmp' "
+                 "sibling inside _replace_ours; names a path, creates "
+                 "nothing",
     "stat": "Path.stat / the transport's stat -- size and mtime, the "
             "quiescence question. A read, and the row it guards is pinned "
             "as a check rather than a claim",
