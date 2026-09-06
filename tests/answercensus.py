@@ -61,15 +61,37 @@ under jarvis/. Nothing here imports the modules it reads.
     is named in the test's KNOWN table instead.) The flow is traced through
     assignments in source order and across the call into a parser.
 
-What this can and cannot see, honestly:
+Round 2 of the adversary (09-06) planted eight answer grammars and six
+walked past this census green. What it sees now, and what it still does
+not -- the BLIND SPOTS, so nobody reads its green as a proof:
 
-  * A rung that reads its parked question through a name ANSWER_STATE_RX
-    does not match is invisible. That is the one hand-written thing here,
-    and it is a NAMING CONVENTION the code already keeps, not a list of
-    rungs. tests/test_answer_census.py pins a floor of rungs and sites the
-    census must keep finding, so a drift in the convention fails loudly.
-  * The flow is optimistic about branches: a strip inside an ``if`` counts
-    for everything below it. A strip that runs only sometimes would pass.
+  SEEN since round 2 (tests/test_answer_census.py plants each one):
+  * A MODE that owns the next words the way a parked question does --
+    the ringing alarm, lecture notes, dictation (MODE_STATE): the rung
+    that reads it is a rung. Two of those were invisible.
+  * A grammar that is not a regex: ``text.startswith(("yes", "yeah"))``,
+    ``t.endswith(...)``, ``t in ("yes", "y")`` / ``t in _YES_WORDS``.
+  * A rung's words under ANY parameter name, annotated or not
+    (``utterance``): every positional parameter of a rung is tainted on
+    entry unless the body only ever uses it as an object (``c.services``,
+    ``m.group(1)``) or it is the channel flag (FLAG_PARAMS).
+  * A regex held on the class or the instance (``self._RX``) and a local
+    alias (``rx = _NO_RX; rx.match(t)``), an ``a if x else b`` between two,
+    and a ``for rx in (_A_RX, _B_RX)`` loop.
+  * A registry HANDLER is derived from the dispatch table (a module-level
+    list of calls naming it) and is never a rung: it runs on words the
+    table already matched as a command.
+
+  BLIND, still:
+  * A rung that reads its parked question through a name outside the
+    convention -- neither ANSWER_STATE_RX nor MODE_STATE (the adversary's
+    P3, ``_awaiting_confirm``). Deriving state from a read-and-clear
+    shape was tried on 09-06 and measured at 218 rungs and 39 false
+    sites; the convention stays, and tests/test_answer_census.py pins a
+    floor of rungs and sites so a drift in it fails loudly.
+  * The flow is optimistic about branches: a strip on one branch that
+    comes LAST in source order counts for everything below it (P8). A
+    strip that runs only sometimes passes.
   * A piece a search picked out (``m.group(1)``) is not the reply, and a
     regex over it is not a site: a leading filler never lands inside a
     capture that a mid-sentence search chose. A grammar that captures
@@ -81,6 +103,9 @@ What this can and cannot see, honestly:
     function of that name when there are DUCK_MAX or fewer, and never
     launders taint: only a precisely resolved callee can be a stripper or
     a sink.
+  * A dispatch table built by calls (``registry.add(rx, handler)``) rather
+    than a module-level list is not read as a table; its handlers would
+    count as rungs if they read answer state.
 """
 from __future__ import annotations
 
@@ -92,9 +117,21 @@ from typing import Optional
 
 ANSWER_STATE_RX = re.compile(
     r"^(?:_pending_\w+|\w+_offer|pending_event|_last_turn|_last_undo)$")
+# A sticky MODE owns the next words exactly as a parked question does, and
+# the rung that reads it judges his words as a steer rather than a command:
+# the ringing alarm ("stop" / "snooze"), lecture notes ("end notes"),
+# dictation ("end dictation"). Two of these rungs were invisible until
+# 09-06 -- "uh, stop" did not silence a six o'clock alarm, "uh, end notes"
+# was filed as a note -- because their state has no _pending_ in its name.
+MODE_STATE = frozenset({"ringing", "lecture_course", "dictation"})
 ANSWER_STATE_CALLS = frozenset({"pending"})       # router.pending()
 CANONICAL = frozenset({"strip_fillers", "strip_inline_fillers"})
 WORD_PARAMS = frozenset({"text", "said"})
+# The channel flag. A ``str`` like the words, and never the words: it is
+# compared to "voice" and never parsed. The one parameter name the taint
+# skips, and it fails LOUD if a rung ever carried words under that name
+# (a false site), never silent.
+FLAG_PARAMS = frozenset({"source"})
 DISPATCHER_RUNGS = 3          # a callee calling this many rungs is not followed
 ROUTER_SITES = 4              # ...nor a command-path callee with this many own grammars
 ROUTER_FANOUT = 3             # ...nor one handing the words to this many callees
@@ -114,6 +151,24 @@ _NOT_DUCK = frozenset({
 _FLAGS_RX = re.compile(r"^(?:\(\?[aiLmsux]+\))+")
 _OPENERS_RX = re.compile(r"^(?:\(\?:|\()+")
 _SITE_METHODS = ("match", "fullmatch", "search", "sub", "subn")
+# A start-anchored grammar that is not a regex at all: "yes" in
+# ``text.startswith(("yes", "yeah"))``, or the whole reply in
+# ``t in ("yes", "y")``. The adversary's P2 (09-06) walked straight past
+# the census with one of these.
+_EDGE_METHODS = ("startswith", "endswith")
+
+
+def is_answer_state(name: str) -> bool:
+    return bool(ANSWER_STATE_RX.match(name)) or name in MODE_STATE
+
+
+# The str methods: a parameter these are called on is being read as WORDS.
+_STR_METHODS = frozenset({
+    "lower", "upper", "casefold", "strip", "lstrip", "rstrip", "split",
+    "rsplit", "splitlines", "startswith", "endswith", "replace", "title",
+    "capitalize", "partition", "rpartition", "find", "rfind", "isdigit",
+    "isalpha", "encode", "removeprefix", "removesuffix", "count", "index",
+})
 
 
 @dataclass(frozen=True)
@@ -143,8 +198,10 @@ class _Module:
     path: str
     tree: ast.Module
     consts: dict = field(default_factory=dict)
-    regexes: dict = field(default_factory=dict)      # name -> pattern | None
+    regexes: dict = field(default_factory=dict)      # name | "Class.attr" -> pattern | None
     collections: dict = field(default_factory=dict)  # name -> [pattern | None]
+    wordsets: dict = field(default_factory=dict)     # name -> [str, ...] (a tuple/set of words)
+    tabled: set = field(default_factory=set)         # functions a module-level TABLE dispatches to
     imports: dict = field(default_factory=dict)      # local -> (module path, name | None)
     functions: dict = field(default_factory=dict)    # qualname -> FunctionDef
 
@@ -157,6 +214,7 @@ class Census:
     parsers: set = field(default_factory=set)        # (module, qualname)
     dispatchers: set = field(default_factory=set)
     routers: set = field(default_factory=set)        # command-path callees not followed
+    handlers: set = field(default_factory=set)       # table-dispatched: on the command path by construction
     command_path: set = field(default_factory=set)
     kinds: dict = field(default_factory=dict)        # (module, qualname) -> strip|sink|pass
     known: dict = field(default_factory=dict)        # (module, qualname) -> the name given
@@ -180,6 +238,7 @@ class Census:
                  f"derived strippers: {len(self.strippers())}  sinks: {len(self.sinks())}  "
                  f"known strippers: {sorted(q for _, q in self.known)}",
                  f"dispatchers: {sorted(q for _, q in self.dispatchers)}",
+                 f"table-dispatched handlers (never rungs): {len(self.handlers)}",
                  f"routers not followed: {sorted(q for _, q in self.routers)}",
                  f"sites: {len(self.sites)}  unstripped: {len(self.unstripped())}"]
         lines += ["  " + str(s) for s in sorted(self.sites, key=lambda s: (s.module, s.lineno))]
@@ -245,15 +304,34 @@ def _load(root: pathlib.Path) -> dict:
         m = _Module(rel, ast.parse(f.read_text()))
         pkg_dir = f.parent
         for node in m.tree.body:
+            bound = None
             if isinstance(node, ast.Assign) and len(node.targets) == 1 \
                     and isinstance(node.targets[0], ast.Name):
-                name, val = node.targets[0].id, node.value
+                bound = (node.targets[0].id, node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                    and node.value is not None:      # REGISTRY: list[Command] = [...]
+                bound = (node.target.id, node.value)
+            if bound is not None:
+                name, val = bound
                 if _is_re_compile(val):
                     m.regexes[name] = _resolve(val.args[0], m.consts) if val.args else None
                 elif isinstance(val, (ast.Tuple, ast.List)) and val.elts \
                         and all(_is_re_compile(e) for e in val.elts):
                     m.collections[name] = [
                         _resolve(e.args[0], m.consts) if e.args else None for e in val.elts]
+                elif _words_of(val) is not None:
+                    m.wordsets[name] = _words_of(val)
+                elif isinstance(val, (ast.List, ast.Tuple)) and val.elts \
+                        and all(isinstance(e, ast.Call) for e in val.elts):
+                    # A dispatch TABLE: ``REGISTRY = [Command("send file",
+                    # _SEND_FILE_RX.match, _h_send_file), ...]``. A function
+                    # named in one runs on words the table already matched
+                    # as a COMMAND; it is never judging a reply, however
+                    # many _pending_ slots it reads while doing its job.
+                    for e in val.elts:
+                        for a in list(e.args) + [k.value for k in e.keywords]:
+                            if isinstance(a, ast.Name):
+                                m.tabled.add(a.id)
                 else:
                     s = _resolve(val, m.consts)
                     if s is not None:
@@ -298,8 +376,44 @@ def _load(root: pathlib.Path) -> dict:
                 for sub in node.body:
                     if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         m.functions[f"{node.name}.{sub.name}"] = sub
+                    # A regex held on the CLASS (``_RX = re.compile(...)`` in
+                    # the body, read as ``self._RX``): the adversary's P5.
+                    elif isinstance(sub, ast.Assign) and len(sub.targets) == 1 \
+                            and isinstance(sub.targets[0], ast.Name) \
+                            and _is_re_compile(sub.value):
+                        m.regexes[f"{node.name}.{sub.targets[0].id}"] = (
+                            _resolve(sub.value.args[0], m.consts) if sub.value.args else None)
+                # ...or bound on the instance in __init__, from a compile or
+                # from a module regex.
+                init = next((s for s in node.body if isinstance(s, ast.FunctionDef)
+                             and s.name == "__init__"), None)
+                for st in (ast.walk(init) if init is not None else ()):
+                    if isinstance(st, ast.Assign) and len(st.targets) == 1 \
+                            and isinstance(st.targets[0], ast.Attribute) \
+                            and isinstance(st.targets[0].value, ast.Name) \
+                            and st.targets[0].value.id == "self":
+                        if _is_re_compile(st.value):
+                            m.regexes[f"{node.name}.{st.targets[0].attr}"] = (
+                                _resolve(st.value.args[0], m.consts) if st.value.args else None)
+                        elif isinstance(st.value, ast.Name) and st.value.id in m.regexes:
+                            m.regexes[f"{node.name}.{st.targets[0].attr}"] = m.regexes[st.value.id]
         mods[rel] = m
     return mods
+
+
+def _words_of(node):
+    """The strings of a literal tuple / list / set of words, or of a
+    ``frozenset({...})`` / ``set([...])`` / ``tuple(...)`` over one; else
+    None."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id in ("frozenset", "set", "tuple", "list") \
+            and len(node.args) == 1:
+        node = node.args[0]
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and node.elts \
+            and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    for e in node.elts):
+        return [e.value for e in node.elts]
+    return None
 
 
 # ------------------------------------------------------------- answer state
@@ -310,13 +424,20 @@ def answer_state_tokens(fn) -> list:
     ``_offer`` and reads nothing, so the func of a Call never counts."""
     called = {n.func for n in ast.walk(fn)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    # A MODE name as a bare string is a VALUE elsewhere ("ringing" is an
+    # alarm item's state in timekeeper.py), so for modes only the
+    # ``getattr(x, "ringing", None)`` spelling counts as a read.
+    getattr_keys = {n.args[1] for n in ast.walk(fn)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "getattr" and len(n.args) >= 2}
     found = []
     for n in ast.walk(fn):
         if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) \
-                and n not in called and ANSWER_STATE_RX.match(n.attr):
+                and n not in called and is_answer_state(n.attr):
             found.append("." + n.attr)
-        elif isinstance(n, ast.Constant) and isinstance(n.value, str) \
-                and ANSWER_STATE_RX.match(n.value):
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and (
+                ANSWER_STATE_RX.match(n.value)
+                or (n.value in MODE_STATE and n in getattr_keys)):
             found.append(repr(n.value))
         elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
                 and n.func.attr in ANSWER_STATE_CALLS and not n.args:
@@ -346,7 +467,37 @@ def _annotated_str(fn, name) -> bool:
 
 
 def _word_param(fn, name) -> bool:
+    if name in FLAG_PARAMS:
+        return False
     return name in WORD_PARAMS or _annotated_str(fn, name)
+
+
+def _object_only(fn, name) -> bool:
+    """Is every use of the parameter an OBJECT use -- an attribute read or
+    a non-string method (``c.services``, ``m.group(1)``, ``item.label``)?
+    Then it is not his words, whatever the taint would otherwise say."""
+    parents = {child: parent for parent in ast.walk(fn)
+               for child in ast.iter_child_nodes(parent)}
+    uses = [n for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)]
+    if not uses:
+        return False                     # unused: nothing says it is not words
+    return all(isinstance(parents.get(u), ast.Attribute)
+               and parents[u].value is u
+               and parents[u].attr not in _STR_METHODS for u in uses)
+
+
+def _rung_params(fn) -> dict:
+    """EVERY positional parameter of a rung carries his words on entry,
+    whatever it is called and however it is annotated -- a rung is where
+    the utterance arrives, and the adversary's P4 (09-06) hid it under
+    ``utterance`` with no annotation. Skipped: the channel flag, and a
+    parameter the body only ever treats as an OBJECT (the commander and
+    the match a registry handler receives as ``c`` and ``m``) -- tainting
+    those was measured to plant false sites in the send-file handler."""
+    return {p: False for p in _params(fn)
+            if p not in FLAG_PARAMS
+            and (p in WORD_PARAMS or _annotated_str(fn, p) or not _object_only(fn, p))}
 
 
 def _utterance(fn) -> Optional[str]:
@@ -415,36 +566,62 @@ class _Flow:
                     self.state.pop(n.id, None)   # rebound to something clean
 
 
-def _regex_of(node, mod: _Module, mods: dict, loops: dict):
-    """(regex name, pattern) for the object a .match/.search/... is called
-    on, or None."""
-    v = node.func.value
+def _regex_value(v, mod: _Module, mods: dict, local: dict, cls=None):
+    """(label, pattern) for an EXPRESSION that evaluates to a compiled
+    regex -- a module regex by name, a loop variable or LOCAL ALIAS over
+    one (``rx = _NO_RX``; the adversary's P6), one held on the class or
+    the instance (``self._RX``; P5), one imported, or a ``re.compile``
+    in place -- else None."""
     if isinstance(v, ast.Name):
+        if v.id in local:
+            return local[v.id]
         if v.id in mod.regexes:
             return v.id, mod.regexes[v.id]
-        if v.id in loops:
-            coll = loops[v.id]
-            pats = mod.collections.get(coll, [])
-            return f"{coll}[*]", (pats[0] if pats else None)
         if v.id in mod.imports:
             path, name = mod.imports[v.id]
             other = mods.get(path)
             if other and name in other.regexes:
                 return v.id, other.regexes[name]
-        if v.id == "re" and node.args:
-            pat = _resolve(node.args[0], mod.consts)
-            label = (pat or ast.unparse(node.args[0]))[:32]
-            return f"re.{node.func.attr}({label!r})", pat
-    if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) \
-            and v.value.id in mod.imports:
-        path, _ = mod.imports[v.value.id]
-        other = mods.get(path)
-        if other and v.attr in other.regexes:
-            return f"{v.value.id}.{v.attr}", other.regexes[v.attr]
+        return None
+    if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name):
+        if v.value.id in ("self", "cls") and cls and f"{cls}.{v.attr}" in mod.regexes:
+            return f"self.{v.attr}", mod.regexes[f"{cls}.{v.attr}"]
+        if v.value.id in mod.imports:
+            path, _ = mod.imports[v.value.id]
+            other = mods.get(path)
+            if other and v.attr in other.regexes:
+                return f"{v.value.id}.{v.attr}", other.regexes[v.attr]
+        return None
     if _is_re_compile(v):
         pat = _resolve(v.args[0], mod.consts) if v.args else None
         return f"re.compile({(pat or '?')[:32]!r})", pat
+    if isinstance(v, ast.IfExp):                 # rx = _A_RX if x else _B_RX
+        return _regex_value(v.body, mod, mods, local, cls) \
+            or _regex_value(v.orelse, mod, mods, local, cls)
     return None
+
+
+def _regex_of(node, mod: _Module, mods: dict, local: dict, cls=None):
+    """(regex name, pattern) for the object a .match/.search/... is called
+    on, or None. ``local`` maps a loop variable or alias to its regex."""
+    v = node.func.value
+    if isinstance(v, ast.Name) and v.id == "re" and node.args:
+        pat = _resolve(node.args[0], mod.consts)
+        label = (pat or ast.unparse(node.args[0]))[:32]
+        return f"re.{node.func.attr}({label!r})", pat
+    return _regex_value(v, mod, mods, local, cls)
+
+
+def _is_wordset(node, mod: _Module) -> bool:
+    return _words_of(node) is not None or (
+        isinstance(node, ast.Name) and node.id in mod.wordsets)
+
+
+def _wordset_label(node, mod: _Module) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    words = _words_of(node) or []
+    return ",".join(repr(w) for w in words[:2]) + (",…" if len(words) > 2 else "")
 
 
 def _ordered(fn):
@@ -490,37 +667,60 @@ def _callee(call, mod: _Module, mods: dict, qualname: str):
     return [], True
 
 
-def _walk_flow(fn, mod: _Module, mods: dict, flow: _Flow, on_site=None, on_return=None):
-    """Run the flow over a function in source order. ``on_site`` sees each
-    regex application on tainted words; ``on_return`` sees each returned
-    expression."""
-    loops = {}
+def _walk_flow(fn, mod: _Module, mods: dict, flow: _Flow, on_site=None, on_return=None,
+               cls=None):
+    """Run the flow over a function in source order. ``on_site(node,
+    label, method, arg)`` sees each grammar applied to tainted words -- a
+    regex site, a ``startswith`` / ``endswith``, or ``x in (...)``;
+    ``on_return`` sees each returned expression."""
+    local = {}                    # loop variable or alias -> (label, pattern)
     for n in _ordered(fn):
-        if isinstance(n, ast.For) and isinstance(n.target, ast.Name) \
-                and isinstance(n.iter, ast.Name) and n.iter.id in mod.collections:
-            loops[n.target.id] = n.iter.id
+        if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+            if isinstance(n.iter, ast.Name) and n.iter.id in mod.collections:
+                pats = mod.collections[n.iter.id]
+                local[n.target.id] = (f"{n.iter.id}[*]", pats[0] if pats else None)
+            elif isinstance(n.iter, (ast.Tuple, ast.List)):
+                rxs = [r for r in (_regex_value(e, mod, mods, local, cls)
+                                   for e in n.iter.elts) if r]
+                if rxs:
+                    local[n.target.id] = ("(" + "|".join(r[0] for r in rxs) + ")[*]", rxs[0][1])
         elif isinstance(n, ast.Assign):
             flow.assign(n.targets, n.value)
+            if len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                rx = _regex_value(n.value, mod, mods, local, cls)
+                if rx:
+                    local[n.targets[0].id] = rx
+                else:
+                    local.pop(n.targets[0].id, None)
         elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and n.value is not None:
             flow.assign([n.target], n.value)
         elif isinstance(n, ast.NamedExpr):
             flow.assign([n.target], n.value)
         elif isinstance(n, ast.Return) and n.value is not None and on_return:
             on_return(n)
-        if on_site and isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
-                and n.func.attr in _SITE_METHODS:
-            rx = _regex_of(n, mod, mods, loops)
-            if rx is None:
-                continue
-            name, pat = rx
-            idx = 1 if n.func.attr in ("sub", "subn") else 0
-            if name.startswith("re."):
-                idx += 1                       # re.match(pattern, string)
-            if len(n.args) <= idx or not flow.tainted(n.args[idx]):
-                continue
-            if n.func.attr not in ("match", "fullmatch") and not anchored(pat):
-                continue
-            on_site(n, name, n.args[idx])
+        if not on_site:
+            continue
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in _SITE_METHODS:
+                rx = _regex_of(n, mod, mods, local, cls)
+                if rx is None:
+                    continue
+                name, pat = rx
+                idx = 1 if n.func.attr in ("sub", "subn") else 0
+                if name.startswith("re."):
+                    idx += 1                       # re.match(pattern, string)
+                if len(n.args) <= idx or not flow.tainted(n.args[idx]):
+                    continue
+                if n.func.attr not in ("match", "fullmatch") and not anchored(pat):
+                    continue
+                on_site(n, name, n.func.attr, n.args[idx])
+            elif n.func.attr in _EDGE_METHODS and n.args and flow.tainted(n.func.value):
+                label = f"{n.func.attr}({ast.unparse(n.args[0])[:32]})"
+                on_site(n, label, n.func.attr, n.func.value)
+        elif isinstance(n, ast.Compare) and len(n.ops) == 1 \
+                and isinstance(n.ops[0], (ast.In, ast.NotIn)) \
+                and _is_wordset(n.comparators[0], mod) and flow.tainted(n.left):
+            on_site(n, f"in({_wordset_label(n.comparators[0], mod)})", "in", n.left)
 
 
 # ------------------------------------------------------------------- census
@@ -533,9 +733,17 @@ def census(root, known_strippers: dict = None) -> Census:
     out = Census(root=root)
     out.known = dict(known_strippers or {})
 
-    # -- rungs: anything that reads answer state
+    # -- handlers: what a module-level dispatch table names (the registry)
+    for path, m in mods.items():
+        for name in m.tabled:
+            if name in m.functions:
+                out.handlers.add((path, name))
+
+    # -- rungs: anything that reads answer state -- and is not a handler
     for path, m in mods.items():
         for q, fn in m.functions.items():
+            if (path, q) in out.handlers:
+                continue
             tokens = answer_state_tokens(fn)
             if tokens:
                 out.rungs.add((path, q))
@@ -608,11 +816,12 @@ def census(root, known_strippers: dict = None) -> Census:
         words = set(_word_params(fn))
         if not words:
             return 0
+        cls = q.split(".")[0] if "." in q else None
         n_sites = 0
         for n in ast.walk(fn):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
                     and n.func.attr in ("match", "fullmatch") and n.args \
-                    and _regex_of(n, m, mods, {}) is not None \
+                    and _regex_of(n, m, mods, {}, cls) is not None \
                     and {x.id for x in ast.walk(n.args[0]) if isinstance(x, ast.Name)} & words:
                 n_sites += 1
         return n_sites
@@ -687,14 +896,19 @@ def census(root, known_strippers: dict = None) -> Census:
         frontier = nxt
 
     # A ROUTER on it is not followed; a leaf is. A router hands the words
-    # on to another command-path callee (_match_assistant ->
-    # _send_file_pieces), or applies ROUTER_SITES grammars of its own, or
-    # fans them out to ROUTER_FANOUT callees. quiet_kind hands them to
-    # nobody: a leaf, followed.
+    # on to another command-path callee that CONSUMES them
+    # (_match_assistant -> _send_file_pieces), or applies ROUTER_SITES
+    # grammars of its own, or fans them out to ROUTER_FANOUT callees.
+    # quiet_kind hands them to nobody: a leaf, followed. Handing the words
+    # to a string HELPER -- one derived as a stripper or a passthrough,
+    # which gives the words back (_lecture_end -> strip_address) -- is not
+    # routing either: under the old rule it was, and the lecture end
+    # grammar sat behind that door unwalked (09-06).
+    helpers = {c for c in out.command_path if out.kinds.get(c) in ("strip", "pass")}
     for c in out.command_path:
         hands = handed_to(*c, derived=True)
         if own_sites(*c) >= ROUTER_SITES or len(hands) >= ROUTER_FANOUT \
-                or hands & out.command_path:
+                or (hands & out.command_path) - helpers:
             out.routers.add(c)
 
     # -- the walk: from every rung, his words into every parser
@@ -708,21 +922,27 @@ def census(root, known_strippers: dict = None) -> Census:
             return
         visited.add(key)
         m, fn = mods[path], mods[path].functions[q]
+        cls = q.split(".")[0] if "." in q else None
         flow = _Flow(tainted, classify_for(m, q))
         entry_stripped = bool(tainted) and all(tainted.values())
 
-        def on_site(n, name, arg):
+        def on_site(n, name, method, arg):
             stripped = flow.stripped(arg)
             text = ast.unparse(arg)
             via = ("stripped on entry" if entry_stripped and stripped
                    and not any(s in text for s in CANONICAL)
                    else ("here" if stripped else "raw"))
-            site = Site(path, q, name, n.func.attr, text, stripped, via, n.lineno, chain)
-            prev = seen_sites.get((site.key, site.lineno))
+            site = Site(path, q, name, method, text, stripped, via, n.lineno, chain)
+            # One record per site PER RUNG: strip_address is reached raw
+            # from the lecture rung (the filed line, by design) and
+            # stripped from the correction rung, and a regression on the
+            # second must not hide behind the first.
+            head = chain.split(" > ")[0]
+            prev = seen_sites.get((site.key, site.lineno, head))
             if prev is None or (prev.stripped and not site.stripped):
-                seen_sites[(site.key, site.lineno)] = site
+                seen_sites[(site.key, site.lineno, head)] = site
 
-        _walk_flow(fn, m, mods, flow, on_site=on_site)
+        _walk_flow(fn, m, mods, flow, on_site=on_site, cls=cls)
 
         # the same walk again for the calls, with the flow now settled
         flow2 = _Flow(tainted, classify_for(m, q))
@@ -772,7 +992,7 @@ def census(root, known_strippers: dict = None) -> Census:
     # that is also a dispatcher is walked for nothing -- its own body is
     # the command path.
     for path, q in sorted(out.rungs - out.dispatchers):
-        words = _word_params(mods[path].functions[q])
+        words = _rung_params(mods[path].functions[q])
         if words:
             visit(path, q, words, 0)
 

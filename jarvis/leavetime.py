@@ -178,7 +178,13 @@ def parse_minutes(text: str) -> Optional[int]:
 _ANSWER_FILLER = ("it's", "its", "it is", "about", "around", "maybe",
                   "roughly", "probably", "takes", "it takes", "i need",
                   "i'd need", "i would need", "call it", "say", "like",
-                  "oh", "uh", "um", "a good")
+                  "oh", "a good")
+# No "uh" / "um" here any more (09-06): the filled pause is one
+# vocabulary, jarvis.endpoint.FILLER_WORDS, and it comes off at the rung
+# (Commander._try_leave_answer) before this list sees the words. The two
+# entries this list kept were a second list, and a second list drifts --
+# it had two of the thirteen spellings and needed "uh " with a space
+# where Whisper writes "Uh, fifteen."
 _ANSWER_TAIL = ("or so", "or so sir", "sir", "walk", "away", "from here",
                 "on foot", "there", "to get there", "each way", "please")
 ANSWER_MAX_WORDS = 4

@@ -56,9 +56,10 @@ KNOWN_STRIPPERS = {
         "on; the maybe judgement in _try_send_confirm now strips at its own call site. "
         "Probed word by word by test_filled_yes.TestTheSendReadBackMaybe.",
 }
-# The OTHER pre-existing list, leavetime._ANSWER_FILLER, needs no stripper
-# row: answer_minutes returns an int and the derivation reads it as a sink.
-# The one site behind it is a KNOWN_UNSTRIPPED row below, owned by it.
+# The OTHER pre-existing list, leavetime._ANSWER_FILLER, needs no row at
+# all since round 3 (09-06): the rung hands answer_minutes the stripped
+# text, so its startswith loop and the parser behind it are reached
+# stripped on entry, and its "uh"/"um" entries are gone.
 
 # Every site the census reports UNSTRIPPED, and why it stays.
 #   command grammar: a grammar the dispatcher applies to every utterance,
@@ -71,13 +72,14 @@ KNOWN_STRIPPERS = {
 #     a pre-existing second vocabulary -- named, backstopped or probed.
 # Rows are (kind, owner, reason); the owner is the list's function for a
 # second-list row and "" for a command grammar.
+#   filed: the words are FILED, not judged -- a lecture line -- and nothing
+#     may be taken off them; the grammar that JUDGES the same utterance
+#     (the end phrase) is a separate, stripped site. Owner: the rung.
+#   not words: the mode convention (MODE_STATE) made a rung of a helper
+#     whose parameter is a tool argument, never the utterance; the grammar
+#     it reaches is over that argument. Owner: the rung. A false hit named
+#     here rather than silenced in the derivation.
 KNOWN_UNSTRIPPED = {
-    "commander.py:quiz_kind:_QUIZ_RX": (
-        "command grammar", "",
-        "\"quiz me on X\" over an open card drops the session for the new quiz, "
-        "which the REGISTRY then starts from the unstripped words."),
-    "commander.py:review_kind:_REVIEW_RX": (
-        "command grammar", "", "the same, for \"review my flashcards\"."),
     "commander.py:read_control_kind:_READ_CTL_RX": (
         "command grammar", "",
         "\"skip\" while something is being READ belongs to the reader (rung 4b), "
@@ -87,11 +89,16 @@ KNOWN_UNSTRIPPED = {
         "second list", "_send_clean",
         "the send lane's own lead list, inside _send_clean itself; backstopped by "
         "the canonical strip after it, hole and probe named on KNOWN_STRIPPERS."),
-    "leavetime.py:parse_minutes:re.fullmatch": (
-        "second list", "answer_minutes",
-        "the duration parser, reached only through answer_minutes, whose own "
-        "startswith loop (leavetime._ANSWER_FILLER) has already taken the filler "
-        "off. Probed word by word by test_filled_yes.TestTheLeaveTimeList."),
+    "commander.py:strip_address:_ADDRESS_RX": (
+        "filed", "Commander._handle_lecture",
+        "the lecture LINE: strip_address takes the address off the line that is "
+        "filed, and the line is filed as he said it -- an \"um\" in a lecture note "
+        "is dictation. The end phrase is judged by _lecture_end, stripped."),
+    "tools/timekeeper.py:normalize_kind:in": (
+        "not words", "adjust_empty_line",
+        "a tool's kind argument (\"alarm\" / \"timer\"), never the utterance: "
+        "adjust_empty_line reads tk.ringing to phrase a line, the mode convention "
+        "makes it a rung, and the in-tuple grammar it reaches is over the kind."),
 }
 
 
@@ -162,6 +169,9 @@ def test_the_known_rows_are_still_the_kind_they_claim(cen):
             elif kind == "second list":
                 assert s.function == owner or owner in s.chain.split(" > "), \
                     f"{key}: reached outside {owner}: <{s.chain}>"
+            elif kind in ("filed", "not words"):
+                assert s.chain.split(" > ")[0] == owner, \
+                    f"{key}: reached from a rung other than {owner}: <{s.chain}>"
             else:
                 pytest.fail(f"unknown kind {kind!r} on {key}")
 
@@ -201,6 +211,9 @@ RUNGS_FLOOR = {
     ("commander.py", "Commander._try_study_offer"),
     ("commander.py", "Commander._try_undo"),
     ("app.py", "JarvisApp.uncertain_answer"),
+    # the two MODE rungs round 2 of the adversary found invisible (09-06)
+    ("commander.py", "Commander._try_ringing"),
+    ("commander.py", "Commander._handle_lecture"),
 }
 # The sites that were gaps on this branch, every one measured bare vs
 # filled in tests/test_filled_yes.py. They must stay VISIBLE and stripped.
@@ -231,6 +244,17 @@ SITES_FLOOR = {
     "dialogue.py:enough_kind:_ENOUGH_RX",
     "dialogue.py:WeekPlanner.settle:_YES_RX",
     "router.py:answer_kind:_ANSWER_CLAUDE_RX",
+    # round 3 (09-06): the two mode rungs, the quiz escape, the second
+    # lists now reached stripped, the non-regex grammars, the undo lane
+    "commander.py:Commander._try_ringing:_RING_STOP_RX",
+    "commander.py:Commander._try_ringing:_SNOOZE_RX",
+    "commander.py:_lecture_end:_LECTURE_END_RX",
+    "commander.py:quiz_kind:_QUIZ_RX",
+    "commander.py:review_kind:_REVIEW_RX",
+    "commander.py:parse_yes_no:in(_YES_WORDS)",
+    "commander.py:_undo_match:_UNDO_RX",
+    "leavetime.py:answer_minutes:startswith(word + ' ')",
+    "leavetime.py:parse_minutes:re.fullmatch",
 }
 
 
@@ -239,11 +263,22 @@ def test_the_floor_of_rungs_is_still_found(cen):
     assert not missing, f"the census lost these rungs: {sorted(missing)}"
 
 
+def _on_floor(key: str) -> bool:
+    return key in SITES_FLOOR or any(key.startswith(k + "(") for k in SITES_FLOOR)
+
+
 def test_the_floor_of_sites_is_still_found_and_stripped(cen):
     keys = set(cen.keys())
-    missing = SITES_FLOOR - keys
+    missing = [k for k in SITES_FLOOR if not any(_on_floor(x) and (x == k or x.startswith(k + "("))
+                                                 for x in keys)]
     assert not missing, f"the census lost these sites: {sorted(missing)}"
-    lost = [s for s in cen.sites if s.key in SITES_FLOOR and not s.stripped]
+    def _named_chain(s) -> bool:
+        """The one chain a KNOWN row owns (the lecture line through
+        strip_address): unstripped by design, and pinned by its own test."""
+        k = _known_for(s.key)
+        return bool(k) and s.chain.split(" > ")[0] == KNOWN_UNSTRIPPED[k][1]
+
+    lost = [s for s in cen.sites if _on_floor(s.key) and not s.stripped and not _named_chain(s)]
     assert not lost, "a fixed site went unstripped again:\n" + "\n".join(map(str, lost))
 
 
@@ -421,3 +456,126 @@ def test_the_canonical_strippers_are_the_one_vocabulary():
 def test_the_census_imports_nothing_from_jarvis():
     src = pathlib.Path(answercensus.__file__).read_text()
     assert "import jarvis" not in src and "from jarvis" not in src
+
+
+# ===================================================================
+# 5. THE ADVERSARY'S EIGHT PLANTS (round 2, 09-06): caught or BLIND
+# ===================================================================
+# Each plant is one rung in a package of its own. Six left the census
+# GREEN in round 2 (P2, P3, P4, P5, P6, P8); the census now catches P2,
+# P4, P5 and P6. P3 and P8 are BLIND, and stated so in the module's
+# docstring: the test below asserts the blindness too, so that a census
+# that learns to see one of them fails here and the docstring is moved.
+_PLANT_HEAD = '''
+import re
+from fake.endpoint import strip_fillers
+
+_P_RX = re.compile(r"^(?:yes|yeah)[.!]*$", re.I)
+
+
+class Commander:
+'''
+PLANTS = {
+    # a raw ^-regex on the raw words inside a walked rung
+    "P1": (_PLANT_HEAD + '''
+    def _try_briefing_offer(self, text: str):
+        if not self.services.briefing_offer:
+            return None
+        return "yes" if _P_RX.match(text) else None
+''', "rungs.py:Commander._try_briefing_offer:_P_RX"),
+    # the grammar is a startswith, not a regex
+    "P2": (_PLANT_HEAD + '''
+    def _try_briefing_offer(self, text: str):
+        if not self.services.briefing_offer:
+            return None
+        return "yes" if text.lower().startswith(("yes", "yeah")) else None
+''', "rungs.py:Commander._try_briefing_offer:startswith(('yes', 'yeah'))"),
+    # a new rung on a slot OUTSIDE the naming convention
+    "P3": (_PLANT_HEAD + '''
+    def _try_confirm(self, text: str):
+        if self._awaiting_confirm is None:
+            return None
+        self._awaiting_confirm = None
+        return "yes" if _P_RX.match(text) else None
+''', None),
+    # the words arrive under a name that is not text/said, unannotated
+    "P4": (_PLANT_HEAD + '''
+    def _try_pending(self, utterance):
+        if self._pending_thing is None:
+            return None
+        return "yes" if _P_RX.match(utterance) else None
+''', "rungs.py:Commander._try_pending:_P_RX"),
+    # the regex is held on the class
+    "P5": (_PLANT_HEAD + '''
+    _PLANT_RX = re.compile(r"^(?:yes|yeah)[.!]*$", re.I)
+
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        return "yes" if self._PLANT_RX.match(text) else None
+''', "rungs.py:Commander._try_pending:self._PLANT_RX"),
+    # a local alias of the regex
+    "P6": (_PLANT_HEAD + '''
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        rx = _P_RX
+        return "yes" if rx.match(text) else None
+''', "rungs.py:Commander._try_pending:_P_RX"),
+    # a NEW rung on a _pending_* slot with a raw grammar
+    "P7": (_PLANT_HEAD + '''
+    def _try_new_thing(self, text: str):
+        if getattr(self, "_pending_new_thing", None) is None:
+            return None
+        return "yes" if _P_RX.match(text) else None
+''', "rungs.py:Commander._try_new_thing:_P_RX"),
+    # a strip on ONE branch only, last in source order
+    "P8": (_PLANT_HEAD + '''
+    def _try_pending(self, text: str):
+        if self._pending_thing is None:
+            return None
+        t = text
+        if self.flag:
+            t = strip_fillers(text)
+        return "yes" if _P_RX.match(t) else None
+''', None),
+}
+BLIND = {"P3", "P8"}
+
+
+@pytest.mark.parametrize("name", sorted(PLANTS))
+def test_the_adversarys_plant_is_caught_or_declared_blind(tmp_path, name):
+    body, key = PLANTS[name]
+    c = _plant(tmp_path, body)
+    unstripped = {s.key for s in c.unstripped()}
+    if name in BLIND:
+        assert key is None and not unstripped, \
+            f"{name} is now CAUGHT ({sorted(unstripped)}): move it out of the " \
+            f"blind spots in answercensus.py's docstring and out of BLIND here"
+    else:
+        assert key in unstripped, f"{name} walked past the census: {sorted(unstripped)}"
+
+
+def test_a_registry_handler_is_derived_from_the_table_and_is_never_a_rung(cen):
+    """_h_send_file reads _pending_send while RUNNING a command the registry
+    already matched; it is not judging a reply. The handlers come from the
+    REGISTRY table itself, not from a list of names."""
+    assert len(cen.handlers) > 100
+    assert ("commander.py", "_h_send_file") in cen.handlers
+    assert ("commander.py", "_h_quiz_stop") in cen.handlers
+    assert not {h for h in cen.handlers} & cen.rungs
+
+
+def test_the_two_mode_rungs_are_walked_and_stripped(cen):
+    """Round 2 (09-06): "uh, stop" over a ringing alarm and "uh, end notes"
+    over open lecture notes were lost, and the census reported both rungs
+    as rung=False, 0 sites."""
+    for rung in (("commander.py", "Commander._try_ringing"),
+                 ("commander.py", "Commander._handle_lecture")):
+        assert rung in cen.rungs, rung
+        assert rung not in cen.dispatchers, f"{rung} is a dispatcher: walked for nothing"
+    keys = {s.key: s for s in cen.sites}
+    for key in ("commander.py:Commander._try_ringing:_RING_STOP_RX",
+                "commander.py:Commander._try_ringing:_SNOOZE_RX",
+                "commander.py:_lecture_end:_LECTURE_END_RX"):
+        assert key in keys and keys[key].stripped, key

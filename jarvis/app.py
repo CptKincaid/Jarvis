@@ -4433,7 +4433,7 @@ class JarvisApp:
             return None
         commander = getattr(self, "commander", None)
         try:
-            addressed = strip_jarvis_prefix(text) is not None or \
+            addressed = strip_jarvis_prefix(strip_fillers(text)) is not None or \
                 bool(commander and commander._match_assistant(text))
         except Exception:  # noqa: BLE001 - a matcher failure must not eat the turn
             addressed = False

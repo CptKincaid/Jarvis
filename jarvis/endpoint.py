@@ -51,6 +51,9 @@ FILLER_WORDS = frozenset({
 # the dots can also arrive as their own token, which is why the loop below
 # skips a token that strips to nothing).
 _EDGE_PUNCT = ".,;:!?…-—–'\"()[]"
+# The punctuation that ends a SENTENCE, as opposed to separating its words:
+# what strip_fillers() carries over from a dropped trailing filler.
+_TERMINAL = ".!?…"
 # What strip_fillers() below walks over from either end: a filler, or a
 # token that was only punctuation. Built once -- it is read inside a loop.
 _SKIPPABLE = FILLER_WORDS | {""}
@@ -108,7 +111,23 @@ def strip_fillers(text) -> str:
     come off with it: the grammars end on ``[?.!]*$`` and a dangling comma
     is as fatal to them as the filler was. A terminal . ! ? is kept --
     "yes." and "yes?" are different answers, and the question mark is a
-    bar on the send read-back.
+    bar on the send read-back -- AND IT IS KEPT WHEN IT RODE ON THE
+    DROPPED TAIL: "yes, uh?" -> "yes?", not "yes". Whisper hangs the
+    rising intonation on the last token, and the last token was the
+    filler. Round 2 of the adversary (09-06) measured what dropping it
+    did: through the real handler with the state armed, "yes, uh?" SENT
+    the file, GRANTED the permission, OPENED the terminal and RAN the
+    strict destructive read-back, 520 of 520 forms, while the bare "yes?"
+    was refused every time. Mainline had the bar because the send lane's
+    own mid-sentence filler regex left "yes, ?" behind; the canonical
+    strip took the "?" with the "uh" and removed it. A "." or "!" on the
+    tail is carried the same way ("yes, uh." -> "yes."). A "?" is never
+    lost even when the kept part already ends on a "." ("yes. uh?" ->
+    "yes.?" -- ugly, and barred, which is the point), and never lost
+    when it sits in the MIDDLE of the dropped run ("yes, uh? uh" ->
+    "yes?"): wherever Whisper hung the rising tone, the sentence was a
+    question. Only the TRAILING run carries: a "?" on a leading filler
+    ("uh? yes") was him questioning his own hesitation, not his answer.
     """
     if not text:
         return ""
@@ -127,7 +146,22 @@ def strip_fillers(text) -> str:
         end -= 1
     if start == 0 and end == len(toks):
         return str(text)                    # nothing to do: hand it back whole
-    return " ".join(toks[start:end]).strip(" \t,;:-–—")
+    out = " ".join(toks[start:end]).strip(" \t,;:-–—")
+    if out and end < len(toks):
+        # The terminal punctuation of the dropped tail ("uh?", "um...",
+        # "uh ?" as its own token) belongs to the sentence, not the filler.
+        tail = toks[-1].rstrip("'\")]")
+        punct = tail[len(tail.rstrip(_TERMINAL)):]
+        # ...and a "?" anywhere in the dropped run is the bar, whichever
+        # token it landed on: "yes, uh? uh" is still a question.
+        if "?" not in punct and any("?" in tok for tok in toks[end:]):
+            punct += "?"
+        if punct:
+            if out[-1] not in _TERMINAL:
+                out += punct
+            elif "?" in punct and not out.endswith("?"):
+                out += "?"
+    return out
 
 
 class _Resampler:

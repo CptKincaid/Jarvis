@@ -152,7 +152,7 @@ class TestStripFillers:
         ("um yes", "yes"),
         ("uh, um, yeah", "yeah"),
         ("yeah, uh", "yeah"),
-        ("Um, yes, uh.", "yes,"),
+        ("Um, yes, uh.", "yes."),           # the tail's "." is carried (round 3)
         ("uh, what time is it", "what time is it"),
         ("yes", "yes"),
         ("", ""),
@@ -194,8 +194,10 @@ class TestStripFillers:
 # ===================================================================
 # 3. THE ROW HE HIT
 # ===================================================================
-@pytest.fixture
-def cmdr(tmp_path, monkeypatch):
+def make_cmdr(tmp_path, monkeypatch) -> Commander:
+    """The slim Commander every filled-pause test drives: a factory, so a
+    sibling module (test_hesitation_teeth) can build the same one without
+    importing this fixture by name."""
     monkeypatch.setenv("JARVIS_ASSISTANT_CONFIG", str(tmp_path / "assistant.json"))
     monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "intent_log.json")
     monkeypatch.setattr(CONFIG, "voice_cmds", True)
@@ -211,6 +213,11 @@ def cmdr(tmp_path, monkeypatch):
     svc.memory.suggest_by_habit.return_value = None
     svc.brain = SimpleNamespace(think=MagicMock(), chat=MagicMock())
     return Commander(svc)
+
+
+@pytest.fixture
+def cmdr(tmp_path, monkeypatch):
+    return make_cmdr(tmp_path, monkeypatch)
 
 
 def _offer(cmdr, ok=True):
@@ -811,13 +818,13 @@ class TestTheQuizSkip:
 #   _ENROL_CONFIRM_RX            "enrol" -> "uh, enrol" is not the word
 #   _SEND_MAYBE_RX (destructive) True  -> False   (the re-ask is lost)
 #
-# NOT fixed, and deliberately: quiz_kind / review_kind. They are COMMAND
-# grammars the registry shares, and a filled "uh, quiz me on the recipe"
-# spoken over an open card is graded rather than starting a new quiz.
-# Stripping at the quiz rung ALONE would drop the open session and still
-# not start the new one, because the registry would then be handed the
-# unstripped words -- so the fix belongs in the command grammar, which is
-# a different decision from this one. Pinned here as it stands today.
+# quiz_kind / review_kind: COMMAND grammars the registry shares. The
+# registry's copy stays unstripped (the 5caf86c ruling), but the quiz
+# rung's ESCAPE now runs on the stripped words (round 3, 09-06): a filled
+# "uh, quiz me on the recipe" over an open card drops the card ungraded
+# and routes on -- it used to reach the GRADER and mark the card wrong.
+# The registry may then not start the new quiz; a repeat, never a card.
+# Measured in test_hesitation_teeth.TestTheCardStandsOnAHesitation.
 class TestThePersonPick:
     """"Which Heather, sir?" -- the same ordinal leg as the file pick,
     which is why it was missed: two functions, one grammar."""
@@ -1280,10 +1287,14 @@ class TestTheDayShift:
 
 
 class TestTheLeaveTimeList:
-    """leavetime._ANSWER_FILLER is a second, pre-existing filler list and is
-    LEFT ALONE. It is named in the census as known; this is the probe that
-    keeps "not a live gap" a measured claim rather than a remembered one:
-    every word in the one vocabulary, in front of and behind a duration."""
+    """leavetime._ANSWER_FILLER is a second, pre-existing list. Round 2 of
+    the adversary contradicted "not a live gap": its "uh"/"um" entries
+    wanted "uh " with a space, Whisper writes "Uh, fifteen.", and only the
+    unit-word shapes below survived because _MIN_RX is a search. The rung
+    now strips canonically first and the two entries are gone
+    (test_hesitation_teeth.TestTheLeaveTimeAnswer measures the rung); this
+    probe stays as the record of what the list itself does with the one
+    vocabulary: the unit-word shapes, and nothing else."""
 
     @pytest.mark.parametrize("word", sorted(FILLER_WORDS))
     def test_every_filler_word_in_front_of_a_duration(self, word):
