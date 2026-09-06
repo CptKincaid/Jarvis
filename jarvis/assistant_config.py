@@ -1201,6 +1201,10 @@ DEFAULTS: dict = {
         # When a copy reaches HPCOMPUTER under your filename but arrives the
         # wrong size, may I delete that broken copy of mine? Off: it stays
         # there under your name and I only tell you about it.
+        # ON HAS A COST: I know that copy is mine by the name I took, and
+        # if you replace the file at that name between my copy landing and
+        # my size check, the delete takes YOUR file. Measured, and it is
+        # what the code does every time -- not a rare accident.
         "remove_broken_copies": False,
     },
     # jarvis/gate.py -- whether Jarvis answers whoever speaks, or only the

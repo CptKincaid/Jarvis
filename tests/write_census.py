@@ -61,10 +61,20 @@ MODULES = ("jarvis/foldersync.py", "jarvis/tools/remote.py")
 # out to be harmless costs one line in KNOWN; a name MISSING here costs a
 # file of his.
 WRITES = frozenset({
+    # THE ARBITRARY ONE, FIRST.  run_ssh runs a command line of our
+    # choosing on his Windows machine, so it is every write there is --
+    # del, rmdir /s, move, a redirect.  It had NO WORD HERE at all until
+    # round 5, and an adversary walked straight past the census with a
+    # method doing a run_ssh `del` on his Windows Inbox: zero rows, four
+    # green tests, the count unchanged at 63.  It is the most dangerous
+    # single name in this file and it belongs at the top of the list.
+    "run_ssh",
     # local
-    "replace", "rename", "link", "symlink", "unlink", "remove", "rmdir",
-    "mkdir", "makedirs", "write_text", "write_bytes", "open", "fdopen",
-    "truncate", "ftruncate", "move", "copy", "copy2", "copyfile", "utime",
+    "replace", "rename", "renames", "link", "symlink", "unlink", "remove",
+    "rmdir", "removedirs", "mkdir", "makedirs", "write_text", "write_bytes",
+    "open", "fdopen", "truncate", "ftruncate", "move", "copy", "copy2",
+    "copyfile", "copytree", "rmtree", "touch", "utime", "write",
+    "writelines", "mkstemp", "mkdtemp", "chmod", "chown",
     # remote
     "run_copy", "sftp_rename", "sftp_remove", "sftp_mkdir", "sftp_rmdir",
     "run_sftp", "push", "pull", "send", "claim", "discard", "fetch",
@@ -121,36 +131,95 @@ def _tail(name: str) -> str:
     return name.rsplit(".", 1)[-1]
 
 
-def _functions(tree: ast.AST):
-    """(qualified name, node) for every function, methods included."""
+SCOPED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _calls_in_scope(node) -> list:
+    """Every ``ast.Call`` that belongs to THIS scope and no deeper one.
+
+    Two corrections in one.  The old census walked each function whole, so a
+    write in a nested closure was counted against the OUTER function as well
+    -- a single call site showing up as two rows, which is exactly the kind
+    of double vision that makes an occurrence count meaningless.  And it
+    started at FunctionDef, so a scope with no function around it did not
+    exist: DEFEAT 3, a module-level ``write_text`` guarded by an environment
+    variable, censused as NOTHING.
+    """
     out = []
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        child = stack.pop()
+        if isinstance(child, SCOPED):
+            continue                      # its own scope; listed separately
+        if isinstance(child, ast.Call):
+            out.append(child)
+        stack.extend(ast.iter_child_nodes(child))
+    return out
+
+
+def _functions(tree: ast.AST):
+    """(qualified name, [calls]) for every scope in the module.
+
+    Functions, methods, lambdas -- AND the module body itself, AND each
+    class body, because both of those run at import and can write.  A
+    scope's own calls only: see :func:`_calls_in_scope`.
+    """
+    out = [("<module>", _calls_in_scope(tree))]
 
     def walk(node, prefix=""):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
+                out.append((f"{prefix}{child.name}.<class body>",
+                            _calls_in_scope(child)))
                 walk(child, f"{prefix}{child.name}.")
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                out.append((f"{prefix}{child.name}", child))
+                out.append((f"{prefix}{child.name}",
+                            _calls_in_scope(child)))
                 walk(child, f"{prefix}{child.name}.")
+            elif isinstance(child, ast.Lambda):
+                out.append((f"{prefix}<lambda>", _calls_in_scope(child)))
+            else:
+                walk(child, prefix)
     walk(tree)
-    return out
+    return [(name, calls) for name, calls in out if calls]
 
 
-def census(paths=MODULES) -> list:
-    """One row per WRITE: ``(module, function, write, guard)``.
+def census(paths=MODULES, sources=None) -> list:
+    """One row per WRITE CALL SITE: ``(module, scope, write, n, guard)``.
+
+    ``n`` is which occurrence of that primitive this is within that scope,
+    counting from 1 in line order.  IT IS THERE BECAUSE THE ROW KEY WITHOUT
+    IT IS DEFEATABLE.  Round 4 keyed a row (module, function, primitive) and
+    kept one row per primitive per function, so a SECOND write of a
+    primitive already listed, in a function already listed, was invisible.
+    MEASURED: an ask-then-write added to ``Syncer.record`` destroyed a
+    100000-byte file of his at ``ok.txt.log`` -- 100000 bytes to 0 -- with
+    all four census tests green and the row count unchanged at 63.  The
+    KNOWN line for that row ("our own history file... no name of his is
+    involved") had silently become false and nothing said so.
+
+    An ORDINAL rather than a LINE NUMBER on purpose: a line number churns
+    the table on every unrelated edit above it, and a table that cries wolf
+    is a table people edit to green.  The ordinal is stable under insertions
+    elsewhere and changes exactly when a call site is added or removed.
+    Its one blind spot is stated in tests/test_write_census.py.
 
     ``guard`` is "claim:<what>" when an atomic claim precedes the write in
-    that function, "check:<what>" when only a question does, and "" when
+    that scope, "check:<what>" when only a question does, and "" when
     NOTHING does -- which is the row that cost this lane two files.
+
+    ``sources`` maps a module name to source TEXT, so a test can census a
+    mutated copy of this lane without writing to the working tree.
     """
-    found = {}
+    found = []
     for rel in paths:
-        tree = ast.parse((REPO / rel).read_text())
-        for qual, fn in _functions(tree):
+        text = (sources or {}).get(rel)
+        if text is None:
+            text = (REPO / rel).read_text()
+        tree = ast.parse(text)
+        for qual, calls in _functions(tree):
             checks, claims, writes = [], [], []
-            for node in ast.walk(fn):
-                if not isinstance(node, ast.Call):
-                    continue
+            for node in calls:
                 dotted = _dotted(node.func)
                 if not dotted or dotted in IGNORE_CALLEES:
                     continue
@@ -163,7 +232,9 @@ def census(paths=MODULES) -> list:
                     checks.append((line, tail))
                 if tail in WRITES:
                     writes.append((line, tail))
-            for wline, wtail in writes:
+            seen = {}
+            for wline, wtail in sorted(writes):
+                seen[wtail] = seen.get(wtail, 0) + 1
                 before_claim = sorted({t for ln, t in claims if ln <= wline})
                 before_check = sorted({t for ln, t in checks if ln <= wline})
                 if before_claim:
@@ -172,12 +243,17 @@ def census(paths=MODULES) -> list:
                     guard = "check:" + "+".join(before_check)
                 else:
                     guard = ""
-                key = (rel, qual, wtail)
-                # One row per write NAME per function; if the same primitive
-                # appears twice, the weakest guard is the one that matters.
-                if key not in found or _weaker(guard, found[key]):
-                    found[key] = guard
-    return sorted((m, f, w, g) for (m, f, w), g in found.items())
+                found.append((rel, qual, wtail, seen[wtail], guard))
+    return sorted(found)
+
+
+def kind(guard: str) -> str:
+    """A guard reduced to the only three answers that matter."""
+    if guard.startswith("claim:"):
+        return "claim"
+    if guard.startswith("check:"):
+        return "check"
+    return "none"
 
 
 def _excl_open(node: ast.Call, tail: str) -> bool:
@@ -199,14 +275,17 @@ def table(rows=None, known=None) -> str:
     from tests.test_write_census import KNOWN          # noqa: PLC0415
     rows = census() if rows is None else rows
     known = KNOWN if known is None else known
-    width = max(len(f"{m}:{f}") for m, f, _w, _g in rows)
-    gwidth = max(len(f"{g} -> {w}") for _m, _f, w, g in rows)
+    def where(m, f, w, n):
+        return f"{m}:{f}" + (f" #{n}" if n > 1 else "")
+    width = max(len(where(m, f, w, n)) for m, f, w, n, _g in rows)
+    gwidth = max(len(f"{g} -> {w}") for _m, _f, w, _n, g in rows)
     out = ["WHERE".ljust(width) + "  GUARD -> WRITE".ljust(gwidth + 2) +
            "  WINDOW"]
     out.append("-" * (width + gwidth + 40))
-    for mod, fn, write, guard in rows:
-        note = known.get((mod, fn, write), "*** NOT IN THE TABLE ***")
-        out.append(f"{mod}:{fn}".ljust(width) +
+    for mod, fn, write, n, guard in rows:
+        row = known.get((mod, fn, write, n))
+        note = row[1] if row else "*** NOT IN THE TABLE ***"
+        out.append(where(mod, fn, write, n).ljust(width) +
                    f"  {guard or 'NOTHING'} -> {write}".ljust(gwidth + 2) +
                    f"  {note}")
     return "\n".join(out)

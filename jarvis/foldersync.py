@@ -322,7 +322,41 @@ class SyncConfig:
     # filename but arrives the wrong size, this lets me delete that broken
     # copy of mine; with it off the broken copy stays there under your name
     # and I only tell you about it.
+    #
+    # WHAT TURNING IT ON COSTS, said plainly because it is the reason it is
+    # a setting.  The identity is the name THIS RUN took with a rename -l,
+    # and between that rename and the size check there is a window in which
+    # the file at that name can stop being ours: if you replace it over
+    # there inside that window, the delete removes YOUR file, not mine.
+    # MEASURED and DETERMINISTIC -- it is not a rare race, it is what the
+    # code does whenever that sequence happens.  Off, nothing of yours can
+    # be deleted on HPCOMPUTER by this lane at all.
     remove_broken_copies: bool = DEFAULTS_REMOVE_BROKEN
+
+
+@dataclass(frozen=True)
+class Sent:
+    """One file this pass put on the far side, and the four things the rest
+    of the pass needs about it.
+
+    IT IS A CLASS AND NOT A TUPLE BECAUSE A TUPLE ALREADY WENT WRONG.
+    Round 4 grew this from three fields to four, and one reader was left
+    unpacking three::
+
+        taken = {e.name for e in fresh} | {n for _, n, _ in sent}
+
+    which is a ValueError on the exact path finding L was about -- a good
+    file ahead of a failing one in the same pass.  MEASURED 50 of 50 first
+    passes crashed.  Nothing of his was destroyed and nothing was sent
+    twice (the ledger ordering caught it) and the inbound half still ran,
+    but round 4's whole stated point was that one file's accident is not
+    the pass's death.  Fields have names now; adding a fifth cannot break
+    a reader that does not ask for it.
+    """
+    path: Path                       # HIS file, still in the Outbox
+    landed: str                      # the name it took on the far side
+    size: int                        # what we copied, for the verify
+    key: str                         # the ledger key, computed while it was HERE
 
 
 @dataclass(frozen=True)
@@ -1349,6 +1383,15 @@ class Syncer:
         self._claimed_here: set = set()      # names WE took, this run
         self._noted_foreign = False
         self._foreign_temps = 0
+        # THE SILENCES.  Three things he can see with his own eyes while
+        # status.txt says nothing, or says "empty".  The counts already
+        # existed at the point each one is skipped; all that was missing
+        # was saying them out loud.  Each is set from THIS pass's evidence
+        # and cleared when there is none, so none of them can go stale the
+        # way _foreign_temps did.
+        self._unsafe_inbound = 0     # names over there this lane will not take
+        self._remote_folders = 0     # FOLDERS over there; this lane moves files
+        self._skipped_outbox: list = []   # his files SKIP_* passes over
         self._listing_truncated = False
         self._note_refused = False
 
@@ -1462,11 +1505,18 @@ class Syncer:
             entries = sorted(self.paths.outbox.iterdir(), key=lambda p: p.name)
         except OSError:
             return out
+        skipped = []
         for p in entries:
             name = p.name
             if name.startswith(SKIP_PREFIXES) or name.endswith(SKIP_SUFFIXES):
+                # A HALF-WRITTEN file, or a dotfile, and skipping it is
+                # right -- but the skip was SILENT, and status.txt then
+                # said "outbox empty" while he was looking at the file.
+                if not name.endswith(NOTE_SUFFIX):
+                    skipped.append(name)
                 continue
             out.append(p)
+        self._skipped_outbox = skipped
         return out
 
     # ------------------------------------------------------------- pushing
@@ -1479,6 +1529,21 @@ class Syncer:
     def _push_once(self, now: Optional[float] = None) -> list:
         now = time.time() if now is None else now
         events: list = []
+        # THE COUNT IS THIS PASS'S OR IT IS NOTHING.  It used to be set only
+        # inside _sweep_my_stages, which is reached only when there is
+        # something to send -- so a number measured while he was sending
+        # files stayed on his desk for hours afterwards, describing litter
+        # that may have been tidied away in the meantime.  A stale fact in
+        # status.txt is the same defect as a silence, dressed up.
+        #
+        # It is CLEARED rather than recomputed on purpose.  The litter is in
+        # the remote INBOX, and the only thing that lists that folder is the
+        # push half; recomputing every pass would mean an extra ssh round
+        # trip to a machine that may be asleep, on every pass, for a number
+        # we only ever REPORT and never act on.  Saying nothing about what
+        # we did not look at is the honest half of the trade, and it is
+        # stated here rather than left for somebody to find.
+        self._foreign_temps = 0
         self._sweep_notes()
         roots = filepick.expand_roots(self.rconf.local_roots)
         ready: list = []
@@ -1534,7 +1599,7 @@ class Syncer:
             events += self._resolve_landing(p, row, now)
 
         taken = {e.name for e in entries}
-        sent: list = []
+        sent: list[Sent] = []
         for p in ready:
             size = self._size(p)
             key = f"push:{p.name}|{stat_key(p)}"   # while the file is HERE
@@ -1561,7 +1626,8 @@ class Syncer:
                         self._listing_failed(now, "inbox", why, len(ready)))
                     break
                 if fresh is not None:
-                    taken = {e.name for e in fresh} | {n for _, n, _ in sent}
+                    taken = ({e.name for e in fresh}
+                             | {s.landed for s in sent})
                 if reason == "too-many-copies":
                     # Not a failure that trying again can fix, so it is not
                     # charged an attempt.
@@ -1572,7 +1638,7 @@ class Syncer:
                 events.append(Event(now, "push", p.name, size, reason))
                 continue
             taken.add(landed)
-            sent.append((p, landed, size, key))
+            sent.append(Sent(p, landed, size, key))
 
         if sent:
             events += self._verify_and_move(sent, now)
@@ -1598,6 +1664,21 @@ class Syncer:
             # Cannot ask.  Keep the record: guessing either way is how a
             # file gets sent twice or dropped.
             return [Event(now, "push", p.name, size, "unverified", why)]
+        # RESOLVED BY SIZE, NOT BY IDENTITY, and that is a real limit
+        # rather than an oversight, so it is written down.  All this can
+        # ask the far side is "is there something at that name, and is it
+        # the number of bytes I sent" -- there is no checksum on this link
+        # and no inode to compare.  A DIFFERENT file of exactly our size
+        # that appeared at that name would be read as ours and his original
+        # would be moved to Sent.
+        #
+        # Finding L's guarantee does not rest on this and never did: it
+        # rests on ORDERING.  The name is written to the ledger and fsync'd
+        # -- file and directory -- BEFORE the rename -l that is the only
+        # step able to put his filename over there, and the rename refuses
+        # a name anything already holds.  So the name asked about here is
+        # one nothing else held at the instant we took it; the size is a
+        # second opinion on top of that, not the thing being trusted.
         if entry is None or entry.is_dir or entry.size != size:
             # It never landed.  Drop the record; the file goes back through
             # the ORDINARY path on the next pass -- deliberately not this
@@ -1697,10 +1778,21 @@ class Syncer:
         self._inner_seq += 1
         reason = self.transport.send(p, temp)
         if reason:
-            # A partial file may be in our staging folder, but the far side
-            # has just failed us and this is not the moment to ask it for a
-            # delete.  It is inside a directory of ours; the close at the
-            # end of the pass, or a later pass, takes it away.
+            # THE SOURCE USED TO SAY "the close at the end of the pass, or a
+            # later pass, takes it away".  The server does not agree: scp
+            # leaves what it managed to write, and the rmdir in stage_close
+            # then REFUSES the non-empty directory, so both the partial and
+            # the folder are permanent.  MEASURED (against the fake far
+            # side, which models scp's leftover): 5 staging folders and 5
+            # part files after 12 passes on one failing file -- the code
+            # saying one thing while the machine did another.
+            #
+            # So it is discarded HERE, at the one moment we know the name.
+            # It is a file OF OURS, inside a directory OF OURS, taken with
+            # the mkdir claim -- the safest delete in this lane -- and if
+            # the far side refuses that too, _discard says so and the stage
+            # simply stays, which is the truth rather than a promise.
+            self._discard(temp)
             return "", reason
         size = self._size(p)
         for candidate in candidates:
@@ -1790,16 +1882,17 @@ class Syncer:
             # opened a second connection to a box that had just refused a
             # first.  It is a link event now.  The files are NOT counted
             # against: an outage must never park a file of his.
-            for p, _landed, size, _key in sent:
-                events.append(Event(now, "push", p.name, size, "unverified",
-                                    why))
+            for s in sent:
+                events.append(Event(now, "push", s.path.name, s.size,
+                                    "unverified", why))
             events.append(self._listing_failed(now, "inbox", why, len(sent)))
             return events
         # A FOLDER at that name is not the file we sent, and its 4096 must
         # never be read as a byte count -- excluded, so the check fails
         # loudly instead of passing by coincidence.
         sizes = {e.name: e.size for e in entries if not e.is_dir}
-        for p, landed, size, key in sent:
+        for s in sent:
+            p, landed, size, key = s.path, s.landed, s.size, s.key
             # `key` was computed while his file was still in the Outbox: it
             # is the one the NEXT pass will look up if his hand takes the
             # file away before the move, so it must not be recomputed here.
@@ -1940,6 +2033,10 @@ class Syncer:
         if self._pass_down:
             return []                          # asked once a pass, not twice
         events: list = []
+        # This pass's word, not the last one's.  A count kept from an
+        # earlier listing is the _foreign_temps mistake with a different
+        # name, so both are cleared before anything is asked.
+        self._unsafe_inbound = self._remote_folders = 0
         entries, why = self.transport.listing(self.conf.pull_from)
         if why:
             return [self._listing_failed(now, self.conf.pull_from, why, 0)]
@@ -1954,7 +2051,9 @@ class Syncer:
                 # It is in the listing so dedupe_name can see the name is
                 # taken; it is never fetched.  This lane moves files, one
                 # at a time, and there is no note to leave over there --
-                # the jarvis account cannot write in that folder.
+                # the jarvis account cannot write in that folder.  He can
+                # SEE the folder, so status.txt says how many there are.
+                self._remote_folders += 1
                 if not self._skipped_dirs:
                     self._skipped_dirs = True
                     log.info("foldersync: there is a folder in the "
@@ -1963,7 +2062,12 @@ class Syncer:
                 continue
             if remote.SAFE_REMOTE_NAME_RX.match(e.name):
                 usable.append(e)
-            elif not self._skipped_names:
+                continue
+            # A comma, an ampersand, an accent: this lane will not put that
+            # in a path, so the file sits over there for ever.  He can see
+            # it there, and until round 5 status.txt said nothing at all.
+            self._unsafe_inbound += 1
+            if not self._skipped_names:
                 self._skipped_names = True
                 log.info("foldersync: skipping a name in the HPCOMPUTER "
                          "outbox that I will not put in a path")
@@ -2319,12 +2423,38 @@ class Syncer:
                          f"{self.rconf.name} look like my own in-flight")
             lines.append("          ones but I did not make them, so I have "
                          "left them alone.")
+        # THE THREE SILENCES, said out loud.  Every one of these is
+        # something he can see with his own eyes -- a file still sitting on
+        # HPCOMPUTER, a folder there, a file still sitting in his Outbox --
+        # while this file said nothing, or said "empty".  No new machinery:
+        # each count already existed at the point the thing was skipped.
+        if self._unsafe_inbound:
+            lines.append(f"note      {self._unsafe_inbound} file(s) on "
+                         f"{self.rconf.name} I cannot bring across")
+            lines.append("          (their names have characters I will "
+                         "not put in a path).")
+            lines.append("          Rename them over there and I will "
+                         "take them next pass.")
+        if self._remote_folders:
+            lines.append(f"note      {self._remote_folders} folder(s) in "
+                         f"the {self.rconf.name} outbox. I move files,")
+            lines.append("          one at a time, never a folder.")
         lines.append(f"outbox    {len(waiting)} waiting"
                      if waiting else "outbox    empty")
         for name in waiting[:10]:
             lines.append(f"            {name}")
         if len(waiting) > 10:
             lines.append(f"            ... and {len(waiting) - 10} more")
+        if self._skipped_outbox:
+            why = ("name ends .tmp"
+                   if self._skipped_outbox[0].endswith(SKIP_SUFFIXES)
+                   else "name starts with a dot")
+            lines.append(f"note      {len(self._skipped_outbox)} file(s) in "
+                         f"your Outbox I am not sending")
+            lines.append(f"          (e.g. {self._skipped_outbox[0]} -- "
+                         f"{why}). A half-written file is")
+            lines.append("          left alone on purpose; rename it and "
+                         "I will send it.")
         if self._recent:
             lines.append("")
             lines.append("recent")
