@@ -10076,8 +10076,14 @@ _DAY_ANCHOR_RX = re.compile(
     r"saturday|sunday)\b", re.I)
 
 
+# "on saturday, september 12": the comma between the weekday and the date
+# kept the weekday in place -- "on saturday, Sunday the 13th" (round five).
 _DAY_BEFORE_DATE_RX = re.compile(
-    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+$", re.I)
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*$", re.I)
+# ...and the weekday said AFTER the date, "the 8th of sept, a tuesday".
+_DAY_AFTER_DATE_RX = re.compile(
+    r"^\s*,?\s*(?:a\s+|on\s+)?(?:monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\b", re.I)
 
 
 def _shift_named_day(prev: str, today) -> Optional[str]:
@@ -10088,7 +10094,7 @@ def _shift_named_day(prev: str, today) -> Optional[str]:
     9th", "Thursday the 1st of October" -- so every downstream reader lands
     on exactly that day."""
     from jarvis.tools.calendar import (as_date, date_span, date_words,
-                                       digit_ordinals, is_ask)
+                                       digit_ordinals, full_date_words, is_ask)
 
     text = digit_ordinals(prev)
     found = date_span(text, today)
@@ -10103,7 +10109,16 @@ def _shift_named_day(prev: str, today) -> Optional[str]:
     lead = _DAY_BEFORE_DATE_RX.search(text[:start])
     if lead:
         start = lead.start()
-    return text[:start] + date_words(day + timedelta(days=1), today) + text[end:]
+    trail = _DAY_AFTER_DATE_RX.match(text[end:])
+    if trail:
+        end += trail.end()
+    moved = day + timedelta(days=1)
+    # A moved day that lies BEFORE today is named in full: "Friday the 4th"
+    # past the 4th is next month's to every reader, and "the 3rd of the
+    # month" moved on became a question about a Sunday in October (round
+    # five, 2026-09-06).
+    words = full_date_words(moved) if moved < today else date_words(moved, today)
+    return text[:start] + words + text[end:]
 
 
 def day_shift_followup(prev_text: str, text: str,

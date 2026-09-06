@@ -410,17 +410,22 @@ def test_a_correct_model_date_stands_on_every_dated_row(reg, monkeypatch):
 def test_the_deriver_rule_holds_even_with_a_hole_in_the_reader(reg, monkeypatch):
     """STRUCTURAL: put the round-three hole back -- a _D_MD_RX with no
     "the" -- so the reader once more reads "january the 5th" as a bare
-    5th (today).  The model's 2027-01-05 must STILL stand: his words gave
-    only a day-of-month, and the model's January agrees with it."""
+    5th (today).  The model's 2027-01-05 is never traded for TODAY.
+    ROUND FIVE: the reader's month (this one) and the model's (January)
+    disagree over a bare day-of-month, so Jarvis ASKS which -- following
+    neither silently -- rather than letting the model's month stand as
+    round four did (tests/test_calendar_date_round_five.py)."""
     hole = re.compile(rf"\b{calendar._MONTH}\s+(?P<d>\d{{1,2}})(?!\d)"
                       rf"(?P<ord>{calendar._ORD})?{calendar._YEAR}", re.I)
     monkeypatch.setattr(calendar, "_D_MD_RX", hole)
+    monkeypatch.setattr(calendar, "_NEAR_MONTH_RX", re.compile(r"(?!x)x"))
     assert calendar.sentence_date("what do i have on january the 5th", TODAY) \
         == TODAY.isoformat()                                # the hole is back
     text = reg.call("get_calendar", {"range": "2027-01-05"}, from_model=True,
                     utterance="what do i have on january the 5th").text
-    assert _answers_about(text, "2027-01-05"), text
     assert "TODAY-EV" not in text
+    assert text.endswith("?") and "which month" in text, text
+    assert "September" in text and "January 2027" in text, text
 
 
 @pytest.mark.parametrize("said,model,want", [
@@ -436,9 +441,11 @@ def test_the_deriver_rule_holds_even_with_a_hole_in_the_reader(reg, monkeypatch)
     # the old wrong value, and no value at all: the words decide
     ("what do i have on the 12th", "today", "2026-09-12"),
     ("what do i have on the 12th", "", "2026-09-12"),
-    # his words gave only a day-of-month: the model's month is a REFINEMENT
-    ("what do i have on the 12th", "2026-10-12", "2026-10-12"),
-    ("what's on the day after the 12th", "2026-10-13", "2026-10-13"),
+    # his words gave only a day-of-month and the model moved its month:
+    # round four called that a refinement; round five ASKS which month
+    # (tests/test_calendar_date_round_five.py::MONTH_MOVED)
+    ("what do i have on the 12th", "2026-10-12", "ask"),
+    ("what's on the day after the 12th", "2026-10-13", "ask"),
     # the model and the words agree
     ("what do i have on the 12th", "2026-09-12", "2026-09-12"),
 ])
@@ -446,6 +453,10 @@ def test_words_override_the_model_only_when_they_contradict_it(
         reg, said, model, want):
     text = reg.call("get_calendar", {"range": model}, from_model=True,
                     utterance=said).text
+    if want == "ask":
+        assert text.endswith("?") and "which month" in text, (said, model, text)
+        assert "EV-" not in text
+        return
     assert _answers_about(text, want), (said, model, text)
 
 
@@ -463,7 +474,8 @@ def test_model_day_stands_is_the_rule_in_one_place():
     from jarvis.tools.calendar import model_day_stands
 
     said = "what do i have on the 12th"
-    assert model_day_stands(said, "2026-09-12", "2026-10-12", NOW)      # refinement
+    # round four: a refinement; round five: a QUESTION (which month)
+    assert not model_day_stands(said, "2026-09-12", "2026-10-12", NOW)
     assert not model_day_stands(said, "2026-09-12", "2026-09-13", NOW)  # contradiction
     assert not model_day_stands(said, "2026-09-12", "today", NOW)       # not a day
     assert not model_day_stands(said, "2026-09-12", None, NOW)

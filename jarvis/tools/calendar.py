@@ -412,10 +412,43 @@ _MONTH_NAMES = ("january", "february", "march", "april", "may", "june",
 _MONTH_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))
 _MONTH = rf"(?P<mon>{_MONTH_ALT})(?:\.|\b)"
 _ORD = r"(?:st|nd|rd|th)"
+# Counts, said in words or digits.  ROUND FIVE: the words stopped at ten,
+# so "in eleven months", "in fifteen days", "in twenty days" were silent
+# todays while "in 15 days" worked; they read to thirty now.  DEFAULT
+# TAKEN FOR HIM: "about" / "roughly" / "around" in front of a count is
+# the count -- "in about a month" was today.
+_COUNT_UNITS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9}
+_COUNT_WORDS = {"a": 1, "an": 1, "couple": 2, "few": 3, "ten": 10,
+                "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+                "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+                "nineteen": 19, "twenty": 20, "thirty": 30}
+_COUNT_WORDS.update(_COUNT_UNITS)
+for _cunit, _cval in _COUNT_UNITS.items():
+    _COUNT_WORDS[f"twenty {_cunit}"] = 20 + _cval
+_COUNT_ALT = (r"couple\s+of|" + "|".join(
+    w.replace(" ", r"[-\s]+")
+    for w in sorted(_COUNT_WORDS, key=len, reverse=True)) + r"|\d{1,3}")
+_APPROX = (r"(?:(?:about|roughly|around|approximately|some|nearly|almost|"
+           r"just|only|exactly)\s+)?")
 # ", 2027", "of 2027" -- and "next year" / "last year", which round four
 # found dropped: "september 12th next year" was September 2026.  Read
 # through _year_of, never through group("y") alone.
-_YEAR = (r"(?:,?\s+(?:of\s+)?(?P<y>\d{4})|\s+(?P<ry>this|next|last)\s+year)?")
+_YEAR = (r"(?:,?\s+(?:of\s+|in\s+)?(?:(?P<y>\d{4})|(?P<ry>this|next|last)\s+year))?")
+# The year said ELSEWHERE in the sentence -- "next year on september
+# 12th", "in 2027 on september 12th" -- read when the date itself carries
+# none.  ROUND FIVE (2026-09-06): both were THIS September's 12th, and
+# "sept 12th OF next year" too, because the pattern above wanted "next
+# year" right after the day with nothing between.
+_YEAR_CTX_RX = re.compile(
+    r"\b(?:in|for|during|of)\s+(?P<y>(?:19|20)\d{2})\b"
+    r"|\b(?P<ry>this|next|last)\s+year\b", re.I)
+# Did his words settle the YEAR at all?  A four-digit year, "next year",
+# a slashed or dashed triple, an ISO date.  The deriver rule needs to know:
+# a year his words left open is the model's to refine.
+_YEAR_SAID_RX = re.compile(
+    r"\b\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*(?P<yy>\d{2,4})\b"
+    r"|\b(?P<y>(?:19|20)\d{2})\b|\b(?P<ry>this|next|last)\s+year\b", re.I)
 # A four-digit year first can only be one day whichever way it is
 # separated: 2026/09/12 is read, not asked about.
 _D_ISO_RX = re.compile(r"\b(?P<y>\d{4})[-/](?P<m>\d{1,2})[-/](?P<d>\d{1,2})\b")
@@ -455,44 +488,166 @@ _D_DM_RX = re.compile(
 # october" -- except in front of a rank of their own: "the 2nd TO LAST
 # meeting" was Friday the 2nd of October through both doors, and "the 3rd
 # IN A ROW" the 3rd (round four, 2026-09-06).
-_ORD_TAIL = (r"at|on|in(?!\s+a\s+row\b)|and|or|for|to(?!\s+last\b)|this|next|"
-             r"please|sir|then|too|instead|"
-             r"is|was|are|were|do|does|did|i|my|me|we|you|there|anything|"
-             r"something|else|yet|still|though|but|if|so|that|it|ok|okay|"
-             r"look|looks")
-_TAIL_OK = rf"(?!\s+(?!(?:{_ORD_TAIL})\b)\w)"
-# The same test applied to a string rather than inline in a pattern.
-_NOT_TAIL_RX = re.compile(rf"\s+(?!(?:{_ORD_TAIL})\b)\w", re.I)
+#
+# ROUND FIVE (2026-09-06) INVERTED IT.  The set above was a WHITELIST of
+# words that may follow a date, and every word not on it made the ordinal
+# a rank: "on the 12th FROM 2 to 4", "AFTER 5", "BEFORE noon", "AROUND
+# 3", "UNTIL 5", "WITH john", "DURING the day", "on the 12th WHAT do i
+# have" -- MEASURED ten of ten silently TODAY -- and "the 12th THROUGH the
+# 14th" the 14th with no question, because the first ordinal failed the
+# tail before the span check could see it.  The rule now runs the other
+# way: a rank needs a NOUN after it ("the 3rd lab", "the 2nd floor", "the
+# 3rd in the list", "the 2nd to last"), and an ordinal followed by
+# anything that cannot be that noun -- a preposition, a conjunction, a
+# question word, a verb, a pronoun, an adverb, a clock word, a digit,
+# punctuation, nothing at all -- is a DATE.  Three words are conditional:
+# "in october" / "in the morning" open a date while "in the list" / "in
+# line" / "in a row" are the rank's own noun; "to the 14th" is a span and
+# "to last" a rank; "last month" follows a date and "the 2nd last meeting"
+# is a rank.  An adjective a day can be ("is the 12th FREE") is
+# transparent: "free" then nothing is a date, "free slot" is a rank.
+_WD_ALT = "|".join(WEEKDAYS)
+_TAIL_WORDS = frozenset("""
+    at from after before around until till through thru with during between
+    by past since about for on this next
+    and or but so if then though whether nor
+    what what's whats how how's hows when when's whens where where's who
+    who's which why
+    is isn't was wasn't are aren't were weren't am be been being do does did
+    don't doesn't didn't have has had haven't hasn't hadn't will won't would
+    wouldn't can can't could couldn't should shouldn't shall may might must
+    look looks looking looked seem seems sound sounds work works suit suits
+    fit fits
+    i i'm i'll i've i'd my me mine we we're we'll our us you you're you'll
+    your he he's she she's they they're him her them his their there there's
+    it it's that that's these those anything something nothing everything
+    else all any
+    please sir jarvis thanks thank too instead yet still again also only just
+    maybe perhaps probably already actually really specifically exactly
+    anyway anyhow
+    am pm a.m p.m noon midnight morning afternoon evening night tonight
+    o'clock oclock sharp today tomorrow yesterday tmrw
+""".split()) | frozenset(w for w in _COUNT_WORDS if w not in ("a", "an", "one"))
+_TAIL_ADJ = frozenset("""
+    free busy open clear fine available booked full packed empty quiet light
+    heavy taken possible doable alright ok okay good bad better best nice
+    great awful terrible hectic crazy wild slow easy hard tough rough tight
+    wide long short early late
+""".split())
+_TAIL_WORD_RX = re.compile(r"^\s+([a-z][\w'.]*)", re.I)
+_TAIL_IN_RX = re.compile(
+    rf"^\s+(?:(?:this|next|last|the)\s+month\b|(?:this|next|last)\s+(?:{_MONTH_ALT})\b"
+    rf"|(?:{_MONTH_ALT})(?:\.|\b)|the\s+(?:morning|afternoon|evening|night|month\s+of)\b"
+    rf"|\d{{4}}\b|total\b|all\b"
+    rf"|{_APPROX}(?:a\s+)?(?:{_COUNT_ALT})\s+(?:days?|weeks?|months?|years?)\b"
+    # a bare noun after "in" is a PLACE or a setting ("the 12th in london",
+    # "in class"); the rank's own noun carries an article ("in the list",
+    # "in a row") or is one of the few that stand bare ("in line")
+    r"|(?!(?:a|an|the|line|row|command|order|charge|rank|place|series|"
+    r"sequence|succession|turn|front|back)\b)[a-z]+\b)", re.I)
+_TAIL_LAST_RX = re.compile(r"^\s+(?:month|year|week)\b", re.I)
+_TAIL_TO_RX = re.compile(r"^\s+last\b", re.I)
 
 
 def _tail_ok(rest: str) -> bool:
-    """True when what follows a bare number cannot be the noun of a rank."""
-    return _NOT_TAIL_RX.match(rest or "") is None
+    """True when what follows a number cannot be the noun of a rank."""
+    rest = rest or ""
+    if not rest or not rest[0].isspace():
+        return True                          # the end, or punctuation
+    match = _TAIL_WORD_RX.match(rest)
+    if match is None:
+        return True                          # a digit, punctuation, the end
+    word = match.group(1).lower().rstrip(".")
+    after = rest[match.end():]
+    if word == "in":
+        return _TAIL_IN_RX.match(after) is not None
+    if word == "last":
+        return _TAIL_LAST_RX.match(after) is not None
+    if word == "to":
+        return _TAIL_TO_RX.match(after) is None
+    if word in _TAIL_ADJ:
+        return _tail_ok(after)
+    return word in _TAIL_WORDS
+
+
 # An ordinal paired by and/or with a RANKED ordinal is a rank itself: "the
 # 1st or 2nd week of october" was the 1st of October (round four).
-_ORD_PAIR_RANK = (rf"(?!\s+(?:and|or)\s+(?:the\s+)?\d{{1,2}}{_ORD}\s+"
-                  rf"(?!(?:{_ORD_TAIL})\b)\w)")
+_PAIR_RX = re.compile(rf"^\s*,?\s*(?:and|or)\s+(?:the\s+)?\d{{1,2}}{_ORD}\b", re.I)
+
+
+def _ord_ok(text: str, match) -> bool:
+    rest = text[match.end():]
+    pair = _PAIR_RX.match(rest)
+    if pair is not None and not _tail_ok(rest[pair.end():]):
+        return False
+    return _tail_ok(rest)
+
+
+def _first(rx, text: str, ok=None):
+    """The first match of ``rx`` in ``text`` that ``ok`` admits, or None.
+    A regex with the tail rule inside it stopped at the first candidate;
+    this lets "the 2nd lab on the 12th" reach its date."""
+    for match in rx.finditer(text):
+        if ok is None or ok(match):
+            return match
+    return None
+
+
+# A weekday may stand between the frame and the ordinal: "on monday 14th"
+# (the transcriber drops "the") was the coming Monday -- the 7th -- with
+# the 14th never read (round five).
 _D_ORD_RX = re.compile(
-    rf"\b(?:on|for|the)\s+(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}\b"
-    rf"{_ORD_PAIR_RANK}{_TAIL_OK}", re.I)
+    rf"\b(?:on|for|the)\s+(?:the\s+)?(?:(?:{_WD_ALT})\s+(?:the\s+)?)?"
+    rf"(?P<d>\d{{1,2}}){_ORD}\b", re.I)
+# "on the 12" -- the suffix the transcriber loses -- was a silent today.
+# It is a QUESTION that offers the ordinal; a clock ("the 12 o'clock") and
+# a rank ("the 5 day forecast") are left alone.
+_D_BARE_NUM_RX = re.compile(
+    r"\b(?:on|for)\s+the\s+(?P<d>\d{1,2})(?!\d)"
+    r"(?!\s*(?:am|pm|a\.m|p\.m|o'?clock|[.:]\d))\b", re.I)
+# Two ordinals joined by to / through / until / and / or are a SPAN, read
+# off the raw text BEFORE the rank rule sees either of them: "the 12th
+# through the 14th" was the 14th silently (4/4).  The second may carry
+# its month ("the 3rd or the 4th of october"); a second that is itself a
+# rank ("the 1st or 2nd week") is not a span.
+_ORD_SPAN_RX = re.compile(
+    rf"\b(?:the\s+)?(?P<a>\d{{1,2}}){_ORD}\b\s*,?\s*(?:to|through|thru|till|"
+    rf"until|and|or|&|-)\s+(?:to\s+)?(?:maybe\s+)?(?:the\s+)?(?P<b>\d{{1,2}}){_ORD}\b"
+    rf"(?:\s+of\s+(?:{_MONTH_ALT})(?:\.|\b))?", re.I)
+# A second MONTH joined to a date already read -- "the 12th of september
+# or october" -- is a span of the same kind.  "may" is left out: "the
+# 12th and may i ask" is one day.
+_JOINER_MONTH_RX = re.compile(
+    rf"^\s*,?\s*(?:or|and)\s+(?:maybe\s+)?(?:the\s+)?(?!may\b)(?:{_MONTH_ALT})(?:\.|\b)",
+    re.I)
 # "the 12th OF this month" names a month without naming it.  It has its own
 # rule because the tail rule above deliberately treats a following "of" as a
 # rank ("the 2nd of three parts"), and _D_DM_RX only fires on a month NAME --
 # so without this "what's on the 12th of this month" was silently TODAY,
 # measured on the same grid as the four blockers.  The "of" is optional
 # since round four: "on the 12th next month" was September the 12th.
+# "the following month", "the coming month", "the previous month" were
+# silent todays (round five): the relative words are read through
+# _rel_step, one place.
+_REL_MONTH = r"this|next|last|the|following|coming|previous|prior"
 _D_REL_MONTH_RX = re.compile(
-    rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d){_ORD}?\s+(?:of\s+)?"
-    r"(?P<rel>this|next|last|the)\s+month\b", re.I)
+    rf"\b(?:the\s+)?(?P<d>\d{{1,2}})(?!\d){_ORD}?\s+(?:of\s+)?(?:the\s+)?"
+    rf"(?P<rel>{_REL_MONTH})\s+month\b", re.I)
 # A bare ordinal takes its month from the REST of the sentence: "next month
 # on the 12th", "in october on the 12th", "on the 12th in october", "what
 # did i have on the 12th last month".  MEASURED 2026-09-06: every one of
 # those was September the 12th, and "on the 5th next month" was TODAY --
 # the tail rule let "next" follow the ordinal, and the ordinal was then
 # read with no month at all.  18 of 20 relative-month phrasings wrong.
+# ROUND FIVE added the month reached by a STEP -- "in a month on the
+# 12th", "on the 12th two months from now" -- which was the 5th of the
+# month stepped to: the unit step won and the ordinal was dropped.
 _MONTH_CTX_RX = re.compile(
     rf"\b(?:in|for|during|of|about)\s+(?:(?:this|next|last)\s+)?{_MONTH}{_YEAR}"
-    r"|\b(?P<rel>this|next|last)\s+month\b", re.I)
+    r"|\b(?:the\s+)?(?P<rel>this|next|last|following|coming|previous)\s+month\b"
+    rf"|\bin\s+{_APPROX}(?:a\s+)?(?P<n>{_COUNT_ALT})\s+months?\b"
+    rf"|\b(?:a\s+)?(?P<n2>{_COUNT_ALT})\s+months?\s+from\s+(?:now|today)\b"
+    rf"|\bin\s+{_APPROX}(?:a\s+)?(?P<ny>{_COUNT_ALT})\s+years?\b", re.I)
 # THE FRAME RULE (round three, 2026-09-05).  A number is a date only when
 # the sentence is about WHEN: a preposition or a calendar word stands right
 # in front of it.  Round two's ``_D_NUM_RX`` took a bare N/N ANYWHERE, so
@@ -517,7 +672,7 @@ _DATE_FRAME = _PREP_FRAME + "|" + _NOUN_FRAME
 # Month-first, because he is in Texas.
 _D_NUM_RX = re.compile(
     rf"\b(?:{_DATE_FRAME})\s+(?:the\s+)?(?P<a>\d{{1,2}})\s*/\s*"
-    rf"(?P<b>\d{{1,2}})(?:\s*/\s*(?P<y>\d{{2,4}}))?\b{_TAIL_OK}", re.I)
+    rf"(?P<b>\d{{1,2}})(?:\s*/\s*(?P<y>\d{{2,4}}))?\b", re.I)
 # DEFAULT TAKEN FOR HIM (round three): a dash- or dot-separated PAIR after
 # on / for / about / of is a QUESTION, not a date.  Round two read "on 9-12"
 # as the 12th of September; but "9-12" is a time range at least as often
@@ -530,11 +685,9 @@ _D_NUM_RX = re.compile(
 # DEFAULT TAKEN FOR HIM (round four): a pair behind "at" -- "at about
 # 9.30" -- is a CLOCK and is left alone too; "about" frames a date only
 # when "at" does not stand in front of it.
-_DASH_TAIL_OK = (rf"(?!\s+(?!(?:{_ORD_TAIL}|from|between|till|until|through|"
-                 rf"thru|am|pm|noon|midnight)\b)\w)")
 _D_DASH_RX = re.compile(
     r"\b(?<!\bat\s)(?:on|for|about|of)\s+(?P<a>\d{1,2})\s*[-.]\s*(?P<b>\d{1,2})"
-    r"(?:\s*[-.]\s*(?P<y>\d{2,4}))?\b" + _DASH_TAIL_OK, re.I)
+    r"(?:\s*[-.]\s*(?P<y>\d{2,4}))?\b", re.I)
 # Date-shaped and UNREADABLE: the shapes that can only be a date and that
 # every rule above declined -- a month name beside a number, an ISO shape.
 # Applied in sentence_date, so BOTH doors and the day-shift rewrite meet
@@ -544,28 +697,53 @@ _D_DASH_RX = re.compile(
 # frame rule it is not date-shaped.  A bare ordinal is absent for the same
 # reason (see _D_ORD_RX).
 _DATEISH_RX = re.compile(
-    rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*(?:the\s+)?\d{{1,2}}{_ORD}?{_TAIL_OK}|"
-    rf"\b\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}\b", re.I)
+    rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*(?:the\s+)?\d{{1,2}}{_ORD}?\b|"
+    rf"\b\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}\b|"
+    rf"\b\d{{1,2}}{_ORD}\s+of\s+(?:(?:this|next|last)\s+year|\d{{4}})\b", re.I)
+# "january the 2nd WEEK" is not January the 2nd: a period noun after a
+# month-and-ordinal is the rank's noun, and the sentence is about the
+# month alone (round five).
+_PERIOD_NOUN_RX = re.compile(r"^\s+(?:week|weekend|quarter|half|fortnight)\b", re.I)
 # A month with no day in it -- "in december", "for october", "in september
 # 2027" -- was a silent today.  It is about WHEN, it names no day the tool
 # can list, so it is a question: which day.  ROUND FOUR added the month
 # that nothing frames but that the sentence is plainly about -- "how does
 # october look", "is october busy", "mid september", "early october" --
 # and the month named without naming it: "what do i have next month".
+# ROUND FIVE: "how does MY october look", "what's MY october like",
+# "how's october looking", "for the rest of THE month" were silent todays
+# through the forced door (5/5) -- the month had to stand right after the
+# frame word.  "my" may stand between, and "of the month" is this month.
 _MONTH_ONLY_RX = re.compile(
-    rf"\b(?:in|for|during|of|about|on|does|is|mid|early|late|"
-    rf"(?:end|start|beginning|middle|rest)\s+of)[\s-]+"
+    rf"\b(?:in|for|during|of|about|on|does|is|was|mid|early|late|"
+    rf"how's|hows|what's|whats|"
+    rf"(?:end|start|beginning|middle|rest|most|half)\s+of)[\s-]+(?:my\s+)?"
     rf"(?:this\s+|next\s+|last\s+)?{_MONTH}{_YEAR}"
-    r"|\b(?P<relm>this|next|last)\s+month\b", re.I)
+    r"|\b(?:(?:end|start|beginning|middle|rest|most|half)\s+of\s+)?"
+    r"(?P<relm>this|next|last)\s+month\b"
+    r"|\b(?:end|start|beginning|middle|rest|most|half)\s+of\s+(?P<them>the)\s+month\b",
+    re.I)
 # A month the transcriber nearly heard -- "the 12th of nevember" -- was a
 # silent today: no rule read it, nothing was date-shaped.  Near enough to
 # one of the twelve, it is a question that offers the month.  Five letters
 # at least: "the 1st of many" is not the 1st of May.
+# ROUND FIVE: the misspelt month IN FRONT of "the Nth" -- "on febuary the
+# 12th" -- read the bare ordinal and answered September the 12th, while
+# "the 12th of febuary" asked; and "in nevember" with no day was today.
+# The near-miss is now looked for before the ordinal rule can see the
+# ordinal, and a framed month-shaped word with no day asks too.
 _NEAR_MONTH_RX = re.compile(
     rf"\b(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}?\s+of\s+(?P<w>[a-z]{{5,9}})\b"
-    rf"|\b(?:in|on|for|during)\s+(?P<w2>[a-z]{{5,9}})\s+(?:the\s+)?"
-    rf"(?P<d2>\d{{1,2}}){_ORD}?\b", re.I)
-_WD_ALT = "|".join(WEEKDAYS)
+    rf"|\b(?:in|on|for|during|about|calendar|schedule|agenda)\s+"
+    rf"(?P<w2>[a-z]{{5,9}})\s+(?:the\s+)?(?P<d2>\d{{1,2}}){_ORD}?\b"
+    rf"|\b(?P<w3>[a-z]{{5,9}})\s+the\s+(?P<d3>\d{{1,2}}){_ORD}\b"
+    rf"|\b(?:in|for|during)\s+(?P<w4>[a-z]{{5,9}})\b(?!\s+(?:the\s+)?\d)", re.I)
+# A slashed pair right after an offset -- "the day after 9/12" -- has the
+# offset for its frame.  Round five: it was "Which day is that after,
+# sir?" while the model held the right day.
+_BARE_LEAD_RX = re.compile(
+    rf"^\s*(?:(?:{_WD_ALT})\s+)?(?:the\s+)?\d{{1,2}}\s*[/.-]\s*\d{{1,2}}"
+    r"(?:\s*[/.-]\s*\d{2,4})?\b", re.I)
 # The WHOLE value, the way the model sends ``range`` -- "9/12", "12th", "the
 # 12th", "september 12", "saturday the 12th" -- has nothing in front of it
 # to frame it.  The value IS the frame: it is read as if he had said "on".
@@ -580,10 +758,21 @@ _BARE_VALUE_RX = re.compile(
 # september" was "friday" -- the 11th, a fortnight short of the 25th he
 # named -- because the weekday loop won and the rest of the phrase was
 # never read.  Digit ordinals arrive already rewritten ("first" -> "1st").
+# ROUND FIVE: the month may be left unsaid -- "on the 3rd tuesday" was
+# "tuesday", the 8th -- and then it is THIS month's, rolling to the next
+# once it has passed (the year rule's shape, one month at a time).  A
+# month-less form needs its "the": "last friday" alone is _LAST_WD_RX.
 _NTH_WD_RX = re.compile(
-    rf"\b(?:the\s+)?(?P<n>[1-5](?:st|nd|rd|th)|last)\s+(?P<wd>{_WD_ALT})\s+"
-    rf"(?:of|in)\s+(?:{_MONTH}|(?P<rel>this|next|last|the)\s+month\b){_YEAR}",
+    rf"\b(?:(?P<the>the)\s+)?(?P<n>[1-5](?:st|nd|rd|th)|last)\s+(?P<wd>{_WD_ALT})\b"
+    rf"(?:\s+(?:of|in)\s+(?:{_MONTH}|(?:the\s+)?(?P<rel>{_REL_MONTH})\s+month\b){_YEAR})?",
     re.I)
+# "last tuesday" with no "the" and no month is the most recent one BEFORE
+# today.  DEFAULT TAKEN FOR HIM (round five): it was the COMING Tuesday --
+# "what did i have last tuesday" listed next week's -- and the day it
+# names is usually past the cache, which then refuses it BY NAME
+# (out_of_reach) rather than answering about a Tuesday he did not say.
+_LAST_WD_RX = re.compile(
+    rf"(?<!\bthe\s)\blast\s+(?P<wd>{_WD_ALT})\b(?!\s+(?:of|in)\b)", re.I)
 # "what DID I have on the 3rd" is a different question from "what DO I
 # have on the 3rd" -- one looks back, one looks forward.
 _PAST_RX = re.compile(r"\b(?:did|was|were|had)\b", re.I)
@@ -634,12 +823,8 @@ def digit_ordinals(text: str) -> str:
 # had explicitly stepped away from.  DECIDED 2026-09-05: an offset is
 # UNDERSTOOD when its base day is one Jarvis can name, and ASKED ABOUT when
 # it is not.  It is never ignored.
-_COUNT_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
-                "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
-                "ten": 10, "couple": 2, "few": 3}
 _OFFSET_RX = re.compile(
-    r"\b(?:the\s+)?(?:(?P<n>a|an|one|two|three|four|five|six|seven|eight|"
-    r"nine|ten|couple(?:\s+of)?|few|\d{1,3})\s+)?"
+    rf"\b(?:the\s+)?{_APPROX}(?:(?P<n>{_COUNT_ALT})\s+)?"
     r"(?P<unit>days?|weeks?|fortnights?|months?|years?)\s+"
     r"(?P<dir>after|before|following|preceding|prior\s+to|"
     r"later\s+than|earlier\s+than|ahead\s+of)\b\s*", re.I)
@@ -661,15 +846,14 @@ _WD_OFFSET_RX = re.compile(
 # minutes" is not a day.  ROUND FOUR: a month and a year are units too --
 # "in a month", "in two months", "a month from now", "in a year" were all
 # a silent today (5 of 5) -- and the count may run to "100 days".
-_COUNT_ALT = (r"a|an|one|two|three|four|five|six|seven|eight|nine|ten|"
-              r"couple(?:\s+of)?|few|\d{1,3}")
 _UNIT = r"(?P<unit>days?|weeks?|fortnights?|months?|years?)"
 _IN_RX = re.compile(
-    rf"\bin\s+(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}(?:'s|s')?(?:\s+time)?\b",
+    rf"\bin\s+{_APPROX}(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}(?:'s|s')?(?:\s+time)?\b",
     re.I)
-_AGO_RX = re.compile(rf"\b(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+ago\b", re.I)
+_AGO_RX = re.compile(
+    rf"\b{_APPROX}(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+ago\b", re.I)
 _FROM_RX = re.compile(
-    rf"\b(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+(?:from|on)\s+", re.I)
+    rf"\b{_APPROX}(?:a\s+)?(?P<n>{_COUNT_ALT})\s+{_UNIT}\s+(?:from|on)\s+", re.I)
 _DAY_WORD_RX = re.compile(
     rf"\b(?P<w>today|tonight|now|yesterday|{'|'.join(WEEKDAYS)})\b", re.I)
 
@@ -714,19 +898,44 @@ def _year_of(match, today: date) -> Optional[int]:
     return None
 
 
+def _year_context(text: str, today: date) -> Optional[int]:
+    """The year the SENTENCE names away from the date -- "next year on
+    september 12th", "in 2027 on september 12th" -- or None."""
+    match = _YEAR_CTX_RX.search(text)
+    return _year_of(match, today) if match else None
+
+
+def _rel_step(word) -> int:
+    """"next" / "following" / "coming" -> 1, "last" / "previous" / "prior"
+    -> -1, "this" / "the" -> 0."""
+    return {"next": 1, "following": 1, "coming": 1,
+            "last": -1, "previous": -1, "prior": -1}.get((word or "").lower(), 0)
+
+
+def _step_month(today: date, months: int) -> tuple:
+    """(month, year) ``months`` whole months from today's."""
+    month = today.month + months
+    return (month - 1) % 12 + 1, today.year + (month - 1) // 12
+
+
 def _month_context(text: str, today: date) -> tuple:
     """(month, year) the sentence gives a bare ordinal -- "in october",
-    "next month" -- or (None, None) when it gives none.  A relative month
-    is explicit in both fields; a named month leaves the year to the year
-    rule."""
+    "next month", "in two months" -- or (None, None) when it gives none.
+    A relative or stepped month is explicit in both fields; a named month
+    leaves the year to the year rule unless the sentence names one."""
     match = _MONTH_CTX_RX.search(text)
     if match is None:
         return None, None
     if match.group("rel"):
-        step = {"next": 1, "last": -1}.get(match.group("rel").lower(), 0)
-        month = today.month + step
-        return (month - 1) % 12 + 1, today.year + (month - 1) // 12
-    return _MONTHS[match.group("mon").rstrip(".").lower()], _year_of(match, today)
+        return _step_month(today, _rel_step(match.group("rel")))
+    if match.group("n") or match.group("n2"):
+        return _step_month(today, _count(match.group("n") or match.group("n2")))
+    if match.group("ny"):
+        return today.month, today.year + _count(match.group("ny"))
+    year = _year_of(match, today)
+    if year is None:
+        year = _year_context(text, today)
+    return _MONTHS[match.group("mon").rstrip(".").lower()], year
 
 
 def step_months(day: date, months: int) -> date:
@@ -869,24 +1078,27 @@ def _find_date(text: str, today: date, backward: bool = False,
         value = got.isoformat() if got is not None else \
             _ask_impossible(int(match.group("m")), int(match.group("d")))
         return value, match.start(), match.end()
-    match = _NTH_WD_RX.search(text)
+    # A month-less "the 3rd tuesday" needs its "the"; "last friday" alone
+    # is the one before today (_LAST_WD_RX).
+    match = _first(_NTH_WD_RX, text,
+                   lambda m: m.group("mon") or m.group("rel") or m.group("the"))
     if match:
         return (_nth_weekday_date(match, today, backward), *_span(match))
-    match = _D_MD_RX.search(text) or _D_DM_RX.search(text)
-    # A month name beside a BARE number ("may 3", "march 3") is a date only
-    # under the same tail rule as a bare ordinal: "may 3 people come" was
-    # answered about the 3rd of May, which is the non-date class of blocker
-    # (1) wearing a month name.  An ordinal suffix or an explicit year
-    # settles it on its own ("september 12th class", "september 12 2027").
-    if match and not match.group("ord") and _year_of(match, today) is None \
-            and not _tail_ok(text[match.end():]):
-        match = None
+    match = _LAST_WD_RX.search(text)
     if match:
+        weekday = WEEKDAYS.index(match.group("wd").lower())
+        got = today - timedelta(days=(today.weekday() - weekday) % 7 or 7)
+        return got.isoformat(), match.start(), match.end()
+    match = _first(_D_MD_RX, text, lambda m: _month_day_ok(text, m, today)) \
+        or _first(_D_DM_RX, text, lambda m: _month_day_ok(text, m, today))
+    if match:
+        year = _year_of(match, today)
+        if year is None:
+            year = _year_context(text, today)
         value = _dated(text, _MONTHS[match.group("mon").rstrip(".").lower()],
-                       int(match.group("d")), _year_of(match, today), today,
-                       backward)
+                       int(match.group("d")), year, today, backward)
         return (value, *_span(match))
-    match = _D_NUM_RX.search(text)
+    match = _first(_D_NUM_RX, text, lambda m: _tail_ok(text[m.end():]))
     if match and not _PREP_LEAD_RX.match(match.group(0)) and not (
             1 <= int(match.group("a")) <= 12
             and _make_date(2000, int(match.group("a")), int(match.group("b")))):
@@ -895,16 +1107,18 @@ def _find_date(text: str, today: date, backward: bool = False,
         return (_separated(text, match, "/", today, backward), *_span(match))
     match = _D_REL_MONTH_RX.search(text)
     if match:
-        step = {"next": 1, "last": -1}.get(match.group("rel").lower(), 0)
-        month = today.month + step
-        year = today.year + (month - 1) // 12
-        month = (month - 1) % 12 + 1
+        month, year = _step_month(today, _rel_step(match.group("rel")))
         value = _dated(text, month, int(match.group("d")), year, today, backward)
         return (value, *_span(match))
-    match = _D_DASH_RX.search(text)
+    match = _first(_D_DASH_RX, text, lambda m: _tail_ok(text[m.end():]))
     if match:
         return (_dashed(text, match, today, backward), *_span(match))
-    match = _D_ORD_RX.search(text)
+    # BEFORE the ordinal rule: "on febuary the 12th" must not read its
+    # bare "the 12th" and drop the month he nearly said.
+    near = _near_month_ask(text)
+    if near:
+        return near, 0, len(text)
+    match = _first(_D_ORD_RX, text, lambda m: _ord_ok(text, m))
     if match:
         # The month, when the rest of the sentence gives one ("next month
         # on the 12th", "on the 12th in october"); otherwise the year rule
@@ -914,6 +1128,50 @@ def _find_date(text: str, today: date, backward: bool = False,
             return None
         value = _dated(text, month, int(match.group("d")), year, today, backward)
         return (value, *_span(match))
+    match = _first(_D_BARE_NUM_RX, text, lambda m: _tail_ok(text[m.end():]))
+    if match and 1 <= int(match.group("d")) <= 31:
+        d = int(match.group("d"))
+        return (_ask(f"Did you mean the {d}{_suffix(d)}, sir?"), *_span(match))
+    return None
+
+
+def _month_day_ok(text: str, match, today: date) -> bool:
+    """A month name beside a BARE number ("may 3", "march 3") is a date
+    only under the tail rule: "may 3 people come" was answered about the
+    3rd of May.  An ordinal suffix or an explicit year settles it
+    ("september 12th class", "september 12 2027") -- except a PERIOD noun
+    after the ordinal ("january the 2nd week"), which is the rank's own."""
+    rest = text[match.end():]
+    if _year_of(match, today) is not None:
+        return True
+    if match.group("ord"):
+        return _PERIOD_NOUN_RX.match(rest) is None
+    return _tail_ok(rest)
+
+
+def _framed_ordinal(text: str):
+    """The first framed bare ordinal the rank rule admits, or None."""
+    return _first(_D_ORD_RX, text, lambda m: _ord_ok(text, m))
+
+
+def _near_month_ask(text: str) -> Optional[str]:
+    """The question for a month the transcriber nearly heard -- "nevember",
+    "febuary" -- with or without a day beside it; None when every
+    month-shaped word is a real month or nothing like one."""
+    for match in _NEAR_MONTH_RX.finditer(text):
+        word = (match.group("w") or match.group("w2") or match.group("w3")
+                or match.group("w4")).lower()
+        if word in _MONTHS:
+            continue
+        near = difflib.get_close_matches(word, _MONTH_NAMES, n=1, cutoff=0.8)
+        if not near:
+            continue
+        day = match.group("d") or match.group("d2") or match.group("d3")
+        if day:
+            day = int(day)
+            return _ask(f"Did you mean the {day}{_suffix(day)} of "
+                        f"{near[0].capitalize()}, sir?")
+        return _ask(f"Did you mean {near[0].capitalize()}, sir — and which day?")
     return None
 
 
@@ -936,6 +1194,8 @@ def _separated(text: str, match, sep: str, today: date, backward: bool) -> str:
     year = None
     if raw_year:
         year = int(raw_year) + (2000 if len(raw_year) == 2 else 0)
+    else:
+        year = _year_context(text, today)
     if a > 12:
         # AMBIGUITY, decided 2026-09-05: separated dates are month-first
         # because he is in Texas, so 9/12 is September 12th.  13/5
@@ -984,10 +1244,19 @@ def _nth_weekday_date(match, today: date, backward: bool) -> str:
     rel = match.group("rel")
     if rel:
         # "of this month" is explicit: no forward/backward search.
-        step = {"next": 1, "last": -1}.get(rel.lower(), 0)
-        month = today.month + step
-        years = [today.year + (month - 1) // 12]
-        month = (month - 1) % 12 + 1
+        month, year = _step_month(today, _rel_step(rel))
+        years = [year]
+    elif not match.group("mon"):
+        # No month said (round five): THIS month's, rolling on -- or back,
+        # in the past tense -- once it has passed, one month at a time.
+        step = -1 if backward else 1
+        for i in range(3):
+            month, year = _step_month(today, step * i)
+            got = _nth_weekday(year, month, weekday, nth)
+            if got is not None and (got <= today if backward else got >= today):
+                return got.isoformat()
+        return _ask("I couldn't make that out as a date, sir — which day did "
+                    "you mean?")                      # pragma: no cover - scan-bounded
     else:
         month = _MONTHS[match.group("mon").rstrip(".").lower()]
         if _year_of(match, today) is not None:
@@ -1027,7 +1296,14 @@ def _base_span(text: str, today: date, backward: bool,
                bare_ordinal: bool = True) -> Optional[tuple]:
     """(value, end) for the day an OFFSET is measured from: an explicit
     date, "today", "tomorrow", "yesterday", "now" or a weekday.  None when
-    ``text`` names none."""
+    ``text`` names none.  A slashed pair standing first ("9/12" after "the
+    day after") has the offset for its frame and is read as "on 9/12"."""
+    lead = _BARE_LEAD_RX.match(text)
+    if lead:
+        pad = len(text) - len(text.lstrip())
+        found = _find_date("on " + text.lstrip(), today, backward, bare_ordinal)
+        if found:
+            return found[0], max(found[2] - 3 + pad, 0)
     found = _find_date(text, today, backward, bare_ordinal)
     if found:
         return found[0], found[2]                # an ISO date, or an ask
@@ -1046,7 +1322,8 @@ def _base_day(text: str, today: date, backward: bool) -> Optional[str]:
 
 
 def _count(raw) -> int:
-    raw = (raw or "one").lower().removesuffix(" of").strip()
+    raw = re.sub(r"[-\s]+", " ", (raw or "one").lower()).strip()
+    raw = raw.removesuffix(" of").strip()
     got = _COUNT_WORDS.get(raw)
     if got is None:
         try:
@@ -1123,6 +1400,13 @@ def _stepped_span(text: str, today: date, backward: bool,
     """"in two days", "three days ago", "a week on tuesday": see _IN_RX."""
     match = _IN_RX.search(text)
     if match:
+        # "in a month ON THE 12TH": the step names the month and the
+        # ordinal the day, and the ordinal rule reads both through
+        # _month_context.  ROUND FIVE: the step won and the 12th was
+        # dropped -- the 5th of October.
+        if match.group("unit").lower().startswith(("month", "year")) and \
+                _framed_ordinal(text[:match.start()] + " " + text[match.end():]):
+            return None
         got = _stepped(today, _count(match.group("n")), match.group("unit"))
         return got.isoformat(), match.start(), match.end()
     match = _AGO_RX.search(text)
@@ -1131,6 +1415,11 @@ def _stepped_span(text: str, today: date, backward: bool,
         return got.isoformat(), match.start(), match.end()
     match = _FROM_RX.search(text)
     if match:
+        # "on the 12th two months FROM NOW": the same shape the other way.
+        if match.group("unit").lower().startswith("month") and \
+                re.match(r"\s*(?:now|today)\b", text[match.end():]) and \
+                _framed_ordinal(text[:match.start()]):
+            return None
         base = _base_span(text[match.end():], today, backward, bare_ordinal)
         if base is not None:
             value, end = base
@@ -1157,20 +1446,16 @@ def _unreadable(text: str, today: date) -> Optional[str]:
     None when nothing date-shaped is there."""
     match = _MONTH_ONLY_RX.search(text)
     if match:
-        if match.group("relm"):
-            return _ask(f"Which day {match.group('relm').lower()} month, sir?")
+        if match.group("relm") or match.group("them"):
+            rel = "this" if match.group("them") else match.group("relm").lower()
+            return _ask(f"Which day {rel} month, sir?")
         month = _month_name(_MONTHS[match.group("mon").rstrip(".").lower()])
         year = _year_of(match, today)
         return _ask(f"Which day in {month}{f' {year}' if year else ''}, sir?")
-    match = _NEAR_MONTH_RX.search(text)
-    if match:
-        word = (match.group("w") or match.group("w2")).lower()
-        near = difflib.get_close_matches(word, _MONTH_NAMES, n=1, cutoff=0.8)
-        if near and word not in _MONTHS:
-            day = int(match.group("d") or match.group("d2"))
-            return _ask(f"Did you mean the {day}{_suffix(day)} of "
-                        f"{near[0].capitalize()}, sir?")
-    if _DATEISH_RX.search(text):
+    near = _near_month_ask(text)
+    if near:
+        return near
+    if _first(_DATEISH_RX, text, lambda m: _tail_ok(text[m.end():])):
         return _ask("I couldn't work out which date you meant, sir — "
                     "which day did you want?")
     return None
@@ -1195,6 +1480,13 @@ def _read(raw: str, today: date, backward,
     got = _stepped_span(raw, today, backward, bare_ordinal)
     if got:
         return got
+    # THE SPAN CHECK runs on the raw text BEFORE the rank rule sees either
+    # ordinal: "the 12th through the 14th" was the 14th with no question
+    # (round five), because the first ordinal failed the old tail rule
+    # and only the second was ever read.
+    span = _first(_ORD_SPAN_RX, raw, lambda m: _tail_ok(raw[m.end():]))
+    if span:
+        return _ask(SPAN_ASK), span.start(), span.end()
     found = _find_date(raw, today, backward, bare_ordinal)
     if found:
         value, start, end = found
@@ -1204,8 +1496,10 @@ def _read(raw: str, today: date, backward,
         # the 14th" -- were answered about the first with no word about the
         # second: a confident partial answer.  One range value cannot carry
         # two days, so a span is a question, never the first day of it.
+        # A second MONTH ("the 12th of september or october") is the same.
         if _YESTERDAY_RX.search(raw) or _second_date(raw[:start], today, backward) \
-                or _second_date(raw[end:], today, backward):
+                or _second_date(raw[end:], today, backward) \
+                or _JOINER_MONTH_RX.match(raw[end:]):
             return _ask(SPAN_ASK), start, end
         return found
     match = _YESTERDAY_RX.search(raw)
@@ -1341,18 +1635,94 @@ def model_day_stands(said, heard: str, model_range, now: datetime) -> bool:
     the model's month and year are a refinement the words cannot
     contradict, and they stand.  A QUESTION from the words is neither
     today nor a different day, so it always stands over a guess.
+
+    ROUND FIVE refined the refinement -- see reconcile_model_day, which is
+    the rule now; this is its yes/no."""
+    return reconcile_model_day(said, heard, model_range, now) is None
+
+
+_MONTH_WORD_RX = re.compile(rf"\b(?:{_MONTH_ALT})(?:\.|\b)", re.I)
+
+
+def _year_said(raw: str, today: date) -> Optional[int]:
+    """The year his words name -- "2027", "next year", the year of a
+    slashed triple -- or None."""
+    match = _YEAR_SAID_RX.search(raw)
+    if match is None:
+        return None
+    if match.group("yy"):
+        raw_year = match.group("yy")
+        return int(raw_year) + (2000 if len(raw_year) == 2 else 0)
+    return _year_of(match, today)
+
+
+def _year_open(said, heard: date, today: date) -> bool:
+    """True when the YEAR in the reading is the reader's default -- the
+    next such day -- and not one his words settled: his words named a
+    month (by name, or as a slashed pair) and either no year at all, or a
+    year the reader did not manage to read (a hole: the reading's year is
+    not the one he said).  A step or an offset settles its own year and
+    is not open."""
+    raw, _shift = _prepared(said, clean=True)
+    if _D_ISO_RX.search(raw):
+        return False
+    if not (_MONTH_WORD_RX.search(raw) or _D_NUM_RX.search(raw)):
+        return False
+    said_year = _year_said(raw, today)
+    if said_year is not None and said_year == heard.year:
+        return False                         # he said it, the reader read it
+    full = _read(raw, today, None)
+    plain = _find_date(raw, today, bool(_PAST_RX.search(raw)))
+    return bool(full and plain and full[0] == plain[0])
+
+
+def _month_words(day: date, today: date) -> str:
+    return _month_name(day.month) + (f" {day.year}" if day.year != today.year else "")
+
+
+def reconcile_model_day(said, heard: str, model_range, now: datetime) -> Optional[str]:
+    """THE DERIVER RULE, round five (2026-09-06): None when the model's
+    value STANDS; otherwise the range to use in its place -- his words'
+    day, or a question.
+
+    DEFAULT TAKEN FOR HIM (a): the model REFINES what his words left
+    unsaid and never overrides what they said.
+
+    * a different day-of-month: his words win (unchanged);
+    * day and month said, no year -- "september 12th" -- and the model
+      sends the same day in another YEAR: the year stands.  Round four
+      compared only the day and the month, and when the reader gave
+      2026-09-12 for "sept 12th OF NEXT YEAR" it counted as pinned and
+      REPLACED the model's correct 2027-09-12 (3 of 262);
+    * day, month and year said: his words win over any of them;
+    * day said and no month -- "the 12th" -- and the model sends the same
+      day in another month or year: round four let the model's month
+      stand as a refinement, and MEASURED 49 of 262 dated phrasings then
+      answered about a month he never said, with no question.  Now the
+      reader's nearest-upcoming month is one reading and the model's is
+      another, and Jarvis ASKS which -- following neither alone.
     """
     if not model_range or is_ask(heard):
-        return False
+        return heard
     model_day = as_date(coerce_range(model_range, now))
     heard_day = as_date(heard)
     if model_day is None or heard_day is None:
-        return False
+        return heard
     if heard_day == model_day:
-        return True
-    if _pinned_by_words(said, now.date()):
-        return False
-    return heard_day.day == model_day.day
+        return None
+    if heard_day.day != model_day.day:
+        return heard                         # a different day: his words win
+    today = now.date()
+    if _pinned_by_words(said, today):
+        if heard_day.month != model_day.month:
+            return heard                     # a month his words named
+        if not _year_open(said, heard_day, today):
+            return heard                     # a year his words settled
+        return None                          # the year is the model's to refine
+    d = heard_day.day
+    return _ask(f"The {d}{_suffix(d)} of which month, sir — "
+                f"{_month_words(heard_day, today)} or "
+                f"{_month_words(model_day, today)}?")
 
 
 # A day commonly holds three or four events. At the default two
@@ -1374,6 +1744,14 @@ def date_words(day: date, today: date) -> str:
     if day.month != today.month:
         return f"{stem} of {_month_name(day.month)}"
     return stem
+
+
+def full_date_words(day: date) -> str:
+    """"Friday the 4th of September 2026": the form no year rule can move.
+    The day-shift rewrite uses it for a day that lies BEFORE today, which
+    "Friday the 4th" alone would roll on to next month (round five)."""
+    return (f"{day.strftime('%A')} the {day.day}{_suffix(day.day)} of "
+            f"{_month_name(day.month)} {day.year}")
 
 
 def _date_label(day: date, today: date) -> tuple:
@@ -2306,12 +2684,17 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             got = sentence_date(said, now.date())
             if not got:
                 return {}
-            if model_day_stands(said, got, (model_args or {}).get("range"), now):
+            # None: the model's value stands (it may have refined the year
+            # his words left open).  A day: his words contradicted it.  An
+            # ask: his words gave only a day-of-month and the model moved
+            # its month -- neither is followed alone (round five).
+            use = reconcile_model_day(said, got, (model_args or {}).get("range"), now)
+            if use is None:
                 return {}
         except Exception:                    # noqa: BLE001 - tool boundary
             log.debug("calendar range derive failed", exc_info=True)
             return {}
-        return {"range": got}
+        return {"range": use}
 
     def add_event(text="", calendar=None, **_) -> ToolResult:
         """Add one event. Writes outright when the parse is unambiguous;
