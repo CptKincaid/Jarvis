@@ -2599,7 +2599,14 @@ class SettingsDrawer(tk.Frame):
         box = self._section("Voice ID")
         self._toggle_row(box, "Speaker verify", "speaker_verify")
         self._scale_row(box, "Threshold", "speaker_threshold", 0.1, 0.9, 0.05)
-        self._button_row(box, "Enroll my voice", self._service("enroll_speaker"))
+        # "ENROLL MY VOICE" WAS HERE AND HAS BEEN TAKEN OUT. It recorded a
+        # fixed fifteen seconds of whatever was in the room and appended it
+        # to voiceprint.npz with no loudness floor, no cohesion or
+        # separation check, no consent, no gate, no owner check and no way
+        # to undo it -- one click deep, next to a slider. Enrolling a voice
+        # is on the USERS tab now, where it is judged before anything is
+        # written and asks for the override code first.
+        self._info_row(box, "Enrol your voice on the Users tab")
         self._button_row(box, "Train wake word", self._service("train_wakeword"))
 
         # Speech

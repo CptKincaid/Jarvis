@@ -528,3 +528,120 @@ def spoken_pose(text: str) -> str:
     anywhere near his clipboard, so a spoken pose cannot become shell."""
     from jarvis.facegallery import clean_note        # noqa: PLC0415 - lazy
     return clean_note(str(text or "").strip())
+
+
+# ---------------------------------------------------------- what a purge did
+# THE ONE THING A SURFACE MAY NOT DO WITH A PURGE IS ROUND IT UP. Both
+# galleries' ``purge_label`` return NUMBERS rather than a boolean, precisely so
+# a caller cannot claim a delete happened because a call did not raise: the
+# invariant is that no file is destroyed until the embeddings it held, minus
+# theirs, have been read back off disk from the new generation by name AND by
+# sample count, and anything that fails any step is counted, named and left
+# alone. Three separate bugs moved through that room. So this builds the
+# sentence FROM those numbers, and when ``complete`` is False it says they are
+# still there and names the command that finishes the job.
+PURGE_FOLLOW_UP = ("Run the enrolment script with --status to see what is "
+                   "left, then --delete with no label to destroy everything.")
+
+
+def purge_line(report, *, kind: str = "face") -> str:
+    """One honest sentence about what a purge actually did.
+
+    ``kind`` is "face" or "voice", and the line always names the OTHER one --
+    a face purge that quietly left a voice pool behind would be the same
+    half-truth as a forget that left a gallery behind, which is the defect
+    this whole surface is correcting.
+    """
+    rep = dict(report or {})
+    who = str(rep.get("label") or "somebody")
+    other = "voice" if kind == "face" else "face"
+    held = list(rep.get("generations_with") or ())
+    removed = int(rep.get("removed") or 0)
+    complete = bool(rep.get("complete"))
+    tail = "This does not touch %s's %s." % (who, other)
+
+    if not held and complete:
+        return ("Nothing to remove: no %s generation held %s. %s"
+                % (kind, who, tail))
+
+    if complete:
+        return ("Removed. %d %s generation(s) held %s; %d file(s) were "
+                "overwritten, and everybody else was read back from the new "
+                "generation at full count. %s"
+                % (len(held), kind, who, removed, tail))
+
+    # NOT COMPLETE. Say which generations still hold them and WHY each one
+    # could not be finished, because "some of it worked" is not something
+    # anybody can act on.
+    bits = []
+    still = list(rep.get("still_holding") or ())
+    if still:
+        bits.append("generation(s) %s still hold %s"
+                    % (", ".join(str(g) for g in still), who))
+    unreadable = list(rep.get("unreadable") or ())
+    if unreadable:
+        bits.append("%s could not be read, so %s was left alone"
+                    % (_gens(unreadable), _they(unreadable)))
+    foreign = list(rep.get("foreign") or ())
+    if foreign:
+        models = ", ".join(str(m) for m in (rep.get("foreign_models") or ())
+                           if m)
+        bits.append("%s %s written by another model (%s) this build cannot "
+                    "rewrite" % (_gens(foreign), _were(foreign),
+                                 models or "unknown"))
+    not_carried = list(rep.get("not_carried") or ())
+    if not_carried:
+        bits.append("%s hold somebody else who could not be carried forward, "
+                    "so destroying %s would cost them their enrolment"
+                    % (_gens(not_carried), _they(not_carried)))
+    why = "; ".join(bits) or "the read-back could not be completed"
+    return ("Not finished, and nothing here may claim otherwise: %s. %d "
+            "file(s) were overwritten. %s %s"
+            % (why, removed, PURGE_FOLLOW_UP, tail))
+
+
+def _gens(gens) -> str:
+    return "generation%s %s" % ("" if len(gens) == 1 else "s",
+                                ", ".join(str(g) for g in gens))
+
+
+def _were(gens) -> str:
+    return "was" if len(gens) == 1 else "were"
+
+
+def _they(gens) -> str:
+    return "it" if len(gens) == 1 else "they"
+
+
+VOICE_SCRIPT = "scripts/voice_enrol.py"
+
+
+def voice_script_path() -> str:
+    """Where scripts/voice_enrol.py is, derived the same way and for the same
+    reason: a hard-coded ~/Jarvis is wrong in every worktree."""
+    return str((Path(__file__).resolve().parent.parent / VOICE_SCRIPT))
+
+
+def voice_command_line(label: str, name: str = "", delete: bool = False,
+                       python: Optional[str] = None,
+                       script: Optional[str] = None) -> str:
+    """The hand-over for somebody ELSE's voice, quoted.
+
+    THE VOICE HALF OF THE SAME REFUSAL. A window cannot take a third party's
+    consent -- ``consent.take_at_terminal``'s precondition is two real ttys
+    and its whole point is that nobody may type it for them, which a dialog
+    driven by whoever is already logged in cannot reproduce. So a guest's
+    voice stays at the terminal and this is the command, ready to run.
+
+    IMPORT-LIGHT, like ``command_line`` beside it: no gallery, no model, no
+    recorder is reached to build a string. That property is tested, because
+    importing this module used to pull the whole vision stack in.
+    """
+    out = [shlex.quote(python or sys.executable),
+           shlex.quote(script or voice_script_path())]
+    if delete:
+        out.append("--delete")
+    out += ["--label", shlex.quote(str(label or ""))]
+    if name:
+        out += ["--name", shlex.quote(str(name))]
+    return " ".join(out)

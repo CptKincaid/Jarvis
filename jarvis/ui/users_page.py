@@ -70,14 +70,31 @@ UNLOCK_PLACEHOLDER = "override code"
 # code constantly, which is one more exposure on his display each time.
 UNLOCK_S = 120.0
 
-# What the voice chip may say. MEASURED in gate._voice_leg: there is ONE
-# voiceprint pool (PATHS.VOICEPRINT) and the leg answers with the OWNER's
-# label on a match, whoever actually spoke. So a guest's "voice" is inert
-# and a tickbox for it would let him build a row that lies.
-VOICE_OWNER = "voice: owner only (one voiceprint)"
-VOICE_OWNER_NONE = "voice: no voiceprint enrolled"
-VOICE_GUEST = ("voice: cannot name a guest — there is one voiceprint and "
-               "it is the owner's")
+# ------------------------------------------------------------- the voice chip
+# IT SAYS WHO HAS A POOL, and it used to assert that nobody but the owner
+# could. The chip it replaces -- VOICE_GUEST, "cannot name a guest", drawn on
+# EVERY non-owner row on the grounds that only one pool existed and it was his
+# -- stopped being true when jarvis/voicegallery.py merged: gate._voice_leg
+# names guests out of it, through speaker.py. Same defect class as the stale
+# foot note, one chip over, so this is derived from the snapshot for the same
+# reason. The old sentence is not quoted here, because a test greps this file
+# for it.
+VOICE_NONE = "voice: none enrolled"
+VOICE_POOL = "voice: enrolled"
+
+
+def voice_chip(label, role="", voices=()) -> str:
+    """What this person's voice chip says, from the pools that EXIST.
+
+    ``voices`` is the voice gallery's label list, carried on the snapshot
+    beside the face gallery's. A row whose label is in it has a pool Jarvis
+    can match against; a row that is not simply has none yet -- which is a
+    fact about today, not a rule about who is allowed one.
+    """
+    who = str(label or "")
+    have = {str(v) for v in (voices or ())}
+    return VOICE_POOL if who and who in have else VOICE_NONE
+
 
 # The one amber sentence on a person block. It NAMES the pointer, because
 # the whole failure is that a face label was renamed or deleted in the
@@ -87,26 +104,122 @@ FACE_DANGLING = ('face: "%s" is not in the face gallery, so the face leg '
                  "cannot name them; re-enrol them or point the row at the "
                  "label the gallery actually holds")
 
-# The standing note in the pinned foot. Plain sentences, and the first one
-# is the one this whole feature rests on.
-CANNOT_DO = (
-    "This is recognition, not a lock: anyone already at this keyboard can "
-    "edit the people file directly.",
-    "Setting a new spoken passphrase or a new override code still needs a "
-    "terminal — this page only says whether each is set.",
-    "Enrolling a face or a voice still needs a terminal: the running Jarvis "
-    "owns the camera and the microphone. The command is handed over ready "
-    "to run.",
-    "Forgetting somebody removes their entry here only. Their face "
-    "measurements stay in the gallery until that command is run.",
-    "Nothing here can be undone: the people file has no history and no "
-    "backup.",
+# ------------------------------------------------------ the standing note
+# IT IS DERIVED, NOT WRITTEN, and that is the fix for the defect he actually
+# caught on 2026-09-05. ``CANNOT_DO`` used to be a hand-edited tuple of
+# sentences sitting a hundred lines from the code whose truth it asserts, and
+# it went stale in three places at once: it said enrolling a face needs a
+# terminal after jarvis/enrolrun.py made that false for him, it said setting a
+# code needs a terminal while the drawer one tab away took a typed code in a
+# masked box, and the voice chip below said a guest cannot be named after the
+# voice gallery made that false too. Fixing the words would have fixed it
+# once. Deriving them from the seams that are actually wired stops the class:
+# a capability that lands turns its own sentence off, a capability that is
+# removed turns one back on, and tests/test_users_footnote.py fails when they
+# disagree.
+
+# The two that are true whatever ships. Neither is a capability, so neither
+# may ever be derived away.
+NOTE_NOT_A_LOCK = ("This is recognition, not a lock: anyone already at this "
+                   "keyboard can edit the people file directly.")
+NOTE_NO_UNDO = ("Nothing here can be undone: the people file has no history "
+                "and no backup.")
+
+# The passphrase. It may be typed here BECAUSE it is said out loud in normal
+# use -- scripts/jarvis_people.py's own text says "it can be overheard; that
+# is accepted" -- so a masked box on his own console makes it no worse.
+NOTE_PHRASE_NO = ("Setting a new spoken passphrase still needs a terminal — "
+                  "this page only says whether one is set.")
+
+# The code. It may NEVER be typed here, and the sentence says what the tab
+# does instead. Its whole value is that it never travels a microphone and is
+# never chosen: a mailed code is generated from an alphabet with no 0/o and
+# no 1/l and rotates on every use.
+NOTE_CODE_NO = ("Setting a new override code still needs a terminal — this "
+                "page only says whether one is set.")
+NOTE_CODE_MAIL = ("Setting an override code by hand still needs a terminal — "
+                  "`scripts/jarvis_people.py set-code`. From here you can "
+                  "only ask for a new one to be emailed to you, and the old "
+                  "one keeps working until the new one has actually been "
+                  "sent.")
+
+NOTE_FACE_NO = ("Enrolling a face still needs a terminal: the running Jarvis "
+                "owns the camera. The command is handed over ready to run.")
+NOTE_VOICE_NO = ("Enrolling a voice still needs a terminal — "
+                 "`scripts/voice_enrol.py`. Nothing here records you.")
+
+# ALWAYS TRUE, whatever else ships. A dialog is driven by whoever is already
+# logged in, so the console cannot reproduce "and nobody may type it for
+# them" for a MEASUREMENT of somebody else.
+NOTE_OTHERS = ("Enrolling somebody else's face or voice still needs a "
+               "terminal: they have to read what is stored and type their "
+               "own name themselves, and nobody may type it for them. The "
+               "command is handed over ready to run.")
+
+NOTE_PURGE_NO = ("Forgetting somebody removes their entry here only. Their "
+                 "face measurements stay in the gallery until that command "
+                 "is run.")
+NOTE_PURGE_FACE_ONLY = ("Forgetting somebody removes their entry and, "
+                        "separately, their face measurements. A voice pool "
+                        "stays until that command is run.")
+NOTE_PURGE_VOICE_ONLY = ("Forgetting somebody removes their entry and, "
+                         "separately, their voice pool. Face measurements "
+                         "stay until that command is run.")
+NOTE_PURGE_BOTH = ("Forgetting somebody removes their entry only. Their face "
+                   "measurements and their voice pool are separate buttons, "
+                   "and each says what it did NOT touch.")
+
+# The asymmetry this work creates, said rather than smoothed over. Every
+# button below is under GUARDED and asks for the override code. The SPOKEN
+# door to the identical write does not: "enrol my face" out loud is gated by
+# the wake word, the speaker verifier and one typed word, and never asks
+# admin_gate. That is the right direction -- the stricter door is the new one
+# -- but he should be told rather than left to find it.
+ENROL_ASYMMETRY = (
+    "Asking me out loud to enrol your face does not ask for the override "
+    "code; this button does.",
+    "That is deliberate. The spoken path already needs the wake word, your "
+    "voice, and a word typed at this keyboard. It is not loosened to match.",
 )
 
-# The actions that demand the code. READING THE LIST IS NOT ONE: the
-# terminal tool runs `list` before it authorises, for exactly this reason,
-# and the list holds no secret -- every row is built from redacted().
-GUARDED = ("add", "set_role", "forget", "set_face")
+
+def cannot_do(services=None) -> Tuple[str, ...]:
+    """The pinned foot note, BUILT FROM THE SEAMS THAT ARE WIRED.
+
+    Every sentence is a fact about this build, asked of the services
+    namespace the app actually handed the console -- so a half-wired UI (the
+    app and the window merged in either order) describes itself correctly
+    instead of promising a button that is not there.
+    """
+    def wired(name):
+        return callable(getattr(services, name, None)) if services else False
+
+    out = [NOTE_NOT_A_LOCK]
+    if not wired("people_set_phrase"):
+        out.append(NOTE_PHRASE_NO)
+    out.append(NOTE_CODE_MAIL if wired("people_new_code") else NOTE_CODE_NO)
+    if not wired("face_enrol_start"):
+        out.append(NOTE_FACE_NO)
+    if not wired("voice_enrol_start"):
+        out.append(NOTE_VOICE_NO)
+    out.append(NOTE_OTHERS)
+    face, voice = wired("people_purge_face"), wired("people_purge_voice")
+    out.append(NOTE_PURGE_BOTH if (face and voice) else
+               NOTE_PURGE_FACE_ONLY if face else
+               NOTE_PURGE_VOICE_ONLY if voice else NOTE_PURGE_NO)
+    out.append(NOTE_NO_UNDO)
+    return tuple(out)
+
+
+# EVERY DOOR INTO THE PEOPLE BOOK OR A GALLERY IS IN HERE. "set_face" was in
+# this tuple and was DEAD: the string appeared in its own definition and
+# nowhere else in the tree -- no action, no button, no seam, and nothing ever
+# called may("set_face"). It is gone, and the six real doors this work opens
+# are in its place. Starting a camera or a microphone is not a registry write,
+# but each writes to something at least as irreversible as the people book, so
+# none of them gets an easier question than `forget` does.
+GUARDED = ("add", "set_role", "forget", "set_phrase", "new_code",
+           "face_enrol", "voice_enrol", "purge_face", "purge_voice")
 
 LOCKED_LINE = ("Unlock with your override code before changing anything, "
                "sir.")
@@ -294,6 +407,209 @@ class UsersUnlockControl:
         self.toast(line, "ok" if ok else "warn")
 
 
+
+# =============================================== the spoken passphrase
+PHRASE_MISMATCH = "Those did not match, sir; nothing was changed."
+PHRASE_FAILED = "That did not work, sir; see the log."
+PHRASE_NOT_WIRED = "Setting a passphrase is not wired to this console."
+
+# WHY THIS ONE MAY BE TYPED ON SCREEN. The page's own header used to argue
+# the opposite for both secrets at once -- "a long-lived secret typed into an
+# on-screen box on :1 is a worse deal than walking to a terminal for it" --
+# and that argument is still exactly right about the OVERRIDE CODE, which is
+# why there is no box for one. It does not transfer to the spoken passphrase,
+# and the difference is in the threat model rather than in the convenience:
+# the passphrase is SAID OUT LOUD in normal use, and scripts/jarvis_people.py
+# says so in its own text -- it can be overheard, and that is accepted. A
+# secret already accepted as overhearable is not made materially worse by a
+# masked box on his own console. The code exists precisely because it never
+# touches a microphone.
+PHRASE_PANEL = (
+    "The spoken way back in, for when the camera is off and your voice will "
+    "not match — ill, in the dark, or turned away.",
+    "It is said out loud, so it can be overheard. That is accepted.",
+    "At least %d letters and digits once punctuation is dropped." %
+    __import__("jarvis.passphrase", fromlist=["x"]).MIN_PHRASE_LEN,
+    "Nothing here can read it back, and it is never spoken aloud: a "
+    "passphrase read back by the assistant is a passphrase in the room.",
+)
+
+
+def phrase_panel_lines() -> Tuple[str, ...]:
+    return PHRASE_PANEL
+
+
+class UsersSecretControl:
+    """The passphrase panel's logic, WITHOUT Tk -- ``UsersUnlockControl``'s
+    split, and its rules, for the same measured reasons.
+
+    BOTH BOXES ARE EMPTIED BEFORE ANYTHING ELSE HAPPENS, and before the hash
+    is computed rather than after the service returns. ``hash_secret`` is a
+    scrypt KDF at N=2^14 -- real work -- and a typed secret must not sit on
+    screen while it runs, nor still be there if the tab is left mid-call.
+
+    THE HASHING HAPPENS IN THIS FRAME and the plaintext dies here.
+    ``identity.Registry`` is documented as never seeing a plaintext, and this
+    is the caller that keeps that true from the console: the service is handed
+    a hash, so a service that raised with its argument in the message could
+    not put a passphrase in a log file even if it tried.
+
+    THE THREAD IS NAMED FOR THE FIELD, never for anything derived from the
+    value, and every ``except`` logs the exception's TYPE only -- a traceback
+    carries the exception's own str(), which is how a plaintext reaches a
+    logfile at ERROR and stays there.
+    """
+
+    def __init__(self, services, *, label: str,
+                 read: Callable[[], Tuple[str, str]],
+                 clear: Callable[[], None], toast: Callable,
+                 later: Callable[[Callable], None],
+                 spawn: Optional[Callable] = None,
+                 on_done: Optional[Callable] = None):
+        self.services = services
+        self.label = str(label or "")
+        self.read = read
+        self.clear = clear
+        self.toast = toast
+        self.later = later
+        self.spawn = spawn or self._thread
+        self.on_done = on_done
+
+    @staticmethod
+    def _thread(fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True,
+                         name="users-phrase").start()
+
+    def pressed(self) -> str:
+        """Read both boxes, EMPTY THEM AT ONCE, then decide.
+
+        "started" / "mismatch" / "too short" / "empty" / "not wired".
+        """
+        from jarvis import passphrase as pp
+        try:
+            first, second = self.read()
+        except Exception:                 # noqa: BLE001 - torn down
+            self.clear()
+            log.error("users: the phrase entries could not be read")
+            self.toast(PHRASE_FAILED, "warn")
+            return "not wired"
+        self.clear()
+        if not str(first or "").strip() and not str(second or "").strip():
+            del first, second
+            self.toast("Type the new passphrase twice, sir.", "warn")
+            return "empty"
+        if first != second:
+            del first, second
+            self.toast(PHRASE_MISMATCH, "warn")
+            return "mismatch"
+        ok, why = pp.phrase_ok(first)
+        if not ok:
+            del first, second
+            self.toast(why, "warn")
+            return "too short"
+        fn = getattr(self.services, "people_set_phrase", None) \
+            if self.services else None
+        if not callable(fn):
+            del first, second
+            log.warning("users: no passphrase service is wired to this "
+                        "console")
+            self.toast(PHRASE_NOT_WIRED, "warn")
+            return "not wired"
+        # HASHED HERE, so the plaintext never crosses the seam and never
+        # leaves this frame.
+        hashed = pp.hash_secret(first)
+        del first, second
+        self.spawn(self._run, fn, hashed)
+        del hashed
+        return "started"
+
+    def _run(self, fn, hashed):
+        try:
+            ok, line = fn(self.label, hashed)
+        except Exception as exc:          # noqa: BLE001 - the service boundary
+            # NOT log.exception, and it is the same measured reason the
+            # unlock control gives: a traceback carries the exception's own
+            # str(). Only the TYPE is recorded, and a type can quote nothing.
+            log.error("users: the passphrase service failed (%s)",
+                      type(exc).__name__)
+            ok, line = False, PHRASE_FAILED
+        finally:
+            del hashed
+        line = str(line or PHRASE_FAILED)
+        self.later(lambda: self._landed(bool(ok), line))
+
+    def _landed(self, ok: bool, line: str) -> None:
+        if ok and callable(self.on_done):
+            try:
+                self.on_done()
+            except Exception:             # noqa: BLE001 - a callback
+                log.exception("users: the passphrase callback failed")
+        self.toast(line, "ok" if ok else "warn")
+
+
+# ============================================== asking for a new override code
+@dataclass(frozen=True)
+class CodePlan:
+    """Whether the button may be pressed, and the caption under it."""
+    enabled: bool
+    line: str
+
+
+CODE_NO_MAILBOX = ("No mail account is set up, so there is nowhere to send a "
+                   "code and this button would do nothing. %s")
+CODE_TO = ("Typed only, never spoken. The next code goes to %s, and the one "
+           "you have now keeps working until that mail has actually gone.")
+CODE_BAD_TO = ("Your configured notice address is not an address, so nothing "
+               "can be sent until that is fixed.")
+
+# THE TRAP, SAID BEFORE THE PRESS. gate._mode_unsafe downgrades enforce to
+# SHADOW while no owner row carries a code, because a wrong verdict would
+# otherwise have no way back in. The moment a code exists that downgrade
+# lifts -- so on a box configured owner.mode=enforce but running in shadow for
+# want of a code, ONE PRESS OF THIS BUTTON starts refusing turns. It is not
+# closed by refusing, because a box with no code is the state that most needs
+# one; it is stated here and logged when it happens.
+CODE_TURNS_GATE_ON = (
+    "This will also switch the owner gate from shadow to enforce. It is "
+    "running in shadow only because no override code is set, and setting one "
+    "lifts that. Turns will start being refused when I am not sure it is you.")
+
+CODE_NO_FREE_TEXT = (
+    "There is no box to choose one. A code you type is one you chose, will "
+    "reuse and will type again; a mailed one is generated from an alphabet "
+    "with no 0/o and no 1/l, is yours only until you next use it, and rotates "
+    "every time. Choosing one by hand is `scripts/jarvis_people.py set-code`.")
+
+
+def code_plan(status=None, *, mode: str = "", has_code: bool = True) -> CodePlan:
+    """May "Send me a new code" be pressed, and what does the caption say?
+
+    THE CAPTION IS THE DRAWER'S OWN, reused rather than written a second
+    time: ``app.knightfall_status`` already answers a masked destination, a
+    problem sentence and a setup line, and the drawer's Knightfall row is
+    drawn from exactly those. A promise made here that the drawer would not
+    make is a promise one of them is going to break.
+    """
+    st = dict(status or {})
+    problem = str(st.get("problem") or "")
+    if problem:
+        return CodePlan(False, CODE_BAD_TO)
+    to = str(st.get("to") or "")
+    if not to:
+        return CodePlan(False, CODE_NO_MAILBOX % (st.get("setup") or ""))
+    return CodePlan(True, CODE_TO % to)
+
+
+def code_panel_lines(status=None, *, mode: str = "",
+                     has_code: bool = True) -> Tuple[str, ...]:
+    """Everything he should read BEFORE pressing, in order."""
+    out = [code_plan(status, mode=mode, has_code=has_code).line]
+    if str(mode) == "enforce" and not has_code:
+        out.append(CODE_TURNS_GATE_ON)
+    out.append(CODE_NO_FREE_TEXT)
+    return tuple(out)
+
+
 # ========================================================== the bootstrap
 @dataclass(frozen=True)
 class BootstrapPlan:
@@ -385,6 +701,10 @@ def rows_from(snapshot) -> Tuple[Row, ...]:
     try:
         people = list((snapshot or {}).get("people") or ())
         gallery = set((snapshot or {}).get("gallery") or ())
+        # The VOICE gallery's labels, beside the face gallery's. Without them
+        # the tab cannot say who has a voice pool, which is what made the
+        # stale voice chip invisible from inside the app.
+        voices = set((snapshot or {}).get("voices") or ())
     except Exception:  # noqa: BLE001 - a snapshot that cannot answer
         log.exception("users: the snapshot could not be read")
         return ()
@@ -394,7 +714,7 @@ def rows_from(snapshot) -> Tuple[Row, ...]:
     for person in people:
         if not isinstance(person, dict):
             continue
-        out.append(_row(person, gallery, sole))
+        out.append(_row(person, gallery, sole, voices))
     return tuple(out)
 
 
@@ -405,7 +725,7 @@ def _get(person, key, default=""):
         return default
 
 
-def _row(person: dict, gallery, sole) -> Row:
+def _row(person: dict, gallery, sole, voices=()) -> Row:
     label = str(_get(person, "label"))
     name = str(_get(person, "name"))
     role = str(_get(person, "role")) or ROLE_KNOWN
@@ -427,11 +747,7 @@ def _row(person: dict, gallery, sole) -> Row:
         # tinting a list of chips that are all perfectly correct.
         tone = "warn"
         face_why = (FACE_DANGLING % face)
-    voice = bool(_get(person, "voice", False))
-    if role == ROLE_OWNER:
-        voice_text = VOICE_OWNER if voice else VOICE_OWNER_NONE
-    else:
-        voice_text = VOICE_GUEST
+    voice_text = voice_chip(label, role=role, voices=voices)
     has_phrase = bool(_get(person, "has_phrase", False))
     has_code = bool(_get(person, "has_code", False))
     phrase_text = "phrase: set" if has_phrase else "phrase: not set"
@@ -507,14 +823,38 @@ class ForgetArm:
         return "forget"
 
 
-def forget_warning(label: str) -> Tuple[str, ...]:
+def forget_warning(label: str, voices=(), gallery=()) -> Tuple[str, ...]:
     """What is destroyed, what SURVIVES, and that none of it comes back.
 
-    MEASURED in ``identity.Registry.forget``: it removes the ROW and
-    nothing else. Saying "removed" and leaving the rest implied is how
-    somebody comes to believe a face gallery was scrubbed when it was not.
+    MEASURED in ``identity.Registry.forget``: it removes the ROW and nothing
+    else. Saying "removed" and leaving the rest implied is how somebody comes
+    to believe a gallery was scrubbed when it was not.
+
+    IT USED TO SAY SOMETHING FALSE, and in the most damaging place to say it.
+    The line it carried told him there was no voice recording of that person
+    to remove, on the grounds that only the owner had a pool. That stopped
+    being true when the voice gallery merged, and it was printed on a
+    DESTRUCTIVE panel -- so he could read "there is nothing of hers to remove"
+    while her pool sat on the disk. The sentence is now built from what the
+    two galleries actually hold. The old wording is not quoted here: a test
+    greps this file for it.
     """
     who = str(label or "")
+    have_face = who in {str(g) for g in (gallery or ())}
+    have_voice = who in {str(v) for v in (voices or ())}
+    if have_face and have_voice:
+        survives = ("%s's face measurements AND %s's voice pool stay on the "
+                    "disk. Each is a separate button below, and each says "
+                    "what it did not touch." % (who, who))
+    elif have_face:
+        survives = ("%s's face measurements stay in the gallery. There is no "
+                    "voice pool under that name." % who)
+    elif have_voice:
+        survives = ("%s's voice pool stays in the gallery. There are no face "
+                    "measurements under that name." % who)
+    else:
+        survives = ("There are no face measurements and no voice pool under "
+                    "that name, so this row is all there is of %s." % who)
     return (
         "Forget %s?" % who,
         "",
@@ -522,17 +862,79 @@ def forget_warning(label: str) -> Tuple[str, ...]:
         "they point at, their consent record and the date they were "
         "added." % who,
         "",
-        "WHAT SURVIVES. %s's face measurements stay in the gallery — this "
-        "page does not touch them. The command that removes those is below "
-        "and it is a separate step." % who,
-        "There is no voice recording of %s to remove: Jarvis holds one "
-        "voiceprint and it is the owner's." % who,
+        "WHAT SURVIVES. " + survives,
         "",
         "THIS CANNOT BE UNDONE. The people file is rewritten in place; "
         "there is no history and no backup.",
         "",
         "Type %s to confirm." % who,
     )
+
+
+PURGE_WARN_FACE = (
+    "Remove %(who)s's FACE measurements?",
+    "",
+    "This destroys every generation on the disk that holds %(who)s -- "
+    "including the older ones -- overwritten and then unlinked. Everybody "
+    "else is carried forward into a new generation first, and nothing is "
+    "destroyed until they have been READ BACK off the disk by name and by "
+    "sample count.",
+    "",
+    "If any generation cannot be read, was written by another model, or "
+    "holds somebody who could not be carried, it is LEFT ALONE and you are "
+    "told -- %(who)s is then still in it and nothing here will claim "
+    "otherwise.",
+    "",
+    "This does not touch %(who)s's voice pool. That is the button beside it.",
+    "",
+    "THIS CANNOT BE UNDONE. There is no history and no backup.",
+    "",
+    "Type %(who)s to confirm.",
+)
+
+PURGE_WARN_VOICE = (
+    "Remove %(who)s's VOICE pool?",
+    "",
+    "This destroys every generation on the disk that holds %(who)s's voice "
+    "embeddings -- 192 numbers per take -- overwritten and then unlinked. "
+    "Everybody else is carried into a new generation and read back off the "
+    "disk first; anything that cannot be finished honestly is left alone and "
+    "named.",
+    "",
+    "No recording is destroyed because none was ever kept: the audio became "
+    "those numbers and was thrown away at the microphone.",
+    "",
+    "This does not touch %(who)s's face measurements. That is the button "
+    "beside it.",
+    "",
+    "THIS CANNOT BE UNDONE. There is no history and no backup.",
+    "",
+    "Type %(who)s to confirm.",
+)
+
+
+def purge_warning(label: str, kind: str = "face") -> Tuple[str, ...]:
+    """What a gallery purge destroys, what it does NOT, and that it may
+    refuse. The confirmation is the person's own label, typed."""
+    who = str(label or "")
+    text = PURGE_WARN_VOICE if kind == "voice" else PURGE_WARN_FACE
+    return tuple(line % {"who": who} for line in text)
+
+
+def enrol_command(label: str, kind: str = "face", name: str = "") -> str:
+    """The hand-over for somebody ELSE, through the seams that already build
+    it -- never a second string to drift.
+
+    IMPORT-LIGHT BY CONSTRUCTION. ``enrolentry.command_line`` and its voice
+    twin reach no gallery, no model and no device; importing this module used
+    to pull the whole vision stack in and the Users page is what found that,
+    so the property is tested rather than remembered.
+    """
+    from jarvis import enrolentry
+    who = str(label or "")
+    if kind == "voice":
+        return enrolentry.voice_command_line(who, name=name)
+    return enrolentry.command_line(who)
 
 
 def forget_face_command(label: str, *, python: Optional[str] = None,
@@ -672,6 +1074,14 @@ class UsersPage(tk.Frame):
         self._wrapped: list = []
         self._lock = Lock(clock=clock)
         self._forget = ForgetArm(clock=clock)
+        # A SECOND ARM, not a shared one. Forgetting a ROW and destroying a
+        # GALLERY are different destructions with different warnings, and one
+        # arm would let a press on either arm the other.
+        self._purge = ForgetArm(clock=clock)
+        self._purge_kind = ""
+        # ("phrase" | "code" | "", label) -- which non-destructive panel is
+        # open, and on whose row.
+        self._panel = ("", "")
         self._role_arm = ""               # the label whose promotion is armed
         self._adding = False
         self._lock_tick = None
@@ -810,7 +1220,7 @@ class UsersPage(tk.Frame):
         # is never a guess.
         self._path_lbl.bind("<Configure>", self._fit_path, add=True)
         self._note_lbl = tk.Label(
-            self._foot, text="\n".join("· " + line for line in CANNOT_DO),
+            self._foot, text="",
             font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
             anchor="w", justify="left", bd=0, padx=0, pady=0)
         self._note_lbl.pack(fill="x", pady=(px(6), 0))
@@ -929,6 +1339,8 @@ class UsersPage(tk.Frame):
         # and was not.
         self._relock()
         self._forget.disarm()
+        self._purge.disarm()
+        self._panel = ("", "")
         self._role_arm = ""
         self._adding = False
         self._untick()
@@ -1033,6 +1445,18 @@ class UsersPage(tk.Frame):
             self._path_lbl.pack_forget()
             self._path_lbl.pack(side="right", fill="x", expand=True,
                                 padx=(theme.PAD_S, 0))
+            # THE NOTE IS BUILT HERE, from the seams this console was
+            # actually handed, rather than being a tuple somebody edits by
+            # hand a hundred lines from the code it describes. That is the
+            # whole fix for the defect he caught on 2026-09-05: a capability
+            # that lands turns its own sentence off, and a half-wired UI
+            # describes itself correctly instead of promising a button it
+            # has not got.
+            lines = list(cannot_do(self.services))
+            if self._service("face_enrol_start") is not None:
+                lines += list(ENROL_ASYMMETRY)
+            self._note_lbl.configure(
+                text="\n".join("· " + line for line in lines))
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the foot could not be repacked",
                       exc_info=True)
@@ -1267,13 +1691,23 @@ class UsersPage(tk.Frame):
                             justify="left", bd=0, padx=0, pady=0)
             note.pack(fill="x")
             self._wrapped.append(note)
+        self._build_actions(block, bg, row)
         if self._forget.armed_for == row.label:
             self._build_forget_panel(block, bg, row.label)
+        if self._purge.armed_for == row.label:
+            self._build_purge_panel(block, bg, row.label, self._purge_kind)
+        if self._panel == ("phrase", row.label):
+            self._build_phrase_panel(block, bg, row.label)
+        if self._panel == ("code", row.label):
+            self._build_code_panel(block, bg, row.label)
         if self._role_arm == row.label:
             self._build_role_panel(block, bg, row.label)
 
     def _build_forget_panel(self, parent, bg, label) -> None:
-        warn = tk.Label(parent, text="\n".join(forget_warning(label)),
+        warn = tk.Label(parent, text="\n".join(forget_warning(
+                            label,
+                            voices=self._snapshot.get("voices") or (),
+                            gallery=self._snapshot.get("gallery") or ())),
                         font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN,
                         bg=bg, anchor="w", justify="left", bd=0, padx=0,
                         pady=0)
@@ -1502,11 +1936,28 @@ class UsersPage(tk.Frame):
             log.debug("users page: the code entry could not take focus",
                       exc_info=True)
 
+    def _later(self, fn) -> None:
+        """Marshal a control's answer back onto the Tk thread, SAFELY.
+
+        Both secret controls run their service call on a daemon thread and
+        land the line through here. If the page (or the console) has been torn
+        down in between, ``after`` raises "main thread is not in main loop"
+        INSIDE that thread, where nothing catches it -- it surfaces as an
+        unhandled-thread-exception warning and the line is lost silently. A
+        landed line that has nowhere to land is not an error; it is a page
+        that has gone.
+        """
+        try:
+            self.after(0, fn)
+        except Exception:                 # noqa: BLE001 - the page has gone
+            log.debug("users page: the answer had nowhere to land",
+                      exc_info=True)
+
     def _unlock_pressed(self) -> str:
         return UsersUnlockControl(
             self.services, read=lambda: self._code_entry.get(),
             clear=lambda: self._code_entry.delete(0, "end"),
-            toast=self.toast, later=lambda fn: self.after(0, fn),
+            toast=self.toast, later=self._later,
             on_unlocked=self._unlocked).unlock_pressed()
 
     def _unlocked(self) -> None:
@@ -1531,6 +1982,8 @@ class UsersPage(tk.Frame):
 
     def _cancel(self) -> None:
         self._forget.disarm()
+        self._purge.disarm()
+        self._panel = ("", "")
         self._role_arm = ""
         self._adding = False
         self._paint()
@@ -1705,6 +2158,317 @@ class UsersPage(tk.Frame):
         self.refresh()
         if owed:
             self._focus_code()
+
+    # -------------------------------------------------- the per-row actions
+    def _btn_row(self, parent, bg):
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(px(4), 0))
+        return row
+
+    def _build_actions(self, parent, bg, row: Row) -> None:
+        """The buttons this row offers, and NOT the ones it must not.
+
+        ONE BUTTON PER ROW-FULL AT MOST TWO, and that is measured rather than
+        tidy: the head row already carries Make owner and Forget anchored
+        right, and a fifth control in it asked for 977 px of his 920 px body
+        the last time this file grew (the cut Cancel, 2026-09-05). Buttons
+        take their width from their own text, so a row that does not fit does
+        not truncate -- it pushes its last button off the edge, where the
+        body's vertical-only scroll cannot reach it.
+
+        THE OWNER'S ROW IS THE ONLY ONE THAT ENROLS. jarvis/enrolrun.py forces
+        the owner label by construction and jarvis/voicerun.py refuses any
+        other, for the reason a window cannot get round: enrolling somebody
+        else stores a measurement of THEM, so they must read what is kept and
+        type their own name, at a terminal, where nobody can type it for
+        them. A guest row gets the hand-over instead.
+        """
+        widgets = self._row_widgets.setdefault(row.label, {})
+        is_owner = row.role == ROLE_OWNER
+        if is_owner:
+            secrets = self._btn_row(parent, bg)
+            widgets["phrase"] = self._action(
+                secrets, bg, "Change phrase",
+                lambda who=row.label: self._phrase_pressed(who))
+            widgets["code"] = self._action(
+                secrets, bg, "Send me a new code",
+                lambda who=row.label: self._code_pressed(who))
+            enrol = self._btn_row(parent, bg)
+            widgets["face"] = self._action(
+                enrol, bg, "Enrol my face",
+                lambda who=row.label: self._face_pressed(who))
+            widgets["voice"] = self._action(
+                enrol, bg, "Enrol my voice",
+                lambda who=row.label: self._voice_pressed(who))
+            # STOP IS ALWAYS THERE while this page is open, not only once a
+            # run is known to be live. The page has no live view of the run
+            # -- it is on its own thread inside the app -- and a Stop that
+            # appears only when the page happens to know is a Stop that is
+            # missing at exactly the moment station four has put the keyboard
+            # out of reach. It answers "Nothing is running, sir." when there
+            # is nothing to stop, which costs him one line and never a lens.
+            widgets["stop"] = self._action(enrol, bg, "Stop", self._enrol_stop)
+        else:
+            # ONE PER ROW, and this is measured rather than cautious. At 2.0
+            # scale "Copy the face command" is 441 px and "Copy the voice
+            # command" is 458; side by side with their padding that is 911 px
+            # of the 856 px a 920x1440 window leaves inside the block, and
+            # the body scrolls only downwards -- so the 55 px would not be
+            # scrolled to, they would be CUT, off the right-hand end of the
+            # second button. That is the same defect as the half-drawn Cancel
+            # photographed on 2026-09-05, and it is why these two are stacked.
+            self._action(self._btn_row(parent, bg), bg,
+                         "Copy the face command",
+                         lambda who=row.label: self._copy(
+                             enrol_command(who, "face", row.name)))
+            self._action(self._btn_row(parent, bg), bg,
+                         "Copy the voice command",
+                         lambda who=row.label: self._copy(
+                             enrol_command(who, "voice", row.name)))
+        # THE GALLERY BUTTONS ARE OFFERED ONLY WHERE THERE IS SOMETHING TO
+        # REMOVE. A "remove their face measurements" on a row with none is a
+        # button whose only possible answer is "there was nothing", which
+        # reads as a failure.
+        if row.face_known and self._service("people_purge_face") is not None:
+            self._action(self._btn_row(parent, bg),
+                         bg, "Remove face measurements",
+                         lambda who=row.label: self._purge_pressed(who, "face"))
+        if row.label in set(self._snapshot.get("voices") or ()) \
+                and self._service("people_purge_voice") is not None:
+            self._action(self._btn_row(parent, bg), bg, "Remove voice pool",
+                         lambda who=row.label:
+                         self._purge_pressed(who, "voice"))
+
+    def _action(self, parent, bg, text, command):
+        btn = RoundButton(parent, text=text, kind="ghost", bg=bg, pad_x=8,
+                          pad_y=4, command=command)
+        btn.pack(side="left", padx=(0, px(6)))
+        return btn
+
+    # ------------------------------------------------------ the phrase panel
+    def _build_phrase_panel(self, parent, bg, label) -> None:
+        """Two masked boxes and what he is agreeing to, in his register.
+
+        THE BOXES ARE MASKED and neither survives the press: the control
+        empties both BEFORE it hashes, because ``hash_secret`` is a scrypt KDF
+        at N=2^14 and a typed secret must not sit on screen while it runs, nor
+        still be there if the tab is left mid-call.
+        """
+        text = tk.Label(parent, text="\n".join(phrase_panel_lines()),
+                        font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED,
+                        bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                        pady=0)
+        text.pack(fill="x", pady=(px(4), 0))
+        self._wrapped.append(text)
+        boxes = []
+        for caption in ("new passphrase", "again, to be sure"):
+            row = tk.Frame(parent, bg=bg)
+            row.pack(fill="x", pady=(px(4), 0))
+            cap = tk.Label(row, text=caption,
+                           font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
+                           bg=bg, anchor="w", bd=0, padx=0, pady=0)
+            cap.pack(fill="x")
+            self._wrapped.append(cap)
+            entry = tk.Entry(
+                row, show="•", bd=0, relief="flat",
+                bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                fg=theme.INK, insertbackground=theme.CYAN,
+                font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+            entry.pack(fill="x", ipady=px(3), pady=(px(2), 0))
+            boxes.append(entry)
+        self._row_widgets.setdefault(label, {})["phrase_boxes"] = tuple(boxes)
+        act = self._btn_row(parent, bg)
+        self._action(act, bg, "Set", lambda who=label: self._phrase_confirm(who))
+        self._action(act, bg, "Cancel", self._cancel)
+
+    # -------------------------------------------------------- the code panel
+    def _build_code_panel(self, parent, bg, label) -> None:
+        """No box to choose one, and the caption says why BEFORE he presses.
+
+        The destination and the "no mailbox" refusal come from
+        ``services.knightfall_status`` -- the drawer's own caption, reused
+        rather than written a second time, because a promise made here that
+        the drawer would not make is a promise one of them will break.
+        """
+        status = self._knightfall_status()
+        row = [r for r in self._rows if r.label == label]
+        has_code = bool(row[0].has_code) if row else True
+        plan = code_plan(status, mode=self._gate_mode(), has_code=has_code)
+        text = tk.Label(
+            parent,
+            text="\n".join(code_panel_lines(status, mode=self._gate_mode(),
+                                            has_code=has_code)),
+            font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.MUTED if plan.enabled else theme.WARN, bg=bg, anchor="w",
+            justify="left", bd=0, padx=0, pady=0)
+        text.pack(fill="x", pady=(px(4), 0))
+        self._wrapped.append(text)
+        act = self._btn_row(parent, bg)
+        send = self._action(act, bg, "Send it",
+                            lambda who=label: self._code_confirm(who))
+        send.set_enabled(plan.enabled)
+        self._action(act, bg, "Cancel", self._cancel)
+
+    def _knightfall_status(self) -> dict:
+        fn = self._service("knightfall_status")
+        if fn is None:
+            return {}
+        try:
+            out = fn() or {}
+        except Exception:                 # noqa: BLE001 - the app boundary
+            log.exception("users page: the knightfall status failed")
+            return {}
+        return out if isinstance(out, dict) else {}
+
+    def _gate_mode(self) -> str:
+        """The gate's live mode, read off the startup line the snapshot
+        already carries -- no second call, and "" when it cannot be read."""
+        line = str(self._snapshot.get("gate_line") or "").lower()
+        for mode in ("enforce", "shadow", "off"):
+            if "owner-gate: %s" % mode in line:
+                return mode
+        return ""
+
+    # ------------------------------------------------------- the purge panel
+    def _build_purge_panel(self, parent, bg, label, kind) -> None:
+        warn = tk.Label(parent, text="\n".join(purge_warning(label, kind)),
+                        font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN,
+                        bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                        pady=0)
+        warn.pack(fill="x", pady=(px(4), 0))
+        self._wrapped.append(warn)
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(px(4), 0))
+        entry = tk.Entry(row, width=8, bd=0, relief="flat",
+                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                         fg=theme.INK, insertbackground=theme.CYAN,
+                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+        # THE BUTTONS TAKE THEIR WIDTH FIRST and the entry gives up what is
+        # left -- the rule this file already learned twice, most recently
+        # when a fixed 18-character entry pushed "Cancel" off the right edge
+        # at 920x1440 on the destructive panel. A confirm box 57 px narrower
+        # still takes a typed label; half a Cancel button does not.
+        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8, pad_y=4,
+                    command=self._cancel).pack(side="right", padx=(px(4), 0))
+        RoundButton(row, text="Remove %s" % label, kind="ghost", bg=bg,
+                    pad_x=10, pad_y=4,
+                    command=lambda who=label, k=kind, e=entry:
+                    self._purge_confirm(who, k, e.get())).pack(
+            side="right", padx=(theme.PAD_S, 0))
+        entry.pack(side="left", fill="x", expand=True, ipady=px(3))
+        self._row_widgets.setdefault(label, {})["purge_confirm"] = entry
+
+    # ------------------------------------------------------- the new presses
+    def _open_panel(self, kind: str, label: str, action: str) -> None:
+        if not self._guard(action):
+            return
+        self._forget.disarm()
+        self._purge.disarm()
+        self._role_arm = ""
+        self._panel = (kind, str(label))
+        self._paint()
+        self._reveal(self._row_widgets.get(label, {}).get("block"))
+
+    def _phrase_pressed(self, label: str) -> None:
+        self._open_panel("phrase", label, "set_phrase")
+
+    def _code_pressed(self, label: str) -> None:
+        self._open_panel("code", label, "new_code")
+
+    def _phrase_confirm(self, label: str) -> None:
+        """Hand the two boxes to the control, which empties them first."""
+        if not self._guard("set_phrase"):
+            return
+        boxes = (self._row_widgets.get(label, {}).get("phrase_boxes")
+                 or ())
+        if len(boxes) != 2:
+            self.toast(PHRASE_NOT_WIRED, "warn")
+            return
+        first, second = boxes
+
+        def _clear():
+            for box in (first, second):
+                try:
+                    box.delete(0, "end")
+                except Exception:         # noqa: BLE001 - torn down
+                    log.debug("users page: a phrase box is gone",
+                              exc_info=True)
+
+        UsersSecretControl(
+            self.services, label=label,
+            read=lambda: (first.get(), second.get()), clear=_clear,
+            toast=self.toast, later=self._later,
+            on_done=self._after_secret).pressed()
+
+    def _after_secret(self) -> None:
+        self._lock.touch()
+        self._panel = ("", "")
+        self.refresh()
+
+    def _code_confirm(self, label: str) -> None:
+        if not self._guard("new_code"):
+            return
+        self._panel = ("", "")
+        self._write("people_new_code")
+
+    def _face_pressed(self, label: str) -> None:
+        if not self._guard("face_enrol"):
+            return
+        self._write("face_enrol_start")
+
+    def _voice_pressed(self, label: str) -> None:
+        if not self._guard("voice_enrol"):
+            return
+        self._write("voice_enrol_start")
+
+    def _enrol_stop(self) -> None:
+        """STOP IS NEVER GATED, and it stops both.
+
+        A code owed must never be the reason a lens or a microphone stays
+        open -- the rule ``Commander._enrol_control`` already follows for the
+        spoken stop, which takes the widest door for the same reason. One
+        button rather than two: he is being asked to stop the thing that is
+        running, and at station four he cannot see which button is which.
+        """
+        lines = []
+        for service in ("face_enrol_stop", "voice_enrol_stop"):
+            fn = self._service(service)
+            if fn is None:
+                continue
+            try:
+                ok, line = fn()
+            except Exception:             # noqa: BLE001 - the app boundary
+                log.exception("users page: %s failed", service)
+                ok, line = False, "That did not stop, sir; see the log."
+            if ok:
+                lines.append(str(line))
+        self.toast(lines[0] if lines else "Nothing is running, sir.",
+                   "ok" if lines else "info")
+
+    def _purge_pressed(self, label: str, kind: str) -> None:
+        if not self._guard("purge_%s" % kind):
+            return
+        self._forget.disarm()
+        self._role_arm = ""
+        self._panel = ("", "")
+        self._purge_kind = str(kind)
+        self._purge.press(label)
+        self._paint()
+        self._reveal(self._row_widgets.get(label, {}).get("purge_confirm"))
+
+    def _purge_confirm(self, label: str, kind: str, typed) -> None:
+        if not self._guard("purge_%s" % kind):
+            return
+        verdict = self._purge.confirm(label, typed)
+        if verdict == "expired":
+            self.toast("That confirmation has gone cold, sir; press Remove "
+                       "again.", "warn")
+            self._paint()
+            return
+        if verdict == "refused":
+            self.toast("Type %s exactly to confirm, sir." % label, "warn")
+            return
+        self._write("people_purge_%s" % kind, label)
 
     # -------------------------------------------------------- the scroll
     def _sync_view(self) -> None:
