@@ -82,7 +82,9 @@ is us.  The dynamism game measures the wrong thing; the rounds that planted
 honest mistakes measured the right one.
 
 WHAT HIS FILES ACTUALLY REST ON is not this file.  It is three properties
-of the product itself, confirmed by seven adversaries and reopened by none:
+of the product itself, confirmed by seven adversaries.  The seventh
+reopened CLAIM -- at _replace_ours's own temp, round 10 item 1 -- and
+round 10 closed it; ORDERING and IDENTITY were reopened by none:
 
   ORDERING   the ledger records which name we are taking, and is fsynced,
              BEFORE the claim is made; the landing is recorded BEFORE the
@@ -107,7 +109,9 @@ those properties are made of, so that an honest edit cannot quietly take
 one apart -- a downgraded guard, a write added beside a claimed one, a new
 helper that deletes.
 
-TODAY'S TABLE IS 510 ROWS.  502 on the round-9 tip (1039ce8); round 10
+TODAY'S TABLE IS 511 ROWS.  502 on the round-9 tip (1039ce8); round 10
+(the 511th is _replace_ours -> unlink: the litter fix after the merge,
+an honest new write the census named before anyone read the diff).
 added eight and moved none -- seven call sites of the lane's own
 destroyers (_replace_ours, _drop, _unlink_after_landing), which are in
 WRITES now, and the fdopen over _replace_ours's claimed temp.  Pinned by

@@ -704,8 +704,10 @@ def _replace_ours(path: Path, text: str, *, fsync: bool = False,
     raises the OSError both callers already catch.  Same mode bits as the
     ``open()`` it replaces (0o666 under the umask), so nothing about the
     target's permissions changed.  The cost is the one land_beside states:
-    a temp OF OURS left at a unique name if the process dies between the
-    claim and the rename -- never a byte of his.
+    a temp OF OURS left at a unique name if the PROCESS DIES between the
+    claim and the rename -- never a byte of his.  A write or a rename that
+    FAILS is not that case: the temp is ours and is removed on the way out
+    (tests/test_replace_ours_leaves_no_litter.py).
 
     The FINAL ``os.replace`` over the target is still unclaimed, on
     purpose: the target is a file of OURS.  NOT for a name of his -- a
@@ -726,12 +728,29 @@ def _replace_ours(path: Path, text: str, *, fsync: bool = False,
     else:
         raise OSError(errno.EEXIST, "every temp name beside the target is "
                       "taken; nothing was written", str(path))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        if fsync:
-            fh.flush()
-            os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    # FROM HERE THE TEMP IS OURS BY THE KERNEL'S WORD -- we created it
+    # O_EXCL a moment ago -- so on ANY failure before the rename lands it
+    # is removed. Round 10 made the name unique, which is right, and
+    # thereby turned "one temp left behind on a failure" into "one temp
+    # left behind PER ATTEMPT": MEASURED, status.txt made a directory by
+    # his hand -> 10 empty temps after 10 passes beside his folders; disk
+    # full -> 10 there and 40 in the state dir; ~2,880 a day at the 30 s
+    # cadence. Never a byte of his, but litter he can see. The one case
+    # this cannot cover is the process dying between the claim and the
+    # rename, which the docstring already states.
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if fsync:
+                fh.flush()
+                os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:                    # already gone, or never landed
+            pass
+        raise
     if fsync:
         dirfd = os.open(path.parent, os.O_RDONLY)
         try:

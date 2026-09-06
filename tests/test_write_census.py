@@ -186,6 +186,14 @@ KNOWN = {
          "is not claimed, on purpose, and a plain replace at a name HE "
          "chose is what destroyed a 100000-byte file in round 5.  That case "
          "is land_beside"),
+    ("jarvis/foldersync.py", "_replace_ours", "unlink", 1):
+        ("claim",
+         "our own claimed tmp, removed on the way out when the write or the "
+         "rename FAILED.  Ours by the kernel's word -- created O_EXCL a "
+         "moment earlier -- so nothing of his can be at that name.  Without "
+         "it a unique temp was left PER FAILED ATTEMPT: measured 10 after 10 "
+         "passes with status.txt made a directory, ~2,880/day at the 30 s "
+         "cadence (tests/test_replace_ours_leaves_no_litter.py)"),
     ("jarvis/foldersync.py", "_replace_ours", "write", 1):
         ("claim",
          "fh.write into our own claimed tmp, on the fd just opened; nothing "
