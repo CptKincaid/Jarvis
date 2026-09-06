@@ -277,6 +277,18 @@ class CommandSocket:
         # rather than spoken. Beside the status case for the same reason --
         # it is a READ of app state, not a turn, so it must not travel the
         # dispatch path, be remembered as an exchange, or wake the speaker.
+        # `jarvis "people reload"`: re-read people.json without a restart.
+        # A READ of a file the owner just edited at this same keyboard, not
+        # a turn -- so it sits beside status and board rather than
+        # travelling the dispatch path. It changes WHO Jarvis recognises
+        # and changes nothing about what anybody may do: enrolling is still
+        # scripts/jarvis_people.py at a terminal, with consent, and this
+        # cannot create, promote or address a person.
+        if text.lower() in ("people reload", "reload people"):
+            _send(conn, {"kind": "reply", "text": _reload_people(self.app),
+                         "speak": False})
+            _send(conn, {"kind": "end", "reason": "done"})
+            return
         if text.lower() in ("board", "the board"):
             fn = getattr(self.app, "board_text", None)
             line = fn() if callable(fn) else "board unavailable"
@@ -375,6 +387,27 @@ class RequestTooLarge(ValueError):
 
     def __init__(self, limit: int):
         super().__init__("request too large (over %d MB)" % (limit // 1048576))
+
+
+def _reload_people(app) -> str:
+    """Re-read the owner registry and hand back the startup line.
+
+    Never raises: this is a convenience, and a convenience that can kill
+    the socket thread is not one. The line it returns is the SAME one the
+    app logs at boot, so what he reads back is what the gate now believes.
+    """
+    gate = getattr(app, "gate", None)
+    if gate is None:
+        return "owner-gate: OFF -- there is no gate on this process."
+    try:
+        gate.reload()
+    except Exception:  # noqa: BLE001 - a reload that failed changes nothing
+        log.exception("people reload failed")
+        return "the registry could not be re-read; nothing changed"
+    try:
+        return gate.startup_line()
+    except Exception:  # noqa: BLE001
+        return "the registry was re-read"
 
 
 def _read_line(conn: socket.socket, limit: int = MAX_LINE) -> str:

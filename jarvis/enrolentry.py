@@ -27,6 +27,18 @@ NOTHING HERE OPENS A DEVICE, and there is no import in this file that could.
 No cv2, no jarvis.camera, no frame, no crop. It reads the gallery -- which is
 128 floats and a string per take -- and formats sentences.
 
+AND SINCE 2026-09-05 THAT CLAIM IS TRUE AT IMPORT TIME AS WELL, which it was
+not. ``jarvis.faceenrol`` and ``jarvis.facegallery`` were imported at module
+scope, and faceenrol imports ``jarvis.facedetect`` and ``jarvis.visionrig`` --
+so merely importing THIS file pulled the whole vision stack in. That was found
+by the USERS page (jarvis/ui/users_page.py), which asks this module for one
+STRING -- the command that deletes somebody's face measurements -- and had the
+photo rig's lens blocker refuse the import outright. A page for managing names
+has no business loading a face detector, so the two heavy imports moved inside
+the four functions that actually need a gallery. ``command_line`` and
+``to_clipboard`` -- the pure string builder and the clipboard seam -- now need
+neither, which is what the users tab uses.
+
 DELETING IS HANDED OVER TOO, AND THAT IS NOT TIMIDITY. "Forget Heather's
 face" arrives as a speech-recognition result. Destroying biometric data on a
 word that might have been misheard is not a risk worth taking for the sake of
@@ -48,8 +60,6 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from jarvis import faceenrol as fe
-from jarvis.facegallery import clean_note, label_ok
 from jarvis.logs import get_logger
 
 log = get_logger("enrolentry")
@@ -107,6 +117,7 @@ def command_line(label: str, owner: str = "hunter",
     if plan and not delete:
         out += ["--plan", shlex.quote(str(plan))]
     for pose in poses:
+        from jarvis.facegallery import clean_note   # noqa: PLC0415 - lazy
         note = clean_note(pose)
         if note:
             out += ["--pose", shlex.quote(note)]
@@ -261,6 +272,8 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
     worth knowing before he starts: with recorded coverage it is the gap, and
     with none it is the five stations. No device is opened to work that out.
     """
+    from jarvis import faceenrol as fe               # noqa: PLC0415 - lazy
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     label = str(label or owner).strip().lower()
     if not label_ok(label):
         return {"reply": "That isn't a name I can store, sir - lowercase "
@@ -356,6 +369,7 @@ def forget_answer(gallery, label: str, owner: str = "hunter",
 
     A misheard word may not destroy biometric data. What this does is name
     what would go, and hand over the command that asks for it in writing."""
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     label = str(label or "").strip().lower()
     if not label_ok(label):
         return {"reply": "That isn't a name I can look up, sir.",
@@ -392,6 +406,7 @@ def gallery_answer(gallery, owner: str = "hunter") -> dict:
     This is the half of the feature that DOES belong in the window: the
     notes were added so a bad match has an answer, and the answer is a
     sentence, not a report."""
+    from jarvis import faceenrol as fe               # noqa: PLC0415 - lazy
     try:
         loaded = bool(gallery.load())
     except Exception:  # noqa: BLE001
@@ -487,6 +502,7 @@ def spoken_label(text: str, owner: str = "hunter") -> str:
     valid tokens and neither is a person; storing one produces a real,
     gallery-shaped, permanent label in the one store whose entire point is
     knowing whose face it holds."""
+    from jarvis.facegallery import label_ok          # noqa: PLC0415 - lazy
     word = str(text or "").strip().lower()
     word = word.replace("'s", "").replace("\u2019s", "").strip()
     if not word or word in _MINE:
@@ -510,4 +526,5 @@ def spoken_pose(text: str) -> str:
     answer better than an index. ``clean_note`` caps it and strips the
     non-printables, and ``command_line`` shlex-quotes it before it goes
     anywhere near his clipboard, so a spoken pose cannot become shell."""
+    from jarvis.facegallery import clean_note        # noqa: PLC0415 - lazy
     return clean_note(str(text or "").strip())

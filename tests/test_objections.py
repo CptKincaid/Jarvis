@@ -27,6 +27,14 @@ from jarvis.config import CONFIG
 from jarvis.router import Router
 
 TZ = ZoneInfo("America/Chicago")
+
+# The fixtures below are built in America/Chicago and handed to the product
+# as absolute timestamps, which the product -- rightly -- renders in the
+# MACHINE's local zone. That made the file silently require the machine to
+# be in Chicago: measured 2026-09-05, green there at all 24 hours and red in
+# UTC, Tokyo, Kiritimati, Kolkata and London. A test about a house in Texas
+# should SAY so rather than assume it.
+pytestmark = pytest.mark.local_tz("America/Chicago")
 NOW = datetime(2026, 9, 14, 21, 30, tzinfo=TZ)       # a Monday evening
 TWO_AM = datetime(2026, 9, 15, 2, 0, tzinfo=TZ)
 
@@ -347,6 +355,14 @@ def test_another_open_question_is_never_talked_over(rich, monkeypatch):
     utterance), so the guard is asserted where it lives."""
     c, svc, _ = rich
     _object_with(monkeypatch)
+    # clock-hygiene: the wall clock is the FIXTURE here, not the
+    # expectation -- `now` is handed straight to objection_for_alarm as
+    # its own clock, and every assertion is relative to it (is None /
+    # is not None), so no hour is written down anywhere. Measured
+    # 2026-09-05 under libfaketime at all 24 hours: 131 passed each
+    # time. This file is zone-pinned, so --clock-at cannot re-check
+    # that for you; re-measure by hand if this test grows an
+    # assertion about a particular time of day.
     now = datetime.now().astimezone()
     due = (now + timedelta(hours=3)).timestamp()
     c.stash_destructive(lambda: CommandResult(handled=True), "Cancel all three, sir?")

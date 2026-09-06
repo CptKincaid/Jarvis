@@ -22,6 +22,7 @@ import email.utils
 import html as _html
 import imaplib
 import mimetypes
+import os
 import re
 import smtplib
 import socket
@@ -136,7 +137,11 @@ def gmail_settings(cfg) -> Optional[dict]:
             # from this account does not have to re-read the config; blank
             # is fine, smtp_host() derives one from the IMAP host.
             "smtp_host": str(_cfg_get(cfg, "gmail.smtp_host", "") or "").strip(),
-            "from_name": str(_cfg_get(cfg, "gmail.from_name", "") or "").strip()}
+            "from_name": str(_cfg_get(cfg, "gmail.from_name", "") or "").strip(),
+            # Where a NOTICE from this account goes (notice_destination
+            # above). Blank = the account's own address, i.e. today.
+            "notice_to": str(_cfg_get(cfg, "gmail.notice_to", "")
+                             or "").strip()}
 
 
 def mail_accounts(cfg) -> list[dict]:
@@ -182,6 +187,12 @@ def mail_accounts(cfg) -> list[dict]:
             # Gmail's server with the wrong credentials (F22, 09-03).
             "smtp_host": str(entry.get("smtp_host") or "").strip(),
             "from_name": str(entry.get("from_name") or "").strip(),
+            # PER ACCOUNT, and deliberately NOT inherited from the
+            # top-level gmail.notice_to -- the same trap as smtp_host in
+            # F22, where one top-level key silently applied to mailboxes
+            # it was never meant for. A top-level notice_to belongs to the
+            # legacy single mailbox and stops there.
+            "notice_to": str(entry.get("notice_to") or "").strip(),
         })
     return out
 
@@ -585,6 +596,129 @@ class MailSendFailed(RuntimeError):
     """SMTP refused, or the attachment could not be read."""
 
 
+class MailAuthFailed(MailSendFailed):
+    """The provider refused the ACCOUNT, not the message.
+
+    Its own class because it is the one send failure with a fix he can
+    act on -- an app password that has been revoked or rotated -- and
+    "that didn't send, sir" sends him looking at his network instead. The
+    server's reply is deliberately NOT carried: an SMTPAuthenticationError's
+    text quotes the username back, and this travels into a spoken line.
+    """
+
+
+class NoticeAddressInvalid(MailSendFailed):
+    """``notice_to`` is set in his config to something that is not an
+    address. A MailSendFailed so every existing ``except`` still holds."""
+
+
+# What a notice destination has to look like. Deliberately its own pattern
+# and not outbox's _ADDR_RX: that one SEARCHES spoken text for something
+# address-shaped and may legitimately find one inside a sentence, while
+# this one is a whole-string check on a value he typed into a config file.
+# One address, no display name, no comma list -- a notice has exactly one
+# recipient, and "a@b.com, c@d.com" quietly becoming one malformed
+# recipient is the kind of thing that should be said out loud, not sent.
+_NOTICE_ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+(\.[\w\-]+)+\Z")
+
+
+def notice_destination(account: dict) -> str:
+    """Where a NOTICE for this account goes; raises NoticeAddressInvalid.
+
+    THIS IS THE WHOLE DESIGN OF THE FEATURE, so it is worth stating here.
+    ``outbox.send_notice`` has no recipient parameter -- that is the guard
+    that makes "can a tool loop mail a stranger?" answerable, and it must
+    not be given one. But Hunter wants the rotated Knightfall code sent to
+    the mailbox his Oracle backup mails to, which is a different address
+    from the sending account's own.
+
+    The difference that makes that safe: an address the ADMINISTRATOR put
+    in his config file is not the same thing as an address a CALLER passes
+    at runtime. So the destination rides on the account object, which
+    ``mail_accounts()`` mints out of his config alongside the SMTP
+    credential -- one function, one file. Anything that could forge the
+    destination would have to forge ``address`` and ``password`` too, and
+    something holding sending credentials never needed this seam.
+
+    ``notice_to`` unset, blank or whitespace -> the account's own address,
+    exactly as before this key existed: the change is invisible until he
+    opts in, and unset can never mean "nowhere".
+
+    ``notice_to`` set to something that is not an address -> REFUSED, not
+    quietly self-sent. He set the key because he expects the code at the
+    address he named; a silent fallback would leave a live code in a
+    different inbox while he waited at the one he chose.
+    """
+    acct = account if isinstance(account, dict) else {}
+    configured = str(acct.get("notice_to") or "").strip()
+    if configured:
+        if not _NOTICE_ADDR_RX.match(configured):
+            # NOT the value itself: this text reaches a toast on his screen.
+            raise NoticeAddressInvalid("the configured notice address is "
+                                       "not an email address")
+        return configured
+    return str(acct.get("address") or "").strip()
+
+
+# ------------------------------------------------------- the rehearsal
+# JARVIS_MAIL_DRYRUN=1 replaces the transport with this. It exists because
+# the whole chain -- phrase to path, name to address, read-back, yes,
+# assembled MIME -- could otherwise only be proved by sending a real
+# message to a real person, and there is no undo for a rehearsal that
+# turns out to have been live. It is a CLASS, used exactly where
+# smtplib.SMTP_SSL would be, so nothing on the send path is special-cased
+# for it; ``dry_run`` is the flag the spoken line reads.
+DRYRUN_ENV = "JARVIS_MAIL_DRYRUN"
+
+
+class DryRunSMTP:
+    """A transport that assembles and discards. Opens no socket, ever."""
+
+    dry_run = True
+    #: every message this process rehearsed, newest last
+    made: list = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.sent: list = []
+        self.logged_in = None
+        DryRunSMTP.made.append(self)
+
+    def login(self, user, password):
+        # The password is accepted and NOT stored: a rehearsal must not put
+        # an app password anywhere a later print could reach.
+        self.logged_in = (user, "<not stored>")
+
+    def send_message(self, msg):
+        self.sent.append(msg)
+        log.info("mail: REHEARSAL only -- %s bytes assembled, nothing sent",
+                 len(bytes(msg)))
+
+    def quit(self):
+        pass
+
+
+def dryrun_enabled(env=None) -> bool:
+    """Is JARVIS_MAIL_DRYRUN set to something that means yes?"""
+    raw = (env if env is not None else os.environ).get(DRYRUN_ENV, "")
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def dryrun_transport(env=None):
+    """The class to hand ``send_message``: DryRunSMTP, or None for live.
+
+    None rather than smtplib.SMTP_SSL so the live path stays exactly the
+    default it has always been (``smtp or smtplib.SMTP_SSL`` inside
+    send_message) and this function can never be the thing that picks a
+    transport for a real send.
+    """
+    return DryRunSMTP if dryrun_enabled(env) else None
+
+
+def is_dryrun(smtp) -> bool:
+    """True when this transport assembles but does not deliver."""
+    return bool(getattr(smtp, "dry_run", False))
+
 def smtp_host(account: dict) -> str:
     """The submission host for an account.
 
@@ -749,6 +883,11 @@ def send_message(account: dict, to_addr: str, subject: str, body: str,
         # is re-raised with the TYPE only, because it travels into a spoken
         # line and a server that echoes the username would put it there.
         log.warning("mail: send failed (%s)", type(exc).__name__)
+        # A refused app password and a dead wire are different problems
+        # and only one of them is his to fix, so they get different
+        # classes. The server's reply is still not carried.
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            raise MailAuthFailed(type(exc).__name__) from exc
         raise MailSendFailed(type(exc).__name__) from exc
     finally:
         for closer in (getattr(conn, "quit", None),):

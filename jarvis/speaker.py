@@ -21,12 +21,14 @@ Usage:
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 import time
 
 import numpy as np
 
+from jarvis import voicegallery as vgal
 from jarvis.config import PATHS
 from jarvis.events import Status, bus
 from jarvis.logs import get_logger
@@ -49,6 +51,15 @@ DEFAULT_THRESHOLD = 0.30
 
 # Maximum stored embeddings (oldest beyond this are dropped)
 MAX_EMBEDDINGS = 100
+
+# Passive samples one PROCESS may add to the voiceprint. See add_sample for
+# the drift measurement that produced the number: at the label's own genuine
+# floor a single passive sample rotates a 14-take centroid to cos 0.997 and
+# leaves an intruder at 0.220, two leave it at 0.991 / 0.281, and three put
+# the intruder INSIDE a 0.30 bar at 0.334. Two is the last safe value and it
+# is the one taken. The app's own 10-minute cooldown and 0.55 bar sit in
+# front of this (app._maybe_learn_voice); this is the floor under them.
+PASSIVE_CAP = 2
 
 # Minimum audio length (seconds) for a useful embedding
 MIN_AUDIO_SECONDS = 1.0
@@ -73,6 +84,49 @@ MIN_SPEECH_SECONDS = 0.35        # below this we cannot tell, so change nothing
 # Bumped when the embedding pipeline changes in a way that makes stored
 # embeddings incomparable with fresh ones. 2 = probes are silence-trimmed.
 VOICEPRINT_FORMAT = 2
+
+# EVERY FORMAT THIS BUILD CAN READ, and the refusal of anything else is the
+# whole point of the tuple. 1 is the pre-trim pool (loadable, and load() says
+# out loud that it scores low); 2 is the current one.
+#
+# WHY A REFUSAL AND NOT ANOTHER WARNING. This file is a SINGLE-SPEAKER pool:
+# load() selects its keys by ``k.startswith("emb_")``, which also matches
+# ``emb_mara_0000``, and the only format complaint it had fired when
+# ``fmt < VOICEPRINT_FORMAT`` -- i.e. never for a NEWER file. So a multi-label
+# voiceprint written by a later build, read by this one after a rollback or by
+# a stale process, pooled every person into one centroid without a word.
+# Measured 2026-09-04 on synthetic vectors (tests/test_speaker_format.py):
+# a _format=3 file holding two people loaded as 20 pooled samples and 6 of 6
+# of the OTHER person's takes then scored past the 0.30 bar as him -- a silent
+# universal false accept, arriving by a path nobody would think to look at.
+# That is the television-reaches-the-commander failure, so an unrecognised
+# format loads NOTHING and says which number it saw.
+#
+# Refusing leaves the pool empty, so both gates fall back to their
+# nothing-enrolled behaviour: the wake gate and the transcript gate both fail
+# OPEN and voice keeps working, unfiltered and loudly logged. That is the
+# right direction -- an unreadable pool is "no instrument", and no label is
+# minted from it, where pooling would have named a stranger as him.
+KNOWN_VOICEPRINT_FORMATS = (1, 2)
+
+# THE OWNER'S TWO POOLS ARE ONE POOL, AND THE MEASUREMENT IS WHAT SAYS SO.
+# ``voiceprint.npz`` has no label, and ``--migrate`` copies its vectors
+# unchanged into the gallery under his label, so a window of his voice scores
+# the two centroids identically up to float rounding and the maximum lands on
+# whichever came first. Identity is decided PER WINDOW (see filter_segments),
+# and a clip of his that split between "the voiceprint" and "hunter" would
+# have half its windows dropped as somebody else's. So a gallery label is
+# folded into the voiceprint's pool when its centroid MEASURES as that pool.
+#
+# IT USED TO BE FOLDED FOR THE LABEL STRING ALONE -- ``if label ==
+# self.owner_label`` with no cosine, no provenance and no consent -- and that
+# was the hole the 2026-09-05 review reproduced at 100/100 through two routes:
+# anybody's takes recorded under his name WERE him. His name is not a
+# credential; ``voiceprint.npz`` is. See voicegallery.OWNER_POOL_COSINE for
+# the number and the measurement behind it. The one thing the label string is
+# still trusted for is BOOTSTRAP: with no voiceprint at all there is nothing
+# to measure against, and the gallery is the only anchor identity has.
+MIGRATED_ALIAS_COSINE = vgal.OWNER_POOL_COSINE
 
 
 def _frame_rms(audio_16k, n):
@@ -133,9 +187,24 @@ def trim_silence(audio_16k, frame_ms=FRAME_MS, min_speech_s=MIN_SPEECH_SECONDS):
 class SpeakerVerifier:
     """ECAPA-TDNN speaker verification with enrollment and passive learning."""
 
-    def __init__(self, gpu=0, threshold=DEFAULT_THRESHOLD):
+    # CLASS-LEVEL DEFAULTS, not only __init__ ones. Several tests build a bare
+    # verifier with ``object.__new__(SpeakerVerifier)`` to exercise the pure
+    # arithmetic without a model, and an attribute that exists only in
+    # __init__ turns every one of them into an AttributeError the moment a new
+    # field is added. The defaults are also the SAFE state: no gallery, no
+    # frozen reference, nothing learned.
+    gallery = None
+    _frozen_centroid = None
+    _passive_added = 0
+    format_fault = ""
+    # The owner's gallery label, so his migrated pool and his voiceprint are
+    # read as ONE pool (see MIGRATED_ALIAS_COSINE). "" is "nobody said".
+    owner_label = ""
+
+    def __init__(self, gpu=0, threshold=DEFAULT_THRESHOLD, owner_label=""):
         self.gpu = gpu
         self.threshold = threshold
+        self.owner_label = str(owner_label or "")
         self._model = None
         self._embeddings = []       # List of 192-dim numpy arrays
         self._centroid = None       # Mean of all embeddings
@@ -145,13 +214,143 @@ class SpeakerVerifier:
         self._model_loaded = False
         self._device = None         # resolved by _resolve_device()
         self._warned_fail_open = False   # one Status(warn) per session
+        self._warned_disowned = False    # one warning per session
+        self._warned_stale = False       # one warning per session
+        self._warned_anchored = False    # one warning per session
         self._model_failed = False       # a failed load is not retried
+        # "" or one plain sentence naming the format on disk that this build
+        # refused to read. Held rather than only logged so a startup line and
+        # the instrument can say WHY the voice leg is dark, the way
+        # facegallery.reenrol_message does for a cross-model gallery.
+        self.format_fault = ""
+        # THE MULTI-SPEAKER STORE, BESIDE THE VOICEPRINT AND NOT INSTEAD OF IT.
+        # ``voiceprint.npz`` stays exactly what it was -- one pool, one
+        # centroid, his -- and is the rollback. The gallery adds labels. Both
+        # are consulted; see ``_all_centroids``.
+        self.gallery = None
+        # The reference passive learning is measured against, captured the
+        # first time it is needed and never moved afterwards. See add_sample.
+        self._frozen_centroid = None
+        self._passive_added = 0
 
     # ------------------------------------------------------------ state
     @property
     def is_enrolled(self):
-        """Whether we have at least one voiceprint embedding."""
-        return len(self._embeddings) > 0
+        """Whether THE OWNER has a pool to be verified against -- the
+        voiceprint, or his own label in the gallery. ``enrolment_gap`` is
+        the same question with the sentence attached.
+
+        BOTH HALVES OF THE "OR" ARE LOAD-BEARING AND IN OPPOSITE DIRECTIONS.
+        False here makes the wake gate and the transcript gate BOTH fail open,
+        which is what keeps a fresh box from being mute; True makes the
+        transcript gate fail shut, which is what stops a television reaching
+        the commander. So a box with only a gallery must read True WHEN HE
+        IS IN IT (enroll_voice --reset after --migrate), and a box with
+        neither must read False (or it goes silent on its first day).
+
+        AND A GALLERY HOLDING ONLY OTHER PEOPLE IS NO INSTRUMENT FOR HIM.
+        The first version read any gallery label as an enrolment, arguing
+        the person who just enrolled must be filtered for. Measured
+        2026-09-04 (tests/test_voice_owner_lockout.py) on the layout that
+        produces -- a guest enrolled first on a box with no voiceprint --
+        that reading woke him 0 of 50 (the wake gate's fail-open None had
+        become a number under the bar, against HER centroid) and admitted
+        him 0 of 50 on the transcript gate. Filtering for her meant
+        refusing him, which is the one thing this feature is not allowed to
+        do; so a verifier that was TOLD who the owner is (``owner_label``,
+        which app.py sets) reads that gallery as nothing enrolled, loudly.
+        A verifier nobody told cannot tell whose the gallery is and keeps
+        the old reading -- the explicit label is the mechanism.
+        """
+        return not self.enrolment_gap()
+
+    def enrolment_gap(self) -> str:
+        """"" when there is a pool of HIS to verify against, else one
+        sentence saying what is missing and what to run. The reason every
+        fail-open in this file logs, so the log says WHY the box is open."""
+        if self._embeddings:
+            return ""
+        labels = self._gallery_labels()
+        if not labels:
+            return "no voiceprint enrolled"
+        if not self.owner_label or self.owner_label in labels:
+            return ""
+        return ("the owner (%s) has no voice pool: no voiceprint, and the "
+                "voice gallery holds only %s. Voice verification is OFF -- "
+                "everyone is answered -- until he is enrolled: "
+                "scripts/enroll_voice.py, then scripts/voice_enrol.py "
+                "--migrate" % (self.owner_label, ", ".join(labels)))
+
+    def _gallery_labels(self):
+        return self._gallery_state()[0]
+
+    def _gallery_state(self):
+        """``(labels, fault)``: every label the gallery holds, and "" -- or
+        one sentence when the gallery could not even say.
+
+        THE FAULT IS RETURNED, NOT ONLY LOGGED, because ``gate._voice_leg``
+        needs it: a gallery that raises used to reach the gate as
+        ``who=""`` -- byte-identical to a legitimate non-match -- and a
+        nameless match is the owner on a one-person box. A wedged instrument
+        must arrive as a wedged instrument, which the gate treats as NOT
+        RUNNING (loud, dead-man counted), never as a name and never as a
+        rejection it did not measure.
+        """
+        if self.gallery is None:
+            return (), ""
+        try:
+            return tuple(self.gallery.labels()), ""
+        except Exception as exc:  # noqa: BLE001 - a broken gallery is no gallery
+            log.warning("voice gallery labels unreadable: %s: %s",
+                        type(exc).__name__, exc, exc_info=True)
+            return (), ("the voice gallery could not list its labels: %s"
+                        % type(exc).__name__)
+
+    def _all_centroids(self, matchable=False):
+        """``{label_or_"": centroid}`` over everything enrolled.
+
+        The voiceprint's pool is keyed "" -- it has no label and inventing one
+        here would put a name into the identity chain that no store agrees on.
+        ``_best_match`` reports WHICH pool a score came from (the stats dict's
+        ``matched_label``), and ``gate._voice_leg`` turns a nameless match
+        into the owner ONLY for a match on that pool or on his own migrated
+        label; that is where the owner's label is actually known.
+
+        ``matchable=True`` LEAVES OUT EVERY PROVISIONAL LABEL, and that is the
+        difference between a store that scores and a door. A label with fewer
+        than ``voicegallery.MIN_TAKES_TO_NAME`` takes is never NAMED, but its
+        centroid used to sit inside the maximum ``_best_score`` takes, so a
+        second person with six takes cleared the 0.30 bar on her own centroid,
+        set ``matched=1`` with no name, and the gate's owner fallback made her
+        HIM. Measured 2026-09-04: 150 of 150 of her clips admitted as the
+        owner, at a centroid cosine to his pool of 0.246. A label that cannot
+        be named cannot match as anybody; it still scores and logs through
+        ``identify``.
+        """
+        out = {}
+        if self._centroid is not None:
+            out[""] = self._centroid
+        if self.gallery is not None:
+            try:
+                cents = self.gallery.centroids()
+                if matchable:
+                    cents = {k: c for k, c in cents.items()
+                             if not self.gallery.provisional(k)}
+                out.update(cents)
+            except Exception:  # noqa: BLE001
+                log.warning("voice gallery centroids unreadable; matching "
+                            "against the voiceprint alone", exc_info=True)
+        if matchable:
+            # AND A LABEL WEARING HIS NAME THAT IS NOT HIS POOL MATCHES
+            # NOBODY -- the same rule a provisional label already lives
+            # under, for the same reason. It cannot be folded into his pool
+            # (``_owner_pools``), and leaving it matchable would hand the
+            # gate a ``matched_label`` spelled like the owner, which
+            # ``gate._voice_leg`` compares to his label as a STRING. Dropping
+            # it is what makes the fix hold at the gate as well as here.
+            for label in self._disowned(out):
+                out.pop(label, None)
+        return out
 
     # Legacy alias (voice_input_gui / hotword_daemon used .enrolled)
     @property
@@ -246,18 +445,85 @@ class SpeakerVerifier:
         return False
 
     # ----------------------------------------------------- persistence
+    def load_gallery(self):
+        """Load the multi-speaker store, if there is one. Never raises.
+
+        SEPARATE FROM ``load()``'s BODY so a gallery that will not read cannot
+        cost him his voiceprint. The two stores are independent on purpose:
+        one is his rollback and the other is the new feature.
+        """
+        try:
+            gal = vgal.default_gallery()
+            if gal.load():
+                self.gallery = gal
+                log.info("voice gallery: %d label(s) enrolled (%s)",
+                         len(gal.labels()), ", ".join(gal.labels()) or "-")
+                labels = gal.labels()
+                if labels and self.owner_label and \
+                        self.owner_label not in labels:
+                    # scripts/voice_enrol.py refuses to build this layout;
+                    # a gallery from an older build can still hold it.
+                    # He is not locked out by it (a match on the voiceprint
+                    # is still his), but identify() cannot rank him against
+                    # anybody, so a guest whose voice also clears his bar
+                    # is answered by the voiceprint alone.
+                    log.warning("voice gallery holds %s but not the owner's "
+                                "label %r: run scripts/voice_enrol.py "
+                                "--migrate so the gallery can tell him from "
+                                "them", ", ".join(labels), self.owner_label)
+            else:
+                self.gallery = None
+                if gal.foreign_generations:
+                    log.warning("voice gallery: %d generation(s) written by "
+                                "another encoder; nothing loaded and nothing "
+                                "touched", len(gal.foreign_generations))
+        except Exception:
+            self.gallery = None
+            log.exception("voice gallery load error; multi-speaker voice ID "
+                          "is off and the voiceprint is unaffected")
+
+    def _warn_if_owner_has_no_pool(self):
+        """Said at LOAD, not only on the first fail-open: a gallery that
+        holds somebody while the owner is enrolled nowhere is the layout
+        that used to lock him out (see is_enrolled), and the fix is a
+        command he has to run."""
+        gap = self.enrolment_gap()
+        if gap and self._gallery_labels():
+            log.warning("voice verification is OFF: %s", gap)
+
     def load(self):
-        """Load saved voiceprint from disk."""
+        """Load saved voiceprint AND the multi-speaker gallery from disk."""
+        self.load_gallery()
         if not VOICEPRINT_FILE.exists():
             self._loaded = True
+            self._warn_if_owner_has_no_pool()
             return
+        self.format_fault = ""
         try:
             data = np.load(VOICEPRINT_FILE)
+            # THE FORMAT IS READ BEFORE THE VECTORS, because it decides
+            # whether these vectors may be read at all -- facegallery._read
+            # settles the same question in the same order and for the same
+            # reason. Reading an unknown pool as if it were this one is how
+            # embeddings silently stop meaning what the code thinks.
+            fmt = int(data["_format"][0]) if "_format" in data.files else 1
+            if fmt not in KNOWN_VOICEPRINT_FORMATS:
+                self.format_fault = (
+                    "voiceprint.npz is format %d and this build reads %s. "
+                    "Loading NOTHING from it: its keys may name several "
+                    "people and this build would pool them into one "
+                    "centroid, which accepts every one of them as you. The "
+                    "file is left exactly where it is."
+                    % (fmt, ", ".join(str(f) for f in KNOWN_VOICEPRINT_FORMATS)))
+                log.error("voice verification is OFF: %s", self.format_fault)
+                self._embeddings = []
+                self._recompute_centroid()
+                self._loaded = True
+                return
             keys = [k for k in sorted(data.files) if k.startswith("emb_")] or \
                 [k for k in sorted(data.files) if not k.startswith("_")]
             self._embeddings = [data[k] for k in keys]
             self._recompute_centroid()
-            fmt = int(data["_format"][0]) if "_format" in data.files else 1
             self._format = fmt
             log.info("voiceprint loaded: %d samples (format %d)",
                      len(self._embeddings), fmt)
@@ -272,6 +538,7 @@ class SpeakerVerifier:
         except Exception:
             log.exception("voiceprint load error")
         self._loaded = True
+        self._warn_if_owner_has_no_pool()
 
     def save(self):
         """Save voiceprint to disk atomically (.tmp + os.replace)."""
@@ -393,6 +660,11 @@ class SpeakerVerifier:
             self._format = VOICEPRINT_FORMAT
             self._embeddings.append(embedding)
             self._recompute_centroid()
+            # A DELIBERATE ENROLMENT IS A NEW REFERENCE. The frozen centroid
+            # exists to stop passive samples walking the pool; it must not
+            # freeze him out of moving it himself, on purpose, at the mic.
+            self._frozen_centroid = None
+            self._passive_added = 0
 
         self.save()
         log.info("enrolled sample #%d (embedding norm: %.3f)",
@@ -425,7 +697,416 @@ class SpeakerVerifier:
         if embedding is None:
             return None
         with self._lock:
-            return float(self._cosine_similarity(embedding, self._centroid))
+            return self._best_score(embedding)
+
+    def _best_score(self, embedding):
+        """The highest cosine against ANY enrolled centroid.
+
+        A MAXIMUM, AND THAT IS WHAT KEEPS THE WAKE GATE FAILING OPEN. The wake
+        gate (hotword._speaker_ok) asks this for a BOOLEAN and never for a
+        name. Adding a label can only ever raise a maximum, so enrolling
+        somebody can only make that gate MORE permissive -- never less. An
+        unwakeable assistant is the worse failure and this feature is not
+        allowed to create one.
+
+        THE ONE TRANSITION A MAXIMUM DOES NOT COVER is nothing -> somebody
+        else: with no pool of his at all there is no maximum to raise, and
+        the first guest's centroid turned the wake gate's ``None`` (fail
+        open) into a number under the bar (suppress) -- measured 2026-09-04,
+        woken 0 of 50. ``is_enrolled`` closes it: a gallery holding only
+        other people is not an enrolment for a verifier that knows who the
+        owner is, so ``score`` keeps returning None there.
+
+        OVER THE MATCHABLE CENTROIDS ONLY -- a provisional label is left out
+        (see ``_all_centroids``), so enrolling somebody with too few takes to
+        be named raises nothing here and lowers nothing here. Nothing enrolled
+        but provisional labels returns None, which the wake gate reads as its
+        fail-open.
+
+        Callers hold ``self._lock``.
+        """
+        best = self._best_match(embedding)
+        return None if best is None else best[1]
+
+    def _owner_pools(self, cents):
+        """The gallery labels that ARE the voiceprint's pool -- his, whatever
+        they are called. ``cents`` is the dict ``_all_centroids`` built, so
+        this costs one cosine per label and no lock.
+
+        ONE QUESTION, ASKED OF EVERY LABEL INCLUDING HIS OWN: does this
+        centroid measure as the voiceprint's pool? The previous version asked
+        a second question first -- "is this label spelled like the owner?" --
+        and answered YES with no measurement at all, which made his name a
+        credential anybody at the microphone could type. Measured 2026-09-05,
+        that admitted a guest with owner scope 100/100 by name and 100/100
+        again through the abstention fail-open (tests/
+        test_voice_owner_label_guard.py). There is no label test here now.
+
+        THE BOOTSTRAP IS THE ONE EXCEPTION AND IT IS NOT A LOOPHOLE. With no
+        voiceprint there is no pool to measure against, so the gallery is the
+        only anchor identity has and his label is it -- the layout a box has
+        after ``enroll_voice.py --reset``, and refusing it would silence him.
+        Nothing can be stolen there, because there is nothing yet to steal.
+
+        THE SECOND ROUTE IN IS PROVENANCE, AND IT ANSWERS A QUESTION THE
+        COSINE CANNOT. A pool that was COPIED OUT OF ``voiceprint.npz``
+        (``voicegallery.carried_from_voiceprint``: every enrolment take
+        stamped ``src="legacy"`` with the migrate/re-anchor note) is his by
+        construction, whatever it measures today -- and the only way to make
+        one is to be able to write ``voiceprint.npz``, at which point you are
+        already the owner as far as this method is concerned. That is the
+        threat model ``reanchor_voiceprint`` states and the 2026-09-05 review
+        confirmed; applying it here is the same argument, not a new risk.
+
+        IT IS WHAT CLOSES THE SECOND HALF OF THE ROUND-3 LOCKOUT. His voice
+        under two labels refused him 0 of 100 in BOTH shapes: two labels that
+        both measure as the voiceprint (a second ``--migrate`` after he
+        renames himself; alias 1.0000, which the cosine alone folds) and ONE
+        measuring beside one gone stale (``--migrate``, re-enrol the
+        voiceprint, rename, ``--migrate`` again; alias 0.920, which the cosine
+        alone cannot see). The margin then ranked one man against himself and
+        ``gate._voice_leg`` answered "I can't tell which of you" to him,
+        alone. This does not weaken the impostor guard by a hair: takes
+        recorded under his name AT THE MICROPHONE carry ``src="enrol"``, so
+        ``carried_from_voiceprint`` is False for exactly the shape
+        ``_disowned`` exists to catch.
+        """
+        out = set()
+        mine = cents.get("")
+        carried = self._carried_labels()
+        for label, c in cents.items():
+            if not label:
+                continue
+            if label in carried:
+                out.add(label)
+            elif mine is None:
+                if label and label == self.owner_label:
+                    out.add(label)
+            elif self._cosine_similarity(c, mine) >= MIGRATED_ALIAS_COSINE:
+                out.add(label)
+        return out
+
+    def _carried_labels(self):
+        """The gallery labels whose pools came out of ``voiceprint.npz``.
+
+        A frozenset, and a broken gallery is an EMPTY one rather than an
+        exception: this is consulted from ``_owner_pools``, which every match
+        goes through, and a store that raises here must not take the door with
+        it. It cannot admit anybody on its own -- everything it returns still
+        has to clear the accept bar on a real centroid.
+        """
+        if self.gallery is None:
+            return frozenset()
+        try:
+            return frozenset(self.gallery.voiceprint_labels())
+        except Exception:  # noqa: BLE001 - a broken store folds nobody
+            log.exception("voice gallery: could not read take provenance")
+            return frozenset()
+
+    def _owner_alias_cosine(self, cents):
+        """How well his GALLERY label measures as the voiceprint's pool, or
+        None when the question does not apply (bootstrap, or no label of his).
+
+        PURE, AND SPLIT OUT FOR EXACTLY ONE REASON: ``add_sample`` has to be
+        able to ask this question about a centroid it has NOT committed yet.
+        The bar that bounds passive drift and the bar that shuts the door are
+        then the same predicate over the same numbers rather than two
+        constants somebody has to keep equal.
+        """
+        mine = cents.get("")
+        if mine is None or not self.owner_label:
+            return None                 # bootstrap: nothing to measure against
+        c = cents.get(self.owner_label)
+        if c is None:
+            return None
+        return float(self._cosine_similarity(c, mine))
+
+    def _disowned(self, cents):
+        """The gallery labels that CLAIM the owner's name without measuring
+        as his pool. Everything below must refuse to read one as him.
+
+        A frozenset, so the empty case -- which is every healthy box -- costs
+        nothing. ``cents`` must be the UNFILTERED dict: a disowned label is
+        dropped from the matchable set by ``_all_centroids`` and cannot be
+        used to look itself up afterwards.
+
+        A POOL CARRIED OUT OF ``voiceprint.npz`` IS NEVER DISOWNED, AND THE
+        DIFFERENCE IS THE WHOLE POINT OF THIS GUARD. What it exists to catch
+        is takes recorded under his name BY SOMEBODY ELSE AT THE MICROPHONE,
+        and those carry ``src="enrol"``. A pool stamped by ``--migrate`` or
+        ``--reanchor`` cannot be that; it is his own voiceprint, gone stale
+        because he re-recorded ``voiceprint.npz`` afterwards
+        (``enroll_voice.py --reset``, measured by the 2026-09-05 review at
+        0.927-0.934 against the 0.98 line -- not drift, simply a second
+        enrolment). Disowning it cost him his own turns, 14 of 100 at apart
+        1.0; the honest answer is to keep reading it as his and SAY SO
+        LOUDLY, because the repair is one command and nothing used to name
+        it. ``_owner_pools`` folds it for the same reason.
+        """
+        carried = self._carried_labels()
+        if self.owner_label and self.owner_label in carried:
+            if not self._warned_stale:
+                self._warned_stale = True
+                score = self._owner_alias_cosine(cents)
+                if score is not None and score < MIGRATED_ALIAS_COSINE:
+                    log.warning(
+                        "voice gallery: %r came out of voiceprint.npz but no "
+                        "longer measures as it (cos %.3f, needs %.2f) -- his "
+                        "voiceprint has been re-recorded since. It is still "
+                        "read as his; repair it with: "
+                        "scripts/voice_enrol.py --reanchor",
+                        self.owner_label, score, MIGRATED_ALIAS_COSINE)
+            return frozenset()
+        score = self._owner_alias_cosine(cents)
+        if score is None or score >= MIGRATED_ALIAS_COSINE:
+            return frozenset()
+        if not self._warned_disowned:
+            self._warned_disowned = True
+            log.warning(
+                "voice gallery: the label %r does not match voiceprint.npz "
+                "(cos %.3f, needs %.2f) -- it is NOT being read as the owner. "
+                "Takes recorded under his name by somebody else look exactly "
+                "like this. Check with: scripts/voice_enrol.py --status",
+                self.owner_label, score, MIGRATED_ALIAS_COSINE)
+        return frozenset({self.owner_label})
+
+    def _pool_of_label(self, label):
+        """Which pool a gallery label belongs to: "" when it is the owner's
+        (see ``_owner_pools``), otherwise itself."""
+        label = str(label or "")
+        if not label:
+            return ""
+        with self._lock:
+            cents = self._all_centroids()
+        return "" if label in self._owner_pools(cents) else label
+
+    def _best_match(self, embedding):
+        """``(pool, score)`` of the best MATCHABLE centroid, or None when
+        nothing matchable is enrolled.
+
+        THE POOL IS WHICH PERSON'S CENTROID THE SCORE CAME FROM, and it is
+        the fact the gate was missing. ``_best_score`` used to return the
+        number alone, so a second person clearing the bar on HER OWN
+        centroid arrived at the gate as "a nameless match" -- byte-identical
+        to a match on his voiceprint -- and the gate's owner fallback made
+        her him (measured 2026-09-04: 50 of 50 short commands of hers
+        admitted with owner scope). "" is the voiceprint's pool, and the
+        owner's migrated label is folded into it (``_owner_pools``); any
+        other label is that person's pool and can never become the owner.
+
+        Callers hold ``self._lock``.
+        """
+        cents = self._all_centroids(matchable=True)
+        if not cents:
+            return None
+        his = self._owner_pools(cents)
+        best = None
+        for label, c in cents.items():
+            score = float(self._cosine_similarity(embedding, c))
+            if best is None or score > best[1]:
+                best = ("" if label in his else label, score)
+        return best
+
+    def _who(self, embedding, speech_s):
+        """``(verdict, fault)`` from the gallery.
+
+        No gallery is ``(None, "")`` -- nobody to name, nothing wrong. A
+        gallery that RAISES is ``(None, "<sentence>")``, and the second
+        value is the whole point: the two used to be the same, so a wedged
+        store reached the gate looking exactly like a voice it had measured
+        and declined to name.
+
+        THE WHOLE VERDICT COMES BACK, not the name alone. This used to
+        return ``(who, scores, "")`` and drop ``verdict.abstained`` on the
+        floor, so an abstention on a short window reached the gate as a
+        MEASURED nameless match -- which is the route a guest's 1.2 s
+        command took to owner scope, and the route his own 1.2 s command
+        took to a refusal (both measured 50/50, 2026-09-04).
+
+        Every bar lives in ``voicegallery.identify`` -- the accept bar, the
+        margin, the provisional rule and the abstain window. Nothing here
+        second-guesses it, and ``gate.py`` holds no threshold at all.
+        """
+        if self.gallery is None:
+            return None, ""
+        try:
+            with self._lock:
+                same = [self._owner_pools(self._all_centroids(matchable=True))]
+            verdict = self.gallery.identify(embedding, speech_s, self.threshold,
+                                            same=same)
+        except Exception as exc:  # noqa: BLE001 - a broken gallery names nobody
+            log.exception("voice gallery identify failed; naming nobody")
+            return None, ("the voice gallery could not identify: %s"
+                          % type(exc).__name__)
+        verdict = self._strip_disowned(verdict)
+        if verdict.who:
+            log.info("voice gallery: %s (%.3f%s)", verdict.who, verdict.score,
+                     "" if verdict.margin is None
+                     else ", margin %.3f" % verdict.margin)
+        elif verdict.provisional:
+            log.info("voice gallery: probably %s (%.3f) but only %d take(s); "
+                     "naming nobody", verdict.provisional, verdict.score,
+                     self.gallery.count(verdict.provisional))
+        elif verdict.why and not verdict.abstained:
+            log.info("voice gallery: naming nobody -- %s", verdict.why)
+        return verdict, ""
+
+    def _strip_disowned(self, verdict):
+        """His name, taken back off a pool that is not his.
+
+        ``identify`` ranks GALLERY LABELS and knows nothing of
+        ``voiceprint.npz``, so it will happily name a disowned label -- his
+        name, on somebody else's voice. The escalation itself is already shut
+        by ``_all_centroids`` (a disowned label cannot be ``matched_label``,
+        which is the only thing ``gate._voice_leg`` turns into scope), so this
+        is not the lock; it is the LIE. A rejected clip still carries the
+        gallery's opinion into ``stats`` and into the log, and "probably
+        hunter" said about a stranger is exactly the sentence that would get
+        the guard hand-waved away as a false alarm next time.
+
+        FILTERING THE RANKING IS ALL IT DOES, AND THAT IS NOW ENOUGH. This
+        used to leave ``score``, ``second`` and ``margin`` alone on the
+        argument that a stale number there could only ever WITHHOLD a name
+        downstream. Measured 2026-09-05, it could also INVENT one: paired in
+        ``_ident`` with a label read out of the filtered list, his score
+        arrived at the gate wearing the guest's name (top='mara' at 0.008
+        against a 0.30 bar) and the gate refused him 30 of 30. Those scalars
+        are properties over ``scores`` now (see ``voicegallery.VoiceVerdict``),
+        so ``dataclasses.replace`` recomputes every one of them here and a
+        stale scalar is not a thing that can exist.
+
+        The lock is taken here and is never held by a caller: all three
+        ``_who`` call sites release it before asking.
+        """
+        if verdict is None:
+            return verdict
+        with self._lock:
+            gone = self._disowned(self._all_centroids())
+        if not gone:
+            return verdict
+        scores = tuple((lab, sc) for lab, sc in (verdict.scores or ())
+                       if lab not in gone)
+        who = "" if verdict.who in gone else verdict.who
+        prov = "" if verdict.provisional in gone else verdict.provisional
+        if (who == verdict.who and prov == verdict.provisional
+                and len(scores) == len(verdict.scores or ())):
+            return verdict
+        log.warning("voice gallery: withholding %r -- that label does not "
+                    "match voiceprint.npz and is not the owner",
+                    verdict.who or verdict.provisional or self.owner_label)
+        return dataclasses.replace(verdict, who=who, provisional=prov,
+                                   scores=scores)
+
+    def _reconcile(self, verdict, pool):
+        """The gallery's NAME must agree with the POOL the bar was cleared
+        on, or the name is withheld and ``top`` carries it as a guess.
+
+        Reachable with the owner un-migrated: ``identify`` ranks gallery
+        labels only, so with a guest in the gallery and him only in
+        ``voiceprint.npz`` it cannot rank him against her and names the one
+        label it has -- on HIS voice, whenever it also clears her bar
+        (measured 2026-09-04 at apart 1.0: 43 of 150 of his clips named
+        "mara" outright, 150 of 150 at apart 2.0). The pool is the measured
+        fact: his voiceprint out-scored her centroid, so the name is
+        withheld and the gate answers nobody rather than her. ONE helper for
+        the whole-clip path and the windowed path, so a clip under 3 s
+        cannot be named what a clip over 3 s would not be.
+        """
+        if verdict is None or not verdict.who:
+            return verdict
+        if self._pool_of_label(verdict.who) == pool:
+            return verdict
+        log.info("voice gallery named %s but the bar was cleared on %s's "
+                 "pool; naming nobody", verdict.who, repr(pool or "voiceprint"))
+        return dataclasses.replace(verdict, who="")
+
+    def _ident(self, verdict=None, *, pool="", abstained=False, fault="",
+               labels=None):
+        """The identity half of a stats dict. ONE builder, so every path out
+        of ``verify`` and ``filter_segments`` carries the same keys:
+
+        who           the label the gallery NAMED (bar, margin and takes all
+                      cleared), or ""
+        who_scores    {label: cosine} the gallery measured
+        labels        every label the gallery holds, provisional included
+                      (for the log; the gate no longer counts them)
+        matched_label WHOSE POOL the kept windows cleared the bar on: "" for
+                      the voiceprint (his), a label for that person. The
+                      gate's owner fallback is legal ONLY for "" or his own
+                      label -- never for anybody else's pool.
+        top           the label identify() ranked first ABOVE THE BAR, named
+                      or not (provisional, or a failed margin). "" when
+                      nothing cleared it. A nameless match whose best guess
+                      is somebody else may not become the owner.
+        provisional   ``top`` when it was withheld only for lack of takes
+        near_miss     True when the margin failed: "I can't tell which of
+                      you", which is the line the gate says for it
+        abstained     True when NOTHING WAS MEASURED on this clip -- too
+                      little speech, no gallery to ask, no model, or an
+                      instrument that raised. NOT a recognition, and the
+                      claim is now literally true on every path: the
+                      enrolment-gap fail-open, the model-not-loaded and
+                      segment-exception fail-shuts and the gallery-fault
+                      path all used to carry False, which said "measured,
+                      and named nobody" about a clip nothing had looked at.
+                      None of them could admit anybody -- they reach the gate
+                      as matched=0 or as a fault, both refusals -- so this is
+                      honesty in the log and in stats rather than a lock; a
+                      flag that lies about the easy cases is one nobody can
+                      trust about the hard one.
+        who_is_owner  True when ``who`` names a pool that IS the
+                      voiceprint's -- measured, or carried out of it. What
+                      the gate reads instead of trying to spell his name.
+        who_fault     "" or one sentence when the gallery raised
+        """
+        if labels is None:
+            labels, lab_fault = self._gallery_state()
+            fault = fault or lab_fault
+        # A FAULT MEASURED NOTHING. The instrument raised, so there is no
+        # verdict to carry a flag of its own, and False here said "measured,
+        # named nobody" about a clip that was never scored. Measured
+        # 2026-09-05: a 1.22 s clip that would have abstained arrived with
+        # abstained=False and who_fault set. It admits nobody either way --
+        # gate._voice_leg refuses on who_fault before it ever reads this --
+        # so the change is the log telling the truth.
+        if fault:
+            abstained = True
+        who = who_top = provisional = ""
+        scores = {}
+        near_miss = False
+        if verdict is not None:
+            abstained = abstained or bool(verdict.abstained)
+            scores = dict(verdict.scores)
+            who = str(verdict.who or "")
+            provisional = str(verdict.provisional or "")
+            # ONE ROW, READ ONCE. ``top`` is a label AND the claim that its
+            # score cleared the bar, so both halves come off the same row of
+            # the same ranking (``VoiceVerdict.top_label`` is the label
+            # ``score`` is the score of). This used to be two reads --
+            # ``verdict.score`` beside ``verdict.scores[0][0]`` -- and after
+            # ``_strip_disowned`` filtered the ranking they described
+            # different rows: measured 2026-09-05 at apart 0.3, the gate was
+            # told top='mara' where mara scored 0.008 against a 0.30 bar, and
+            # refused him 30 of 30 for it.
+            if verdict.score >= self.threshold:
+                who_top = verdict.top_label
+            near_miss = bool(not who and not provisional and not abstained
+                             and verdict.margin is not None
+                             and who_top
+                             and verdict.margin < vgal.MARGIN)
+        # WHOSE POOL THE NAME BELONGS TO, asked of the labels rather than
+        # inferred from ``pool``. ``gate._voice_leg`` cannot tell his OLD
+        # gallery slug -- what a rename leaves on disk -- from a label it has
+        # never heard of, and it should not try: this layer knows, by
+        # measurement or by provenance (``_owner_pools``), and says so.
+        # Measured 2026-09-05: without it, a renamed box refused his own turns
+        # 55 of 100 even with the fold in place, because the winning row wore
+        # a name no registry knew and ``recognise`` dropped it.
+        return {"who": who, "who_scores": scores, "labels": tuple(labels),
+                "matched_label": str(pool or ""), "top": who_top,
+                "provisional": provisional, "near_miss": near_miss,
+                "who_is_owner": bool(who) and self._pool_of_label(who) == "",
+                "abstained": bool(abstained), "who_fault": str(fault or "")}
 
     def verify(self, audio_16k):
         """Check if audio matches the enrolled voiceprint.
@@ -441,10 +1122,22 @@ class SpeakerVerifier:
         clip is ACCEPTED (True, 1.0) — logged at WARNING, with one
         Status(kind=warn) event per session.
         """
-        if not self.is_enrolled:
-            # No voiceprint yet — accept all audio
-            self._fail_open("no voiceprint enrolled")
-            return True, 1.0
+        is_match, score, _ident = self._verify_named(audio_16k)
+        return is_match, score
+
+    def _verify_named(self, audio_16k):
+        """``verify()`` plus the identity. ``(is_match, score, ident)`` where
+        ``ident`` is the dict ``_ident`` builds.
+
+        Split out rather than folded in because ``filter_segments`` falls back
+        to whole-clip verification on a short capture and needs the name too;
+        returning it through a shared attribute would race the recorder's
+        1 Hz polling."""
+        gap = self.enrolment_gap()
+        if gap:
+            # Nobody enrolled -- or nobody who is HIM -- accept all audio
+            self._fail_open(gap)
+            return True, 1.0, self._ident(abstained=True)
 
         speech_s = len(trim_silence(audio_16k)) / SAMPLE_RATE
         if speech_s < ABSTAIN_SECONDS:
@@ -457,26 +1150,41 @@ class SpeakerVerifier:
             # themselves be judged -- rather than reject him silently.
             log.info("speaker verify: %.2fs of speech is too little to judge; "
                      "abstaining (fail-open)", speech_s)
-            return True, 0.0
+            # NO NAME FROM AN ABSTENTION, and that is the trap a naive label
+            # change springs. The clip is accepted (fail-open) with who="",
+            # and SAID TO BE an abstention: gate._voice_leg keeps the owner
+            # fallback for one -- nothing was measured, so enrolling a second
+            # person moves nothing about it -- where a MEASURED nameless
+            # match on a two-person box is unknown. An abstention must never
+            # be narrated as a recognition.
+            return True, 0.0, self._ident(abstained=True)
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             # Can't extract embedding (model missing, audio too short) — accept
             reason = ("model not loaded" if not self._model_loaded
                       else "no embedding (audio too short?)")
             self._fail_shut(reason)
-            return False, 0.0
+            return False, 0.0, self._ident(abstained=True)
 
         with self._lock:
-            score = self._cosine_similarity(embedding, self._centroid)
+            best = self._best_match(embedding)
+        # None: nothing matchable is enrolled (only provisional labels). That
+        # is a REJECT on the transcript gate, not an accept -- somebody IS
+        # enrolled, so the gate fails shut exactly as it did before labels.
+        pool, score = ("", 0.0) if best is None else best
+        verdict, fault = self._who(embedding, speech_s)
+        verdict = self._reconcile(verdict, pool)
 
         # Duration beside the score, always: it is the variable that actually
         # drives rejection, and it was invisible in the log until now.
         log.info("speaker verify: score=%.3f on %.2fs of speech (threshold %.2f)",
                  score, speech_s, self.threshold)
         is_match = score >= self.threshold
-        log.info("speaker verify: score=%.3f threshold=%s %s",
-                 score, self.threshold, "MATCH" if is_match else "REJECT")
-        return is_match, score
+        who = "" if verdict is None else verdict.who
+        log.info("speaker verify: score=%.3f threshold=%s %s%s",
+                 score, self.threshold, "MATCH" if is_match else "REJECT",
+                 " (%s)" % (who or pool or "voiceprint") if is_match else "")
+        return is_match, score, self._ident(verdict, pool=pool, fault=fault)
 
     # ------------------------------------------------ passive learning
     def add_sample(self, audio_16k):
@@ -490,39 +1198,152 @@ class SpeakerVerifier:
 
         Returns:
             True if sample was added
+
+        GATED AGAINST A FROZEN CENTROID, NOT THE LIVE ONE, and the difference
+        is a measured one. This method used to score a candidate against the
+        centroid it was about to move, so the bar bounded one STEP and not the
+        WALK: every accepted sample buys the next one more room. Measured
+        2026-09-04 on synthetic vectors at his pool's spread
+        (tests/test_voice_passive.py), worst-case attacker, 14-take enrolment,
+        an intruder starting at 0.149 against a 0.30 bar --
+
+            gate on the live centroid, 20 accepts   cos 0.657, intruder 0.843
+            gate on the frozen centroid, 20         cos 0.724, intruder 0.790
+
+        -- so freezing is better and IS NOT ENOUGH. Twenty new vectors against
+        fourteen originals is a 59% swing in a mean whatever each one scores;
+        only the COUNT bounds it, hence PASSIVE_CAP.
+
+        AND SAY THE LIMIT OUT LOUD. ``voiceprint.npz`` has no per-sample
+        provenance, so it cannot tell an enrolment take from a passively
+        learned one. This "frozen" centroid is frozen for the life of the
+        PROCESS; after a restart it is recomputed over a pool that already
+        contains the passive samples, and the walk resumes from wherever it
+        got to. Closing that needs a per-sample key, which is a format bump
+        this file may not take -- ``jarvis/voicegallery.py`` has the key
+        (``src_``), and passive learning into that store is OFF for exactly
+        the reasons above.
         """
         if self._format < VOICEPRINT_FORMAT:
             log.info("passive sample skipped: voiceprint predates silence "
                      "trimming; re-enrol with scripts/enroll_voice.py --reset")
             return False
+        if self._passive_added >= PASSIVE_CAP:
+            log.info("passive sample skipped: %d already added this session, "
+                     "the cap (see add_sample for the measured drift)",
+                     self._passive_added)
+            return False
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             return False
 
-        # Only add if it matches current profile (sanity check)
+        # Only add if it matches the FROZEN reference (sanity check)
         if self.is_enrolled:
             with self._lock:
-                score = self._cosine_similarity(embedding, self._centroid)
+                if self._frozen_centroid is None and self._centroid is not None:
+                    self._frozen_centroid = np.array(self._centroid, copy=True)
+                ref = self._frozen_centroid
+                score = (self._cosine_similarity(embedding, ref)
+                         if ref is not None else None)
+            if score is None:
+                log.info("passive sample skipped: no frozen reference to "
+                         "measure it against")
+                return False
             if score < self.threshold:
-                log.info("passive sample rejected (score=%.3f < %s)",
+                log.info("passive sample rejected (score=%.3f < %s against "
+                         "the frozen enrolment centroid)",
                          score, self.threshold)
                 return False
 
         with self._lock:
-            self._embeddings.append(embedding)
-            # Trim oldest if over limit (keep first 10 enrollment + newest)
-            if len(self._embeddings) > MAX_EMBEDDINGS:
-                # Keep first 10 (original enrollment) + newest
-                keep_first = min(10, len(self._embeddings) // 2)
-                keep_recent = MAX_EMBEDDINGS - keep_first
-                self._embeddings = (
-                    self._embeddings[:keep_first]
-                    + self._embeddings[-keep_recent:]
-                )
-            self._recompute_centroid()
+            pool = self._trimmed(self._embeddings + [embedding])
+            cand = np.mean(pool, axis=0)
+            why = self._would_leave_his_own_pool(cand)
+            if why:
+                if not self._warned_anchored:
+                    self._warned_anchored = True
+                    log.warning("passive sample refused: %s", why)
+                else:
+                    log.info("passive sample refused: %s", why)
+                return False
+            self._passive_added += 1
+            self._embeddings = pool
+            self._centroid = cand
 
         self.save()
         return True
+
+    @staticmethod
+    def _trimmed(pool):
+        """``pool`` capped at ``MAX_EMBEDDINGS``, keeping the first ten (the
+        original enrolment) and the newest. Lifted out of ``add_sample`` so
+        the candidate centroid measured below is the one that would actually
+        be stored, trim and all -- a projection that skipped the trim would
+        bound a pool nobody keeps."""
+        if len(pool) <= MAX_EMBEDDINGS:
+            return list(pool)
+        keep_first = min(10, len(pool) // 2)
+        keep_recent = MAX_EMBEDDINGS - keep_first
+        return list(pool[:keep_first]) + list(pool[-keep_recent:])
+
+    def _would_leave_his_own_pool(self, candidate):
+        """"" when the voiceprint may move to ``candidate``, else the
+        sentence saying why not.
+
+        THE LOCKOUT THIS CLOSES NEEDS NO COMMAND, NO ATTACKER AND NO MISTAKE.
+        ``add_sample`` moves ``voiceprint.npz``'s centroid; the gallery's
+        migrated copy of him does not move; ``_disowned`` compares the two on
+        ``MIGRATED_ALIAS_COSINE``. So ordinary use walks the two apart until
+        his own gallery label stops being read as his and the gate refuses
+        him. Measured 2026-09-05 on synthetic vectors, two passive samples
+        per restart, seed 3, and the same shape at apart 0.3 / 1.0 / 2.0::
+
+            passive   0     2     4     8    12    16 | 18    20    40
+            cosine  1.0000 .9951 .9925 .9869 .9840 .9821| .9809 .9787 .9750
+            admits    30    30    30    30    30    30 |  0     0     0
+                                          nine restarts ^ LOCKED
+
+        THE BOUND IS THE DOOR'S OWN PREDICATE, ASKED OF A CENTROID NOT YET
+        COMMITTED. Not a second constant, not a headroom margin, not a step
+        size: ``_owner_alias_cosine`` over a centroid dict whose "" entry is
+        the candidate. Committed only if the answer would still be at or
+        above the line, so the invariant is exact rather than approximate --
+        the stored voiceprint centroid is never on the far side of the bar
+        the runtime disowns on, however many samples arrive or in what order.
+
+        WHY THE MOVER IS THE ONE THAT GETS BOUNDED. Both pools could in
+        principle drift; only one of them does so by itself. Gallery passive
+        learning is off (``voicegallery.MAX_PASSIVE`` is 0) and every other
+        write to the gallery is an operator running the enrol script, which
+        applies ``OWNER_POOL_COSINE`` itself (``pool_ok``). Passive learning
+        into the voiceprint is the single automatic mover, so it is the one
+        that must not be allowed to walk out of the pair.
+
+        AND NOTHING CHANGES ON A SINGLE-SPEAKER BOX. With no label of his in
+        the gallery there is no pair to hold together, ``_owner_alias_cosine``
+        answers None, and the sample is taken exactly as it was before this
+        feature existed. A box that never asked for multi-speaker does not
+        pay for it.
+
+        The recovery for a box that ALREADY drifted -- and the reason this is
+        a refusal rather than a silent re-anchor -- is
+        ``voicegallery.reanchor_voiceprint`` and ``voice_enrol.py
+        --reanchor``: an operator's decision with the numbers printed, never
+        something the runtime does to his identity behind his back.
+
+        Callers hold ``self._lock``.
+        """
+        cents = dict(self._all_centroids())
+        cents[""] = candidate
+        score = self._owner_alias_cosine(cents)
+        if score is None or score >= MIGRATED_ALIAS_COSINE:
+            return ""
+        return ("it would move voiceprint.npz to cos %.4f of the voice "
+                "gallery's %r, under the %.2f line that label is read as his "
+                "on -- Jarvis would stop answering him. Nothing was added. If "
+                "his pool and his voiceprint have genuinely come apart, "
+                "re-anchor them: scripts/voice_enrol.py --reanchor"
+                % (score, self.owner_label, MIGRATED_ALIAS_COSINE))
 
     # ------------------------------------------------ segment filtering
     def _dump_reject(self, audio_16k, windows, scores):
@@ -559,15 +1380,22 @@ class SpeakerVerifier:
             (filtered_audio, stats_dict)
             filtered_audio: numpy array of concatenated matching segments,
                             or None if no segments matched
-            stats_dict: {'total': N, 'matched': M, 'scores': [...]}
+            stats_dict: {'total': N, 'matched': M, 'scores': [...]} plus
+                        the identity keys ``_ident`` documents (who,
+                        matched_label, top, abstained, ...). ``matched``
+                        counts the windows KEPT: those that cleared the bar
+                        on the clip's own speaker's pool.
         """
-        if not self.is_enrolled:
+        gap = self.enrolment_gap()
+        if gap:
             # Unconfigured: pass through, or voice never works on a fresh box.
-            self._fail_open("no voiceprint enrolled")
-            return audio_16k, {"total": 0, "matched": 0, "scores": []}
+            self._fail_open(gap)
+            return audio_16k, {"total": 0, "matched": 0, "scores": [],
+                               **self._ident(abstained=True)}
         if not self._ensure_model():
             self._fail_shut("model not loaded")
-            return None, {"total": 0, "matched": 0, "scores": []}
+            return None, {"total": 0, "matched": 0, "scores": [],
+                          **self._ident(abstained=True)}
 
         window_samples = int(window_sec * SAMPLE_RATE)
         hop_samples = int(hop_sec * SAMPLE_RATE)
@@ -575,10 +1403,13 @@ class SpeakerVerifier:
 
         if total_samples < window_samples:
             # Audio shorter than one window — fall back to whole-clip verify
-            is_match, score = self.verify(audio_16k)
+            is_match, score, ident = self._verify_named(audio_16k)
             if is_match:
-                return audio_16k, {"total": 1, "matched": 1, "scores": [score]}
-            return None, {"total": 1, "matched": 0, "scores": [score]}
+                return audio_16k, {"total": 1, "matched": 1, "scores": [score],
+                                   **ident}
+            # No name on a rejection; the fault and the labels still travel.
+            return None, {"total": 1, "matched": 0, "scores": [score],
+                          **dict(ident, who="")}
 
         windows = []
         positions = []
@@ -622,36 +1453,105 @@ class SpeakerVerifier:
             windows = [windows[i] for i in voiced]
             positions = [positions[i] for i in voiced]
 
-        # Batch embedding extraction for speed
+        # IDENTITY IS DECIDED PER WINDOW, AND THE CLIP IS ONE PERSON'S.
+        #
+        # The first version scored every window against the MAXIMUM over all
+        # centroids, kept every window that cleared it, and ran ONE identify()
+        # on the best window. So a 6 s capture holding him for 3 s and her
+        # for 3 s kept BOTH halves (each cleared the bar on its own
+        # centroid) and ran the whole thing under whichever of them scored
+        # higher: measured 2026-09-04, her half passed to the commander under
+        # HIS name 61 of 100 times. Enrolling a guest had turned the filter
+        # into a laundry.
+        #
+        # Now every window records WHOSE pool it cleared the bar on
+        # (``_best_match``), the clip is attributed to the pool of its
+        # strongest window, and a matched window on anybody else's pool is
+        # DROPPED -- its audio does not reach Whisper and it does not count
+        # toward ``matched``. The name comes from the kept windows' own
+        # verdicts, a named one first, and an abstention on every kept window
+        # is carried as an abstention rather than laundered into a match.
         scores = []
-        matched_mask = []
+        pools = []
+        embs = []
+        speech = []
         try:
             for chunk in windows:
                 emb = self._extract_embedding(chunk)
                 if emb is not None:
                     with self._lock:
-                        score = self._cosine_similarity(emb, self._centroid)
+                        best = self._best_match(emb)
+                    pool, score = ("", 0.0) if best is None else best
                     scores.append(score)
-                    matched_mask.append(score >= self.threshold)
+                    pools.append(pool)
+                    embs.append(emb)
+                    speech.append(len(trim_silence(chunk)) / SAMPLE_RATE)
                 else:
                     scores.append(0.0)
-                    matched_mask.append(False)
-            if os.environ.get("JARVIS_DEBUG_AUDIO") == "1" and not any(matched_mask):
+                    pools.append("")
+                    embs.append(None)
+                    speech.append(0.0)
+            cleared = [i for i, s in enumerate(scores) if s >= self.threshold]
+            if os.environ.get("JARVIS_DEBUG_AUDIO") == "1" and not cleared:
                 self._dump_reject(audio_16k, windows, scores)
         except Exception:
             log.exception("segment verification error")
             self._fail_shut("segment verification error")
-            return None, {"total": len(windows), "matched": 0, "scores": []}
+            return None, {"total": len(windows), "matched": 0, "scores": [],
+                          **self._ident(abstained=True)}
 
-        matched_count = sum(matched_mask)
         total_count = len(windows)
+        if not cleared:
+            # No name on a rejection, whatever the gallery thought: "matched"
+            # is the pipeline's verdict and a label may never contradict it.
+            # The gallery still SCORES the strongest window so the log can
+            # say "probably mara, 6 takes" about a clip that went nowhere.
+            log.info("segment filter: 0/%d windows matched (scores: %s)",
+                     total_count, ", ".join(f"{s:.2f}" for s in scores))
+            verdict, fault = None, ""
+            scored = [i for i, e in enumerate(embs) if e is not None]
+            if scored:
+                i = max(scored, key=lambda i: scores[i])
+                verdict, fault = self._who(embs[i], speech[i])
+                if verdict is not None:
+                    verdict = dataclasses.replace(verdict, who="")
+            return None, {"total": total_count, "matched": 0, "scores": scores,
+                          **self._ident(verdict, fault=fault)}
 
-        log.info("segment filter: %d/%d windows matched (scores: %s)",
-                 matched_count, total_count,
+        strongest = max(cleared, key=lambda i: scores[i])
+        clip_pool = pools[strongest]
+        kept = [i for i in cleared if pools[i] == clip_pool]
+        dropped = [i for i in cleared if pools[i] != clip_pool]
+        if dropped:
+            log.info("segment filter: %d window(s) cleared the bar on %s, "
+                     "not on %s; dropped as somebody else's",
+                     len(dropped),
+                     ", ".join(repr(pools[i] or "voiceprint") for i in dropped),
+                     repr(clip_pool or "voiceprint"))
+
+        # The verdict for the clip, from ITS OWN windows: a named verdict
+        # beats a nameless one, a measured one beats an abstention, and the
+        # strongest evidence breaks ties. Every kept window is asked, so a
+        # short window that abstains cannot hide a longer one that names him.
+        verdict, fault = None, ""
+        ranked = []
+        for i in kept:
+            v, f = self._who(embs[i], speech[i])
+            if f:
+                fault = fault or f
+                continue
+            if v is not None:
+                ranked.append((bool(v.who), not v.abstained, scores[i], i, v))
+        if ranked:
+            ranked.sort(key=lambda r: r[:3], reverse=True)
+            verdict = self._reconcile(ranked[0][4], clip_pool)
+        ident = self._ident(verdict, pool=clip_pool, fault=fault)
+
+        matched_count = len(kept)
+        matched_mask = [i in kept for i in range(total_count)]
+        log.info("segment filter: %d/%d windows matched on %s (scores: %s)",
+                 matched_count, total_count, repr(clip_pool or "voiceprint"),
                  ", ".join(f"{s:.2f}" for s in scores))
-
-        if matched_count == 0:
-            return None, {"total": total_count, "matched": 0, "scores": scores}
 
         # Reconstruct audio from matched segments using a mask over the
         # original audio to preserve continuity where possible
@@ -665,7 +1565,7 @@ class SpeakerVerifier:
         filtered = audio_16k[keep]
 
         return filtered, {"total": total_count, "matched": matched_count,
-                          "scores": scores}
+                          "scores": scores, **ident}
 
     # ------------------------------------------------------------ reset
     def clear(self):
@@ -674,6 +1574,8 @@ class SpeakerVerifier:
             self._embeddings.clear()
             self._centroid = None
             self._format = VOICEPRINT_FORMAT
+            self._frozen_centroid = None
+            self._passive_added = 0
         try:
             VOICEPRINT_FILE.unlink(missing_ok=True)
             log.info("voiceprint cleared")

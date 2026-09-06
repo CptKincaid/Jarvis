@@ -19,6 +19,7 @@ import socket
 import subprocess as _real_subprocess
 import sys as _sys
 import tempfile
+import time as _time
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,13 @@ os.environ["JARVIS_VOICEPRINT"] = str(_TEST_LOG_DIR / "voiceprint.npz")
 # embedding is the same kind of irreplaceable measurement of one person.
 # Forced, not setdefault, for the same reason as the line above.
 os.environ["JARVIS_FACE_GALLERY"] = str(_TEST_LOG_DIR / "face_gallery")
+# The MULTI-SPEAKER voice gallery (jarvis/voicegallery.py, PATHS.VOICE_GALLERY).
+# Forced BEFORE the store can be written to rather than after something has
+# destroyed it -- which is the order the voiceprint did not get on 2026-09-02.
+# It holds ECAPA embeddings of him AND, once anyone else enrols, of them: a
+# test that reached it could destroy an enrolment belonging to somebody who is
+# not even in the room to be asked. Forced, not setdefault, like the two above.
+os.environ["JARVIS_VOICE_GALLERY"] = str(_TEST_LOG_DIR / "voice_gallery")
 # The downloaded YuNet/SFace weights (jarvis/facemodels.py). Forced at a
 # throwaway directory so the suite is identical on a box that has them and a
 # box that does not: a test that quietly passed only because 38 MB of SFace
@@ -468,6 +476,20 @@ def pytest_configure(config):
         "real_subprocess(*modules): put the REAL subprocess module back inside "
         "the named jarvis modules for this test (the desktop firewall in "
         "tests/conftest.py refuses run/Popen there otherwise)")
+    config.addinivalue_line(
+        "markers",
+        "local_tz(zone): this file's fixtures are written in ZONE, so pin the "
+        "process's local zone to it for the test (see THE CLOCK GUARD below)")
+    # --clock-at / --clock-tz, applied here: pytest_configure runs before any
+    # test module is imported, so a module that reads the clock at import time
+    # still sees the simulated zone.
+    at, zone = config.getoption("--clock-at"), config.getoption("--clock-tz")
+    if at and zone:
+        raise pytest.UsageError("--clock-at and --clock-tz are exclusive")
+    if at:
+        _apply_tz(_tz_for_local_time(at))
+    elif zone:
+        _apply_tz(zone)
 
 
 @pytest.fixture(autouse=True)
@@ -531,6 +553,16 @@ def _firewall_live_log_dir(tmp_path_factory):
         "PATHS.FACE_GALLERY still targets the user's enrolled face"
     assert real_face not in config.PATHS.FACE_GALLERY.parents, \
         "PATHS.FACE_GALLERY is inside the user's real face gallery"
+    # The VOICE GALLERY, asserted here for the reason the two above are: the
+    # env var is one belt, and this store will hold enrolments belonging to
+    # people who are not the user -- a guest cannot come back and re-record
+    # eight takes because a test overwrote them. Session-scoped, so a broken
+    # redirect fails before the first test writes anything.
+    real_voice_gallery = Path.home() / ".aiws_trainer" / "voice_gallery"
+    assert config.PATHS.VOICE_GALLERY != real_voice_gallery, \
+        "PATHS.VOICE_GALLERY still targets the real voice gallery"
+    assert real_voice_gallery not in config.PATHS.VOICE_GALLERY.parents, \
+        "PATHS.VOICE_GALLERY is inside the real voice gallery"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"
@@ -662,6 +694,25 @@ def _firewall_live_log_dir(tmp_path_factory):
             mod.subprocess = real
 
 
+@pytest.fixture(autouse=True)
+def _addressee_is_the_owner():
+    """Every test starts and ends addressing HUNTER.
+
+    ``brain.set_addressee`` is module state, like ``set_register``, and the
+    owner gate writes it on every judged turn. A test that admits Heather
+    and does not reset it leaves the next test's prompt addressed to her --
+    which is how tests/test_persona.py started failing only when run after
+    tests/test_owner_gate_wiring.py. Reset here rather than in each test,
+    because the next one to forget is the one that matters.
+    """
+    from jarvis import brain as _brain
+    _brain.set_addressee("", "sir")
+    try:
+        yield
+    finally:
+        _brain.set_addressee("", "sir")
+
+
 def pytest_sessionfinish(session, exitstatus):
     """The SMTP firewall's second belt (F24, 09-03). SmtpFirewallRefused
     already comes out of the test that lost its fake; this catches the one
@@ -711,3 +762,156 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 _owned_nodeids: set = set()
+
+
+# ======================================================================
+# THE CLOCK GUARD
+# ======================================================================
+# 2026-09-05: the suite was green at 03:50 and red at 09:48 on the SAME
+# commit, and the difference was the wall clock -- four claim-guard tests
+# hard-coded "Good evening" while jarvis/brain.py:ground_greeting correctly
+# regrounds a stale greeting against the hour. That is a RECURRING class
+# here, not a one-off: a 2026-09-02 note already wrote off "1 pre-existing
+# time-of-day failure" in another file rather than fixing it. A suite that
+# is only green in the evening cannot be a merge gate, so this section
+# gives the suite a way to catch the next one.
+#
+# The instrument is the TZ environment variable, not a frozen clock. To
+# ask "what does this test do at 09:00?" we move the process's local zone
+# so that datetime.now() reads 09:00 -- the clock keeps TICKING at the
+# normal rate and every absolute instant is unchanged. That matters: a
+# frozen clock (freezegun) hangs every test that waits on a deadline, and
+# it breaks anything that subclasses date/datetime. Shifting the zone
+# costs nothing, needs no library, no sudo and no LD_PRELOAD, and it reads
+# the machine's own tzdata only when asked for a named zone.
+#
+# It follows that this guard covers the HOUR and the ZONE axes. It cannot
+# move the DATE, so it does not reach a DST transition day or a specific
+# calendar date; the static guard in tests/test_clock_hygiene.py covers
+# the import-time-capture class that those dates used to expose.
+#
+#   pytest --clock-at=09:00          # run as if the local clock said 09:00
+#   pytest --clock-at=23:59          # ... and let the run cross midnight
+#   pytest --clock-tz=UTC            # run as if the machine were in UTC
+#   scripts/clock_guard.sh           # sweep them all and diff the verdicts
+#
+# NB the system clock and the machine's timezone are NEVER touched: this
+# sets TZ for the pytest process alone (`_time` is imported at the top).
+_DAY_S = 24 * 3600
+
+
+def _posix_tz_for_offset(seconds: int) -> str:
+    """A POSIX TZ string for a fixed UTC offset, in SECONDS east of UTC.
+
+    POSIX counts the other way round (west is positive), hence the sign
+    flip, and it needs no tzdata file -- which keeps the guard runnable on
+    a box with no zoneinfo installed. Seconds are representable, but
+    --clock-at no longer produces them: see the note in _tz_for_local_time
+    about sub-minute offsets corrupting RFC 2822 timestamps.
+    """
+    west = -seconds
+    sign = "-" if west < 0 else ""
+    hh, rem = divmod(abs(west), 3600)
+    mm, ss = divmod(rem, 60)
+    out = f"XXX{sign}{hh}"
+    if mm or ss:
+        out += f":{mm:02d}"
+    if ss:
+        out += f":{ss:02d}"
+    return out
+
+
+def _tz_for_local_time(spec: str) -> str:
+    """The zone that makes the CURRENT instant read as local time `spec`.
+
+    `spec` is HH, HH:MM or HH:MM:SS. The offset is a fixed one, so the
+    simulated clock ticks forward from there exactly as the real one does
+    -- 23:59 really does roll over into tomorrow a minute later, which is
+    how the guard covers a run that crosses the date.
+    """
+    try:
+        parts = [int(x) for x in str(spec).split(":")]
+        if not 1 <= len(parts) <= 3:
+            raise ValueError(spec)
+        parts += [0] * (3 - len(parts))
+        want = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except (TypeError, ValueError):
+        raise pytest.UsageError(
+            f"--clock-at: expected HH, HH:MM or HH:MM:SS, got {spec!r}")
+    if not 0 <= want < _DAY_S:
+        raise pytest.UsageError(f"--clock-at: {spec!r} is not a time of day")
+    utc = _time.gmtime()
+    have = utc.tm_hour * 3600 + utc.tm_min * 60 + utc.tm_sec
+    east = (want - have) % _DAY_S           # seconds east of UTC
+    # Round the offset UP to a whole MINUTE. No real timezone has ever had a
+    # sub-minute offset, and simulating one is not harmless: an RFC 2822 date
+    # (email.utils.format_datetime) can only express +/-HHMM, so the odd
+    # seconds are truncated when a timestamp is serialised and it comes back
+    # up to 59 s adrift. Measured 2026-09-05: the guard reported three
+    # tests/test_notes_mail.py tests as clock-dependent at --clock-at=09:00,
+    # which produced the offset +12:08:12; they are green at all 24 hours
+    # under libfaketime, and green at a whole-hour offset on either date, so
+    # the finding was the instrument, not the suite. That is a false positive,
+    # and a guard that cries wolf gets ignored.
+    #
+    # Rounding UP (never down) keeps the simulated local time at or just
+    # after the time asked for -- within 59 s -- so --clock-at=09:00 is
+    # always inside hour 09, and --clock-at=23:59 is always still before
+    # midnight, which is what makes it cross the date during the run.
+    east += (-east) % 60
+    if east > 14 * 3600:                    # prefer a western offset, so we
+        east -= _DAY_S                      # ... stay inside -10h .. +14h
+    return _posix_tz_for_offset(east)
+
+
+def _apply_tz(zone: str) -> None:
+    os.environ["TZ"] = zone
+    _time.tzset()
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("clock", "clock-dependence guard")
+    group.addoption("--clock-at", default=None, metavar="HH:MM[:SS]",
+                    help="run the suite as if the local clock said HH:MM[:SS] "
+                         "(shifts this process's TZ; the clock still ticks "
+                         "and the system clock is not touched)")
+    group.addoption("--clock-tz", default=None, metavar="ZONE",
+                    help="run the suite as if the machine were in ZONE "
+                         "(e.g. UTC, Asia/Tokyo)")
+
+
+def pytest_report_header(config):
+    """Say the simulated time in the header, so a red run in CI is never
+    mistaken for a real failure -- or the other way round."""
+    if config.getoption("--clock-at") or config.getoption("--clock-tz"):
+        now = _time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        return f"clock guard: TZ={os.environ.get('TZ')} -> local now is {now}"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _local_tz_marker(request):
+    """`pytestmark = pytest.mark.local_tz("America/Chicago")` pins the
+    process's local zone for that module.
+
+    Some files are ABOUT a house in a particular place: they build fixture
+    instants in Central time, hand the product an absolute timestamp, and
+    the product -- rightly -- renders it in the machine's local zone. Such
+    a test is not zone-independent and should not pretend to be; it should
+    SAY which zone its fixtures are written in. That is what this marker
+    does, and it is why those files are green in a UTC container now.
+    """
+    marker = request.node.get_closest_marker("local_tz")
+    if marker is None:
+        yield
+        return
+    before = os.environ.get("TZ")
+    _apply_tz(marker.args[0])
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = before
+        _time.tzset()

@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from jarvis import gateledger
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import (
     AlarmFired,
@@ -71,8 +72,10 @@ from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
 from jarvis import gate as gate_mod
+from jarvis import honorific as honorific_mod
 from jarvis import passphrase as pp
 from jarvis import identity as identity_mod
+from jarvis import scope as scope_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
 # The one module in the package that may call the mail transport
@@ -238,6 +241,15 @@ KNIGHTFALL_NO_OWNER_LOG = ("knightfall: nobody is enrolled as an owner yet; "
                            "run scripts/jarvis_people.py add <you> "
                            "--role owner")
 KNIGHTFALL_COOLDOWN_S = 60.0
+# The rotation's failure lines carry the exception's TYPE, never its words,
+# because that text came from a transport that had just been handed a code.
+# This one is different in a way worth writing down: it is raised by
+# mail.notice_destination BEFORE anything reaches a transport, so it can be
+# a sentence he can act on. It is still a CONSTANT rather than str(exc), so
+# there is no channel from an exception's words to the toast -- and it names
+# no address, because the toast is on screen.
+KNIGHTFALL_BAD_DESTINATION = ("the notice address in your config is not an "
+                              "email address")
 # ONE ROTATION AT A TIME. check -> open -> mail -> store is not atomic, and
 # the drawer runs each press on its own thread: two presses measured
 # (verdict, 2026-09-05) both passed the check against the OLD hash, both
@@ -246,6 +258,22 @@ KNIGHTFALL_COOLDOWN_S = 60.0
 # one keyboard and one drawer; held across the send, so the second press
 # reads the state the first one left rather than the state it found.
 _KNIGHTFALL_LOCK = threading.RLock()
+
+# ---------------------------------------------- the people book's own lock
+# HOW LONG A TYPED OVERRIDE CODE IS GOOD FOR, and it lives HERE rather than
+# in the users page because the page is not the guard. The page kept its own
+# 120-second dwell and decided from it; a decision made in the UI is not a
+# decision at all, because the UI is not what performs the write.
+#
+# A dwell rather than a prompt per press: the terminal tool authorises ONCE
+# per invocation and then acts, and asking on every click trains him to type
+# a break-glass code constantly -- one more exposure on his display each
+# time. It is re-armed by each successful write and dropped the moment he
+# leaves the tab.
+PEOPLE_UNLOCK_S = 120.0
+# One keyboard, one people book. Held across read-decide-write so two
+# presses on two threads cannot both pass a check made before either wrote.
+_PEOPLE_LOCK = threading.RLock()
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -405,6 +433,9 @@ class JarvisApp:
     _pending_debrief = None
     aside = None
     debrief = None
+    # The reading _gate_admits installs for an admitted VOICE turn, read
+    # back by _process_audio one statement later on that same thread.
+    _gate_addressee = scope_mod.OWNER
 
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
@@ -537,7 +568,11 @@ class JarvisApp:
         self.history = TypedHistory()           # typed-command history
 
         # ---- audio in -----------------------------------------------------
-        self.speaker = SpeakerVerifier(gpu=0, threshold=CONFIG.speaker_threshold)
+        # owner_label: so his migrated gallery label and his voiceprint are
+        # read as ONE pool by the per-window filter (speaker.MIGRATED_ALIAS_COSINE).
+        self.speaker = SpeakerVerifier(
+            gpu=0, threshold=CONFIG.speaker_threshold,
+            owner_label=identity_mod.owner_label(self.assistant))
         # Load the stored voiceprint now -- one npz read. Without it
         # `speaker.enrolled` stays False and BOTH gates (the wake-word gate
         # below and the transcript filter in _process_audio) silently do
@@ -988,6 +1023,99 @@ class JarvisApp:
             log.exception("address thinning failed; speaking as written")
             return list(fragments)
 
+    def _tell_the_model_who_is_here(self, who: str):
+        """Name the addressee to the prompt builder, or clear it, and hand
+        back THE READING it installed -- ``(name, honorific)``.
+
+        BELT TO THE SWAP'S BRACES. The swap at ``_say`` is the authority
+        and would correct a "sir" gemma4 generated anyway; this stops it
+        being generated, and stops the prompt telling the model to call a
+        woman "he". Anything that is not a KNOWN non-owner clears the
+        addressee, which restores the frozen owner prompt byte for byte.
+        """
+        try:
+            gate = getattr(self, "gate", None)
+            owner = identity_mod.owner_label(self.assistant)
+            person = (honorific_mod.known_person(gate.registry, who)
+                      if gate is not None else None)
+            if person is None or who == owner or person.role == \
+                    identity_mod.ROLE_OWNER:
+                return brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+            return brain_mod.set_addressee(person.display(), person.honorific)
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("honorific: the addressee could not be named to "
+                          "the model; using the owner prompt")
+            try:
+                return brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+            except Exception:                      # noqa: BLE001
+                return scope_mod.OWNER
+
+    def _the_turn_is_his(self):
+        """This turn is the OWNER'S: attribute it to nobody, name the owner
+        to the prompt builder, and HAND BACK that reading.
+
+        Called for every source the gate does not judge -- the keyboard,
+        the command socket, the phone's intercom clip, Discord -- and
+        before every proactive ask (the first-wake briefing). The
+        round-2 review (09-04) found the attribution written only by the
+        voice path and never cleared: one admitted guest turn and every
+        typed turn of his, and his own briefing, ran scoped as the guest.
+        The scope is per turn now (jarvis/scope.py); this is the owner's
+        half of "per turn", and ``_gate_admits`` is the voice half.
+
+        RETURNS THE READING (round-3, 09-05). Clearing the module state and
+        then having the commander look it up again put an unbounded wait
+        between the two -- measured 198/200 as HIM being refused his own
+        notes when a guest was admitted in that window. The caller carries
+        this value into every door of the turn instead.
+        """
+        self._gate_who, self._gate_how = "", ""
+        self._gate_who_ts = -1e9
+        self._tell_the_model_who_is_here("")
+        return scope_mod.OWNER
+
+    def _honorific(self) -> str:
+        """"sir", "ma'am" or "" for WHOEVER THE NEXT LINE IS AIMED AT.
+
+        Resolved from the gate's own attribution and the stored, typed
+        value on that person's row -- never from a name, never from a
+        guess. Falls back to "sir" whenever there is no registry, no
+        attribution, or a stale one, which is the state the live app is in
+        today: with no people.json the answer is "sir" on every line and
+        the swap below is a no-op.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return honorific_mod.SIR_DEFAULT
+        try:
+            return honorific_mod.for_addressee(
+                gate.registry, lambda: self._gate_who,
+                lambda: self._gate_who_ts,
+                identity_mod.owner_label(self.assistant), time.monotonic())
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("honorific: could not be resolved; using sir")
+            return honorific_mod.SIR_DEFAULT
+
+    def _address_for_addressee(self, text):
+        """The line as the CURRENT ADDRESSEE should hear it.
+
+        THE ONE PLACE THE FORM OF ADDRESS CHANGES on the spoken path. The
+        ~1,000 "sir" literals in this tree are authored as written and
+        rewritten here; not one of them is edited. For the owner
+        ``swap_addresses`` returns the input object unchanged, so his line
+        is byte-identical and nothing about his voice can regress through
+        this door.
+
+        Guarded exactly as _thin_fragments is: a failure here speaks the
+        line as written, because a wrong courtesy is a far smaller bug than
+        a lost sentence.
+        """
+        try:
+            return address_mod.swap_addresses(text, self._honorific())
+        except Exception:                          # noqa: BLE001
+            log.exception("honorific: the swap failed; speaking as written")
+            return text
+
     def _say(self, text, proactive=False, kind="message"):
         """The one door to TTS. ``proactive=True`` marks a line Jarvis
         decided to say on his own (watchdog, reminder, heads-up, narrator);
@@ -1030,7 +1158,7 @@ class JarvisApp:
         # Claude session ack -- got "Checking right now, sir. One moment."
         # on top of an answer the user had already heard.
         self._note_spoke()
-        self.tts.speak(text)
+        self.tts.speak(self._address_for_addressee(text))
 
     def _async_reply(self, text, speak=True):
         """A Tier 1 handler's answer arriving from its worker thread (an
@@ -1232,12 +1360,19 @@ class JarvisApp:
 
         b = self.brain
 
-        def chat(text, force_tool=None, force_args=None):
+        def chat(text, force_tool=None, force_args=None, addressee=None):
             # Every keyword the real JarvisBrain.chat accepts must be forwarded
             # here: the commander only ever sees this wrapper, and a keyword it
             # does not take raises TypeError inside the handler, which the
             # dispatcher turns into "Command failed: <name>" for the user.
+            # ``addressee`` is the commander's ONE reading of whose turn this
+            # is (jarvis/scope.py). Dropped here, a known person's question
+            # would reach the model as his turn with every tool offered --
+            # and test_app_wiring pins that this wrapper takes every keyword
+            # JarvisBrain.chat takes.
             extra = {"force_args": force_args} if force_args is not None else {}
+            if addressee is not None:
+                extra["addressee"] = addressee
             if CONFIG.stream_replies:
                 extra["on_sentence"] = app._on_stream_sentence
             return b.chat(text, callback=app._on_brain_tags,
@@ -1350,6 +1485,11 @@ class JarvisApp:
             # ("...and a memory warning") instead of waking him at 3 am.
             speak=lambda text, proactive=True, kind="warning": self._say(
                 text, proactive=proactive, kind=kind),
+            # "sir", "ma'am" or "" for whoever is being addressed right now.
+            # A CALLABLE, resolved at speak time: commander._speak bypasses
+            # _say, and a value captured at build time would be the owner's
+            # for the life of the process.
+            honorific=self._honorific,
             # a Tier 1 worker thread's answer (explain, quiz): see _async_reply
             reply=self._async_reply,
             # docs.make_tools parks its DocsIndex here for quiz mode
@@ -3504,6 +3644,11 @@ class JarvisApp:
         # "the face leg named Heather while the voice leg abstained" is.
         self._gate_who = ""
         self._gate_how = ""
+        # WHEN that attribution was made (monotonic). The honorific resolver
+        # will not use an attribution older than honorific.ADDRESSEE_TTL:
+        # one turn in which the camera named Mara must not make tonight's
+        # reminder and tomorrow's briefing come out addressed to her.
+        self._gate_who_ts = -1e9
         self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
         self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
@@ -3524,7 +3669,13 @@ class JarvisApp:
             self.gate = gate_mod.OwnerGate(
                 registry=identity_mod.Registry.load(),
                 get_option=self.get_option,
-                owner=identity_mod.owner_label(self.assistant))
+                owner=identity_mod.owner_label(self.assistant),
+                # THE LEDGER, and shadow mode is worth nothing without it.
+                # Every gated verdict lands in gate.jsonl as decisions and
+                # scores -- never a word of what was said -- so that
+                # scripts/gate_scorecard.py can tell him what enforce would
+                # have done to him before he switches it on.
+                record=gateledger.writer(PATHS.LOG_DIR / "gate.jsonl"))
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: could not be built; it is OFF and "
                           "everyone is being answered")
@@ -3569,15 +3720,35 @@ class JarvisApp:
         the sentence rather than left to work it out from being refused.
         """
         try:
-            # The LIVE model's width, not facegallery.EMBED_DIM -- that name
+            # THE LIVE MODEL'S WIDTH, not facegallery.EMBED_DIM. That name
             # is a fixed alias for SFace's 128 and says nothing about what
-            # this box runs. Comparing against it told Hunter on 2026-09-05
+            # this box runs; comparing against it told Hunter on 2026-09-05
             # to re-enrol a CORRECT 512-D ArcFace enrolment, and re-enrolling
-            # would have produced another 512-D one. Pinned by
-            # tests/test_face_leg_line.py.
+            # would have produced another 512-D one. BOTH branches fixed this
+            # independently and they disagreed on one point only: which
+            # backend to ask about. The config-aware read wins -- it is the
+            # documented one-line reversal to SFace, and asking about the
+            # DEFAULT would call a correct SFace enrolment stale the moment
+            # he takes it. Pinned by tests/test_face_leg_line.py.
+            #
+            # AND AN UNREADABLE NAME FALLS BACK RATHER THAN GOING SILENT
+            # (merge, 09-05). facemodels.backend_for RAISES on a name it does
+            # not know -- deliberately, so a typo cannot silently keep the old
+            # models -- and letting that escape turned the WHOLE sentence into
+            # "the camera could not be asked", which hides a genuinely stale
+            # row behind a config typo. A width is not a model load: the
+            # default's width is the honest thing to measure against when the
+            # configured name cannot be read, and the reason is said out loud
+            # in the line's own log.
             from jarvis import facemodels
-            live_dim = facemodels.backend_for(
-                str(self.get_option("camera.face_backend", "") or "")).embed_dim
+            want = str(self.get_option("camera.face_backend", "") or "")
+            try:
+                live_dim = int(facemodels.backend_for(want).embed_dim)
+            except Exception:                      # noqa: BLE001 - a name only
+                live_dim = int(facemodels.backend_for(None).embed_dim)
+                log.warning("owner-gate: camera.face_backend %r is not a "
+                            "known backend; the face-leg line measures "
+                            "against the default's %d-D", want, live_dim)
             enrolled = [p for p in self.gate.registry.people if p.face]
             stale = [p for p in enrolled if p.face_dim and
                      p.face_dim != live_dim]
@@ -3593,8 +3764,16 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - a line only
             return "the camera could not be asked"
 
-    def _after_dispatch(self, text, source, result):
+    def _after_dispatch(self, text, source, result, addressee=None):
         """Bookkeeping once a command has been handled synchronously."""
+        # ROUND-3, named lower and closed here: this filed a GUEST'S
+        # sentence and Jarvis's refusal of it into HIS conversation memory
+        # -- measured add_exchange("what's on my to-do list", "That one's
+        # Hunter's, Mara Voss. ..."). Nothing of his is disclosed by that,
+        # but his record is his: a turn that was not his leaves no trace
+        # in it. The mic and follow-up bookkeeping below is I/O, not his
+        # data, and still runs for her.
+        his_turn = not scope_mod.reading(addressee)[0]
         # "no, I said X" / "that was for you" answered X, not the words
         # said: the exchange is remembered under X.
         text = getattr(result, "corrected", None) or text
@@ -3610,10 +3789,11 @@ class JarvisApp:
                 self._reopen_mic = True
             return
         if reply and done and not getattr(result, "ack", False):
-            self.context.add_exchange(text, reply)
+            if his_turn:
+                self.context.add_exchange(text, reply)
             if source == "voice" and result.speak and CONFIG.talkback:
                 self._followup_after_speech = True
-        if done and getattr(result, "speak", False):
+        if his_turn and done and getattr(result, "speak", False):
             # After the answer, never inside it. _emit_result has already
             # queued the reply, and TTS.speak is FIFO, so this lands as its
             # own beat behind it (jarvis/aside.py).
@@ -3673,7 +3853,7 @@ class JarvisApp:
         self._followup_after_speech = True   # answer it without the wake word
         self._say(cand.question)
 
-    def _debrief_reply(self, text, source):
+    def _debrief_reply(self, text, source, addressee=None):
         """The open debrief owns this transcript -- or gives it up.
 
         Gives it up for anything that is plainly a command (a Tier-1 match,
@@ -3683,6 +3863,25 @@ class JarvisApp:
         meant to be able to trust months from now."""
         pending = self._pending_debrief
         if pending is None or source not in ("voice", "typed"):
+            return None
+        # ROUND-3 BLOCKER 3, MEASURED. This method is hoisted ABOVE
+        # commander.handle on purpose (see _ask_debrief), so it is the one
+        # door of the turn that sits above the commander's scope read --
+        # and it took no reading of its own. With the gate naming a guest,
+        # "honestly it was a disaster, he ran out of time" was written to
+        # BOTH his private sinks (memory.remember + context.journal_debrief)
+        # and commander.handle was never called. Worse than an ordinary
+        # leak: mark_asked is written when the question is PUT, so she did
+        # not merely answer his once-ever question, she SPENT it.
+        #
+        # It cannot simply move below the commander (jarvis/debrief.py:381
+        # explains why), so it asks the same question the commander asks,
+        # of the same carried value. Like the floor-holder branch below,
+        # this returns None WITHOUT clearing _pending_debrief: the question
+        # is his, it was not answered, and it stays open for him.
+        who = scope_mod.reading(addressee)[0]
+        if who:
+            log.info("debrief stands down: this turn is %s's, not his", who)
             return None
         if time.monotonic() - pending["at"] > self.DEBRIEF_TTL_S:
             self._pending_debrief = None
@@ -4029,6 +4228,18 @@ class JarvisApp:
             scores = list(stats.get("scores") or [])
             if not scores or not CONFIG.speaker_verify:
                 return
+            # ONLY HIS OWN CLIPS GO INTO HIS VOICEPRINT. filter_segments says
+            # whose pool the kept windows cleared the bar on (matched_label,
+            # "" for his) and whom the gallery named or guessed (who / top).
+            # A KNOWN person's admitted turn -- "what's the time" from Mara
+            # -- reaches here too, and learning HER into HIS pool is the
+            # walk add_sample's cap exists to bound, one sample at a time.
+            mine = str(getattr(self.speaker, "owner_label", "") or "")
+            guess = str(stats.get("who") or stats.get("top") or "")
+            if stats.get("matched_label") or (guess and guess != mine):
+                log.info("passive learning skipped: the clip is %s's, not "
+                         "the owner's", stats.get("matched_label") or guess)
+                return
             if max(scores) < max(CONFIG.speaker_threshold + 0.2, 0.55):
                 return
             if len(audio) < int(SAMPLE_RATE * 1.5):
@@ -4275,8 +4486,12 @@ class JarvisApp:
         # time-of-day rule for the house (jarvis/arc.py), not a second one
         # here.
         when = arc_mod.greeting_word(datetime.now())
+        # Proactive, and his: the calendar and the lab it reads are not
+        # scoped by whoever the gate last named (round-2 review, 09-04).
+        self._the_turn_is_his()
         try:
-            brain.chat(f"my {when} briefing", force_tool="get_briefing")
+            brain.chat(f"my {when} briefing", force_tool="get_briefing",
+                       addressee=scope_mod.OWNER)
         except Exception:
             log.exception("first-wake briefing failed")
             return False
@@ -5048,9 +5263,13 @@ class JarvisApp:
             fn = self.transcriber.transcribe
         return fn(audio)
 
-    def _gate_rescue(self, audio, stats, speculative):
+    def _gate_rescue(self, audio, stats, speculative, turn=""):
         """A clip the speaker filter dropped: `(audio, stats, result)` to let
         it through after all, or None to keep today's behaviour.
+
+        ``turn`` IS THE LEDGER'S, NOT THE GATE'S. It changes no decision
+        here; it stamps both verdicts of one utterance with one id so the
+        scorecard counts a rescued clip as ONE turn (jarvis/gateledger.py).
 
         THE SPOKEN PASSPHRASE COSTS ONE DECODE, and only here. It arrives as
         a Whisper transcript, and a rejected clip is never transcribed -- so
@@ -5069,13 +5288,15 @@ class JarvisApp:
             return None
         try:
             return self._gate_rescue_inner(gate, audio, stats,
-                                           speculative=speculative)
+                                           speculative=speculative,
+                                           turn=turn)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: the rescue failed; the clip is "
                           "dropped exactly as it was before")
             return None
 
-    def _gate_rescue_inner(self, gate, audio, stats, speculative=False):
+    def _gate_rescue_inner(self, gate, audio, stats, speculative=False,
+                           turn=""):
         face, running = self._eye_identity(), self._face_running()
         # THE PHRASE COSTS ONE DECODE, IN EVERY MODE, and only when an owner
         # has set one. It is the ONE thing that acts in shadow: a rejected
@@ -5087,7 +5308,7 @@ class JarvisApp:
             result = self._gate_quiet_decode(audio)
             text = (getattr(result, "text", "") or "").strip()
         d = gate.judge("voice", text, stats=stats, rejected=True,
-                       face=face, face_running=running)
+                       face=face, face_running=running, turn=turn)
         if d.consumed:
             self._gate_consumed(d, getattr(result, "confidence", 0.0),
                                 speculative)
@@ -5140,16 +5361,18 @@ class JarvisApp:
         self._refuse_politely(d.line)
         return None
 
-    def _gate_judge(self, text, stats):
+    def _gate_judge(self, text, stats, turn=""):
         """One verdict for the turn, or None when there is no gate or it
-        could not decide (both mean: the turn stands, exactly as today)."""
+        could not decide (both mean: the turn stands, exactly as today).
+
+        ``turn`` only reaches the ledger row -- see ``_gate_rescue``."""
         gate = getattr(self, "gate", None)
         if gate is None:
             return None
         try:
             return gate.judge("voice", text, stats=stats,
                               face=self._eye_identity(),
-                              face_running=self._face_running())
+                              face_running=self._face_running(), turn=turn)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: judging failed; the turn stands")
             return None
@@ -5189,15 +5412,43 @@ class JarvisApp:
         d = decision if decision is not None else self._gate_judge(text, stats)
         if d is None:
             return True
+        if not d.admit:
+            # NOT ATTRIBUTED. Round 3 measured this the other way round:
+            # the three lines below used to run BEFORE this check, so a
+            # voice turn the gate REFUSED still left that person owning
+            # the process-wide scope for the full 120 s TTL -- after
+            # _gate_admits("read me my mail") returned False,
+            # scope.addressee() was ("Heather", "ma'am"). A refused turn
+            # is nobody's; whatever held the scope before still holds it.
+            self.turns.abandon("gate:%s" % (d.role or "unknown"))
+            self._refuse_politely(d.line)
+            return False
         self._gate_who, self._gate_how = d.who, d.how
-        if d.admit:
-            return True
-        self.turns.abandon("gate:%s" % (d.role or "unknown"))
-        self._refuse_politely(d.line)
-        return False
+        self._gate_who_ts = time.monotonic()
+        # THE READING FOR THIS TURN, taken at the instant the turn is
+        # attributed and read back by _process_audio one statement later
+        # on this same thread -- never looked up again after a wait.
+        self._gate_addressee = self._tell_the_model_who_is_here(d.who)
+        if d.line:
+            # The sign-in welcome. Only ever set on an admitted turn where
+            # a name was CONFIRMED by a leg, and rate-limited inside the
+            # gate, so this cannot become a preamble on every sentence.
+            self._say(d.line)
+        return True
 
     def _process_audio(self, audio):
         stats = {}
+        # ONE STAMP FOR ONE THING HE SAID. A clip the speaker filter dropped
+        # and a window rescued is judged TWICE below -- once inside
+        # _gate_rescue with rejected=True, and again at `verdict =
+        # self._gate_judge(...)` once the rescue has cleared `rejected`.
+        # Both verdicts are real and both belong in the ledger; without a
+        # shared id the scorecard reports one utterance as two turns and
+        # two window admits, and it does so on exactly the path his FIRST
+        # Knightfall test takes. A timestamp rather than a counter on
+        # purpose: gate.jsonl outlives a restart, and a counter that began
+        # again at 1 would fold two boots' turns together.
+        tid = "%.4f" % time.time()
         try:
             spec = self._take_speculation()
             if spec is not None:
@@ -5217,7 +5468,8 @@ class JarvisApp:
                 # his voice will not) and to hear the spoken passphrase,
                 # which is his way back in when he is ill, in the dark, or
                 # turned away. Anything else and today's behaviour stands.
-                rescued = self._gate_rescue(audio, stats, spec is not None)
+                rescued = self._gate_rescue(audio, stats, spec is not None,
+                                            turn=tid)
                 if rescued is PHRASE_CONSUMED:
                     return             # the gate answered it; nothing else
                 if rescued is None:
@@ -5242,7 +5494,7 @@ class JarvisApp:
             # phrase on the bus as a rejected transcript.
             verdict = None
             if text and (result.accepted or self._owner_has_phrase()):
-                verdict = self._gate_judge(text, stats)
+                verdict = self._gate_judge(text, stats, turn=tid)
                 if verdict is not None and verdict.consumed:
                     self._gate_consumed(verdict, result.confidence,
                                         spec is not None)
@@ -5288,10 +5540,17 @@ class JarvisApp:
                 # taking one of its own.
                 if not self._gate_admits(text, stats, decision=verdict):
                     return
+                # The reading _gate_admits just installed, carried by
+                # value. Only this thread writes it and only this thread
+                # reads it, one statement apart, with no lock between --
+                # so unlike the module state it cannot be flipped by
+                # another turn while this one queues.
+                turn_addr = getattr(self, "_gate_addressee", scope_mod.OWNER)
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
-                self._dispatch(text, "voice", confidence=result.confidence)
+                self._dispatch(text, "voice", confidence=result.confidence,
+                               addressee=turn_addr)
             elif text:
                 # Garbled, not silent: say so and re-open the mic rather
                 # than routing "by Agenda 4.2.6" or going quiet -- once.
@@ -5496,7 +5755,7 @@ class JarvisApp:
     _turn_seq = 0
     _turn_answered = False
 
-    def _dispatch(self, text, source, confidence=None):
+    def _dispatch(self, text, source, confidence=None, addressee=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
@@ -5508,9 +5767,24 @@ class JarvisApp:
         self._dispatch_gen = getattr(self, "_dispatch_gen", 0) + 1
         if source not in SOCKET_SOURCES:
             self._active_turn_id = ""
+        # THE ONE READING OF WHOSE TURN THIS IS, taken HERE -- where the
+        # turn is attributed -- and carried by value into the debrief, the
+        # commander and the bookkeeping below. Round 3 (09-05) measured
+        # what looking it up downstream costs: the commander re-read this
+        # module state inside its own turn lock, i.e. after an unbounded
+        # wait, and with the lock contended 200/200 trials answered a
+        # guest from his notes and 198/200 refused him his own. Nothing
+        # below this line looks the scope up again.
+        turn_addr = scope_mod.OWNER
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
+            turn_addr = scope_mod.reading(addressee)
+        elif source not in gate_mod.GATED_SOURCES:
+            # Not judged by the gate, so nobody but him: the keyboard, the
+            # socket, his phone, Discord. The attribution a guest's voice
+            # turn left behind must not scope HIS typed turn.
+            turn_addr = self._the_turn_is_his()
         # The Whisper avg_logprob travels only when there is one: typed
         # text has none, and a stand-in commander need not take the keyword.
         kw = {} if confidence is None else {"confidence": confidence}
@@ -5518,16 +5792,17 @@ class JarvisApp:
             # An open debrief question owns this transcript unless it is
             # plainly a command -- the answer is FILED, never routed to the
             # model as chat (jarvis/debrief.py).
-            filed = self._debrief_reply(text, source)
+            filed = self._debrief_reply(text, source, turn_addr)
             result = self._emit_result(
                 filed if filed is not None
-                else self.commander.handle(text, source, **kw))
+                else self.commander.handle(text, source,
+                                           addressee=turn_addr, **kw))
             corrected = getattr(result, "corrected", None)
             if corrected:
                 self._last_user_text = corrected
             if source == "voice":
                 self._turn_after_result(result)
-            self._after_dispatch(text, source, result)
+            self._after_dispatch(text, source, result, turn_addr)
         except Exception:
             if source == "voice":
                 self._turn_finished()
@@ -5819,7 +6094,12 @@ class JarvisApp:
         # or a synchronous command is closed right here.
         self._turn_start()
         try:
-            result = self._emit_result(self.commander.resolve_uncertain(text, yes))
+            # The card is on HIS screen, so this turn is his -- said with
+            # the argument rather than left to the ambient scope, which a
+            # guest's voice turn may hold when he clicks (round-3: this was
+            # a third path around the one scope read).
+            result = self._emit_result(self.commander.resolve_uncertain(
+                text, yes, addressee=self._the_turn_is_his()))
         except Exception:
             self._turn_finished()
             raise
@@ -6556,6 +6836,362 @@ class JarvisApp:
                                                     smtp=smtp, accepted=True)
             return line
 
+    # ------------------------------------------- the people book (USERS tab)
+    def people_snapshot(self) -> dict:
+        """Everything the USERS tab draws, and NOTHING it must not hold.
+
+        Rows come from ``Person.redacted()``, which replaces both salted
+        hashes with a bare yes/no and is already documented as safe for a
+        log, a report or the pane. A hash never crosses out of the app, so
+        it cannot reach a widget even by accident.
+
+        ``admin`` is ``gate.admin_gate``'s answer -- the SAME decision
+        ``scripts/jarvis_people.py`` asks, so the tab and the terminal tool
+        cannot come to different conclusions about whether a code is owed.
+
+        The gallery LABELS are listed too, so the tab can flag a face
+        pointer that resolves to nothing (that is exactly how the face leg
+        silently stops naming anyone). Labels are strings stored beside the
+        embeddings; nothing here opens a device or reads a frame.
+
+        THE ROWS AND THE DECISION COME OFF DISK, not from ``gate.registry``.
+        That object is rebound only by ``reload()``, which nothing calls
+        until a write from this tab succeeds -- so a code, a row or a role
+        set at a terminal was invisible here until he happened to change
+        something, and the tab's "read the file NOW on open" was not
+        reading the file at all. ``gate_line`` is the exception and stays
+        the GATE's own sentence, because that one describes what the
+        running gate is doing rather than what the file says; when the two
+        disagree, the disagreement is the thing worth seeing.
+
+        NEVER RAISES. A page that cannot be painted must not be able to
+        take the console down with it.
+        """
+        out = {"people": [], "gate_line": "", "fault_kind": "",
+               "path": "", "gallery": [], "admin": gate_mod.ADMIN_REFUSE,
+               "admin_line": ""}
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            out["admin_line"] = ("the owner gate is not built, so nobody "
+                                 "can be changed from here")
+            return out
+        registry, why = self._people_registry()
+        if registry is None:
+            out["admin_line"] = why
+            return out
+        try:
+            out["people"] = [p.redacted() for p in registry.people]
+            out["fault_kind"] = str(getattr(registry, "fault_kind", "") or "")
+            out["path"] = str(getattr(registry, "path", "") or "")
+            out["admin"], out["admin_line"] = gate_mod.admin_gate(registry)
+        except Exception:                          # noqa: BLE001 - a page
+            log.exception("users: the people snapshot could not be built")
+            return out
+        try:
+            out["gate_line"] = gate.startup_line(
+                voice_ok=bool(CONFIG.speaker_verify),
+                face_ok=False, face_why="not asked from this tab")
+        except Exception:                          # noqa: BLE001 - a line
+            log.exception("users: the gate line could not be built")
+        try:
+            out["gallery"] = list(gallery_labels())
+        except Exception:                          # noqa: BLE001 - optional
+            log.exception("users: the gallery labels could not be listed")
+        return out
+
+    def _people_registry(self) -> tuple:
+        """The people book AS IT IS NOW, re-read from disk. ``(reg, why)``.
+
+        NEVER ``gate.registry``. That object is the copy this process
+        loaded at boot and rebinds only when something calls ``reload``,
+        and the whole defect this method exists to close is that the tab
+        decided from a copy that old: he set an override code at a terminal
+        and the in-process copy had never heard of it.
+
+        The window is not closed by this, only shrunk: the terminal tool is
+        a separate PROCESS and nothing here can lock against it. What it
+        does guarantee is that the decision and the write are made from the
+        same read, moments apart, instead of from a snapshot taken when a
+        tab was opened.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return None, "the owner gate is not built; see the log"
+        try:
+            path = getattr(gate.registry, "path", None)
+            return identity_mod.Registry.load(path), ""
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the people file could not be re-read")
+            return None, "the people file could not be read; see the log"
+
+    def _people_unlock_left(self, now=None) -> float:
+        """Seconds the typed code still buys. Zero is locked.
+
+        0.0 IS A SENTINEL AND IS TESTED AS ONE, never subtracted from. This
+        used to be a bare ``max(0.0, until - t)``, and with ``until`` left
+        at 0.0 while the tab is locked, any NEGATIVE ``now`` made a dwell
+        out of nothing: ``0.0 - (-1.0)`` is 1.0, so
+        ``people_forget(..., now=-1.0)`` deleted a row from his people book
+        with no override code ever presented, and the book has no history
+        and no backup (verdict, 2026-09-05, measured).
+
+        The verdict called this robustness rather than a boundary crossing,
+        and it was right: ``now=`` is not on the Services dataclass, and no
+        socket, phone or voice rung reaches it, so whoever can pass it
+        already holds the app object. It is fixed anyway because a guard
+        that decides whether his people book may be written should not be
+        forgeable by the clock it is handed. A clock BEFORE the grant is
+        also refused, so a negative ``now`` cannot stretch a dwell that is
+        genuinely open either. Pinned by
+        tests/test_people_dwell_forgery.py.
+        """
+        t = time.monotonic() if now is None else float(now)
+        with _PEOPLE_LOCK:
+            until = float(getattr(self, "_people_unlock_until", 0.0) or 0.0)
+        if until <= 0.0 or t < 0.0:
+            return 0.0
+        return max(0.0, until - t)
+
+    def _people_open_unlock(self, now=None) -> None:
+        """Arm the dwell. ONLY ever called where a code was just proved --
+        ``people_unlock`` on a match, and a successful write that had to
+        present one. A bootstrap write must not call it: making the first
+        owner proves nothing about a code, and a window left open there is
+        exactly the hole a code set seconds later would fall into."""
+        t = time.monotonic() if now is None else float(now)
+        with _PEOPLE_LOCK:
+            self._people_unlock_until = t + PEOPLE_UNLOCK_S
+
+    def people_relock(self) -> None:
+        """Shut it now: the Lock button, and leaving the tab.
+
+        THE PAGE RELOCKING ITSELF IS NOT ENOUGH, because the page is not
+        the guard. A page that dropped its own dwell and left this one
+        standing would look locked and not be."""
+        with _PEOPLE_LOCK:
+            self._people_unlock_until = 0.0
+
+    def people_admin_state(self, now=None) -> dict:
+        """The lock decision, RE-READ FROM DISK, plus what the dwell has
+        left. ``{"admin", "admin_line", "unlocked_s"}``. NEVER RAISES.
+
+        This is what lets the tab notice a code set at a terminal while it
+        is open. ``people_snapshot`` also carries the decision, but it
+        rebuilds every row, the startup line and the gallery listing, which
+        is too much to do on a one-second tick; this reads one small JSON
+        file and answers.
+
+        IT IS NOT THE GUARD EITHER. It exists so the page can DRAW the
+        right thing; ``_people_write`` re-decides for itself at the write.
+        """
+        out = {"admin": gate_mod.ADMIN_REFUSE, "admin_line": "",
+               "unlocked_s": 0.0}
+        registry, why = self._people_registry()
+        if registry is None:
+            out["admin_line"] = why
+            return out
+        try:
+            out["admin"], out["admin_line"] = gate_mod.admin_gate(registry)
+        except Exception:                          # noqa: BLE001 - a page
+            log.exception("users: the admin state could not be decided")
+            return out
+        out["unlocked_s"] = self._people_unlock_left(now=now)
+        return out
+
+    def people_unlock(self, code, *, now=None) -> tuple:
+        """The typed override code, from the tab. ``(ok, line)``.
+
+        AGAINST THE FILE AS IT IS NOW, not the gate's boot-time copy. That
+        was a second face of the same staleness and it failed CLOSED in a
+        way he could not get out of: set a code at a terminal, come back to
+        the running app, type the right code, and the in-memory registry
+        carried no ``code_hash`` at all -- so the answer was "no override
+        code has been set" and the only cure was restarting Jarvis.
+
+        THIS OPENS NO VOICE WINDOW, and the difference from
+        ``knightfall_code`` two methods up is deliberate rather than an
+        oversight: Knightfall's whole job is to let the microphone answer
+        him for five minutes, and an ADMINISTRATIVE unlock that did the
+        same would make Jarvis answer whoever is standing in the room. The
+        terminal tool grants no such thing for `add` or `forget`, and
+        neither does this. What it opens is a WRITE dwell, checked by
+        ``_people_write`` and by nothing else.
+
+        The counter is the gate's OWN ``code_attempts``. A fresh one here
+        would silently double the budget from ten tries per five minutes to
+        twenty, because the tab -- unlike the CLI -- is inside this process,
+        and it is the CODE's counter rather than the spoken phrase's so
+        burning one can never close the other.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False, "the owner gate is not built; see the log"
+        registry, why = self._people_registry()
+        if registry is None:
+            return False, why
+        try:
+            who, why = gate_mod.check_override_code(
+                registry, code, attempts=gate.code_attempts)
+        except Exception as exc:                   # noqa: BLE001 - never str
+            # Never the exception's text and never a traceback: what that
+            # call was handed is a code, and an exception is free to quote
+            # its argument back into the log.
+            log.error("users: the override check failed (%s)",
+                      type(exc).__name__)
+            return False, "that check failed; see the log"
+        finally:
+            del code
+        if not who:
+            return False, why
+        self._people_open_unlock(now=now)
+        return True, "Unlocked, sir."
+
+    def _people_write(self, what: str, change, *, now=None) -> tuple:
+        """Re-read, DECIDE, mutate, save, reload the gate. ``(ok, line)``.
+
+        THIS IS WHERE THE AUTHORITY TO CHANGE THE REGISTRY IS DECIDED, and
+        it is decided from the registry as it is at the moment of the
+        write. It used to be decided by the users page, from a snapshot
+        read when the tab was OPENED, and this seam re-read the file only
+        to refuse the CORRUPT case -- so the code case was enforced in
+        exactly one place, from possibly-stale data. The sequence the page
+        itself teaches walked straight through it: make the first owner in
+        the tab (no code, correctly open), go and set a code at a terminal,
+        come back to the same open tab, and forget somebody with nothing
+        asked for.
+
+        THE RULE IS NOT INVENTED HERE. ``gate.admin_gate`` is the same
+        three-and-a-half-case decision ``scripts/jarvis_people.py::
+        _authorise`` asks, and a test greps both:
+
+        * no registry or no owner -- anybody at this keyboard may make the
+          FIRST owner, because otherwise a fresh install is a brick;
+        * an owner with NO code -- allowed, and the page says so out loud;
+        * an owner WITH a code -- ``gate.check_override_code`` must have
+          admitted one, within ``PEOPLE_UNLOCK_S``;
+        * the file is there and BROKEN -- refused outright, and that
+          outranks everything above. ``Registry.load`` answers with an
+          EMPTY people list for a file that failed to parse, so an
+          add-then-save would write a one-row registry over whatever it
+          held. There is no history and no backup.
+
+        RE-READ FIRST, EVERY TIME. The terminal tool is a separate process
+        and nothing in this one can lock against it, so a write that used a
+        registry read minutes ago would silently drop whatever was typed at
+        a terminal in between. Re-reading immediately before the mutation
+        shrinks that window; it does not close it, and the tab says so.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False, "the owner gate is not built; see the log"
+        with _PEOPLE_LOCK:
+            return self._people_write_now(what, change, gate, now)
+
+    def _people_write_now(self, what, change, gate, now) -> tuple:
+        """``_people_write`` with ``_PEOPLE_LOCK`` already held. Split out
+        only so the lock is one line rather than a body-wide indent; the
+        decision and the reasoning are in ``_people_write``'s docstring."""
+        registry, why = self._people_registry()
+        if registry is None:
+            return False, why
+        state, why = gate_mod.admin_gate(registry)
+        if state == gate_mod.ADMIN_REFUSE:
+            return False, why
+        if (state == gate_mod.ADMIN_CODE
+                and self._people_unlock_left(now=now) <= 0.0):
+            # The name of the action and nothing else. What was typed is
+            # not here to be logged, and must never become loggable.
+            log.info("users: %s refused -- the override code is owed", what)
+            return False, gate_mod.ADMIN_CODE_OWED
+        try:
+            ok, line = change(registry)
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the %s failed", what)
+            return False, "that did not work, sir; see the log"
+        if not ok:
+            return False, line
+        if not registry.save():
+            return False, "the people file could not be written; see the log"
+        if state == gate_mod.ADMIN_CODE:
+            # A run of edits is one code rather than five -- but ONLY on
+            # the leg where a code was actually presented. Re-arming after
+            # a bootstrap write would hand a free window to whatever the
+            # registry became a moment later.
+            self._people_open_unlock(now=now)
+        try:
+            # LIVE, with no restart. reload() rebinds gate.registry -- one
+            # attribute swap, which the audio path then reads. The sensors
+            # page says "restart to apply"; this one does not have to.
+            gate.reload()
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the gate could not be reloaded")
+            return True, line + " (restart Jarvis for it to take effect)"
+        log.info("users: %s -- %s", what, line)
+        return True, line
+
+    def people_add(self, *, label, name="", role=identity_mod.ROLE_KNOWN,
+                   face="", face_dim=0, voice=False, consent="",
+                   confirm_existing_owner=None, now=None) -> tuple:
+        """Enrol somebody from the tab. ``(ok, line)``.
+
+        A NON-OWNER WITHOUT A CONSENT RECORD IS REFUSED HERE, not merely
+        discouraged in the UI. The record is the only durable evidence that
+        the agreement happened at all, and the tab must not become the way
+        around the rule the terminal tool enforces.
+        """
+        who = str(label or "").strip().lower()
+        role = (identity_mod.ROLE_OWNER
+                if role == identity_mod.ROLE_OWNER else identity_mod.ROLE_KNOWN)
+        if role != identity_mod.ROLE_OWNER and not str(consent or "").strip():
+            return False, ("adding %s takes their consent, and no consent "
+                           "was recorded" % (who or "somebody"))
+
+        def change(registry):
+            person = identity_mod.Person(
+                label=who, name=str(name or "").strip(), role=role,
+                voice=bool(voice), face=str(face or "").strip().lower(),
+                face_dim=int(face_dim or 0),
+                consent=str(consent or "").strip())
+            ok, why = registry.add_person(
+                person, confirm_existing_owner=confirm_existing_owner)
+            if not ok:
+                return False, why
+            return True, "%s is enrolled as %s (consent: %s)" % (
+                who, role, person.consent or "-")
+
+        return self._people_write("add", change, now=now)
+
+    def people_set_role(self, label, role, *,
+                        confirm_existing_owner=None, now=None) -> tuple:
+        who = str(label or "").strip().lower()
+
+        def change(registry):
+            ok, why = registry.set_role(
+                who, role, confirm_existing_owner=confirm_existing_owner)
+            return (True, "%s is now %s" % (who, role)) if ok else (False, why)
+
+        return self._people_write("set-role", change, now=now)
+
+    def people_forget(self, label, *, now=None) -> tuple:
+        """Remove a row, and SAY WHAT SURVIVED IT.
+
+        MEASURED in ``identity.Registry.forget``: it removes the row and
+        nothing else. The face gallery entry is untouched, so a line that
+        said only "forgotten" would leave him believing a gallery was
+        scrubbed when it was not.
+        """
+        who = str(label or "").strip().lower()
+
+        def change(registry):
+            ok, why = registry.forget(who)
+            if not ok:
+                return False, why
+            return True, ("%s is forgotten here. Their face measurements "
+                          "stay in the gallery until that command is run."
+                          % who)
+
+        return self._people_write("forget", change, now=now)
+
     def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
         """THE BOOTSTRAP: "Email me a new Knightfall code". The same
         generate -> mail -> store sequence, for the first owner, and it
@@ -6594,6 +7230,45 @@ class JarvisApp:
                 self._knightfall_new_ts = t
             return line
 
+    def knightfall_status(self) -> dict:
+        """What the drawer's Knightfall caption needs, for
+        ui.views.format_knightfall_status. Three keys:
+
+        * ``to`` -- the MASKED destination the next code would go to, or
+          "" when there is none. Masked because the drawer is on screen
+          and a full address does not need to be.
+        * ``problem`` -- a fixed sentence when his configured destination
+          is not usable, "" otherwise.
+        * ``setup`` -- where to configure a mailbox, when there is none.
+
+        WHY IT EXISTS AT ALL. The caption under the button was the flat
+        sentence "Using it emails you the next one" -- which was false in
+        the state he was actually in (zero mail accounts configured,
+        measured 2026-09-05): the button mails nothing, and the promise
+        was made before he pressed. A read only: no socket, no code.
+        """
+        from jarvis.tools import mail as mail_mod
+        out = {"to": "", "problem": "", "setup": ""}
+        try:
+            accounts = mail_mod.mail_accounts(self.assistant)
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the mail accounts could not be read")
+            accounts = []
+        if not accounts:
+            try:
+                out["setup"] = mail_mod.setup_line(self.assistant)
+            except Exception:                      # noqa: BLE001 - config
+                log.exception("knightfall: the setup line could not be read")
+            return out
+        try:
+            out["to"] = mail_mod._mask_address(
+                mail_mod.notice_destination(accounts[0]))
+        except mail_mod.NoticeAddressInvalid:
+            out["problem"] = KNIGHTFALL_BAD_DESTINATION
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the notice destination is unreadable")
+        return out
+
     def _knightfall_rotate(self, who, *, mail=None, smtp=None,
                            accepted=False):
         """Generate -> mail FIRST -> store ONLY on a Message-ID. Returns
@@ -6616,8 +7291,11 @@ class JarvisApp:
         """
         head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
         keep = head + "the code stays as it is (mail: %s)."
+        # The REAL module either way: `mail` is the seam a test substitutes
+        # for the transport, but the destination and the refusal that goes
+        # with it are decided against the real one (see outbox.send_notice).
+        from jarvis.tools import mail as mail_mod
         if mail is None:
-            from jarvis.tools import mail as mail_mod
             mail = mail_mod
         try:
             accounts = mail.mail_accounts(self.assistant)
@@ -6632,6 +7310,17 @@ class JarvisApp:
         try:
             msgid = outbox.send_notice(account, KNIGHTFALL_SUBJECT, body,
                                        smtp=smtp, mail=mail)
+        except mail_mod.NoticeAddressInvalid:
+            # HIS CONFIG, not the transport: notice_destination refused a
+            # destination that is not an address, before a socket was
+            # opened. Nothing was sent and nothing is stored, so the old
+            # code stands -- and he is told what to fix rather than a
+            # class name, because these words are ours and never touched
+            # a mail server.
+            del new, body
+            log.warning("knightfall: the configured notice address is not "
+                        "an address; the old code stands")
+            return keep % KNIGHTFALL_BAD_DESTINATION, False
         except Exception as exc:                   # noqa: BLE001 - transport
             # MailSendFailed, or anything else the transport did: the old
             # code stands, and only the TYPE of what went wrong is said.
@@ -6646,6 +7335,23 @@ class JarvisApp:
             return keep % "no Message-ID came back", True
         hashed = pp.hash_secret(new)
         del new
+        # RE-READ BEFORE WRITING. self.gate.registry is the copy loaded at
+        # BOOT, and the save below writes that whole object over the file --
+        # so anything added to the people book since this process started
+        # was silently overwritten by a memory that never knew about it.
+        # MEASURED 2026-09-05: one press of "Email me a new Knightfall code"
+        # DELETED a person enrolled at a terminal since boot, and REVERTED a
+        # passphrase set at a terminal to empty. The book has no history and
+        # no backup -- jarvis/ui/users_page.py says so on screen -- so the
+        # row was simply gone. Same rule the Users tab now follows: a write
+        # decides from the file as it is AT THE WRITE, never from a memory
+        # of it. Pinned by tests/test_knightfall_stale_registry.py.
+        try:
+            self.gate.reload()
+        except Exception:                          # noqa: BLE001 - a line, not a raise
+            log.exception("knightfall: the people book could not be re-read; "
+                          "not writing a stale copy over it")
+            return keep % "the people book could not be re-read", True
         registry = getattr(self.gate, "registry", None)
         person = registry.person(who) if registry is not None else None
         old = person.code_hash if person is not None else ""
@@ -6722,6 +7428,23 @@ class JarvisApp:
             # both run off the Tk thread (KnightfallControl).
             knightfall_code=self.knightfall_code,
             knightfall_new_code=self.knightfall_new_code,
+            knightfall_status=self.knightfall_status,
+            # The USERS tab (jarvis/ui/users_page.py). Seven narrow seams:
+            # a redacted snapshot, the administrative unlock, the three
+            # writes, and the two that stop the PAGE being the guard --
+            # people_admin_state re-reads the file so a code set at a
+            # terminal is noticed while the tab is open, people_relock
+            # shuts the app's dwell when he leaves it. Each answers ONE
+            # line to toast and never a hash. build_ui_services drops them
+            # on a UI that does not declare them, so either merge order is
+            # safe.
+            people_snapshot=self.people_snapshot,
+            people_unlock=self.people_unlock,
+            people_add=self.people_add,
+            people_set_role=self.people_set_role,
+            people_forget=self.people_forget,
+            people_admin_state=self.people_admin_state,
+            people_relock=self.people_relock,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,
@@ -6764,6 +7487,27 @@ class JarvisApp:
                          if getattr(getattr(self, "desk", None), "enabled", False)
                          else None),
         )
+
+
+def gallery_labels() -> tuple:
+    """The face gallery's LABELS, with no lens involved at all.
+
+    A gallery generation is 128 floats and a string per take; this reads
+    the strings so the USERS tab can say whether a row's face pointer
+    resolves to anything. It imports no camera module, opens no device and
+    touches no frame -- the same split jarvis/enrolentry.py already makes.
+    Any failure is an empty tuple: a chip that cannot be drawn is not worth
+    a traceback out of a repaint.
+    """
+    try:
+        from jarvis.facegallery import default_gallery
+        gallery = default_gallery()
+        gallery.load()
+        return tuple(gallery.labels())
+    except Exception:                              # noqa: BLE001 - optional
+        log.debug("users: the face gallery could not be listed",
+                  exc_info=True)
+        return ()
 
 
 def build_ui_services(services_cls, kwargs: dict):

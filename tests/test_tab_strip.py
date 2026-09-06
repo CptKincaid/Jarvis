@@ -475,13 +475,19 @@ def test_adding_a_surface_is_one_call_that_carries_its_own_lifecycle():
 def test_the_console_wires_its_tabs_with_one_line_each():
     """The requirement, read off main_window: a third surface is one more
     add() and nothing else. If this ever needs a second line per tab, the
-    strip has stopped being the thing he asked for."""
+    strip has stopped being the thing he asked for.
+
+    The USERS tab (2026-09-05) is the third, and it cost exactly that:
+    one add() naming the key, the word and the page's show/hide. The list
+    is asserted in ORDER rather than by count, so a fourth surface arrives
+    as one more name here and nothing else.
+    """
     import re
     from pathlib import Path
     src = Path(ts.__file__).with_name("main_window.py").read_text()
     body = src[src.index("    def _fill_tabs"):src.index("    def _build_sensors")]
-    adds = re.findall(r"strip\.add\(", body)
-    assert len(adds) == 2, adds
+    adds = re.findall(r'strip\.add\("([a-z]+)"', body)
+    assert adds == ["chat", "sensors", "users"], adds
     # and each one is a single statement, not a block
     assert 'strip.add("chat", "CHAT")' in body
 

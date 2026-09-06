@@ -1991,6 +1991,42 @@ KNIGHTFALL_FAILED = "Knightfall: that did not work, sir; see the log"
 # "Knightfall accepted, sir; ..." and "... a new code is in your inbox.";
 # every refusal, cooldown and mail failure is a warn.
 KNIGHTFALL_OK_MARKS = ("Knightfall accepted", "in your inbox")
+# The caption under the row. It used to be the flat sentence "Typed only,
+# never spoken. Using it emails you the next one." -- and the second half
+# was FALSE in the state he was actually in on 2026-09-05: with no mail
+# account configured the button mails nothing and changes nothing, but the
+# caption promised otherwise BEFORE he pressed it. It is state-dependent
+# now (format_knightfall_status below), and the bootstrap button is
+# disabled in the states where pressing it cannot do anything.
+KNIGHTFALL_LEAD = "Typed only, never spoken."
+KNIGHTFALL_NO_ACCOUNT = ("No mail account is set up, so there is nowhere to "
+                         "send a code and this button will do nothing.")
+
+
+def format_knightfall_status(status) -> tuple:
+    """``(caption, the button can do something)`` from what
+    ``app.JarvisApp.knightfall_status()`` answered -- ``to`` (the MASKED
+    destination, "" when there is none), ``problem`` (a fixed sentence
+    when his configured destination is unusable) and ``setup`` (where to
+    configure a mailbox).
+
+    Tk-free like ``format_code_status`` and ``KnightfallControl``, and for
+    the same reason: a caption that can only be read off a built window
+    cannot be tested at all. Anything unrecognised -- unwired, None, a
+    service that raised -- reads as "no account", which is the honest
+    reading: nothing here can promise a mail it cannot see an account for.
+    """
+    if not isinstance(status, dict):
+        status = {}
+    problem = str(status.get("problem") or "")
+    if problem:
+        return f"{KNIGHTFALL_LEAD} {problem}.", False
+    to = str(status.get("to") or "")
+    if not to:
+        setup = str(status.get("setup") or "")
+        line = f"{KNIGHTFALL_LEAD} {KNIGHTFALL_NO_ACCOUNT}"
+        return (f"{line} {setup}".rstrip(), False)
+    return f"{KNIGHTFALL_LEAD} The next code goes to {to}.", True
 
 
 class KnightfallControl:
@@ -2167,6 +2203,10 @@ class SettingsDrawer(tk.Frame):
         # disk: read now so it is current when he looks (four short git
         # calls, 6-14 ms measured 2026-09-04).
         self._refresh_code_status()
+        # ...and the Knightfall caption, for the same reason: his mail
+        # config can change while the drawer is shut, and the row must not
+        # promise a code it cannot send.
+        self._refresh_knightfall()
         self._open = True
         self.place(in_=self.host, relx=1.0, y=0, x=self._x,
                    anchor="ne", relheight=1.0, width=self.WIDTH)
@@ -2697,9 +2737,38 @@ class SettingsDrawer(tk.Frame):
             box, self.KNIGHTFALL_NEW_HOLO if holo
             else "Email me a new Knightfall code",
             self._knightfall_new_pressed)
-        self._info_row(box, "Typed only, never spoken. Using it emails you "
-                            "the next one.")
+        # The caption is NOT a literal: it names the masked destination the
+        # next code would go to, or says there is no mail account and the
+        # button will do nothing (format_knightfall_status). Filled here and
+        # re-read in open(), because his config can change while the drawer
+        # is shut and a hand edit only takes effect on a restart anyway.
+        self._knightfall_info = self._info_row(box, "")
+        self._refresh_knightfall()
         return self._knightfall_entry
+
+    def _knightfall_status(self) -> dict:
+        fn = getattr(self.services, "knightfall_status", None) \
+            if self.services else None
+        if fn is None:
+            return {}
+        try:
+            return fn()
+        except Exception:                      # noqa: BLE001 - service edge
+            log.exception("knightfall status read failed")
+            return {}
+
+    def _refresh_knightfall(self):
+        """The caption and whether the bootstrap button is live. Both, from
+        one read: a button that says it will mail him a code must not be
+        pressable in a state where it cannot."""
+        text, can_press = format_knightfall_status(self._knightfall_status())
+        lbl = getattr(self, "_knightfall_info", None)
+        if lbl is not None:
+            lbl.configure(text=text)
+        btn = getattr(self, "_knightfall_new", None)
+        setter = getattr(btn, "set_enabled", None)
+        if callable(setter):
+            setter(can_press)
 
     def _knightfall_control(self) -> KnightfallControl:
         entry = getattr(self, "_knightfall_entry", None)

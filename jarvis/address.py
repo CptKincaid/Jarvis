@@ -148,6 +148,39 @@ reminder."  A summons still spends the sign-off budget: it has addressed him.
      least one address always comes out with at least one;
   4. and the pass never raises.  Every caller may join what it gets back.
 
+SWAPPING ONE FORM OF ADDRESS FOR ANOTHER (added for the people section)
+-----------------------------------------------------------------------
+``swap_addresses(text, honorific)`` is the SECOND thing this module does,
+and it reuses every rule above.  Jarvis says "sir" throughout because the
+lines are authored that way; Mara and Heather are "ma'am"
+(``jarvis/identity.Person.honorific``, typed by the owner, never inferred),
+and the swap happens at the door -- ``app._say`` and ``commander._speak`` --
+rather than by editing a thousand literals.
+
+Three things about it are load-bearing:
+
+* ``honorific="sir"`` RETURNS THE INPUT OBJECT.  Not a copy: the same
+  object.  So the owner's line cannot move by one character and nothing
+  about his tuned voice can regress through this door.
+* The swap sees TWO shapes the remover refuses, and each for the same
+  reason the remover refuses it.  A MEDIAL vocative (", sir, but ...") in
+  front of a LOWER-CASE word: dropping one would eat a word out of "Yes,
+  Sir, I Can Boogie", but swapping one is safe under the Title-Case
+  discriminator already used for a summons, and a third of the authored
+  corpus addresses him there.  And a LONE "Sir?" (``app.NUDGE_LINE``).
+* NOTHING INSIDE A QUOTATION IS SWAPPED OR CUT.  ``vocative_spans`` counts
+  a quoted vocative (it is not droppable, but it has addressed him);
+  ``swap_spans`` refuses it outright, because putting "ma'am" into a
+  report of what somebody else said is the same defect as deleting a word
+  from it.  ``honorific=""`` therefore goes through ``drop_swappable``
+  rather than ``drop_addresses``.
+
+THE ACCEPTED COST, stated rather than discovered: a rendered line carrying
+an interpolated mail subject or note body of the shape ", sir." can have
+that "sir" swapped too.  It is bounded -- ``gate._HIS`` refuses mail,
+notes and messages to a KNOWN person, so those lines are never spoken to a
+ma'am person in the first place -- and it never deletes anything.
+
 Only "sir" is governed.  "Hunter" is the rare form (0 uses in 24 live replies)
 and is also an ordinary word that turns up in text he asked to have read back;
 it is neither counted nor touched.
@@ -480,6 +513,191 @@ def drop_addresses(text: str) -> str:
         out = (_drop_trailing(out, start, end) if kind == TRAILING
                else _drop_summons(out, start, end))
     return out
+
+
+# ----------------------------------------------------------------------
+# Swapping one form of address for another
+# ----------------------------------------------------------------------
+# THE THREE VALUES, and there is no fourth. Kept as literals here rather
+# than imported from jarvis/identity.py because this module is pure and has
+# no dependency on the registry -- and a test pins that the two tuples say
+# the same thing.
+SIR = "sir"
+MAAM = "ma'am"
+NO_ADDRESS = ""
+SWAPPABLE = (SIR, MAAM, NO_ADDRESS)
+
+# A MEDIAL vocative -- ", sir, but I've no way in yet" -- in front of a
+# LOWER-CASE word.
+#
+# WHY SWAPPING SEES A SHAPE THAT DROPPING REFUSES, which is the one place
+# these two passes differ and it is worth being explicit about. Dropping a
+# medial vocative would eat a word out of "Yes, Sir, I Can Boogie", so
+# ``vocative_spans`` refuses the whole shape and that refusal stays exactly
+# as it was. But a medial vocative is where a third of the authored corpus
+# addresses him -- "I have the result, sir, but the model didn't get to
+# putting it into words." -- and refusing it here would mean 30-odd real
+# lines say "sir" to a woman. The discriminator is the one this module
+# already trusts for a summons (``_SUMMONS_TITLE_RX``): a title is Title
+# Case, so a LOWER-CASE word behind the comma is Jarvis's own clause
+# carrying on. "Yes, Sir, I Can Boogie" has a capital there and is
+# untouched, at any setting.
+_MEDIAL_RX = re.compile(r"^[ \t]*,[ \t]*[a-z]")
+
+# A vocative that IS the whole line: "Sir?" (``app.NUDGE_LINE``). No comma
+# in front of it and no clause behind it, so neither of the other two
+# shapes sees it.
+_LONE_RX = re.compile(r"^[ \t]*[?.!…]*[ \t]*$")
+
+
+
+def _swap_records(text: str) -> list[tuple]:
+    """``[(cut_start, word_start, word_end, kind), ...]``.
+
+    ``cut_start`` is where a REMOVAL begins -- the attaching comma when
+    there is one, otherwise the word itself -- and ``word_start`` is where
+    a SWAP begins. They differ because dropping a vocative takes its comma
+    with it ("Very good, sir" -> "Very good") while swapping one must not.
+    """
+    text = text or ""
+    out = []
+    for m in _SIR_RX.finditer(text):
+        rest = text[m.end():]
+        if _is_possessive(rest) or _is_before_a_name(rest):
+            continue
+        if inside_a_quotation(text, m.start()):
+            # NOTHING INSIDE A QUOTATION IS EVER REWRITTEN OR REMOVED HERE.
+            # Reported speech carries somebody else's vocative:
+            # 'He said, "Thank you, sir." and left.'
+            continue
+        lead = _ATTACHING_COMMA_RX.search(text[:m.start()])
+        if lead is not None:
+            if rest.strip() == "" or _TERMINAL_RX.match(rest) \
+                    or _MEDIAL_RX.match(rest):
+                out.append((lead.start(), m.start(), m.end(), TRAILING))
+            continue
+        if not _at_fragment_start(text, m.start()):
+            # A COMMA-LESS trailing vocative -- "Good morning sir." -- is
+            # deliberately NOT an address here. The only rule that would
+            # catch it is loose enough to rewrite "Now playing Yes Sir."
+            # and "Thank You Sir.", so the fix belongs in the one authored
+            # line that had one (workflows.DEFAULT_WORKFLOWS, given its
+            # comma) rather than in this pass.
+            continue
+        if _SUMMONS_AFTER_RX.match(rest) and not _SUMMONS_TITLE_RX.match(rest):
+            out.append((m.start(), m.start(), m.end(), SUMMONS))
+        elif _LONE_RX.match(rest):
+            out.append((m.start(), m.start(), m.end(), TRAILING))
+    return out
+
+
+def swap_spans(text: str) -> list[tuple]:
+    """``[(start, end), ...]`` -- every "sir" in ``text`` that is a form of
+    address AND may be rewritten as a different one.
+
+    Every veto ``vocative_spans`` applies applies here too, and one more:
+    NOTHING INSIDE A QUOTATION IS EVER REWRITTEN. That shield is only
+    advisory in ``vocative_spans`` (a quoted vocative is still counted, it
+    is merely not droppable), and this pass needs it as a hard rule --
+    'He said, "Thank you, sir." and left.' is reported speech and putting
+    "ma'am" in somebody else's mouth is the same defect as deleting a word
+    from it.
+
+    A test pins that every span ``vocative_spans`` finds outside a
+    quotation is also found here, so the two passes cannot drift into
+    disagreeing about what an address is.
+    """
+    return [(ws, we) for _cut, ws, we, _kind in _swap_records(text)]
+
+
+def drop_swappable(text: str) -> str:
+    """Every address this pass recognises, CUT OUT, comma and all.
+
+    What ``honorific=""`` means: a person who asked not to be addressed.
+
+    It is NOT ``drop_addresses``. That one removes every span
+    ``vocative_spans`` finds INCLUDING one inside a quotation, which is
+    right for its caller (``brain.strip_relay_address``, aiming a whole
+    line at somebody else) and wrong here: taking "sir" out of 'He said,
+    "Thank you, sir."' edits a report of what somebody said.
+    """
+    out = text
+    for _ in range(_MAX_ADDRESSES_PER_LINE):
+        recs = _swap_records(out)
+        if not recs:
+            return out
+        cut, start, end, kind = recs[0]
+        out = (_drop_summons(out, start, end) if kind == SUMMONS
+               else _tidy(out[:cut] + out[end:]))
+    return out
+
+
+def _cased_like(word: str, sample: str) -> str:
+    """``word`` wearing ``sample``'s capitalisation.
+
+    Only the first letter is consulted, because that is the only thing that
+    varies in the corpus: a SUMMONS is "Sir, ..." at index 0 and a trailing
+    vocative is ", sir." -- and both templates are authored, so an ALL-CAPS
+    address does not occur and is not invented here.
+    """
+    if sample[:1].isupper():
+        return word[:1].upper() + word[1:]
+    return word
+
+
+def swap_addresses(text, honorific: str = SIR):
+    """The same line, addressed to somebody who is not "sir".
+
+    THE ONE PLACE THE HONORIFIC CHANGES, and it changes nothing else. The
+    1,000-odd "sir" literals in this tree are not edited, ever: they are
+    authored as written and rewritten HERE, at the door, for whoever is
+    actually being spoken to (``jarvis/app.py:_say``,
+    ``jarvis/commander.py:_speak``).
+
+    THE OWNER PATH IS BYTE-IDENTICAL AND RETURNS THE INPUT OBJECT. That is
+    not an optimisation, it is the safety argument: with ``honorific="sir"``
+    this function cannot change a single character of anything Hunter hears,
+    so the test files asserting exact spoken strings stay green and his
+    tuned voice cannot regress through this door.
+
+    ``honorific=""`` is a real choice -- somebody who asked not to be
+    addressed at all -- and delegates to ``drop_addresses``.
+
+    Every "is this an address?" question is delegated to ``swap_spans``,
+    which is why "Sir Isaac Newton", "Yes Sir, I Can Boogie", "sir's
+    coffee" and anything inside a quotation are untouched here as
+    everywhere else. A bare ``str.replace("sir", ...)`` anywhere in this
+    tree is a defect.
+
+    Never raises: a failure here must speak the line as written rather than
+    cost him the sentence.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if honorific == SIR:
+        return text                     # the owner. Not one byte moves.
+    try:
+        if honorific == NO_ADDRESS:
+            return drop_swappable(text)
+        if honorific not in SWAPPABLE:
+            # A value nobody typed. Speak the line as authored rather than
+            # rewrite it with something that was never a choice.
+            log.error("address: %r is not a form of address; speaking as "
+                      "written", honorific)
+            return text
+        spans = swap_spans(text)[:_MAX_ADDRESSES_PER_LINE]
+        if not spans:
+            return text
+        # Right to left, so an earlier span's indices are still good after
+        # a later one has changed the length of the string.
+        out = text
+        for start, end in reversed(spans):
+            out = (out[:start] + _cased_like(honorific, out[start:end])
+                   + out[end:])
+        return out
+    except Exception:                       # noqa: BLE001 - never lose a line
+        log.exception("address: the swap failed; speaking as written")
+        return text
 
 
 # ----------------------------------------------------------------------

@@ -32,13 +32,17 @@ confirmed, never something a tool loop decided.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from jarvis import contacts as contacts_mod
+from jarvis.config import PATHS
 from jarvis import filephrase
 from jarvis.logs import get_logger
 from jarvis.tools import filepick
@@ -105,6 +109,34 @@ WHICH_PERSON_STATUS = "Which person?"
 # none to offer — Gmail will not carry it however plainly he says so.
 TOO_BIG_LINE = ("{what} is {size}, sir — Gmail won't carry more than "
                 "{cap} as an attachment, so I've not sent it.")
+
+# The rehearsal and the two send failures. AUTH and WIRE are separate
+# sentences because they are separate problems and only one of them is
+# his to fix: a revoked app password reported as "that didn't send" sends
+# him looking at his network. Every one of them promises, in words, that
+# nothing left the machine -- so a failure can never be mistaken for a
+# send.
+REHEARSAL_LINE = "Rehearsal only, sir — nothing left the machine."
+AUTH_FAILED_LINE = ("Gmail wouldn't take your {label} password, sir; "
+                    "nothing was sent.")
+WIRE_FAILED_LINE = ("That didn't send, sir. Nothing has left the machine — "
+                    "the file is still here, and you can ask me again.")
+# Past filepick.MAX_CANDIDATES the offer is REPLACED rather than shortened:
+# a cut list invites him to pick from candidates the right file may not be
+# in, and he has no way to know it was cut. filephrase.Match.total is the
+# count this line reads.
+TOO_MANY_LINE = "I've {n} it could be, sir — give me more of the name."
+# The read-back's own question was answered with something that is not an
+# address. One re-ask, then the slot is spent.
+NOT_AN_ADDRESS_LINE = ("I didn't catch an address there, sir. Say it as "
+                       "heather at example dot com, or say never mind.")
+EXPIRED_STATUS = "Not sent — expired"
+
+# THE AUDIT. There is no unsend over SMTP -- Gmail's is a client-side delay
+# its web app implements and its submission server does not -- so a record
+# of what left is the only thing that replaces an undo. Append-only, one
+# JSON object per line, and it holds NO body and NO password.
+SENT_LOG = PATHS.MEMORY_DIR / "sent.jsonl"
 
 
 @dataclass
@@ -369,19 +401,60 @@ def spoken_who(who: str) -> str:
     return spoken_address(w).strip() if "@" in w else w
 
 
+def spoken_recipient(name: object = "", addr: object = "") -> str:
+    """THE ONE PLACE a recipient becomes something Jarvis SAYS OUT LOUD.
+
+    Name first when there is one, the address in words when there is not
+    -- and NOTHING that leaves here carries an "@", whichever slot it
+    arrived in. Jarvis must never say an at sign: neither engine is
+    reliable on a raw address (edge-tts spells some domains letter by
+    letter; F5 clones prosody from a reference clip that has never said
+    one), so an address he HEARS has to be an address in words.
+
+    Every spoken line that names a recipient goes through here -- the
+    read-back, the correction, the re-ask, the sent line, the day's audit
+    summary. It exists because ``to_name or spoken_address(to_addr)`` was
+    written out by hand in four places and each copy spoke ``to_name``
+    UNTOUCHED: a half address that reached the name slot ("hjones@example"
+    -- round 4's attack), or a masked audit row ("d…@example.com" -- the
+    sent-log summary, measured), was said with its "@" in it. Masking is
+    not speaking. A field being safe on disk says nothing about whether
+    it is safe in the ear, and only this function decides that.
+    """
+    said = spoken_who(str(name or ""))
+    return said or spoken_address(str(addr or "")).strip()
+
+
+def auth_failed_line(label: object = "") -> str:
+    """The refused-password sentence, with the account label SPOKEN.
+
+    account_label falls back to whatever ``label`` the config carries,
+    raw, and this string is read out: a label he set to an address would
+    put an "@" in a spoken line by the same route the recipient did.
+    """
+    return AUTH_FAILED_LINE.format(label=spoken_who(str(label or "")) or "mail")
+
+
 def pronoun_for(gender: Optional[str]) -> str:
     """"her" / "him" for a known gender, "them" for none."""
     return {"f": "her", "m": "him"}.get(str(gender or "").lower(), "them")
 
 
 def account_words(account: dict) -> str:
-    """"your school account"."""
-    label = mail_mod.account_label(account)
+    """"your school account".
+
+    Through spoken_who, because account_label returns the configured
+    label RAW and this sentence is said out loud.
+    """
+    label = spoken_who(mail_mod.account_label(account))
     return f"your {label} account" if label else "your account"
 
 
 def _to_words(draft: Draft) -> str:
-    who = draft.to_name or ""
+    # spoken_who, not the raw field: a half address that landed in the
+    # name slot ("hjones@example") is said here, and it must be said in
+    # words like every other address.
+    who = spoken_who(str(draft.to_name or ""))
     if getattr(draft, "from_book", False) and who:
         hon = str(getattr(draft, "honorific", "") or "").strip()
         return f"{hon} {who}".strip()
@@ -412,7 +485,7 @@ def read_back(draft: Draft) -> str:
 def gender_line(draft: Draft) -> str:
     """The re-ask for a pronoun that is not the pending person's (Hunter's
     19:00 ruling): names them, and the pronoun that is theirs."""
-    who = draft.to_name or spoken_address(draft.to_addr)
+    who = spoken_recipient(draft.to_name, draft.to_addr)
     return GENDER_LINE.format(who=who, pron=pronoun_for(getattr(draft, "to_gender", None)))
 
 
@@ -1011,16 +1084,35 @@ def send_notice(account, subject: str, body: str, *, smtp=None,
     (verdict, 2026-09-05). It comes through here instead.
 
     The door is NARROWER than :func:`send`'s: there is no recipient
-    parameter and no attachment. A notice goes to the account's own
-    address or nowhere, so nothing that gets hold of this seam can use it
-    to mail a stranger. ``mail`` is the module seam the tests substitute.
+    parameter and no attachment. Nothing that gets hold of this seam can
+    use it to mail a stranger. ``mail`` is the module seam the tests
+    substitute.
+
+    WHERE IT GOES (2026-09-05). The account's own address, unless HIS
+    CONFIG named another one -- a key ``mail.mail_accounts()`` mints onto
+    the account dict beside the SMTP credential, spelled and specified in
+    :func:`mail.notice_destination`, which is the one place in the package
+    that knows its name. That is still NOT a recipient parameter: the
+    address the transport is handed is a pure function of the
+    account object, and the account object is a pure function of his
+    config file. A caller supplies the subject and the body and nothing
+    else, and neither is parsed for an address.
+
+    NOTE THE ``mail_mod`` ON THE NEXT LINE, not ``mail``. The destination
+    is resolved against the REAL module, never against the injected seam:
+    resolving it through ``mail`` would let a caller that passes a stub
+    module choose the recipient after all, which is the banned thing
+    wearing a different hat.
     """
     mail = mail or mail_mod
-    to_addr = str((account or {}).get("address") or "").strip()
+    to_addr = mail_mod.notice_destination(account)
     if not to_addr:
         raise mail_mod.MailSendFailed("that account has no address")
-    log.info("outbox: notice %r to the account itself (%s)", subject,
-             mail_mod.account_label(account))
+    # MASKED, like the file lane's line: the destination is now something
+    # he can configure, so "the account itself" stopped being true and a
+    # log that says where a break-glass code went should not spell it out.
+    log.info("outbox: notice %r to %s (from %s)", subject,
+             mail_mod._mask_address(to_addr), mail_mod.account_label(account))
     return mail.send_message(account, to_addr, subject, body, smtp=smtp)
 
 
@@ -1052,7 +1144,200 @@ def send(draft: Draft, smtp=None, cap_mb: float = MAX_ATTACHMENT_MB) -> str:
                     draft.path.name)
         raise DraftChanged(CHANGED_LINE)
 
-    mail_mod.send_message(draft.account, draft.to_addr, draft.subject,
-                          draft.body, attachment=draft.path, smtp=smtp)
-    who = draft.to_name or spoken_address(draft.to_addr)
+    # THE REHEARSAL SWITCH, applied last and over everything. It wins over
+    # the transport it was handed on purpose: it can only ever turn a send
+    # into no-send, never the other way round, so there is no arrangement
+    # of flags in which setting it causes a message to leave. A rehearsal
+    # is then said in its OWN sentence -- it must be impossible to mistake
+    # for "Sent to Heather, sir."
+    if mail_mod.dryrun_enabled():
+        smtp = mail_mod.DryRunSMTP
+    rehearsal = mail_mod.is_dryrun(smtp)
+
+    message_id = mail_mod.send_message(draft.account, draft.to_addr,
+                                       draft.subject, draft.body,
+                                       attachment=draft.path, smtp=smtp)
+    # THE AUDIT, written only once the send has actually returned. A
+    # failure raises above this line, so the log can never claim a message
+    # that did not go -- and record_sent never raises, so a log that
+    # cannot be written can never turn a delivered message into a
+    # reported failure.
+    record_sent(draft, message_id=message_id, dry_run=rehearsal)
+    if rehearsal:
+        return REHEARSAL_LINE
+    who = spoken_recipient(draft.to_name, draft.to_addr)
     return SENT_LINE.format(who=who)
+
+
+# ----------------------------------------------------------- the audit
+#: The fields of a sent-log row that are free text and could therefore
+#: carry an address. Masked on the way IN, never on the way out: masking
+#: at read time would still leave the raw address sitting on disk.
+_MASKED_FIELDS = ("to", "to_name", "subject")
+
+
+def record_sent(draft: "Draft", message_id: str = "",
+                dry_run: bool = False, path: Optional[Path] = None) -> bool:
+    """Append one line to sent.jsonl. Never raises.
+
+    THIS IS WHAT REPLACES AN UNDO. There is no unsend over SMTP -- Gmail's
+    is a delay its own web client implements and its submission server
+    knows nothing about -- so the honest substitute is a record of what
+    left, when, to whom and as which identity. Deliberately NOT recorded:
+    the message body, the app password, and anything the server said.
+
+    Every address-bearing field goes through mask_addresses FIRST. The
+    branch this was carried from wrote ``to`` raw; the address-book lane
+    rewrote mask_addresses tonight so that an address the parser can draft
+    never reaches a log line raw, and writing one raw into a new file
+    would reopen that hole rather than inherit the fix. The file name and
+    path are NOT masked -- they are filesystem facts, not addresses, and
+    the audit is worthless if it cannot say which file went.
+    """
+    line = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "path": str(draft.path),
+        "name": Path(draft.path).name,
+        "bytes": int(draft.size),
+        "to": str(draft.to_addr),
+        "to_name": str(draft.to_name or ""),
+        "account": mail_mod.account_label(draft.account),
+        "subject": str(draft.subject),
+        "message_id": str(message_id or ""),
+        "dry_run": bool(dry_run),
+    }
+    for field_name in _MASKED_FIELDS:
+        line[field_name] = mask_addresses(line[field_name])
+    target = Path(path) if path is not None else SENT_LOG
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        # An audit that fails must never be the reason a send is reported
+        # as failed: the message HAS gone, and saying otherwise is the
+        # exact lie this lane must not tell.
+        log.warning("outbox: could not write the sent log", exc_info=True)
+        return False
+
+
+def sent_rows(path: Optional[Path] = None, limit: int = 200) -> list:
+    """The audit lines, oldest first. A bad line is skipped, not fatal."""
+    target = Path(path) if path is not None else SENT_LOG
+    out: list = []
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return out
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out[-limit:]
+
+
+def sent_today_line(now: Optional[datetime] = None,
+                    path: Optional[Path] = None) -> str:
+    """"What did I email today?" -- one spoken sentence over the audit.
+
+    Rehearsals are excluded: nothing left the machine, so listing one
+    among the day's sends would be the audit telling the same lie the
+    spoken line is written to avoid.
+
+    The address is already masked on DISK, so nothing here can say one in
+    full -- but masked is not spoken, and this line read the masked value
+    straight for one commit: "One, sir: lab report.pdf to d…@example.com",
+    measured. The recipient goes through spoken_recipient like every other
+    spoken recipient, and the "@" is said as "at".
+    """
+    ref = now or datetime.now()
+    day = ref.date().isoformat()
+    rows = [r for r in sent_rows(path)
+            if str(r.get("at", ""))[:10] == day and not r.get("dry_run")]
+    if not rows:
+        return "Nothing today, sir."
+    said = []
+    for row in rows:
+        who = spoken_recipient(row.get("to_name"), row.get("to"))
+        said.append(f"{spoken_name(str(row.get('name') or 'a file'))} to {who}")
+    if len(said) == 1:
+        return f"One, sir: {said[0]}."
+    listed = ", ".join(said[:-1]) + " and " + said[-1]
+    return f"{len(said)}, sir: {listed}."
+
+
+def spoken_when(mtime: float, now: Optional[float] = None) -> str:
+    """"saved yesterday" / "saved this morning" / "saved on 30 August".
+
+    The modified date is in the read-back because it is HOW TWO VERSIONS
+    OF ONE REPORT ARE TOLD APART. The tie band already turns
+    lab_report.pdf and lab_report_final.pdf into a question, but the case
+    it cannot help with is the same NAME saved twice -- he overwrote it
+    after the lecture, and the only fact that distinguishes what he means
+    from what is on disk is when it was written. Said in words, never as a
+    timestamp: "modified 2026-09-03 18:42" is on the card for his eyes.
+    """
+    try:
+        stamp = datetime.fromtimestamp(float(mtime))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    ref = datetime.fromtimestamp(float(now)) if now is not None \
+        else datetime.now()
+    days = (ref.date() - stamp.date()).days
+    if days < 0:
+        return "saved today"
+    if days == 0:
+        if (ref - stamp).total_seconds() < 3600:
+            return "saved in the last hour"
+        return "saved this morning" if stamp.hour < 12 else \
+            ("saved this afternoon" if stamp.hour < 18
+             else "saved this evening")
+    if days == 1:
+        return "saved yesterday"
+    if days < 7:
+        return f"saved on {stamp.strftime('%A')}"
+    return f"saved on {stamp.day} {stamp.strftime('%B')}"
+
+
+def subfolder_words(draft: "Draft") -> str:
+    """", in Fall2026" when the file is NOT sitting directly in a root.
+
+    A folder is the other thing that separates two files with the same
+    name, and it is the one he can check without looking: he knows which
+    folder he put it in. Empty when the parent IS a search root, because
+    "in Desktop" adds nothing he did not already say.
+    """
+    try:
+        parent = Path(draft.path).parent.resolve()
+    except (OSError, RuntimeError):
+        return ""
+    for root in (draft.roots or ()):
+        try:
+            if Path(root).resolve() == parent:
+                return ""
+        except (OSError, RuntimeError):
+            continue
+    return parent.name
+
+
+def clean_subject(said: str) -> str:
+    """A spoken subject line, trimmed and capped, or "".
+
+    Capped at SUBJECT_MAX because it is READ BACK VERBATIM and a subject
+    long enough to lose him is a subject he stops checking. Newlines are
+    removed outright: a header may not contain one, and a mis-transcribed
+    line break would be a header-injection shape rather than a subject.
+    """
+    text = " ".join(str(said or "").split()).strip(" ,.;:!?\"'")
+    return text[:SUBJECT_MAX]
