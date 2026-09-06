@@ -31,6 +31,7 @@ import uuid
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 from jarvis import gateledger
 from jarvis.config import CONFIG, MACHINE, PATHS
@@ -66,6 +67,8 @@ from jarvis.logs import get_logger
 from jarvis import address as address_mod
 from jarvis import arc as arc_mod
 from jarvis import board as board_mod
+from jarvis import castview as castview_mod
+from jarvis import procnet
 from jarvis import brain as brain_mod
 from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
@@ -670,6 +673,13 @@ class JarvisApp:
 
         # ---- routing ------------------------------------------------------
         self.services = self._build_services()
+        # The Windows cast poller's only way in (jarvis/castview.CastRelay
+        # through webapp's one gated /api/cast route). Attached here because
+        # this is the first line where both objects exist; with it absent
+        # the route answers "none" forever, which is the honest degradation
+        # for a startup script polling a Jarvis that cannot cast.
+        if self.webapp is not None and self.gesture is not None:
+            self.webapp.cast_relay = getattr(self.gesture, "relay", None)
         self._register_tools()
         # The mixer was built at 372, before any tool existed; the Connect
         # ducker it asks on every hold alongside the local one (#72) is the
@@ -1686,11 +1696,236 @@ class JarvisApp:
                 speak=lambda text: self._say(text),
                 board_show=self._board_show,
                 transfer=self._spotify_transfer,
+                view_launch=self._rustdesk_view,
+                view_stop=self._rustdesk_close,
+                view_alive=self._rustdesk_alive,
+                view_connected=self._rustdesk_connected,
+                view_served=self._hpcomputer_watching,
+                view_serve_arm=self._hpcomputer_watch_arm,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
                           "stays off")
             return None
+
+    # -- the screen viewer, the one place a RustDesk window is opened -----
+    # NOTHING IN THE DESIGN OR TEST SESSION EVER RAN THESE. They are the
+    # injected seam jarvis/castview.py refuses to own: that module holds no
+    # process spawner at all, so the only way a viewer window can appear is
+    # through these two methods, in the running app, on his say-so.
+    #
+    # THE ONE THING I COULD NOT VERIFY FROM NUMBERS, and he should read it:
+    # I do not know whether the RustDesk viewer steals focus when it opens,
+    # whether it can be launched minimised, or whether --connect honours a
+    # window-state flag. I did not start a session and would not. It is the
+    # same class of harm as the 08-26 desktop freeze, so it is his to try
+    # once, deliberately, when he is not mid-sentence in something.
+    def _rustdesk_view(self, host: str) -> None:
+        """Open the Spark's own RustDesk viewer on ``host``. Outbound only.
+
+        A FIXED argument list built here, never a string from anywhere
+        else: the host comes from castview's own constant and the flag is a
+        literal. There is no shell, so nothing can be interpolated into
+        one.
+        """
+        import shutil                                       # noqa: PLC0415
+
+        binary = shutil.which("rustdesk") or os.path.expanduser(
+            "~/.local/bin/rustdesk")
+        if not os.path.exists(binary):
+            raise OSError("no rustdesk viewer on this box")
+        self._close_rustdesk()
+        self._rustdesk = subprocess.Popen(          # noqa: S603 - fixed argv
+            [binary, "--connect", str(host)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info("cast: opened a viewer on %s", host)
+
+    def _rustdesk_alive(self) -> bool:
+        """Is the viewer THIS app started still running?
+
+        ``Popen`` returning is only evidence that the fork worked, and
+        jarvis/castview.py may not call a cast landed on that: a viewer
+        that cannot reach the host, cannot open a window or dies on a
+        missing display is gone within a moment, and this is what notices.
+        ``poll()`` is None while the child lives.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        return proc is not None and proc.poll() is None
+
+    # How long the byte counter is sampled over. Long enough that one
+    # frame of a desktop stream is unmistakable, short enough to sit
+    # inside the settle the sink already waits.
+    _STREAM_SAMPLE_S = 0.35
+
+    def _rustdesk_connected(self) -> Optional[bool]:
+        """Is the viewer this app started actually RECEIVING a desktop?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. ``Popen.poll() is None`` is not evidence: a
+        RustDesk viewer sitting on an accept-or-password prompt on the
+        Windows side is a perfectly live process, and round 2 called that
+        a cast (MEASURED).
+
+        THE EVIDENCE IS LOCAL AND IT IS NUMBERS. Two readings out of
+        /proc, both about THIS process and no other:
+
+          * an ESTABLISHED TCP socket that this pid owns, to
+            castview.HPCOMPUTER_HOST. That is necessary and it is not
+            sufficient -- the password prompt holds one open too.
+          * bytes actually arriving. ``/proc/<pid>/io``'s ``rchar`` over a
+            short window: a viewer painting a desktop pulls hundreds of
+            kilobytes a second, one waiting to be let in pulls a
+            keepalive. ``castview.VIEWER_STREAM_BPS`` is the floor and it
+            is GUESSED between those two orders of magnitude.
+
+        NOTHING HERE OPENS A WINDOW, A CAPTURE DEVICE OR THE PICTURE, and
+        nothing leaves this box. It cannot prove a window is visible or on
+        the right monitor; it proves a live connection carrying a stream,
+        which is as far as local evidence goes. That last step is his.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        if proc is None or proc.poll() is not None:
+            return False
+        pid = int(proc.pid)
+        try:
+            if not procnet.has_socket_to(pid, castview_mod.HPCOMPUTER_HOST):
+                return False
+            first = procnet.rchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._STREAM_SAMPLE_S)
+            second = procnet.rchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the connection probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._STREAM_SAMPLE_S
+        log.info("cast: viewer pid %d is pulling %.0f B/s", pid, rate)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
+
+    # How long the byte counter is sampled over on the SERVING side. The
+    # same idea as _STREAM_SAMPLE_S and the same GUESS.
+    _SERVE_SAMPLE_S = 0.35
+
+    def _hpcomputer_watch_arm(self) -> None:
+        """Remember which RustDesk connections from HPCOMPUTER were ALREADY
+        there, so the probe below can answer about THIS cast.
+
+        ROUND 5. ``_hpcomputer_watching`` said True for ANY established
+        socket from HPCOMPUTER on a screen-sharing port -- including a
+        RustDesk session he opened himself an hour earlier, which is a live
+        connection carrying a stream and is not a cast Jarvis landed. The
+        sink calls this before it parks the verb; anything in this set is
+        not evidence for what happens next.
+
+        THE LIMIT, and it is real: inode numbers are reused, and a
+        reconnect of his own session inside the same cast would look new.
+        This narrows the probe from "he has RustDesk open" to "a connection
+        appeared after I asked" and no further. It reads /proc/net and
+        nothing else -- no socket is opened, nothing leaves this box.
+        """
+        try:
+            self._serve_seen = set(procnet.established_to(
+                castview_mod.HPCOMPUTER_HOST, castview_mod.RUSTDESK_PORTS))
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving baseline could not be read",
+                      exc_info=True)
+            self._serve_seen = set()
+        log.info("cast: %d RustDesk connection(s) from HPCOMPUTER were "
+                 "already up before this cast", len(self._serve_seen))
+
+    def _hpcomputer_watching(self) -> Optional[bool]:
+        """Is HPCOMPUTER actually PULLING the Spark's screen?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. This is the Spark -> HPCOMPUTER direction
+        and it is NOT the mirror of ``_rustdesk_connected``: there is no
+        viewer process on this box to ask about. The viewer runs in HIS
+        Windows session; the Spark is the end being VIEWED. So the
+        evidence is what arrives here:
+
+          * an ESTABLISHED TCP socket INBOUND from castview.HPCOMPUTER_HOST
+            on one of ``castview.RUSTDESK_PORTS``. THE PORT SCOPING IS THE
+            WHOLE POINT: the Windows helper's own long poll is also an
+            established socket to that host, held open 25 s at a time
+            about 2.4 times a minute, so "is there a connection to
+            HPCOMPUTER" is true almost always and is worth nothing. The
+            poll's own port (webapp's 8765) is deliberately not in that
+            tuple.
+          * bytes actually leaving over it. The socket alone is not
+            enough for the same reason it was not enough in the other
+            direction -- a viewer negotiating a password holds one open --
+            so the inode is traced back to the process serving it and its
+            ``wchar`` is sampled. ``castview.VIEWER_STREAM_BPS`` is the
+            floor and it is GUESSED.
+
+        THE HONEST WEAKNESS, stated rather than buried: ``wchar`` is that
+        process's WHOLE output, not this socket's. If his RustDesk were
+        serving a second viewer at the same moment, this would read that
+        traffic too and could say yes to a cast that is not carrying. It
+        cannot say yes to a machine that is not connected at all, which is
+        the failure this exists to catch, and per-socket byte counters are
+        not in /proc -- reading them means opening a netlink socket, which
+        this lane does not do.
+
+        NOTHING HERE OPENS A WINDOW, A SOCKET, A CAPTURE DEVICE OR THE
+        PICTURE, and nothing leaves this box. It proves a live connection
+        carrying a stream. It does NOT prove a window is visible or on his
+        middle monitor. That last step is his.
+        """
+        try:
+            inodes = procnet.established_to(castview_mod.HPCOMPUTER_HOST,
+                                            castview_mod.RUSTDESK_PORTS)
+            # TIED TO THIS CAST, as far as local evidence reaches: a
+            # connection that was already up when the cast was asked for is
+            # his own session, not this one. With no baseline taken the
+            # behaviour is round 4's exactly.
+            inodes = set(inodes) - set(getattr(self, "_serve_seen", ()) or ())
+            if not inodes:
+                return False
+            pid = None
+            for inode in sorted(inodes):
+                pid = procnet.pid_for_inode(inode)
+                if pid is not None:
+                    break
+            if pid is None:
+                return None                # not ours to look into
+            first = procnet.wchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._SERVE_SAMPLE_S)
+            second = procnet.wchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the serving probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._SERVE_SAMPLE_S
+        log.info("cast: HPCOMPUTER is pulling %.0f B/s from pid %d",
+                 rate, pid)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
+
+    def _rustdesk_close(self) -> None:
+        self._close_rustdesk()
+
+    def _close_rustdesk(self) -> None:
+        """Stop ONLY the viewer this app started. A session he opened
+        himself is never touched -- which was the first thing the design
+        got wrong: killing every rustdesk process would have closed his
+        own window."""
+        proc = getattr(self, "_rustdesk", None)
+        self._rustdesk = None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:                          # noqa: BLE001 - teardown
+            log.debug("cast: the viewer would not close", exc_info=True)
 
     def _eye_identity(self) -> str:
         """The camera's name for whoever is in frame, "" for no opinion.

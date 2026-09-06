@@ -1299,3 +1299,134 @@ def test_the_page_lists_an_alias_it_passed_over_and_keeps_both_people(server, bo
     assert out["trimmed"] == [{"index": 1, "name": "Mum", "why": out["trimmed"][0]["why"]}]
     assert "Heather" in out["trimmed"][0]["why"] and "alias" in out["trimmed"][0]["why"]
     assert "example.com" not in out["trimmed"][0]["why"]
+
+
+# ------------------------------------------- 12. the cast poller's one route
+class TestCastRoute:
+    """The Windows startup script's only way in (POST /api/cast).
+
+    HIS RULING, and it is not re-opened here: the Windows side POLLS,
+    receives a VERB FROM A CLOSED SET, and holds its own fixed command
+    lines. Never a command string over the wire. That line is what keeps
+    this from being remote execution into his live session, so the closed
+    set is enforced AT THE ROUTE and not only where the verb was set.
+
+    Nothing here starts a RustDesk session or reaches HPCOMPUTER: the relay
+    is a plain object and the only transport is a loopback socket this test
+    opened itself.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_long_poll(self, monkeypatch):
+        # The real hold is 25 s (RATE_MAX is 60/60 s, so a 1 s poll would sit
+        # on the limit). A test must not wait for it.
+        monkeypatch.setattr(wa, "CAST_POLL_S", 0.0)
+
+    def relay(self, srv, **kw):
+        from jarvis import castview as cv
+        r = cv.CastRelay(**kw)
+        srv.srv.cast_relay = r
+        return r
+
+    def poll(self, srv, seq=-1, mon=0, layout="0,1920,1920,1920", token=None):
+        return call(srv.srv, "POST", "/api/cast",
+                    json.dumps({"seq": seq, "mon": mon, "layout": layout}),
+                    token=srv.srv.token if token is None else token,
+                    ctype="application/json")
+
+    def test_it_needs_the_key_like_every_acting_route(self, server):
+        self.relay(server)
+        status, _body = self.poll(server, token="not-the-key")
+        assert status == 401
+
+    def test_with_no_relay_wired_it_answers_none_rather_than_erroring(self, server):
+        """A startup script he installed weeks ago must keep polling
+        harmlessly when Jarvis cannot cast, not error in a loop he never
+        sees."""
+        assert server.srv.cast_relay is None
+        status, body = self.poll(server)
+        assert status == 200
+        assert body == {"seq": 0, "verb": "none"}
+
+    def test_a_queued_verb_comes_back_once(self, server):
+        from jarvis import castview as cv
+        relay = self.relay(server)
+        relay.set_verb(cv.VERB_SHOW)
+        status, body = self.poll(server)
+        assert status == 200
+        assert body["verb"] == "show-spark"
+        status, again = self.poll(server, seq=body["seq"])
+        assert again["verb"] == "none"
+
+    def test_the_reply_carries_a_verb_and_a_number_and_nothing_else(self, server):
+        self.relay(server)
+        _status, body = self.poll(server)
+        assert sorted(body) == ["seq", "verb"]
+        assert isinstance(body["seq"], int)
+        assert body["verb"] in ("none", "show-spark", "stop")
+
+    def test_NO_COMMAND_STRING_CAN_EVER_BE_RETURNED(self, server):
+        """The pin. Something inside Jarvis parks a command string on the
+        relay -- a bug, simulated -- and what goes out on the wire is still
+        a verb from the closed set."""
+        relay = self.relay(server)
+        for poison in ("rustdesk --connect 192.168.50.109",
+                       "show-spark && shutdown /s", "cmd.exe /c del *",
+                       "SHOW-SPARK", "", "start rustdesk"):
+            relay._verb = poison
+            relay._seq += 1
+            _status, body = self.poll(server)
+            assert body["verb"] == "none", poison
+
+    def test_a_relay_that_raises_still_answers_a_verb(self, server):
+        class Boom:
+            def note(self, **kw):
+                raise RuntimeError("the relay is broken")
+
+            def poll(self, seq, timeout_s=0.0):
+                raise RuntimeError("the relay is broken")
+
+        server.srv.cast_relay = Boom()
+        status, body = self.poll(server)
+        assert status == 200
+        assert body["verb"] == "none"
+
+    def test_the_helper_reports_a_monitor_index_and_a_layout(self, server):
+        relay = self.relay(server)
+        self.poll(server, mon=2, layout="0,1920,1920,1920,3840,2560")
+        assert relay.mon == 2
+        assert relay.layout == "0,1920,1920,1920,3840,2560"
+        assert relay.alive()
+
+    def test_rubbish_from_the_helper_is_dropped_not_stored(self, server):
+        relay = self.relay(server)
+        status, body = call(
+            server.srv, "POST", "/api/cast",
+            json.dumps({"seq": "x", "mon": "; rm -rf /", "layout": 7}),
+            token=server.srv.token, ctype="application/json")
+        assert status == 200
+        assert body["verb"] == "none"
+        assert relay.mon == -1
+        assert relay.layout == ""
+
+    def test_a_malformed_body_is_refused_without_touching_the_relay(self, server):
+        relay = self.relay(server)
+        status, _body = call(server.srv, "POST", "/api/cast", b"not json",
+                             token=server.srv.token,
+                             ctype="application/json")
+        assert status == 400
+        assert relay.polls == 0
+
+    def test_an_oversized_body_is_refused_before_it_is_read(self, server):
+        self.relay(server)
+        status, _body = call(server.srv, "POST", "/api/cast",
+                             json.dumps({"layout": "0,1920," * 4000}),
+                             token=server.srv.token,
+                             ctype="application/json")
+        assert status == 413
+
+    def test_the_route_is_POST_only(self, server):
+        self.relay(server)
+        status, _body = call(server.srv, "GET", "/api/cast",
+                             token=server.srv.token)
+        assert status == 404
