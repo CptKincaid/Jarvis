@@ -453,6 +453,11 @@ WHY = {
     "outside": "it is not inside the folders I am allowed to send from",
     "too-many-copies": "there are already fifty files by that name over there",
     "verify-failed": "it arrived the wrong size, so I have not moved yours",
+    # THE FOURTH SILENCE.  Not a failure of this pass -- a deliberate rest
+    # after five of them.  It reads as an outcome in the record so the hour
+    # is visible there too, and status_text says when the rest ends.
+    "parked": "it has failed five times, so I have stopped retrying it for "
+              "a while rather than hammering it every half minute",
     # Every name we offered was taken at the instant we offered it.  This is
     # what a refusal looks like when somebody is actively writing into that
     # folder, and it is the SAFE outcome -- the alternative is the write
@@ -1362,17 +1367,37 @@ class Ledger:
             self.fails = dict(keep)
 
     # -- how often one thing has failed ---------------------------------
-    def blocked(self, key: str, now: Optional[float] = None) -> bool:
+    def parked(self, key: str, now: Optional[float] = None):
+        """``(when it is tried again, why it stopped)`` if this key is
+        parked right now, else ``None``.
+
+        Split out of :meth:`blocked` so the callers can SAY what they are
+        skipping.  For an hour after the fifth failure both of them used to
+        answer this question with a bare ``continue``: no event, no line in
+        status.txt, nothing -- while the file sat in plain sight in the
+        HPCOMPUTER outbox or in his own Outbox.  The ledger has held the
+        deadline and the reason the whole time; nobody asked it.
+
+        READ-ONLY.  Sweeping an expired row is a decision and it stays in
+        :meth:`blocked`, which is the method that makes decisions.
+        """
         now = time.time() if now is None else now
         row = self.fails.get(key)
-        if not row:
-            return False
-        if int(row.get("n") or 0) < MAX_ATTEMPTS:
-            return False
-        if now >= float(row.get("next") or 0):
+        if not row or int(row.get("n") or 0) < MAX_ATTEMPTS:
+            return None
+        until = float(row.get("next") or 0)
+        if now >= until:
+            return None
+        return until, str(row.get("why") or "")
+
+    def blocked(self, key: str, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        if self.parked(key, now) is not None:
+            return True
+        row = self.fails.get(key)
+        if row and int(row.get("n") or 0) >= MAX_ATTEMPTS:
             self.fails.pop(key, None)          # the parking period is over
-            return False
-        return True
+        return False
 
     def bump(self, key: str, reason: str = "",
              now: Optional[float] = None) -> int:
@@ -1463,6 +1488,16 @@ class Syncer:
         self._unsafe_inbound = 0     # names over there this lane will not take
         self._remote_folders = 0     # FOLDERS over there; this lane moves files
         self._skipped_outbox: list = []   # his files SKIP_* passes over
+        # THE FOURTH, and the one with a clock on it.  A file that has failed
+        # MAX_ATTEMPTS times is parked for RETRY_AFTER_S -- an HOUR -- and
+        # both skip sites were a bare `continue`.  Once every 30 seconds for
+        # that hour this lane looked at a file, decided about it, and said
+        # nothing, while he could see the file the whole time.  Each list is
+        # (name, when it is tried again, why it stopped), set from THIS
+        # pass's evidence by the half that owns it and cleared at the top of
+        # that half, so neither can go stale the way _foreign_temps did.
+        self._parked_in: list = []        # over there, in the HPCOMPUTER outbox
+        self._parked_out: list = []       # here, in his own Outbox
         self._listing_truncated = False
         self._note_refused = False
 
@@ -1615,6 +1650,7 @@ class Syncer:
         # we did not look at is the honest half of the trade, and it is
         # stated here rather than left for somebody to find.
         self._foreign_temps = 0
+        self._parked_out = []               # this pass's word, not the last's
         self._sweep_notes()
         roots = filepick.expand_roots(self.rconf.local_roots)
         ready: list = []
@@ -1643,7 +1679,17 @@ class Syncer:
                 log.debug("foldersync: %s is still changing; leaving it",
                           p.name)
                 continue
-            if self.ledger.blocked(f"push:{p.name}|{stat_key(p)}", now):
+            key = f"push:{p.name}|{stat_key(p)}"
+            if self.ledger.blocked(key, now):
+                # PARKED, AND SAID SO.  His file is in his own Outbox and
+                # status.txt already lists it under "outbox N waiting"; what
+                # it never said is why it has stopped moving, or for how
+                # long.  The event goes in the record because status.txt is
+                # rewritten every pass and keeps no history of its own.
+                until, why = self.ledger.parked(key, now)
+                self._parked_out.append((p.name, until, why))
+                events.append(Event(now, "push", p.name, self._size(p),
+                                    "parked", why))
                 continue
             ready.append(p)
         if not ready and not outstanding:
@@ -2112,6 +2158,7 @@ class Syncer:
         # earlier listing is the _foreign_temps mistake with a different
         # name, so both are cleared before anything is asked.
         self._unsafe_inbound = self._remote_folders = 0
+        self._parked_in = []
         entries, why = self.transport.listing(self.conf.pull_from)
         if why:
             return [self._listing_failed(now, self.conf.pull_from, why, 0)]
@@ -2160,6 +2207,13 @@ class Syncer:
             if self.ledger.has(entry.key):
                 continue
             if self.ledger.blocked(f"pull:{entry.key}", now):
+                # PARKED, AND SAID SO.  This is the one he can SEE: the file
+                # stays in the HPCOMPUTER outbox for the whole hour and, until
+                # now, nothing on his desk mentioned it once.
+                until, why = self.ledger.parked(f"pull:{entry.key}", now)
+                self._parked_in.append((entry.name, until, why))
+                events.append(Event(now, "pull", entry.name, entry.size,
+                                    "parked", why))
                 continue
             if fetched >= MAX_PULLS_PER_PASS:
                 # A WORK bound, not a visibility one (finding Q).  Every
@@ -2514,6 +2568,25 @@ class Syncer:
             lines.append(f"note      {self._remote_folders} folder(s) in "
                          f"the {self.rconf.name} outbox. I move files,")
             lines.append("          one at a time, never a folder.")
+        # THE FOURTH SILENCE, and the one with a clock on it.  Five failures
+        # park a file for an hour; for that hour both halves skipped it with
+        # a bare `continue` and nothing anywhere said so, while he could see
+        # the file the whole time -- in the HPCOMPUTER outbox, or in his own
+        # Outbox under "N waiting" with no reason beside it.  Say the count,
+        # ONE example with the reason it stopped, and -- the half that makes
+        # it a sentence rather than a shrug -- WHEN it starts again.
+        for where, rows in (("on " + self.rconf.name, self._parked_in),
+                            ("in your Outbox", self._parked_out)):
+            if not rows:
+                continue
+            name, until, why = min(rows, key=lambda r: r[1])
+            when = time.strftime("%H:%M:%S", time.localtime(until))
+            lines.append(f"note      {len(rows)} file(s) {where} I have "
+                         f"stopped retrying for now")
+            lines.append(f"          (e.g. {name} -- {MAX_ATTEMPTS} tries, "
+                         f"last said: {why or 'no reason recorded'}).")
+            lines.append(f"          Nothing is lost and nothing has been "
+                         f"changed. Next try {when}.")
         lines.append(f"outbox    {len(waiting)} waiting"
                      if waiting else "outbox    empty")
         for name in waiting[:10]:

@@ -227,11 +227,20 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
     was censused by neither."""
     import ast
 
-    from tests.write_census import (_assigned_in, _classify, _first_party,
-                                    _lane_names, _method_names,
+    from tests.write_census import (_assigned_in, _classify, _exports,
+                                    _first_party, _lane_names, _method_names,
                                     _module_bindings, _resolve, _scope_imports,
                                     _scopes)
     walked = _first_party(MODULES)
+    # ROUND 8.  Rule S now asks whether a name is a def or a class of the
+    # OTHER walked module, so the hand rebuild has to carry that map too --
+    # the same reason it had to grow _scope_imports.  A drifting rebuild is
+    # an instrument wearing a new sign, which is the whole point of this
+    # test, so _classify takes `exports` with no default and this call is
+    # the reason it may not have one.
+    exports = {rel[:-3].replace("/", "."):
+               _exports(ast.parse((REPO / rel).read_text()))
+               for rel in MODULES}
     escapes = set()
     for rel in MODULES:
         tree = ast.parse((REPO / rel).read_text())
@@ -248,7 +257,7 @@ def test_the_walked_set_is_closed_under_this_lanes_own_imports():
             scoped = dict(b, **_scope_imports(owner))
             for node in calls:
                 r = _resolve(node.func, scoped, m, lane, local)
-                is_row, prim = _classify(r, walked)
+                is_row, prim = _classify(r, walked, exports)
                 if is_row and prim == "?uncensused":
                     escapes.add(str(r))
     assert escapes == {"jarvis.logs.get_logger",

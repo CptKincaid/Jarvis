@@ -182,6 +182,28 @@ WRITES = frozenset({
     # process: the seam every remote write actually goes through
     "Popen", "run", "call", "check_call", "check_output", "system",
     "popen", "execv", "execvp", "spawn",
+    # ROUND 8 WAS ASKED TO ADD getoutput, getstatusoutput AND THE os.exec* /
+    # posix_spawn FAMILY HERE, as defence in depth behind the namespace fix
+    # below.  REFUSED, and the refusal is measured rather than argued.
+    # Round 7 left a test whose whole point is this exact move -- no table
+    # the instrument consults may name a trick an adversary used -- and it
+    # failed the moment the names went in.  Two things broke, both real:
+    #
+    #   * `remote.subprocess.getoutput(...)` stopped being a ?through: row
+    #     and became a plain `getoutput` row.  The table then SAYS "a known
+    #     write" when what it KNOWS is "a call reached through a namespace
+    #     this census does not walk".  The second sentence is the true one
+    #     and it is the one that generalises.
+    #   * a lazy `import subprocess; subprocess.getoutput(...)` stopped
+    #     resolving as ?reach -- round 7 pinned that structural answer on
+    #     purpose (test_a_lazy_import_resolves_exactly_like_a_module_level_one)
+    #     and the vocabulary entry silently took it away.
+    #
+    # A name here that catches an attack is a name that stops the STRUCTURE
+    # being tested against it, and the structure is the only part that
+    # holds against the seventeenth spelling.  Three rounds of this lane
+    # have now been lost to enumerating vocabulary; the list above stays
+    # the list of things this lane's OWN code does, not a list of tricks.
     # arbitrary evaluation is arbitrary writing
     "exec", "eval", "compile", "__import__",
     # remote
@@ -208,7 +230,7 @@ READS = frozenset({
     "load", "access",
 })
 
-# Modules whose ENTIRE surface is vouched for: they cannot name a file.  os,
+# Modules whose OWN surface is vouched for: they cannot name a file.  os,
 # os.path, pathlib, shutil, subprocess, tempfile, glob and operator are
 # deliberately NOT here -- reaching into any of those needs a line in
 # PROVEN_SAFE naming the exact function.
@@ -232,6 +254,24 @@ READS = frozenset({
 # and creates, truncates or destroys the thing at it".  json.dump, textwrap,
 # traceback.print_exc and contextlib.redirect_stdout all take an ALREADY OPEN
 # file object -- the open is the row, and it is somebody else's line.
+#
+# ROUND 8: THAT SENTENCE IS ABOUT THE MODULE'S OWN FUNCTIONS, and until now
+# the code asked it of everything the module's NAMESPACE could reach.  No
+# module on earth passes that stronger reading, because a module re-exports
+# every module it imports as an attribute of itself.  MEASURED: six of the
+# names below re-export `os` outright --
+#
+#     shlex.os        contextlib.os      uuid.os
+#     dataclasses.os? no -- dataclasses.inspect.os, one hop further
+#     typing.contextlib.os               traceback.linecache.os
+#
+# -- and remote.py already writes `import shlex` at line 96, so
+# `shlex.os.posix_spawn(...)` was one line, no new import, no alias, no
+# lazy import, no getattr, and NOT A ROW.  So the match is no longer on the
+# ROOT of the resolved name.  It is the root plus EXACTLY ONE segment:
+# `json.dumps` is vouched for, `json.codecs.EncodedFile` is a row.  That
+# makes the sentence above a checkable claim about this list instead of an
+# unmeetable one about the standard library's import graph.
 HARMLESS_MODULES = frozenset({
     "json", "re", "time", "errno", "stat", "shlex", "dataclasses",
     "threading", "itertools", "difflib", "typing", "sys",
@@ -490,8 +530,15 @@ def _resolve(node: ast.AST, bindings: dict, methods: set, lane: set,
     return _Unresolved("unbound:" + root)
 
 
-def _classify(resolved, walked: set):
-    """(is_row, primitive).  Rules U, S, M, T, R applied in that order."""
+def _classify(resolved, walked: set, exports: dict):
+    """(is_row, primitive).  Rules U, S, M, T, R applied in that order.
+
+    ``exports`` maps each walked module's dotted name to the names it binds
+    with a module-level ``def`` or ``class`` STATEMENT.  It is required, not
+    defaulted: a caller that forgets it would silently get a different
+    answer from the census, and this file already has one test whose whole
+    point is that a hand-rebuilt resolver must not drift from the real one.
+    """
     if isinstance(resolved, _Unresolved):
         return True, "?unresolved"                              # rule U
 
@@ -531,11 +578,53 @@ def _classify(resolved, walked: set):
         return True, "?untyped:" + tail
     if resolved.startswith("<builtin>."):
         return (False, tail) if tail in SAFE_BUILTINS else (True, "?builtin")
+    # ROUND 8, AND IT IS THE WHOLE ROUND.  The two rules below are the last
+    # two that hand out silence, and BOTH of them used to match a PREFIX of
+    # the resolved name and then stop looking.  A prefix is not a promise
+    # about what is behind it.  Each was written as a statement about a
+    # MODULE and read by the code as a statement about every name that
+    # module's namespace can reach -- and those are not the same statement,
+    # BECAUSE A MODULE RE-EXPORTS EVERY MODULE IT IMPORTS AS AN ATTRIBUTE
+    # OF ITSELF.  remote.py says `import subprocess`, so
+    #
+    #     remote.subprocess.getoutput("rm -f .../quarterly.xlsx")
+    #
+    # resolved to jarvis.tools.remote.subprocess.getoutput, matched the
+    # walked prefix, and was NOT A ROW.  MEASURED on the round-7 tip in a
+    # git-archive copy: quarterly.xlsx 100000 bytes -> GONE, census frozen
+    # at 483 rows identical to the clean baseline, 42 census tests green.
+    # Sixteen further spellings of the one idea were planted against that
+    # same instrument and every one was silent; they are all in
+    # tests/test_census_reexport.py.
+    #
+    # THE RULE IS ONE SENTENCE: a vouched namespace vouches for its OWN
+    # members, never for what it re-exports.  So both prefixes stop at one
+    # segment.
     root = resolved.split(".")[0]
     if root in HARMLESS_MODULES:                                # rule S
-        return False, tail
-    if any(resolved == w or resolved.startswith(w + ".") for w in walked):
-        return False, tail       # rule S: a module this census DOES walk
+        # `json.dumps` yes; `json.codecs.EncodedFile` no.  See the comment
+        # on HARMLESS_MODULES: six of the names on that list re-export os,
+        # and remote.py already imports one of them.
+        if resolved.count(".") == 1:
+            return False, tail
+        return True, "?through:" + tail
+    for mod in sorted(walked):
+        if resolved != mod and not resolved.startswith(mod + "."):
+            continue
+        rest = resolved[len(mod) + 1:]
+        # A DEF OR A CLASS OF THAT MODULE, and nothing else.  Not "a name
+        # bound there": that reading blesses `remote.subprocess` and
+        # `remote.FileHandler` alike, and FileHandler(p, "w") TRUNCATES --
+        # it is route A of round 7 handed back through a walked module.
+        # Not a module-level variable either: `_RM = os.remove` over there
+        # is round 5's alias attack with one module between us and it.
+        # A def or a class is the one case where silence is EARNED, because
+        # its body is a scope of its own and is censused in its own module;
+        # everything else behind that prefix is a namespace this file has
+        # not walked and cannot type.
+        if rest and "." not in rest and rest in exports.get(mod, ()):
+            return False, tail   # rule S: a real function of a walked module
+        return True, "?through:" + tail
     if root == "jarvis":                                        # rule R
         return True, "?uncensused"
     return True, "?reach"                                       # rule R
@@ -655,6 +744,23 @@ def _method_names(tree: ast.AST) -> set:
     return out
 
 
+def _exports(tree: ast.AST) -> set:
+    """The names a MODULE-LEVEL ``def`` or ``class`` STATEMENT binds here.
+
+    This is what one walked module may reach for in another and still be
+    silent.  Deliberately NOT ``_lane_names``, which walks to any depth: a
+    def nested inside a function is not reachable as ``<module>.<name>`` at
+    all, and blessing it would be blessing a name that does not exist.
+    Deliberately NOT ``_module_bindings`` either, which is every name bound
+    at module level -- that includes ``import subprocess`` and
+    ``from logging import FileHandler``, which are the two shapes this
+    whole rule exists to stop.
+    """
+    return {n.name for n in ast.iter_child_nodes(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef))}
+
+
 def _first_party(paths) -> set:
     """The dotted first-party module names the census walks, so a call into
     a jarvis module that is NOT walked can be told apart from one that is."""
@@ -686,12 +792,23 @@ def census(paths=MODULES, sources=None) -> list:
     mutated copy without writing to the working tree.
     """
     walked = _first_party(paths)
-    found = []
+    # EVERY module is parsed before ANY is classified.  Rule S now asks a
+    # question about a module OTHER than the one it is reading -- "is this
+    # name a def or a class over there?" -- so the answer has to exist
+    # before the walk starts.  It is also why ``sources`` maps the whole
+    # set: censusing a mutated copy of one module must see the real other
+    # two, and it does.
+    trees = {}
     for rel in paths:
         text = (sources or {}).get(rel)
         if text is None:
             text = (REPO / rel).read_text()
-        tree = ast.parse(text)
+        trees[rel] = ast.parse(text)
+    exports = {rel[:-3].replace("/", "."): _exports(t)
+               for rel, t in trees.items()}
+    found = []
+    for rel in paths:
+        tree = trees[rel]
         bindings = _module_bindings(tree)
         methods = _method_names(tree)
         lane = _lane_names(tree)
@@ -702,7 +819,7 @@ def census(paths=MODULES, sources=None) -> list:
             checks, claims, writes = [], [], []
             for node in calls:
                 resolved = _resolve(node.func, scoped, methods, lane, local)
-                is_row, prim = _classify(resolved, walked)
+                is_row, prim = _classify(resolved, walked, exports)
                 line = getattr(node, "lineno", 0)
                 if not isinstance(resolved, _Unresolved):
                     tail = resolved.rsplit(".", 1)[-1]

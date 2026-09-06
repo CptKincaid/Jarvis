@@ -407,6 +407,51 @@ KNOWN = {
     ("jarvis/tools/remote.py", "sftp_rmdir", "run_sftp", 1):
         ("none",
          'guarded: our own stage shape, and empty-only by the server'),
+
+    # ---- ROUND 8: REACHING THROUGH A VOUCHED NAMESPACE (?through:)
+    # Rule S used to bless any dotted name starting with a walked module's
+    # path, and any name whose ROOT was on HARMLESS_MODULES.  Both are
+    # prefix matches, and a prefix says nothing about what is behind it: a
+    # module re-exports every module it imports, so
+    # `remote.subprocess.getoutput("rm -f ...")` was NOT A ROW.  MEASURED
+    # destroying a 100000-byte file of his with the census frozen at 483.
+    # Both rules now stop at ONE segment, and the walked one additionally
+    # requires that the segment be a real def or class of that module.
+    #
+    # THE SEVEN ROWS BELOW ARE THE PRICE, and they are worth reading,
+    # because they are the ATTACK'S OWN SHAPE sitting in the lane's real
+    # code: a module-level NAME of remote.py that is not a def and not a
+    # class, called through the walked prefix.  Both are compiled regexes
+    # and both are safe -- but this census cannot prove that from the
+    # source, which is exactly what it now says instead of guessing.  If
+    # either ever stops being a regex, these lines go false and a person
+    # has to look, which is the only guarantee on offer.
+    ("jarvis/foldersync.py", "windows_name_problem", "?through:match", 1):
+        ("none",
+         "remote.SAFE_REMOTE_NAME_RX.match -- a module-level name of "
+         "remote.py, not a def or a class, so this census cannot type it; "
+         "it is a compiled regex and .match only ASKS about a string"),
+    ("jarvis/foldersync.py", "remote_folder_problems", "?through:search", 1):
+        ("none",
+         "remote._SFTP_UNQUOTABLE_RX.search -- same shape, same module-"
+         "level regex; a question about a name, never a write"),
+    ("jarvis/foldersync.py", "SshTransport.listing", "?through:search", 1):
+        ("none",
+         "remote._SFTP_UNQUOTABLE_RX.search on the path before a listing"),
+    ("jarvis/foldersync.py", "SshTransport.stat", "?through:match", 1):
+        ("none",
+         "remote.SAFE_REMOTE_NAME_RX.match on the name before a stat"),
+    ("jarvis/foldersync.py", "SshTransport.stat", "?through:search", 1):
+        ("none",
+         "remote._SFTP_UNQUOTABLE_RX.search on the path before a stat"),
+    ("jarvis/foldersync.py", "SshTransport.fetch", "?through:match", 1):
+        ("none",
+         "remote.SAFE_REMOTE_NAME_RX.match on the name before a fetch -- "
+         "the refusal that keeps an odd remote name out of an argv"),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "?through:match", 1):
+        ("check",
+         "remote.SAFE_REMOTE_NAME_RX.match on each listed name; the one "
+         "that decides a file is unsafe to bring across at all"),
 }
 
 
@@ -575,6 +620,9 @@ UNTYPED = {
     "bump": "Ledger.bump, the fail counter; memory plus a later save",
     "has": "Ledger.has, a membership question",
     "blocked": "Ledger.blocked, a question about the fail counter",
+    "parked": "Ledger.parked, the same question as blocked asked so the "
+              "answer can be SAID: when the hour is up, and what stopped it. "
+              "Read-only -- the sweep of an expired row stays in blocked",
     "landed_row": "Ledger.landed_row, a lookup",
     "mark_landed": "Ledger.mark_landed, an entry in the landing record. "
                    "The ORDER matters and is the duplicate-send guarantee; "
@@ -616,11 +664,17 @@ UNTYPED_SITES = {
     ("jarvis/foldersync.py", "Ledger._trim.<lambda> #3", "?untyped:get", 1),
     ("jarvis/foldersync.py", "Ledger.blocked", "?untyped:get", 1),
     ("jarvis/foldersync.py", "Ledger.blocked", "?untyped:get", 2),
-    ("jarvis/foldersync.py", "Ledger.blocked", "?untyped:get", 3),
     ("jarvis/foldersync.py", "Ledger.blocked", "?untyped:pop", 1),
     ("jarvis/foldersync.py", "Ledger.bump", "?untyped:get", 1),
     ("jarvis/foldersync.py", "Ledger.bump", "?untyped:get", 2),
     ("jarvis/foldersync.py", "Ledger.clear", "?untyped:pop", 1),
+    # ROUND 8.  Ledger.parked reads the deadline and the reason out of
+    # the fail row so the two skip sites can SAY what they are skipping;
+    # blocked keeps the decision and the sweep, and gave up these reads.
+    ("jarvis/foldersync.py", "Ledger.parked", "?untyped:get", 1),
+    ("jarvis/foldersync.py", "Ledger.parked", "?untyped:get", 2),
+    ("jarvis/foldersync.py", "Ledger.parked", "?untyped:get", 3),
+    ("jarvis/foldersync.py", "Ledger.parked", "?untyped:get", 4),
     ("jarvis/foldersync.py", "Ledger.clear_landed", "?untyped:pop", 1),
     ("jarvis/foldersync.py", "Ledger.landed_row", "?untyped:get", 1),
     ("jarvis/foldersync.py", "Ledger.landed_row", "?untyped:get", 2),
@@ -677,9 +731,13 @@ UNTYPED_SITES = {
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:append", 5),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:append", 6),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:append", 7),
+    # ROUND 8: the parked note and the parked event, outbound.
+    ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:append", 8),
+    ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:append", 9),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:blocked", 1),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:bump", 1),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:debug", 1),
+    ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:parked", 1),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:landed_row", 1),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:listing", 1),
     ("jarvis/foldersync.py", "Syncer._push_once", "?untyped:warning", 1),
@@ -738,12 +796,17 @@ UNTYPED_SITES = {
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:append", 7),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:append", 8),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:append", 9),
+    # ROUND 8: the parked note and the parked event, inbound -- the one
+    # he can see sitting in the HPCOMPUTER outbox for the whole hour.
+    ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:append", 10),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:append", 11),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:blocked", 1),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:bump", 1),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:bump", 2),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:bump", 3),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:clear", 1),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:has", 1),
+    ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:parked", 1),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:info", 1),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:info", 2),
     ("jarvis/foldersync.py", "Syncer.pull_once", "?untyped:info", 3),
@@ -790,6 +853,10 @@ UNTYPED_SITES = {
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 28),
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 29),
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 30),
+    # ROUND 8: the three lines of the parked note itself.
+    ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 31),
+    ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 32),
+    ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:append", 33),
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:get", 1),
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:join", 1),
     ("jarvis/foldersync.py", "Syncer.status_text", "?untyped:rstrip", 1),
