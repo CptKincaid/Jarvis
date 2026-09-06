@@ -173,3 +173,45 @@ def test_the_release_path_works_on_a_bare_object_that_owns_only_the_flag():
         pass
     ns._audio_busy.clear()
     assert not ns._audio_busy.is_set()
+
+
+# ------------------------------------------------- the instrument: WHERE
+def test_the_watchdog_prints_where_the_stuck_thread_is_standing(caplog):
+    """The question nobody could answer on 2026-09-06. A thread parked in a
+    function we can name must be reported BY that name, innermost last."""
+    import logging
+    gate = threading.Event()
+
+    def _somewhere_recognisable():
+        gate.wait(5.0)
+
+    t = threading.Thread(target=_somewhere_recognisable, daemon=True,
+                         name="audio-decode")
+    t.start()
+    time.sleep(0.05)
+    try:
+        lines = app_mod._stuck_thread_stack(t)
+        joined = "\n".join(lines)
+        assert "audio-decode" in joined
+        assert "_somewhere_recognisable" in joined, joined
+        assert "gate.wait" in joined or "wait" in joined, joined
+        # and the app wires it: a timed-out flag logs those lines at ERROR
+        a = _app(timeout=99.0)
+        a._audio_thread = t
+        a._audio_busy.set()
+        with caplog.at_level(logging.ERROR, logger="jarvis.app"):
+            _bind(a, "_audio_timed_out")()
+        assert any("_somewhere_recognisable" in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
+    finally:
+        gate.set()
+        t.join(1.0)
+
+
+def test_the_instrument_never_raises():
+    """A diagnostic that can fail inside a watchdog is worse than none."""
+    assert app_mod._stuck_thread_stack(None) == ["no decode thread recorded"]
+    t = threading.Thread(target=lambda: None, daemon=True)
+    t.start()
+    t.join(1.0)
+    assert "already exited" in app_mod._stuck_thread_stack(t)[0]

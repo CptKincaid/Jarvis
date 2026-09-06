@@ -760,7 +760,14 @@ class TestSelfCheck:
         assert report["capture_fps"] == 15.0
         assert report["counters_scaled"] is True
         assert report["thresholds"]["dwell_frames"] == 6
-        assert report["thresholds"]["exit_step_u"] == pytest.approx(0.175)
+        # ROUND 4: 0.175 -> 0.15. Not a scaling change -- ``for_fps`` still
+        # halves it at 15 fps -- but the BASE moved. jarvis/assistant_config
+        # still carried round 2's distance bars, and thresholds_from_options
+        # applies this file's values ON TOP of the module's, so round 3's
+        # 0.86 rescale was silently put back on his real box. The config now
+        # agrees with jarvis/gesture.py: exit_step_u is 0.30, and half of it
+        # is 0.15.
+        assert report["thresholds"]["exit_step_u"] == pytest.approx(0.15)
         assert report["thresholds"]["reach_min"] == 2.35
 
     def test_the_selfcheck_writes_no_frame_and_opens_no_device_itself(self):

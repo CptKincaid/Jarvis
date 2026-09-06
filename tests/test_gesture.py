@@ -650,9 +650,17 @@ def test_events_and_status_are_numbers_only():
     m.update((obs(100, 360, OPEN),), EYE_PX, 10)
     assert_numbers_only(m.status())
     ev = CastEvent(kind="throw", at=1.0, frame=3, sector="left", toward="left")
+    # ROUND 4 added the two a silent drop never told him: how fast the
+    # hand actually went, and which bar refused it. ROUND 5 added the two
+    # that made those honest -- ``fling_us``, the speed the bar was
+    # ACTUALLY compared against (``speed_us`` is the peak of the whole
+    # carry and could sit above the bar on a refusal), and ``windup_u``,
+    # how far the hand pulled back before it swung.
     assert set(ev.numbers_only()) == {"kind", "at", "frame", "dist_u",
                                       "bearing_deg", "sector", "why", "reach",
-                                      "closed", "payload", "toward"}
+                                      "closed", "payload", "toward",
+                                      "speed_us", "fling_us", "windup_u",
+                                      "refused"}
 
 
 def test_the_machine_holds_no_array_and_no_observation():
@@ -709,7 +717,13 @@ class TestTheIntendedGesture:
             for e in ends:
                 if e.toward == "":
                     assert e.dist_u < g.TOWARD_MIN_U, e
-            assert sum(e.toward == "down" for e in ends) >= 9, \
+            # ROUND 3: 9 of 12 became 8 of 12. Every distance bar was
+            # rescaled by 0.86 into the corrected hand-unit, so one more
+            # of these short downward flings now falls under
+            # ``TOWARD_MIN_U`` and is reported with no direction at all --
+            # which is the honest outcome for a fling that short. Still
+            # 12 drops, still no sector, still nothing thrown.
+            assert sum(e.toward == "down" for e in ends) >= 8, \
                 [(e.why, e.toward, round(e.dist_u, 2)) for e in ends]
 
     @pytest.mark.parametrize("fps", [7.5, 6.0])
@@ -771,8 +785,12 @@ class TestOtherFrameRates:
         assert th.lost_grace_frames == 4
         assert th.carry_max_frames == 60
         assert th.open_lookback_frames == 24
-        assert th.exit_step_u == pytest.approx(0.35 / 2.0)
-        assert th.reach_min == 2.35 and th.throw_release_u == 1.00
+        # ROUND 3: the base is 0.30, not 0.35 -- see CastThresholds, every
+        # distance bar was rescaled by 0.86 into the corrected hand-unit.
+        assert th.exit_step_u == pytest.approx(CastThresholds().exit_step_u
+                                               / 2.0)
+        assert th.reach_min == 2.35
+        assert th.throw_release_u == CastThresholds().throw_release_u
 
     def test_fast_rates_with_the_raw_counters_would_misfire(self):
         """Why for_fps exists: at 30 fps three frames is 100 ms."""
@@ -872,21 +890,47 @@ class TestOtherFrameRates:
         What the LOGIC can do at 2 fps, so the limit is shown to be the
         rate and not the machine: a slow, deliberate gesture whose open
         approach stays in frame for 1.2 s (2-3 open samples), holds 1.5 s
-        (3-4 fist samples) and swings wide grabs 6/6 and lands 6/6 on the
-        named side, both sides. MEASURED. The first draft's slow variant,
-        whose approach starts out of frame, grabbed only 3/6: three phases
-        never sampled an open hand and the resting-fist rule refused them,
-        which is that rule working."""
+        (3-4 fist samples) and swings wide grabs 6/6, both sides, and
+        lands on the NAMED side every time it lands at all. MEASURED. The
+        first draft's slow variant, whose approach starts out of frame,
+        grabbed only 3/6: three phases never sampled an open hand and the
+        resting-fist rule refused them, which is that rule working.
+
+        THE THROW COUNT MOVED WHEN THE FLING TEST LANDED (09-05), and it
+        moved for the reason this test is about. A throw now has to be
+        measurably FAST -- ``throw_speed_us``, off the clock -- and at 2 fps
+        a 0.5 s sample interval smears a 0.8 s swing together with the hold
+        that came before it, so the speed READS as 1.7 hand-units/s against
+        a real 3.4. It was 6/6 and 6/6; it is now 4/6 and 3/6, and the rest
+        are drops that still name the side in ``toward``. That is the same
+        conclusion this test already drew from the other end: below the
+        band the rate is the limit, and the lane must be OFF at idle rather
+        than degraded. At 5.5-8.0 fps the SAME slow gesture is untouched at
+        6/6, which the next test pins."""
         natural = tally(run(GOOD["his-right"], 2.0, phases=6))
         assert natural["grab"] == 0 and natural["throw"] == 0, natural
-        for side, end in (("right", (-300, -10, 440)),
-                          ("left", (310, -10, 440))):
+        # ROUND 3: 4/3 became 3/3. At 2 fps the fling grant is floored at
+        # the loss grace (1.5 s) and the whole gesture is between samples;
+        # one fewer landing at a rate the lane is meant to be OFF at is
+        # the safe direction, and the sentence above already says so.
+        # ROUND 4: 3/3 became 4/3, because the speed bar came down off the
+        # spread of his own throw (2.65 -> 2.45). It is the same conclusion
+        # from the same end -- below the band the RATE is the limit, and
+        # nothing here is loosened for it.
+        for side, want in (("right", 4), ("left", 3)):
+            end = (-300, -10, 440) if side == "right" else (310, -10, 440)
             t = tally(run(slow_gesture(end), 2.0, phases=6))
-            assert t["grab"] == 6 and t["throw"] == 6, (side, t)
-            assert t["sectors"] == {side: 6}, (side, t)
+            assert t["grab"] == 6, (side, t)
+            assert t["throw"] == want, (side, t)
+            assert t["sectors"] == {side: want}, (side, t)
 
     def test_the_slow_gesture_also_lands_at_the_design_rates(self):
-        for fps in (7.5, 6.0):
+        """And it still does with the fling test in front of it: MEASURED
+        09-05 across the whole band, 6/6 both sides at every rate. The
+        slow deliberate throw peaks at 3.4 hand-units/s against the 3.0
+        bar -- a 13% margin, which is the thinnest margin in this file and
+        is stated as such in ``CastThresholds.throw_speed_us``."""
+        for fps in (5.5, 6.0, 7.5, 8.0):
             for side, end in (("right", (-300, -10, 440)),
                               ("left", (310, -10, 440))):
                 t = tally(run(slow_gesture(end), fps, phases=6))
@@ -914,11 +958,13 @@ class TestThrowBars:
         return m.update((obs(x, y, OPEN),), EYE_PX, 6)
 
     def test_released_in_frame_needs_a_full_hand_width(self):
-        under = self._release(-0.99)
-        over = self._release(-1.01)
+        # ROUND 3: the bar is 0.86, not 1.00 -- rescaled by 0.86 into the
+        # corrected hand-unit, where it means the same millimetres.
+        under = self._release(-0.85)
+        over = self._release(-0.87)
         assert under.kind == "drop" and under.why == "released"
         assert over.kind == "throw" and over.sector == "right"
-        assert over.dist_u == pytest.approx(1.01, abs=1e-6)
+        assert over.dist_u == pytest.approx(0.87, abs=1e-6)
 
     def test_image_minus_x_is_his_right_and_plus_x_his_left(self):
         assert self._release(-1.5).sector == "right"
@@ -967,10 +1013,17 @@ class TestThrowBars:
         assert e.kind == "drop" and "his right is not a target" in e.why
 
     # -- leaving the frame ----------------------------------------------
-    def _exit(self, last_x, last_y, step_units, edge_ok=True):
+    def _exit(self, last_x, last_y, step_units, edge_ok=True, fps=6.0):
         """Grab at centre, one fist frame at (last_x, last_y) reached with
-        a last step of ``step_units``, then the hand is gone."""
-        m = CastGesture(now=Clock())
+        a last step of ``step_units``, then the hand is gone.
+
+        THE CLOCK HERE DOES NOT ADVANCE, and that is now load-bearing: with
+        no measurable interval the machine falls back to one frame period
+        at ``preview_fps``, so the step this drives is a speed of
+        ``step_units * fps`` hand-units per second. At the 6.0 fps default
+        a 0.5-unit step is 3.0 u/s -- exactly the fling bar -- so every
+        caller below states a step that is unambiguously one side of it."""
+        m = CastGesture(now=Clock(), preview_fps=fps)
         grab_at(m, 640, 360)
         # a frame before the last so the last STEP is what we say it is
         ux = (last_x - 640) / max(abs(last_x - 640), 1e-9)
@@ -984,41 +1037,71 @@ class TestThrowBars:
 
     def test_leaving_through_the_image_left_edge_is_a_throw_to_his_right(self):
         # 100 px from the left edge: frac 0.16 <= 0.30, dist 1.93 >= 0.25
-        e = self._exit(100, 360, 0.5)
+        e = self._exit(100, 360, 0.8)
         assert e.kind == "throw" and e.sector == "right"
         assert e.why == "left frame (his right)"
 
     def test_leaving_through_the_image_right_edge_is_a_throw_to_his_left(self):
-        e = self._exit(W - 100, 360, 0.5)
+        e = self._exit(W - 100, 360, 0.8)
         assert e.kind == "throw" and e.sector == "left"
         assert e.why == "left frame (his left)"
 
     def test_leaving_through_the_bottom_is_the_cancel(self):
-        e = self._exit(640, H - 60, 0.5)
+        e = self._exit(640, H - 60, 0.8)
         assert e.kind == "drop" and e.why == "cancelled (his down)"
 
     def test_leaving_through_the_top_is_not_a_target(self):
-        e = self._exit(640, 60, 0.5)
+        e = self._exit(640, 60, 0.8)
         assert e.kind == "drop" and "his up is not a target" in e.why
 
-    def test_the_edge_bar_is_a_quarter_hand_width(self):
-        # anchor 100 px from the left edge so it can leave with little travel
-        for dist, kind in ((0.24, "drop"), (0.26, "throw")):
-            m = CastGesture(now=Clock())
+    def test_the_edge_bar_is_a_quarter_hand_width_but_no_longer_decides(self):
+        """``throw_exit_u`` is still the distance floor, and it is still a
+        quarter of a hand-width -- but it is no longer what decides.
+
+        A fling has to come with it (09-05), and that changes which of
+        these two bars you can actually reach. At the design rates you
+        cannot reach the distance bar at all: a single step small enough to
+        leave the hand 0.26 units from its anchor is 1.6 hand-units/s,
+        which is not a fling by any measure. So the distance bar is driven
+        here at 20 fps, where the SAME 0.26-unit step is 5.2 u/s and the
+        quarter-hand-width is once again what separates the two -- and the
+        row underneath shows the same geometry refusing at 6 fps, which is
+        the whole of the fix in two lines."""
+        # ROUND 3: the bar is 0.22, not 0.25 -- rescaled by 0.86 into the
+        # corrected hand-unit, where it means the same millimetres.
+        for dist, kind in ((0.21, "drop"), (0.23, "throw")):
+            m = CastGesture(now=Clock(), preview_fps=20.0)
             grab_at(m, 100, 360)
             m.update((obs(100 - dist * UNIT, 360, FIST),), EYE_PX, 5)
             e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
             assert e.kind == kind, (dist, e)
             if kind == "throw":
                 assert e.sector == "right"
+        # the same 0.23 units, carried rather than flung: 1.4 u/s at 6 fps
+        m = CastGesture(now=Clock(), preview_fps=6.0)
+        grab_at(m, 100, 360)
+        m.update((obs(100 - 0.23 * UNIT, 360, FIST),), EYE_PX, 5)
+        e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
+        assert e.kind == "drop" and e.sector == ""
+        assert e.why == "carried out of frame, not flung"
 
     def test_lost_in_open_space_needs_distance_and_motion(self):
-        # centre of the frame: frac > 0.30 from every edge -> the lost rule
-        far_fast = self._exit(640 - 0.51 * UNIT, 360, 0.36)
-        far_slow = self._exit(640 - 0.51 * UNIT, 360, 0.34)
-        near_fast = self._exit(640 - 0.49 * UNIT, 360, 0.36)
+        """Centre of the frame: frac > 0.30 from every edge, so the lost
+        rule judges it. It wants distance from the anchor AND to have been
+        moving on the last step -- and since 09-05 that motion has to be a
+        FLING (3.0 hand-units/s; at the 6 fps this helper implies, a step
+        of 0.5 units). ``exit_step_u`` is still the per-frame bar and is
+        still 0.35, which is why the 0.36-unit step below is a drop now:
+        it clears the old bar and is not a fling."""
+        # ROUND 3: the two bars are 0.43 and 0.30, not 0.50 and 0.35 --
+        # rescaled by 0.86 into the corrected hand-unit.
+        far_fast = self._exit(640 - 0.53 * UNIT, 360, 0.52)
+        far_carried = self._exit(640 - 0.53 * UNIT, 360, 0.31)
+        far_slow = self._exit(640 - 0.44 * UNIT, 360, 0.29)
+        near_fast = self._exit(640 - 0.42 * UNIT, 360, 0.52)
         assert far_fast.kind == "throw" and far_fast.sector == "right"
         assert far_fast.why == "lost"
+        assert far_carried.kind == "drop" and far_carried.why == "lost, not flung"
         assert far_slow.kind == "drop" and far_slow.why == "lost"
         assert near_fast.kind == "drop" and near_fast.why == "lost"
 
@@ -1032,7 +1115,7 @@ class TestThrowBars:
     def test_the_bearing_of_an_edge_exit_is_the_edges_not_the_vectors(self):
         """A diagonal run out through the left edge is still a throw to his
         right: leaving the picture is the evidence and the edge names it."""
-        e = self._exit(100, 200, 0.5)
+        e = self._exit(100, 200, 0.8)
         assert e.kind == "throw" and e.sector == "right"
         assert e.bearing_deg == 0.0
 
@@ -1049,9 +1132,10 @@ class TestThrowBars:
         e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
         assert e.kind == "drop" and e.why == "lost"
         assert e.sector == ""
-        # ...and the same 0.3 u drift OUTWARD is the throw it always was.
+        # ...and the same run OUTWARD is the throw it always was, given a
+        # fling: 0.9 units in one frame is 5.4 hand-units/s at 6 fps.
         m = CastGesture(now=Clock())
-        grab_at(m, W - 80 - 0.3 * UNIT, 360)
+        grab_at(m, W - 80 - 0.9 * UNIT, 360)
         m.update((obs(W - 80, 360, FIST),), EYE_PX, 5)
         e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
         assert e.kind == "throw" and e.sector == "left"
@@ -1419,6 +1503,15 @@ class TestCancels:
         The ONLY difference is ``reach_exit``."""
         off = CastThresholds(reach_exit=0.0)
         t = tally(run(WITHDRAW["his-left"], 7.5, thresholds=off, phases=12))
+        # 10 of 12 -- it was 12 of 12 before the fling test landed, which
+        # catches the other two on its own: a retraction to the shoulder is
+        # a slow motion as well as a backward one. Two independent cancels
+        # for one class of accident is the design working, not redundancy.
+        # ROUND 3: 10 became 12 -- with ``reach_exit`` switched OFF, as
+        # this test does deliberately, the corrected unit reads the
+        # retraction's speed honestly and two more of them clear the
+        # fling bar. The point of the test is unchanged and is made by
+        # the line above it: with reach_exit ON, none of these throws.
         assert t["throw"] == 12 and t["drop"] == 0
         assert t["sectors"] == {"left": 12}
 
@@ -1725,6 +1818,375 @@ class TestDwellRules:
             (0.70, 0.85, 2.35, 1.60)
         assert (t.dwell_frames, t.open_lookback_frames, t.lost_grace_frames,
                 t.carry_max_frames, t.cooldown_frames) == (3, 12, 2, 30, 8)
+        # ROUND 3 rescaled every distance bar by 0.86 -- the ratio between
+        # palm_diag and the corrected hand-unit at his working pose -- so
+        # each one means the same millimetres it was measured at and stops
+        # moving with his wrist. The speed bar was re-measured outright.
         assert (t.throw_release_u, t.throw_exit_u, t.throw_lost_u,
-                t.exit_step_u, t.edge_frac) == (1.00, 0.25, 0.50, 0.35, 0.30)
+                t.exit_step_u, t.edge_frac) == (0.86, 0.22, 0.43, 0.30, 0.30)
+        # ROUND 4: the speed bar came down to 2.45. Round 3 put it at 2.65,
+        # which is INSIDE the spread of his own slow throw (measured
+        # 2.512-3.180 u/s over swings 270-330 mm and depths 420-470), and
+        # the gesture stopped firing when his swing was 10 mm shorter. The
+        # WINDOW did not move: round 3's fix -- measured to the moment the
+        # throw would fire rather than to the last sighting with the grace
+        # stacked on top -- is kept whole. See CastThresholds and
+        # castgrid/test_r4_recall.py.
+        assert (t.throw_speed_us, t.fling_window_s) == (2.45, 0.55)
+        assert (t.closed_ratio_max, t.open_ratio_min) == (1.05, 99.0)
+        assert (t.yaw_hold_deg, t.yaw_required) == (25.0, True)
         assert t.carry_max_s == 8.0 and t.target_sectors == ("left", "right")
+
+
+# ============================================ a throw must be a throw
+# HIS DESK, and it is the whole reason this section exists. The LifeCam
+# sits ON TOP OF THE SPARK'S MONITOR -- the right-hand screen, looking
+# across at him -- so a grab at that screen is close to the lens and his
+# hands are beside that lens all day. Reaching for a mug there looks
+# exactly like grabbing at that screen, which makes the Spark-as-source
+# case the one most exposed to a false fire. Every family below is a
+# motion AT that screen, and the grid is weighted accordingly.
+#
+# THE ATTACK, MEASURED before the fix: reach at the screen, CLOSE the hand
+# on something, carry it laterally out of the picture. No fling, no
+# release, no follow-through. At a 3.2 s traverse (147 mm/s, twenty times
+# slower than a throw) it fired every time, because gesture.py treated
+# LEAVING THE PICTURE as the evidence of intent (throw_exit_u = 0.25).
+# A man carrying a mug leaves the picture.
+
+def carry_out(side, end_z=425.0, traverse=3.2, hold=0.50, pitch=35.):
+    """The attack. ``side`` names the side HE carries it toward.
+
+    Reach beside the screen, close on something, lift it to ``end_z`` and
+    carry it out of the picture over ``traverse`` seconds. The hand is
+    STILL SHUT when the picture loses it: nothing here is a fling.
+    """
+    sgn = 1.0 if side == "his-left" else -1.0        # image +x is HIS LEFT
+    lift, tail, x0 = 0.45, 1.2, 15.0
+    gone = sgn * (0.72 * float(end_z) + 200.0)       # well outside the frame
+    return (0.55 + 0.20 + hold + lift + traverse + tail, lambda t: seg(t, [
+        (0.55, (140, 300, 780), (10, 10, 430), 0.10, 0.06, pitch - 5, 0, 0),
+        (0.20, (10, 10, 430), (10, 10, 425), 0.06, 1.00, pitch, 0, 0),
+        (hold, (10, 10, 425), (x0, 5, 425), 1.00, 1.00, pitch, 0, 0),
+        (lift, (x0, 5, 425), (x0, 8, end_z), 1.00, 1.00, pitch, 0, 0),
+        (traverse, (x0, 8, end_z), (gone, 10, end_z), 1.00, 1.00, pitch, 0, 0),
+        (tail, (gone, 10, end_z), (gone, 10, end_z), 1.00, 1.00, pitch,
+         0, 0)]))
+
+
+def slide_aside(side, mm=200.0, secs=1.8, z=430.0):
+    """Close on something beside the screen and slide it aside IN FRAME,
+    then let go there. The RELEASE branch rather than the exit branch: he
+    sets a thing down 200 mm to one side, which is 1.6 hand-units and
+    clears ``throw_release_u`` easily."""
+    sgn = 1.0 if side == "his-left" else -1.0
+    ex = sgn * float(mm)
+    return (0.55 + 0.20 + 0.4 + secs + 0.9, lambda t: seg(t, [
+        (0.55, (140, 300, 780), (10, 10, 435), 0.10, 0.06, 30, 0, 0),
+        (0.20, (10, 10, 435), (10, 10, z), 0.06, 1.00, 35, 0, 0),
+        (0.40, (10, 10, z), (12, 8, z), 1.00, 1.00, 35, 0, 0),
+        (secs, (12, 8, z), (ex, 12, z), 1.00, 1.00, 35, 0, 0),
+        (0.90, (ex, 12, z), (ex, 14, z), 1.00, 0.06, 35, 0, 0)]))
+
+
+# The traverses and the ending depths the attack swept. 425-550 mm is the
+# band that stays AT reach depth (the mug slid across the desk at arm's
+# length); 600 and 700 mm are already caught by ``reach_exit``, which is
+# the ending-depth discriminator the attack named.
+ATTACK_TRAVERSES = (3.2, 2.4, 2.0)
+ATTACK_DEPTHS = (425.0, 460.0, 500.0, 550.0, 600.0, 700.0)
+
+CARRY_OUT = {"carry-out/%s/%.1fs/%.0fmm" % (side, tv, z):
+             carry_out(side, z, tv)
+             for side in ("his-left", "his-right")
+             for tv in ATTACK_TRAVERSES
+             for z in ATTACK_DEPTHS}
+
+SLIDE = {"slide-aside/%s/%.0fmm/%.1fs" % (side, mm, secs):
+         slide_aside(side, mm, secs)
+         for side in ("his-left", "his-right")
+         for mm, secs in ((200.0, 1.8), (260.0, 2.4))}
+
+# Ordinary life beside that monitor: the common case, not the edge case.
+AT_THE_SCREEN = {
+    "mug-to-mouth": (3.4, lambda t: seg(t, [
+        (0.6, (150, 240, 700), (60, 40, 430), 0.15, 0.10, 25, 0, 0),
+        (0.3, (60, 40, 430), (60, 40, 428), 0.10, 0.95, 30, 0, 0),
+        (0.9, (60, 40, 428), (90, -120, 520), 0.95, 0.95, 25, 10, 5),
+        (0.8, (90, -120, 520), (95, -125, 525), 0.95, 0.95, 20, 10, 5),
+        (0.8, (95, -125, 525), (150, 240, 700), 0.95, 0.15, 25, 0, 0)])),
+    "keyboard-hands": (5.0, lambda t: (
+        (95 + 55 * math.sin(4.1 * t), 235 + 12 * math.sin(6.3 * t), 545),
+        0.40 + 0.12 * math.sin(9.0 * t), -20, 8 * math.sin(2.0 * t), 0)),
+    "scratch-at-the-screen": (3.4, lambda t: seg(t, [
+        (0.8, (150, 240, 690), (30, -80, 445), 0.45, 0.70, 15, 0, 0),
+        (1.4, (30, -80, 445), (45, -70, 440), 0.70, 0.72, 18, 8, 12),
+        (1.2, (45, -70, 440), (150, 240, 690), 0.72, 0.45, 15, 0, 0)])),
+    "stretch-arms-wide": (2.2, lambda t: seg(t, [
+        (0.9, (60, 120, 600), (330, -160, 520), 0.10, 0.12, 10, 20, 0),
+        (0.6, (330, -160, 520), (335, -165, 515), 0.12, 0.14, 10, 25, 0),
+        (0.7, (335, -165, 515), (60, 120, 600), 0.14, 0.10, 10, 20, 0)])),
+    "grab-the-bezel": (3.0, lambda t: seg(t, [
+        (0.7, (150, 250, 700), (-30, -40, 415), 0.10, 0.90, 28, 0, 0),
+        (1.0, (-30, -40, 415), (-15, -25, 405), 0.90, 0.92, 30, 10, 8),
+        (1.3, (-15, -25, 405), (150, 250, 700), 0.92, 0.10, 28, 0, 0)])),
+    "reach-past-the-screen": (3.2, lambda t: seg(t, [
+        (0.9, (140, 250, 700), (150, -60, 430), 0.12, 0.55, 25, 15, 0),
+        (1.1, (150, -60, 430), (175, -55, 425), 0.55, 0.60, 28, 20, 5),
+        (1.2, (175, -55, 425), (140, 250, 700), 0.60, 0.12, 25, 15, 0)])),
+}
+AT_THE_SCREEN.update({k + "/fingers-down": fingers_down(v)
+                      for k, v in list(AT_THE_SCREEN.items())})
+
+# The grid. Weighted to his desk: 36 carry-outs and 4 slides at that
+# monitor, 12 ordinary motions beside it, then the design's own 24
+# everyday trajectories, the 2 withdrawals and the deliberate put-back.
+DESK_GRID = {}
+DESK_GRID.update(CARRY_OUT)
+DESK_GRID.update(SLIDE)
+DESK_GRID.update(AT_THE_SCREEN)
+DESK_GRID.update({"everyday/" + k: v for k, v in BAD.items()})
+DESK_GRID.update({"withdraw/" + k: v for k, v in WITHDRAW.items()})
+DESK_GRID["put-back"] = PUT_BACK
+
+
+def desk_misfire(fps=7.5, phases=16, thresholds=None, **kw):
+    """P(fire | not a cast gesture) over the desk grid, and who fired."""
+    fires = {}
+    grabs = 0
+    for name, scen in DESK_GRID.items():
+        t = tally(run(scen, fps, thresholds=thresholds, phases=phases, **kw))
+        grabs += t["grab"]
+        if t["throw"]:
+            fires[name] = t["throw"]
+    seqs = len(DESK_GRID) * phases
+    return {"sequences": seqs, "fires": sum(fires.values()),
+            "rate": sum(fires.values()) / seqs, "grabs": grabs,
+            "who": fires}
+
+
+class TestAThrowMustBeAThrow:
+    """Leaving the picture is not intent. A man carrying a mug leaves the
+    picture; what he does not do is FLING.
+
+    THE RULE: a carry becomes a throw only if the hand was still travelling
+    at throw speed -- ``throw_speed_us``, 3.0 hand-units a second, about
+    380 mm/s at his reach -- within ``fling_window_s`` of the last frame
+    that saw it. The distance bars are untouched: distance cannot separate
+    these two at all, because a mug carried out of the picture and a thrown
+    hand cover the SAME ~2 units before the frame edge takes them.
+    """
+
+    def test_the_named_attack_a_mug_carried_out_of_the_picture(self):
+        """THE BLOCKER. 3.2 s of traverse, 147 mm/s, both directions, every
+        ending depth. MEASURED before the fix: it fired 18 of 18 at the
+        depths that stay at reach."""
+        fired = {}
+        for side in ("his-left", "his-right"):
+            for z in ATTACK_DEPTHS:
+                t = tally(run(carry_out(side, z, 3.2), 7.5, phases=18))
+                if t["throw"]:
+                    fired["%s/%.0fmm" % (side, z)] = t["throw"]
+        assert fired == {}, fired
+
+    # ROUND 4 BOUGHT RECALL AND PAID FOR IT HERE, IN ONE FAMILY, AND THE
+    # PRICE IS NAMED RATHER THAN HIDDEN. Dropping ``throw_speed_us`` from
+    # 2.65 to 2.45 -- which is what took the gesture's own recall back
+    # above round 2 at every point of the measured surface -- lets exactly
+    # one carry-out family through: a 2.0 s traverse ending 550 mm from
+    # the lens, to his right. MEASURED: 0 of 576 sequences at 2.65, 16 of
+    # 576 at 2.45, and no other traverse, side or depth moves at all.
+    #
+    # WHY IT IS ACCEPTED. That family's measured speed sits between 2.45
+    # and 2.65, and so does his own 270 mm throw (2.512). There is no
+    # value of this bar that keeps both, which is the round-3 finding
+    # restated: no scalar separates his throw from his brisk desk motion.
+    # Choosing 2.65 does not buy safety, it buys a 0.0000 on THIS 77-family
+    # grid while the 172-family grid says 0.1995 at the same setting -- and
+    # it costs a gesture that stops firing on a 10 mm shorter swing and
+    # SAYS NOTHING ABOUT WHY. The gesture ships enabled: False either way.
+    SLOW_CARRY_ALLOWED = {(2.0, "his-right", 550.0)}
+
+    def test_the_whole_slow_carry_band_is_silent_in_both_directions(self):
+        """Every traverse the attack swept, at both design rates -- silent
+        everywhere except the one family named above, which is the price of
+        round 4's recall recovery and is pinned so it cannot grow."""
+        fired = set()
+        for fps in (6.0, 7.5):
+            for tv in ATTACK_TRAVERSES:
+                for side in ("his-left", "his-right"):
+                    for z in ATTACK_DEPTHS:
+                        t = tally(run(carry_out(side, z, tv), fps, phases=8))
+                        if t["throw"]:
+                            fired.add((tv, side, z))
+        print("\n  carry-out families that still fire: %s" % sorted(fired))
+        assert fired == self.SLOW_CARRY_ALLOWED, sorted(fired)
+
+    def test_setting_a_thing_down_beside_the_screen_is_not_a_throw(self):
+        """The same class on the RELEASE branch: he closes on something
+        beside the monitor, slides it 200 mm aside -- 1.6 hand-units, well
+        past ``throw_release_u`` -- and lets go. MEASURED before the fix:
+        6 of 6, both directions."""
+        for name, scen in SLIDE.items():
+            for fps in (6.0, 7.5):
+                t = tally(run(scen, fps, phases=8))
+                assert t["throw"] == 0, (name, fps, t)
+
+    def test_the_desk_misfire_rate(self):
+        """THE HEADLINE, on the grid weighted to where his hands actually
+        are: 77 families x 16 phases = 1232 sequences, of which 36 are the
+        carry-out at that monitor and 4 are the slide-aside beside it.
+
+        MEASURED ON THIS SAME GRID, before and after the fling test:
+
+            P(fire | not a cast gesture)   6.0 fps   7.5 fps
+            before the fling test           0.3636    0.3636
+            with it, at speed 2.65          0.0000    0.0000
+            with it, at speed 2.45 (r4)     0.0130    0.0130
+
+        448 of 1232 became 0 of 1232, and round 4 took it back to 16 of
+        1232 -- all sixteen the SAME family, carry-out/his-right/2.0s/550mm,
+        whose measured speed sits between the two bars exactly as his own
+        shortest throw does. The false GRAB count does not move at all
+        (720 and 726) and is not meant to: a grab costs a tone and a chip
+        that drops itself, and this whole file exists because a false
+        THROW costs a desktop on a monitor he is working at.
+
+        AND THIS GRID'S 0.0000 WAS NEVER THE REAL NUMBER. 77 families is a
+        narrow grid; the independent 172-family grid says 0.1995 at 2.65
+        and 0.2362 at 2.45, against a bar of 0.005. Both are unshippable,
+        which is why the gesture is off. What changed between them is
+        whether HIS OWN throw fires -- see castgrid/test_r4_recall.py."""
+        for fps in (6.0, 7.5):
+            res = desk_misfire(fps=fps)
+            print("\n  %.1f fps: %d of %d = %.4f  %s"
+                  % (fps, res["fires"], res["sequences"], res["rate"],
+                     res["who"]))
+            assert res["rate"] <= 0.0130 + 1e-9, (fps, res["who"])
+            assert set(res["who"]) <= {"carry-out/his-right/2.0s/550mm"}, \
+                res["who"]
+
+    def test_the_desk_misfire_rate_survives_landmark_noise(self):
+        """WITH NOISE, AND THE SAME TRADE, MEASURED RATHER THAN ASSUMED.
+
+            7.5 fps, 462 sequences   3 px      5 px
+            speed 2.65 (round 3)     0.0000    0.0022
+            speed 2.45 (round 4)     0.0087    0.0108
+
+        At 5 px the survivors are four carry-out families rather than one,
+        which is what landmark noise does to a bar that already sits inside
+        the overlap. 0.0108 is over this file's 0.005, and it is over it in
+        the same direction and for the same reason the 172-family grid is
+        forty-seven times over it: no scalar separates his throw from his
+        brisk desk motion. The bar is bounded here so it cannot drift
+        further without somebody noticing."""
+        # the exact fractions, so a drift of one sequence is a failure
+        want = {3.0: 4 / 462, 5.0: 5 / 462}
+        for noise in (3.0, 5.0):
+            res = desk_misfire(fps=7.5, phases=6, noise=noise,
+                               seed=int(noise))
+            print("\n  %.0f px: %d of %d = %.4f  %s"
+                  % (noise, res["fires"], res["sequences"], res["rate"],
+                     res["who"]))
+            assert res["rate"] <= want[noise] + 1e-9, (noise, res["who"])
+            assert all(k.startswith("carry-out/") for k in res["who"]), \
+                res["who"]
+
+    def test_the_ordinary_throw_still_fires(self):
+        """THE OTHER HALF. The same gesture has to work when he means it.
+        Full lateral recall at every rate in the design band, with the
+        tracker's own noise, and never to the wrong side."""
+        for fps in (5.5, 6.0, 7.5, 8.0):
+            grabs, throws, wrong = lateral_recall(fps, phases=6)
+            assert (grabs, throws, wrong) == (24, 24, 0), fps
+        for noise in (3.0, 5.0):
+            grabs, throws, wrong = lateral_recall(7.5, noise=noise,
+                                                  seed=int(noise), phases=6)
+            assert (grabs, throws, wrong) == (24, 24, 0), noise
+
+    def test_distance_cannot_tell_them_apart_and_speed_can(self):
+        """WHY the fix is not a raised ``throw_exit_u``. Both motions cover
+        the same ground before the picture loses them; only the speed of
+        the hand at that moment separates them, and by a factor of three."""
+        thrown = _carry_end_scalars(GOOD["his-right/fingers-down"], 7.5)
+        carried = _carry_end_scalars(carry_out("his-right", 425.0, 3.2), 7.5)
+        assert thrown and carried
+        # the same ground... (ROUND 3: read in the corrected hand-unit,
+        # which is 16% larger at this pose, so every figure here is 0.86
+        # of what round 2 measured. The RATIO between the two families,
+        # which is what the test is about, is untouched.)
+        assert min(d for d, _s in thrown) > 0.86
+        assert min(d for d, _s in carried) > 0.86
+        # ...at wholly different speeds
+        assert min(s for _d, s in thrown) > 2.65
+        assert max(s for _d, s in carried) < 1.80
+
+    def test_a_mug_snatched_out_faster_than_a_fling_is_the_stated_limit(self):
+        """THE RESIDUAL, stated rather than hidden. A hand that leaves the
+        picture at more than ~380 mm/s IS a fling by every signal this rig
+        has, so a genuine snatch at that speed still fires. MEASURED at
+        7.5 fps, 24 sequences per row, a mug carried out of the picture:
+
+            3.2 s traverse  147 mm/s    0/24 fire
+            2.4 s           196 mm/s    0/24
+            2.0 s           235 mm/s    0/24
+            1.6 s           294 mm/s   12/24   <- the boundary
+            1.2 s           392 mm/s   24/24
+            0.7 s           671 mm/s   24/24
+
+        Nothing here can close that gap without refusing his own slow
+        deliberate throw, which sits inside the same band: measured floor
+        3.02 hand-units/s against the 1.6 s carry's peak of 3.34. Those
+        two are the same motion, and the bar is placed between the mug's
+        ORDINARY speeds and his gesture rather than between two things
+        that can actually be told apart."""
+        fast = tally(run(carry_out("his-right", 425.0, 1.0), 7.5, phases=8))
+        assert fast["throw"] > 0
+        slow = tally(run(carry_out("his-right", 425.0, 2.0), 7.5, phases=8))
+        assert slow["throw"] == 0
+
+    def test_the_speed_bar_is_per_second_so_for_fps_leaves_it_alone(self):
+        """A throw is fast IN THE WORLD, not fast per sample. The frame
+        counters rescale; this one must not."""
+        base = CastThresholds()
+        for fps in (5.0, 7.5, 15.0, 30.0):
+            t = CastThresholds.for_fps(fps)
+            assert t.throw_speed_us == base.throw_speed_us, fps
+            assert t.fling_window_s == base.fling_window_s, fps
+
+    def test_the_machine_reports_the_speed_it_judged_on(self):
+        m = CastGesture(now=Clock())
+        grab_at(m, 640, 360)
+        st = m.status()
+        assert "speed_us" in st and "flung" in st
+        assert_numbers_only(st)
+
+
+def _carry_end_scalars(scen, fps, phases=12):
+    """(dist_u, speed_us) at every carry end past a fifth of a unit."""
+    dur, traj = scen
+    out = []
+    clk_rate = 1.0 / fps
+    for ph in range(phases):
+        clk = Clock()
+        rng = np.random.default_rng(ph)
+        m = CastGesture(CastThresholds.for_fps(fps), (W, H), now=clk,
+                        preview_fps=fps)
+        t = ph * clk_rate / phases
+        i, last_seen, peak = 0, None, 0.0
+        while t < dur:
+            hands = sample(traj, t, 0.0, rng)
+            carrying = m.state is CastState.CARRYING
+            e = m.update(hands, EYE_PX, i)
+            if carrying and hands:
+                dt = (clk.t - last_seen) if last_seen is not None else clk_rate
+                peak = max(peak, m._last_step_u / (dt if dt > 0 else clk_rate))
+            if hands:
+                last_seen = clk.t
+            if e is not None and e.kind in ("throw", "drop") and e.dist_u > 0.2:
+                out.append((e.dist_u, peak))
+                peak = 0.0
+            t += clk_rate
+            clk.t += clk_rate
+            i += 1
+    return out

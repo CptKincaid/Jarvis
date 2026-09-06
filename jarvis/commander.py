@@ -9011,12 +9011,32 @@ _CAST_HOLDING_RX = re.compile(
 _CAST_SIDE_RX = re.compile(
     r"^(?:which|what)\s+side\s+(?:is\s+)?" + _CAST_SINK
     + r"(?:\s+on)?[?.!]*$", re.I)
+# Casting a SCREEN VIEW between his two machines (jarvis/castview.py). His
+# ruling gives TWO ways in, the gesture and a sentence -- "no its ok with
+# teh gesture or if i tell jarvis to cast directly" -- and neither asks for
+# confirmation. This one names the DESTINATION outright, so it needs no
+# learned map and works with the camera off. It cannot collide with the
+# throw patterns above: those all require "this", "it" or "that" as the
+# object, and this one requires a named machine.
+_CAST_MACHINE = (r"(?P<where>spark|hpcomputer|hp\s*computer|"
+                 r"(?:the\s+)?(?:windows\s+(?:machine|box)|pc))")
+_CAST_SCREEN_RX = re.compile(
+    r"^(?:cast|show|mirror|put)\s+(?:the\s+|my\s+)?"
+    r"(?:spark|hpcomputer|hp\s*computer|windows(?:\s+machine)?|pc|screen|"
+    r"desktop)(?:'s)?(?:\s+screen|\s+desktop)?\s+"
+    r"(?:on|onto|to|up\s+on|over\s+to|across\s+to)\s+(?:the\s+)?"
+    + _CAST_MACHINE + r"(?:'s)?(?:\s+screen)?[.!]*$", re.I)
+_CAST_STOP_RX = re.compile(
+    r"^(?:stop|end|close|drop|kill)\s+(?:the\s+|that\s+)?"
+    r"(?:cast|casting|screen\s+cast|mirror(?:ing)?)[.!]*$", re.I)
+
 # The whole family, for the one rule that a sentence outranks a gesture:
 # any OTHER utterance puts a live carry down (Commander._cast_spoken_over).
 _CAST_FAMILY_RX = re.compile("|".join(
-    "(?:%s)" % rx.pattern.replace("(?P<sink>", "(?:")
+    "(?:%s)" % re.sub(r"\(\?P<\w+>", "(?:", rx.pattern)
     for rx in (_CAST_THROW_RX, _CAST_PUT_RX, _CAST_DROP_RX,
-               _CAST_HOLDING_RX, _CAST_SIDE_RX)), re.I)
+               _CAST_HOLDING_RX, _CAST_SIDE_RX, _CAST_SCREEN_RX,
+               _CAST_STOP_RX)), re.I)
 
 
 def _cast_svc(c):
@@ -9056,6 +9076,41 @@ def _h_cast_holding(c, t, m):
         return None
     return CommandResult(handled=True, reply=courier.holding_line(),
                          speak=True, status="Cast")
+
+
+def _h_cast_screen(c, t, m):
+    """"cast the spark to HPCOMPUTER" -- a whole SCREEN, not a file.
+
+    It fires. It does not ask, because he overruled a confirmation step and
+    the safety that replaces it is structural: there are two machines, and
+    with a named destination there is no source to misread at all.
+    """
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line, status = courier.cast_screen(m.group("where"))
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("screen cast by voice failed")
+        return CommandResult(handled=True, status="Cast",
+                             reply="I couldn't manage that cast, sir.",
+                             speak=True)
+    return CommandResult(handled=True, reply=line or None, speak=bool(line),
+                         status="Cast: %s" % status)
+
+
+def _h_cast_stop(c, t, m):
+    """"stop the cast". A stop must be as easy as a start: what a start
+    puts on his screen, no tone takes off."""
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line = courier.stop_cast()
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("stopping the cast failed")
+        return None
+    return CommandResult(handled=True, reply=line, speak=True, status="Cast")
 
 
 def _h_cast_teach(c, t, m):
@@ -9395,6 +9450,13 @@ REGISTRY: list[Command] = [
     Command("cast side", _CAST_SIDE_RX.match, _h_cast_side,
             needs=("gesture",)),
     Command("cast teach", cast_mod.parse_side_teaching, _h_cast_teach,
+            needs=("gesture",)),
+    # BEFORE "cast throw" would be wrong -- these name a MACHINE where the
+    # throw patterns name a pronoun, so they cannot overlap -- but they go
+    # beside them so the whole family reads in one place.
+    Command("cast screen", _CAST_SCREEN_RX.match, _h_cast_screen,
+            needs=("gesture",)),
+    Command("cast stop", _CAST_STOP_RX.match, _h_cast_stop,
             needs=("gesture",)),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
