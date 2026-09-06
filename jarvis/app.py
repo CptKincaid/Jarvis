@@ -65,6 +65,8 @@ from jarvis.logs import get_logger
 from jarvis import address as address_mod
 from jarvis import arc as arc_mod
 from jarvis import board as board_mod
+from jarvis import castview as castview_mod
+from jarvis import procnet
 from jarvis import brain as brain_mod
 from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
@@ -1435,6 +1437,7 @@ class JarvisApp:
                 view_launch=self._rustdesk_view,
                 view_stop=self._rustdesk_close,
                 view_alive=self._rustdesk_alive,
+                view_connected=self._rustdesk_connected,
                 preview_fps=fps)
         except Exception:                          # noqa: BLE001 - optional lane
             log.exception("gesture courier could not be built; the gesture "
@@ -1485,6 +1488,59 @@ class JarvisApp:
         """
         proc = getattr(self, "_rustdesk", None)
         return proc is not None and proc.poll() is None
+
+    # How long the byte counter is sampled over. Long enough that one
+    # frame of a desktop stream is unmistakable, short enough to sit
+    # inside the settle the sink already waits.
+    _STREAM_SAMPLE_S = 0.35
+
+    def _rustdesk_connected(self) -> Optional[bool]:
+        """Is the viewer this app started actually RECEIVING a desktop?
+
+        True / False / None, and None means CANNOT TELL -- which
+        jarvis/castview.py turns into an honest "I can't say it landed"
+        rather than a landing. ``Popen.poll() is None`` is not evidence: a
+        RustDesk viewer sitting on an accept-or-password prompt on the
+        Windows side is a perfectly live process, and round 2 called that
+        a cast (MEASURED).
+
+        THE EVIDENCE IS LOCAL AND IT IS NUMBERS. Two readings out of
+        /proc, both about THIS process and no other:
+
+          * an ESTABLISHED TCP socket that this pid owns, to
+            castview.HPCOMPUTER_HOST. That is necessary and it is not
+            sufficient -- the password prompt holds one open too.
+          * bytes actually arriving. ``/proc/<pid>/io``'s ``rchar`` over a
+            short window: a viewer painting a desktop pulls hundreds of
+            kilobytes a second, one waiting to be let in pulls a
+            keepalive. ``castview.VIEWER_STREAM_BPS`` is the floor and it
+            is GUESSED between those two orders of magnitude.
+
+        NOTHING HERE OPENS A WINDOW, A CAPTURE DEVICE OR THE PICTURE, and
+        nothing leaves this box. It cannot prove a window is visible or on
+        the right monitor; it proves a live connection carrying a stream,
+        which is as far as local evidence goes. That last step is his.
+        """
+        proc = getattr(self, "_rustdesk", None)
+        if proc is None or proc.poll() is not None:
+            return False
+        pid = int(proc.pid)
+        try:
+            if not procnet.has_socket_to(pid, castview_mod.HPCOMPUTER_HOST):
+                return False
+            first = procnet.rchar(pid)
+            if first is None:
+                return None
+            time.sleep(self._STREAM_SAMPLE_S)
+            second = procnet.rchar(pid)
+            if second is None:
+                return None
+        except Exception:                          # noqa: BLE001 - /proc
+            log.debug("cast: the connection probe raised", exc_info=True)
+            return None
+        rate = (second - first) / self._STREAM_SAMPLE_S
+        log.info("cast: viewer pid %d is pulling %.0f B/s", pid, rate)
+        return rate >= castview_mod.VIEWER_STREAM_BPS
 
     def _rustdesk_close(self) -> None:
         self._close_rustdesk()

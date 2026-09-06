@@ -933,7 +933,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"seq": 0, "verb": castview_mod.VERB_NONE})
             return
         try:
-            relay.note(mon=msg.get("mon"), layout=msg.get("layout"))
+            # ``fail``/``failseq`` are round 3's: the helper may now say
+            # it could not open the viewer instead of silently committing
+            # a receipt for a launch that never happened. The code is
+            # enumerated against castview.HELPER_FAILS inside note(), so
+            # a Windows error string still cannot cross this line.
+            relay.note(mon=msg.get("mon"), layout=msg.get("layout"),
+                       fail=msg.get("fail"), failseq=msg.get("failseq"))
             out = relay.poll(seq, timeout_s=CAST_POLL_S)
             verb = str(out.get("verb") or "")
             answer = {"seq": int(out.get("seq", 0)),

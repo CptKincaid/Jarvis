@@ -157,9 +157,16 @@ def rig(*, on=True, armed=True, helper=True, learned=True, yaw=None,
             relay.poll(seen[0], timeout_s=0.0)
         return True
 
+    # ROUND 3: a live process is not a connection -- a RustDesk viewer on
+    # an accept-or-password prompt is a live process -- so the sink now
+    # needs a ``connected`` probe as well, and a scheduler for the second
+    # look. Both are injected recorders; nothing here opens a viewer, a
+    # socket or a window.
     out = build(opts=opts, view_launch=launched.append,
                 view_stop=lambda: stopped.append(1),
                 view_alive=lambda: viewer_up,
+                view_connected=lambda: viewer_up,
+                view_later=lambda _d, _fn: None,
                 view_ack_wait=windows_helper,
                 view_settle=lambda _s: None, **kw)
     box.append(out.courier)

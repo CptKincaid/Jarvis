@@ -61,7 +61,8 @@ def deck(clock=None, *, launch=True, helper_at=None, answers=True,
     Set either False for a cast that goes out and is never confirmed.
     """
     clock = clock or Clock()
-    rec = {"launched": [], "stopped": [], "verbs": [], "naps": []}
+    rec = {"launched": [], "stopped": [], "verbs": [], "naps": [],
+           "later": []}
     state = cv.ViewState(now=clock)
     relay = cv.CastRelay(now=clock)
     if helper_at is not None:
@@ -78,10 +79,15 @@ def deck(clock=None, *, launch=True, helper_at=None, answers=True,
             relay.poll(helper_seq[0], timeout_s=0.0)   # ...and it says so
         return True
 
+    # ROUND 3: a live process is not a connection, so the sink now needs a
+    # ``connected`` probe too, and a ``later`` for the second look. Both
+    # are injected recorders here; nothing opens a viewer or a socket.
     spark = cv.SparkViewSink(
         launch=(lambda host: rec["launched"].append(host)) if launch else None,
         stop=lambda: rec["stopped"].append(1),
-        alive=lambda: viewer_up, settle=rec["naps"].append,
+        alive=lambda: viewer_up, connected=lambda: viewer_up,
+        settle=rec["naps"].append,
+        later=lambda d, fn: rec["later"].append((d, fn)),
         state=state, now=clock)
     hp = cv.HpViewSink(relay=relay, state=state, now=clock, wait=helper)
     return spark, hp, relay, state, rec, clock
@@ -255,7 +261,11 @@ class TestHpcomputerToSpark:
         def boom(host):
             raise OSError("no rustdesk on PATH")
 
-        sink = cv.SparkViewSink(launch=boom, state=state, now=clock)
+        sink = cv.SparkViewSink(launch=boom, alive=lambda: True,
+                                connected=lambda: True,
+                                settle=lambda s: None,
+                                later=lambda d, fn: None,
+                                state=state, now=clock)
         res = sink.deliver(subject())
         assert res.held and not res.landed
         assert state.live == ""            # and the deck is not left busy
@@ -415,7 +425,11 @@ class TestTheStartupFile:
         """The first thing the design got wrong: ``Get-Process rustdesk |
         Stop-Process`` would have closed a session he opened himself."""
         src = self.source()
-        assert "Stop-Process -Id $castPid" in src
+        # ROUND 3 moved the kill into Stop-Cast, which takes the pid this
+        # script recorded and nothing else. The property is the same one:
+        # only a pid this script started is ever stopped.
+        assert "Stop-Process -Id $ProcId" in src
+        assert "Stop-Cast -ProcId $castPid" in src
         assert "Get-Process" not in src
 
     def test_it_backs_off_rather_than_hammering_a_spark_that_is_down(self):
@@ -515,7 +529,9 @@ class TestReceiptNotHope:
         state = cv.ViewState(now=clock)
         naps = []
         sink = cv.SparkViewSink(launch=lambda host: None, stop=lambda: None,
-                                alive=lambda: False, settle=naps.append,
+                                alive=lambda: False, connected=lambda: False,
+                                settle=naps.append,
+                                later=lambda d, fn: None,
                                 state=state, now=clock)
         res = sink.deliver(subject())
         assert not res.landed
@@ -527,7 +543,10 @@ class TestReceiptNotHope:
         clock = Clock()
         state = cv.ViewState(now=clock)
         sink = cv.SparkViewSink(launch=lambda host: None, alive=lambda: True,
-                                settle=lambda s: None, state=state, now=clock)
+                                connected=lambda: True,
+                                settle=lambda s: None,
+                                later=lambda d, fn: None,
+                                state=state, now=clock)
         res = sink.deliver(subject())
         assert res.landed and not res.held
         assert state.live == "spark-view"
@@ -551,7 +570,9 @@ class TestReceiptNotHope:
         stopped = []
         sink = cv.SparkViewSink(launch=lambda host: None,
                                 stop=lambda: stopped.append(1),
-                                alive=lambda: False, settle=lambda s: None,
+                                alive=lambda: False, connected=lambda: False,
+                                settle=lambda s: None,
+                                later=lambda d, fn: None,
                                 state=state, now=clock)
         sink.deliver(subject())
         assert stopped == [1]
@@ -564,7 +585,9 @@ class TestReceiptNotHope:
         relay = cv.CastRelay(now=clock)
         relay.note(mon=1, layout="0,1920", at=clock.t)
         outs = [cv.SparkViewSink(launch=lambda h: None, alive=lambda: False,
-                                 settle=lambda s: None, state=state,
+                                 connected=lambda: False,
+                                 settle=lambda s: None,
+                                 later=lambda d, fn: None, state=state,
                                  now=clock).deliver(subject()),
                 cv.HpViewSink(relay=relay, state=state,
                               now=clock).deliver(subject())]

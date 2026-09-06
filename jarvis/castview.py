@@ -50,16 +50,43 @@ makes the spoken line the only thing he has to go on.
 So each direction now has one piece of evidence behind the word "landed",
 and it is the cheapest true one available:
 
-* HPCOMPUTER: the helper's NEXT POLL, quoting the sequence it acted on.
-  The Windows script already sends that (``$seq``) and is not changed for
-  this. No receipt inside ``HELPER_ACK_S`` and the verb is taken back off
+* HPCOMPUTER: the helper's NEXT POLL, quoting the sequence it ACTED ON --
+  and round 3 changed the Windows script so that this is true. It used to
+  commit ``$seq`` before it attempted ``Start-Process``, under
+  ``$ErrorActionPreference = 'SilentlyContinue'``, so RustDesk not being
+  at the fixed path produced a receipt for a launch that never happened
+  (MEASURED: 1 launch attempt, 0 windows up, and Jarvis said it had
+  landed). Now the receipt moves only after a launch the script has
+  watched survive, and a launch that fails sends a CODE from
+  ``HELPER_FAILS`` instead, which Jarvis repeats.
+  No receipt inside ``HELPER_ACK_S`` and the verb is taken back off
   the relay as a ``stop`` -- so a helper that was merely slow puts the
   window away rather than leaving one up that Jarvis has already said it
   did not open -- the deck is released, and the cast HOLDS out loud.
-* The Spark: the viewer is still running ``VIEWER_SETTLE_S`` after launch.
-  That is a floor, not a guarantee: a viewer that dies at three seconds was
-  reported as landed at one. Both the wait and the probe are injected, so
-  the suite neither sleeps nor opens a process.
+* The Spark: the viewer is still running ``VIEWER_SETTLE_S`` after launch
+  AND it is actually receiving something. Round 2 stopped at the first
+  half, and the module's own docstring had already predicted what that
+  costs: without direct-IP access and an unattended password on
+  HPCOMPUTER a direct-IP connect waits for someone to accept it, and a
+  viewer parked on that prompt is a LIVE PROCESS. ``Popen.poll() is None``
+  said yes and Jarvis said "HPCOMPUTER's screen is on the Spark, sir."
+  with nothing cast. So there is a second, injected probe -- ``connected``
+  -- and it is a TRI-STATE: True, False, or None for cannot tell, which
+  becomes an honest "I can't say it landed" rather than a landing. With no
+  such probe wired the sink reports itself UNAVAILABLE, on exactly the
+  rule the launcher is already held to. jarvis/app.py implements it out
+  of /proc: an ESTABLISHED socket the viewer itself owns to that host,
+  and bytes arriving over it. It opens no window and no capture device.
+  And it is ASKED AGAIN at ``VIEWER_CONFIRM_S``, because a viewer alive
+  at 0.7 s and gone at 3 s was claimed landed and never revisited -- the
+  deck stayed held by a cast that was not there and the next genuine cast
+  was refused as busy. The second look gives the deck back and RETRACTS
+  the sentence out loud.
+
+WHAT THE CONNECTION PROBE STILL CANNOT SAY, and he should have it plainly:
+it proves a live connection carrying a stream. It does not prove a window
+is visible, or on the right monitor, or in front of what he was reading.
+That last step has no local evidence and is his to look at once.
 
 THE CLOSED SET IS ENFORCED TWICE. ``CastRelay.set_verb`` raises on anything
 outside ``VERBS``, and ``poll`` re-checks before answering, so a bug
@@ -130,6 +157,31 @@ HELPER_ACK_S = 2.0
 # window has at least got up. GUESSED, and it is a floor not a guarantee:
 # a viewer that dies at three seconds was reported as landed at one.
 VIEWER_SETTLE_S = 0.7
+# ...and then again, later, because a viewer that dies at three seconds was
+# reported as landed at one and NOTHING ever revisited it: the deck stayed
+# held by a cast that was not there and the next genuine cast was refused
+# as busy (MEASURED, round-3 attack). This is when the second look happens.
+# GUESSED, and it is a compromise: long enough that a viewer which is
+# going to fall over has done so, short enough that he is still in the
+# same moment when Jarvis takes the sentence back.
+VIEWER_CONFIRM_S = 4.0
+# The throughput a viewer must be pulling to count as CONNECTED rather than
+# merely running. A RustDesk viewer showing a desktop pulls hundreds of
+# kilobytes a second; one sitting on an accept-or-password prompt pulls a
+# keepalive and nothing else. 40 kB/s is an order of magnitude above the
+# prompt and an order below the stream. GUESSED from those two orders, not
+# measured against his HPCOMPUTER -- the probe that reads it is in
+# jarvis/app.py and it reads /proc, never the picture.
+VIEWER_STREAM_BPS = 40000.0
+# How many times the ack wait may re-enter before giving up, whatever the
+# clock says. A hard bound, because an unbounded wait loop on this box has
+# already cost a session.
+ACK_WAIT_ROUNDS = 8
+# What the Windows helper is allowed to say went wrong. A CLOSED SET, for
+# exactly the reason the verbs are one: a free-text Windows error would put
+# a path, a window title or a process name on the wire, and this lane has
+# always sent nothing but an index and a layout.
+HELPER_FAILS = ("no-viewer", "launch-failed", "viewer-exited")
 # A second cast is refused for this long after one starts or stops. The
 # gesture's own cooldown is 8 frames, about 1.1 s at 7.5 fps, which is not
 # enough to stop a double fling opening two viewers.
@@ -149,6 +201,18 @@ NO_VIEWER_LINE = "I've no viewer to open here, sir; I've not cast anything."
 VIEWER_FAILED_LINE = "The viewer wouldn't open, sir."
 VIEWER_DIED_LINE = ("The viewer opened and closed again, sir. Nothing's "
                     "cast.")
+VIEWER_NOT_CONNECTED_LINE = ("The viewer opened but never connected, sir — "
+                             "HPCOMPUTER didn't let it in. Nothing's cast.")
+CANNOT_TELL_LINE = ("I can't tell whether that viewer connected, sir, so I "
+                    "won't say it did. Nothing's cast.")
+CAST_GONE_LINE = ("The cast has dropped, sir. What I told you a moment ago "
+                  "is no longer true.")
+LAUNCH_FAILED_LINE = "HPCOMPUTER couldn't open the viewer, sir"
+HELPER_FAIL_LINES = {
+    "no-viewer": LAUNCH_FAILED_LINE + " — RustDesk isn't where it expects it.",
+    "launch-failed": LAUNCH_FAILED_LINE + " — it wouldn't start.",
+    "viewer-exited": LAUNCH_FAILED_LINE + " — it closed straight away.",
+}
 NO_RECEIPT_LINE = ("HPCOMPUTER didn't come back for it, sir. I've taken it "
                    "back rather than leave it queued — nothing's cast.")
 BUSY_LINE = "There's a cast up already, sir"
@@ -159,6 +223,11 @@ NOTHING_UP_LINE = "There's nothing cast, sir."
 NO_HELPER_REASON = "the startup script isn't running on HPCOMPUTER"
 NO_VIEWER_REASON = "there is no viewer wired on this box"
 NO_PROBE_REASON = "there is no way to tell whether the viewer is up"
+NO_CONNECTION_PROBE_REASON = ("there is no way to tell whether the viewer "
+                              "actually connected")
+NOT_CONNECTED_REASON = "the viewer was running but nothing was flowing"
+CANNOT_TELL_REASON = "the connection probe had no opinion"
+CAST_GONE_REASON = "the viewer was gone when it was checked again"
 NO_RECEIPT_REASON = "HPCOMPUTER never acknowledged the verb"
 VIEWER_DIED_REASON = "the viewer was gone a moment after it started"
 
@@ -214,6 +283,15 @@ class CastRelay:
         # helper already sends it and its script is not being changed.
         self._ack_wake = threading.Event()
         self.acked = -1
+        # What the helper said went WRONG, from HELPER_FAILS, and which
+        # sequence it failed on. The shipped script committed its receipt
+        # before it even attempted the launch and swallowed the error, so
+        # a Jarvis that read the receipt said a cast had landed on a
+        # machine where RustDesk was not installed (MEASURED: 1 launch
+        # attempt, 0 windows up, "The Spark's screen is on HPCOMPUTER,
+        # sir."). Now a failed launch never becomes a receipt AND says so.
+        self.fail = ""
+        self.failseq = -1
         self._verb = VERB_NONE
         self._seq = 0
         self.mon = -1
@@ -247,10 +325,29 @@ class CastRelay:
         return seq
 
     # -- what the helper reports --------------------------------------
-    def note(self, *, mon=None, layout=None, at: Optional[float] = None) -> None:
-        """One poll from the Windows side. Rubbish is DROPPED, not stored."""
+    def note(self, *, mon=None, layout=None, at: Optional[float] = None,
+             fail=None, failseq=None) -> None:
+        """One poll from the Windows side. Rubbish is DROPPED, not stored.
+
+        ``fail`` is enumerated against ``HELPER_FAILS`` here for the same
+        reason ``poll`` re-checks the verb: this is the line the wire
+        crosses, and a free-text Windows error carries paths and window
+        titles that this lane has never sent.
+        """
         self.seen_at = float(at) if at is not None else float(self._now())
         self.polls += 1
+        code = fail if isinstance(fail, str) else ""
+        self.fail = code if code in HELPER_FAILS else ""
+        try:
+            self.failseq = int(failseq)
+        except (TypeError, ValueError):
+            self.failseq = -1
+        if self.fail:
+            log.warning("cast relay: HPCOMPUTER reports %r for seq %d",
+                        self.fail, self.failseq)
+            # A failure ends the wait as surely as a receipt does, and it
+            # ends it with the truth instead of a timeout.
+            self._ack_wake.set()
         try:
             index = int(mon)
         except (TypeError, ValueError):
@@ -321,6 +418,16 @@ class CastRelay:
             verb = VERB_NONE
         return {"seq": int(current), "verb": str(verb)}
 
+    def failed_for(self, seq) -> str:
+        """The helper's reason for not acting on ``seq``, or "". Never a
+        guess: only a code the helper actually sent for that sequence."""
+        try:
+            want = int(seq)
+        except (TypeError, ValueError):
+            return ""
+        with self._lock:
+            return self.fail if self.failseq == want else ""
+
     def acked_through(self, seq) -> bool:
         """Has the helper confirmed it holds ``seq``? Never assumed."""
         try:
@@ -339,22 +446,43 @@ class CastRelay:
         drive the helper's side of the round trip by hand. Returns whether
         the receipt actually arrived -- never whether it probably did.
         """
-        if self.acked_through(seq):
-            return True
-        self._ack_wake.clear()
-        if self.acked_through(seq):
-            return True
+        deadline = float(self._now()) + float(timeout_s)
         waiter = wait if callable(wait) else self._ack_wake.wait
-        try:
-            waiter(float(timeout_s))
-        except Exception:                   # noqa: BLE001 - the injected seam
-            log.debug("cast relay: the ack wait raised", exc_info=True)
-        return self.acked_through(seq)
+        rounds = 0
+        while True:
+            if self.acked_through(seq) or self.failed_for(seq):
+                return self.acked_through(seq)
+            left = deadline - float(self._now())
+            if left <= 0.0 or rounds >= ACK_WAIT_ROUNDS:
+                return self.acked_through(seq)
+            # RE-ARM AND RE-CHECK EVERY ROUND. Round 2 waited ONCE on a
+            # shared event, so the receipt for the PREVIOUS verb woke the
+            # wait for this one and spent it: waiting on seq 2 and woken
+            # by the receipt for seq 1, it reported NO RECEIPT and held --
+            # it called a genuine cast failed (MEASURED). The clock and
+            # the round cap are what bound the loop; a waiter that
+            # neither wakes nor advances the clock ends it on the first
+            # pass.
+            self._ack_wake.clear()
+            if self.acked_through(seq) or self.failed_for(seq):
+                return self.acked_through(seq)
+            rounds += 1
+            before = float(self._now())
+            try:
+                woke = waiter(left)
+            except Exception:               # noqa: BLE001 - the injected seam
+                log.debug("cast relay: the ack wait raised", exc_info=True)
+                return self.acked_through(seq)
+            if not woke and float(self._now()) <= before:
+                # An injected wait that reports nothing and moves no clock
+                # has, by contract, consumed the whole budget.
+                return self.acked_through(seq)
 
     def numbers_only(self) -> dict:
         return {"verb": self.verb, "seq": self.seq, "mon": int(self.mon),
                 "layout": str(self.layout), "polls": int(self.polls),
-                "acked": int(self.acked), "alive": bool(self.alive())}
+                "acked": int(self.acked), "alive": bool(self.alive()),
+                "fail": str(self.fail), "failseq": int(self.failseq)}
 
 
 # ------------------------------------------------------- one at a time
@@ -483,8 +611,12 @@ class SparkViewSink(_ViewSink):
     def __init__(self, *, launch: Optional[Callable[[str], object]] = None,
                  stop: Optional[Callable[[], object]] = None,
                  alive: Optional[Callable[[], bool]] = None,
+                 connected: Optional[Callable[[], Optional[bool]]] = None,
                  settle: Optional[Callable[[float], object]] = None,
+                 later: Optional[Callable[[float, Callable], object]] = None,
+                 retract: Optional[Callable[[str], object]] = None,
                  settle_s: float = VIEWER_SETTLE_S,
+                 confirm_s: float = VIEWER_CONFIRM_S,
                  host: str = HPCOMPUTER_HOST,
                  state: Optional[ViewState] = None,
                  now: Callable[[], float] = time.monotonic) -> None:
@@ -493,12 +625,29 @@ class SparkViewSink(_ViewSink):
         self._stop_fn = stop if callable(stop) else None
         # ``alive`` answers one question a moment after the launch: is the
         # viewer still there? The real launcher is a Popen, so "it did not
-        # raise" means the fork succeeded and nothing more. ``settle`` is
-        # the wait before asking, injected so the suite never sleeps.
+        # raise" means the fork succeeded and nothing more.
         self._alive = alive if callable(alive) else None
+        # ...AND ALIVE IS NOT CONNECTED, which is the round-3 finding on
+        # this sink. Without direct-IP access and an unattended password
+        # on HPCOMPUTER a direct-IP connect waits for someone to accept it
+        # on the Windows side, and a viewer sitting on that prompt is a
+        # live process: ``Popen.poll() is None`` says yes and round 2 said
+        # "HPCOMPUTER's screen is on the Spark, sir." with nothing cast.
+        # ``connected`` is a TRI-STATE -- True, False, or None for cannot
+        # tell -- and jarvis/app.py implements it by reading /proc: an
+        # ESTABLISHED socket the viewer itself owns to that host, and
+        # sustained bytes coming in over it. It never opens a window, a
+        # capture device or the picture.
+        self._connected = connected if callable(connected) else None
         self._settle = settle if callable(settle) else time.sleep
+        # How the SECOND look is scheduled. Injected so the suite neither
+        # sleeps nor spawns; the default is a daemon timer.
+        self._later = later if callable(later) else _default_later
+        self._retract = retract if callable(retract) else None
         self.settle_s = float(settle_s)
+        self.confirm_s = float(confirm_s)
         self.host = str(host)
+        self._watch = None
 
     def available(self) -> tuple:
         if self._launch is None:
@@ -508,6 +657,13 @@ class SparkViewSink(_ViewSink):
             # cannot be read is a viewer whose landing cannot be claimed,
             # and this sink may not claim one.
             return False, NO_PROBE_REASON
+        if self._connected is None:
+            # AND THE SAME RULE AGAIN, one level up. If there is no honest
+            # local evidence that the viewer CONNECTED then this sink
+            # cannot know whether a cast landed, and an honest "I cannot
+            # tell" is the correct outcome -- better than a confident
+            # wrong sentence.
+            return False, NO_CONNECTION_PROBE_REASON
         return True, ""
 
     def deliver(self, subject: CastSubject):
@@ -524,33 +680,91 @@ class SparkViewSink(_ViewSink):
             self.state.release()
             return held_result(VIEWER_FAILED_LINE, sink=self.name,
                                detail=str(exc))
+        try:
+            self._settle(self.settle_s)
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the settle wait raised", exc_info=True)
         if not self._still_up():
             # It started and went. Clean up whatever is left of it, give
             # the deck back and say so: a window that is not there is not
             # a cast, however cleanly the process was spawned.
             log.warning("castview: the viewer was gone %.1fs after launch",
                         self.settle_s)
-            self._stop()
-            self.state.release()
-            return held_result(VIEWER_DIED_LINE, sink=self.name,
-                               detail=VIEWER_DIED_REASON)
+            return self._give_back(VIEWER_DIED_LINE, VIEWER_DIED_REASON)
+        linked = self._is_connected()
+        if linked is False:
+            return self._give_back(VIEWER_NOT_CONNECTED_LINE,
+                                   NOT_CONNECTED_REASON)
+        if linked is None:
+            return self._give_back(CANNOT_TELL_LINE, CANNOT_TELL_REASON)
+        self._arm_confirm()
         return landed_result(
             SHOWN_LINE.format(What=_cap(VIEW_SCREENS[HPCOMPUTER]),
                               target=self.label), sink=self.name)
 
+    def _give_back(self, line: str, why: str):
+        self._stop()
+        self.state.release()
+        return held_result(line, sink=self.name, detail=why)
+
     def _still_up(self) -> bool:
-        """Wait a beat, then ask. A probe that raises is not a yes."""
-        try:
-            self._settle(self.settle_s)
-        except Exception:                           # noqa: BLE001 - the seam
-            log.debug("castview: the settle wait raised", exc_info=True)
+        """Ask whether the process is there. A probe that raises is not a
+        yes."""
         try:
             return bool(self._alive())
         except Exception:                           # noqa: BLE001 - the seam
             log.debug("castview: the viewer probe raised", exc_info=True)
             return False
 
+    def _is_connected(self) -> Optional[bool]:
+        """True, False, or None for CANNOT TELL. A probe that raises has
+        no opinion; it is never a yes."""
+        if self._connected is None:
+            return None
+        try:
+            got = self._connected()
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the connection probe raised", exc_info=True)
+            return None
+        return None if got is None else bool(got)
+
+    def _arm_confirm(self) -> None:
+        """The SECOND LOOK. A viewer alive at 0.7 s and gone at 3 s was
+        claimed landed and never revisited, so the deck stayed held by a
+        cast that was not there and the next genuine cast was refused as
+        busy. This gives the deck back and takes the sentence back."""
+        try:
+            self._watch = self._later(self.confirm_s, self._confirm)
+        except Exception:                           # noqa: BLE001 - the seam
+            log.debug("castview: the confirm timer would not arm",
+                      exc_info=True)
+            self._watch = None
+
+    def _confirm(self) -> None:
+        self._watch = None
+        if self.state.live != self.name:
+            return                                  # already stopped
+        if self._still_up() and self._is_connected() is True:
+            return
+        log.warning("castview: the cast was gone %.1fs after it was claimed",
+                    self.confirm_s)
+        self._stop()
+        self.state.release()
+        if self._retract is not None:
+            try:
+                self._retract(CAST_GONE_LINE)
+            except Exception:                       # noqa: BLE001 - the seam
+                log.debug("castview: the retraction raised", exc_info=True)
+
     def _stop(self) -> None:
+        watch, self._watch = self._watch, None
+        cancel = getattr(watch, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:                       # noqa: BLE001 - the seam
+                log.debug("castview: the confirm timer would not cancel",
+                          exc_info=True)
         if self._stop_fn is None:
             return
         try:
@@ -623,12 +837,18 @@ class HpViewSink(_ViewSink):
         if not self.relay.await_ack(seq, self.ack_s,
                                     wait=wait if callable(wait)
                                     else self._wait):
-            log.warning("castview: no receipt for verb %d after %.1fs",
-                        seq, self.ack_s)
+            # THE HELPER MAY NOW SAY WHY. A failed launch is not a
+            # receipt, and the shipped script used to commit one anyway;
+            # when it reports a reason instead, Jarvis repeats it rather
+            # than saying "it didn't come back for it".
+            why = self.relay.failed_for(seq)
+            line = HELPER_FAIL_LINES.get(why, NO_RECEIPT_LINE)
+            log.warning("castview: no receipt for verb %d after %.1fs (%s)",
+                        seq, self.ack_s, why or "silence")
             self._stop()
             self.state.release()
-            return held_result(NO_RECEIPT_LINE, sink=self.name,
-                               detail=NO_RECEIPT_REASON)
+            return held_result(line, sink=self.name,
+                               detail=why or NO_RECEIPT_REASON)
         return landed_result(
             SHOWN_LINE.format(What=_cap(VIEW_SCREENS[SPARK]),
                               target=self.label), sink=self.name)
@@ -640,6 +860,15 @@ class HpViewSink(_ViewSink):
             self.relay.set_verb(VERB_STOP)
         except Exception:                           # noqa: BLE001 - the seam
             log.debug("castview: stopping the cast raised", exc_info=True)
+
+
+def _default_later(delay_s: float, fn: Callable[[], object]):
+    """The real second look: one daemon timer, cancellable. It is the only
+    thread this module owns and it does nothing but call back in."""
+    timer = threading.Timer(float(delay_s), fn)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _cap(text: str) -> str:
@@ -658,6 +887,11 @@ def registry(spark: SparkViewSink, hp: HpViewSink) -> dict:
 
 
 __all__ = [
+    "ACK_WAIT_ROUNDS", "CANNOT_TELL_LINE", "CANNOT_TELL_REASON",
+    "CAST_GONE_LINE", "CAST_GONE_REASON", "HELPER_FAILS",
+    "HELPER_FAIL_LINES", "LAUNCH_FAILED_LINE",
+    "NOT_CONNECTED_REASON", "NO_CONNECTION_PROBE_REASON",
+    "VIEWER_CONFIRM_S", "VIEWER_NOT_CONNECTED_LINE", "VIEWER_STREAM_BPS",
     "BUSY_FULL_LINE", "BUSY_LINE", "CAST_SUPPRESS_S", "CastRelay",
     "HELPER_ACK_S", "HELPER_ALIVE_S", "HPCOMPUTER_HOST", "HpViewSink",
     "MAX_LAYOUT_CHARS",

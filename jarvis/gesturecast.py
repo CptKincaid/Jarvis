@@ -186,6 +186,9 @@ class GestureCast:
                  view_launch: Optional[Callable[[str], object]] = None,
                  view_stop: Optional[Callable[[], object]] = None,
                  view_alive: Optional[Callable[[], bool]] = None,
+                 view_connected: Optional[Callable[[], Optional[bool]]] = None,
+                 view_later: Optional[Callable[[float, Callable],
+                                               object]] = None,
                  view_ack_wait: Optional[Callable[[float], object]] = None,
                  view_settle: Optional[Callable[[float], object]] = None,
                  now: Callable[[], float] = time.monotonic,
@@ -255,9 +258,17 @@ class GestureCast:
             # ``view_alive`` is not optional decoration: without it the
             # sink cannot tell whether the viewer it spawned is still
             # there, so it reports itself unavailable rather than claiming
-            # a landing off a Popen that merely forked.
+            # a landing off a Popen that merely forked. ``view_connected``
+            # is the round-3 half of the same rule: a viewer parked on a
+            # password prompt is a LIVE PROCESS, so aliveness alone said a
+            # cast had landed with nothing on the screen. Without a
+            # connection probe the sink is unavailable too. ``retract`` is
+            # how it takes the sentence back when the second look finds
+            # the cast gone -- it speaks, exactly as a drop does.
             "spark-view": view_mod.SparkViewSink(
                 launch=view_launch, stop=view_stop, alive=view_alive,
+                connected=view_connected, later=view_later,
+                retract=self._speak,
                 settle=view_settle, state=self.view_state, now=now),
             # ``view_ack_wait`` is how the sink waits for HPCOMPUTER to
             # acknowledge the verb; None is the real one -- the relay's own
