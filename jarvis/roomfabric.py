@@ -526,6 +526,47 @@ class RoomFabric:
         with self._lock:
             return self._where(self._now())
 
+    def last_seen_room(self) -> tuple:
+        """(room name, seconds since it last saw anybody) -- ("", None) if
+        no room has ever seen anyone.
+
+        THE SOURCE FOR THE BEDROOM HINT, and deliberately not
+        ``where().room``. The active room is dropped after
+        ``stale_after_s`` (90 s) measured from its last_true, and with the
+        office's own 10 s absence delay on top the active room survives
+        about 100 seconds after he leaves it. Every bedroom trip that
+        matters is longer than that, so ``where()`` would hand back "" at
+        exactly the moment the hint is needed.
+
+        ``Room.last_true`` has none of that: it is per room, stamped on
+        every tick that sees anybody, never cleared while the process
+        lives, and unbounded in age. Zero new state, zero new polling.
+        See ``presencevote.bedroom_split`` for what the hint buys.
+        """
+        with self._lock:
+            now = self._now()
+            best = max((r for r in self.rooms if r.last_true),
+                       key=lambda r: r.last_true, default=None)
+            if best is None:
+                return ("", None)
+            return (best.name, now - best.last_true)
+
+    def readings(self) -> dict:
+        """``{room: True | False | None}`` as of the last tick, RAW.
+
+        Stuck rooms are NOT filtered here. There is exactly one place that
+        drops a room -- ``presencevote.rooms_leg(faulted=...)`` -- and two
+        dropping mechanisms is how one of them ends up forgotten. Use
+        ``stuck_rooms()`` for the fabric's own half of that set.
+        """
+        with self._lock:
+            return {r.name: r.value for r in self.rooms}
+
+    def stuck_rooms(self) -> frozenset:
+        """The rooms the fabric's own duration detector has given up on."""
+        with self._lock:
+            return frozenset(r.name for r in self.rooms if r.stuck)
+
     def anywhere(self) -> Optional[bool]:
         """Is anyone in the house? True / False / None.
 

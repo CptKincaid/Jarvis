@@ -343,7 +343,10 @@ DISCORD_ACTIVE_S = 600.0        # a Discord exchange stays "active" this long
 # minutes apart on the same walk through the door, and that is ONE return:
 # both greetings go through _greet_return, which speaks at most once per
 # damper. release() already drains atomically, so only the LINE could double.
-GREET_DAMPER_S = 600.0
+# The number lives in jarvis/arrival.py, which owns the choreography and has
+# to be able to NAME this gate in a refusal (arrival.greet_refusal); this is
+# an alias so the two can never drift apart.
+GREET_DAMPER_S = arrival_mod.GREET_DAMPER_S
 
 
 def _same_clause(a: str, b: str) -> bool:
@@ -720,6 +723,9 @@ class JarvisApp:
                      if self.assistant is not None
                      else arrival_mod.DEFAULT_DOOR_ROOM))
         self._warn_door_room_names_nothing()
+        # HIS DEPARTURE RULE, as an ordered sequence. Pure and silent; see
+        # _departure_seq_room.
+        self._departure_seq = self._make_departure_seq()
         # A radar whose gates have gone back to 0 sees 0.75 m and reads the
         # room as EMPTY -- measured twice on real hardware, 2026-09-03. The
         # check is a daemon thread that waits before its first read (the
@@ -831,7 +837,56 @@ class JarvisApp:
             # A sensor with no owner does not sense: that is the ruling.
             sens = _import_optional("jarvis.sensing")
             policy = None if sens is None else sens.DENIED
-        return mod.PresenceSentinel(self.assistant, policy=policy)
+        sentinel = mod.PresenceSentinel(self.assistant, policy=policy)
+        legs = getattr(sentinel, "legs", None)
+        if legs is not None:
+            # Guarded on ``legs`` rather than called unconditionally:
+            # tests/test_sensing.py drives this method with a partial self
+            # (types.SimpleNamespace) on purpose, and that path has no
+            # fabric, so no legs, so nothing to wire.
+            self._wire_camera_leg(legs)
+        return sentinel
+
+    def _wire_camera_leg(self, legs) -> bool:
+        """Attach the camera leg and SAY OUT LOUD whether it can answer.
+
+        His ruling, 2026-09-05: "The camera should be the number one
+        understanding for if I'm in. Followed by phone connection then
+        sensor." The voter obeys that -- a camera that NAMES him ends the
+        vote in every one of the 27 cells.
+
+        BUT NOTHING IN THIS TREE EVER ASSIGNS ``services.camera_feed``
+        (grep for "camera_feed ="), so ``_eye_leg`` answers BLIND
+        unconditionally today, and BLIND is "could not look", which never
+        votes. That makes the running voter a TWO-leg voter wearing a
+        three-leg name, and the one thing it must not do is claim
+        otherwise: this is his number one signal, and he is entitled to
+        know it is dark rather than to find out from a missed greeting.
+        So the dark case is a WARNING that names the missing wiring and
+        says what the vote is actually standing on.
+
+        The slot is wired either way, so the leg goes live the moment
+        something finally attaches a feed -- no second restart.
+        """
+        if legs is None:
+            return False
+        legs.eye = self._eye_leg
+        live = False
+        try:
+            identity, faces, live = self._eye_leg()
+        except Exception:  # noqa: BLE001 - a broken eye is not a boot failure
+            live = False
+        if live:
+            log.info("presence: the camera leg is live -- his number one "
+                     "signal can vote")
+            return True
+        log.warning(
+            "presence: HIS NUMBER ONE SIGNAL IS DARK. Nothing on this tree "
+            "assigns services.camera_feed, so the camera leg answers "
+            '"could not look" to everything and never votes. The verdict is '
+            "standing on the phone and the room sensors only, in that "
+            "order. It goes live by itself the moment a feed is attached.")
+        return False
 
     def _make_room_light(self):
         mod = _import_optional("jarvis.room")
@@ -1588,6 +1643,47 @@ class JarvisApp:
             return ""
         return str(getattr(state, "identity", "") or "")
 
+    def _eye_leg(self):
+        """(identity, faces, live) for the camera leg of the three-leg
+        voter. A NAME AND A COUNT, NEVER A FRAME.
+
+        ``live`` is the whole value of this leg and the reason tonight is
+        not covered by his rule 1. A camera that is off, inside its curfew,
+        or -- as on this box today -- never attached to
+        ``services.camera_feed`` at all has NOT "failed to see him". It did
+        not look, and its silence is not evidence of an empty room. Only a
+        usable feed reporting a face count has actually looked.
+
+        NOTHING IN THIS TREE EVER ASSIGNS ``services.camera_feed`` (grep
+        for "camera_feed ="), so this returns ("", None, False) -- BLIND --
+        unconditionally today, and the camera leg is a stub with a real
+        shape rather than a leg that votes. campreview builds its own feed
+        and logs "no services.camera_feed" instead.
+        """
+        feed = getattr(getattr(self, "services", None), "camera_feed", None)
+        eye = getattr(feed, "eye", None)
+        state = getattr(eye, "state", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:                      # noqa: BLE001 - the eye
+                return ("", None, False)
+        if state is None:
+            return ("", None, False)
+        usable = getattr(state, "usable", None)
+        try:
+            live = bool(usable()) if callable(usable) else bool(usable)
+        except Exception:                          # noqa: BLE001 - the eye
+            return ("", None, False)
+        if not live:
+            return ("", None, False)
+        faces = getattr(state, "faces", None)
+        try:
+            faces = None if faces is None else int(faces)
+        except (TypeError, ValueError):
+            faces = None
+        return (str(getattr(state, "identity", "") or ""), faces, True)
+
     def _spotify_transfer(self, device):
         """HpcomputerSink's one working route: a TRACK moves by Spotify's
         own outbound connection (the firewall does not block it)."""
@@ -1920,10 +2016,12 @@ class JarvisApp:
         """
         now = time.monotonic()
         last = getattr(self, "_last_greeted", 0.0)
-        if last and now - last < GREET_DAMPER_S:
-            log.info("presence: %s return within the damper; not greeting again",
-                     source)
-            return
+        if last:
+            why = arrival_mod.greet_refusal(source=source, since_s=now - last,
+                                            damper_s=GREET_DAMPER_S)
+            if why:
+                log.info("arrival: no greeting -- %s", why)
+                return
         # GREET AT THE DOOR, ASK AT THE DESK. The catch-up is dropped from
         # the door plan and owed to his desk -- but ONLY if some leg can
         # actually deliver it there (_settle_legs). A deferral nothing can
@@ -2692,6 +2790,7 @@ class JarvisApp:
             door = getattr(self, "_door", None)
             if door is not None:
                 door.left()
+            self._departure_seq_phone(ev)
             self._arm_departure(ev)
             return
         if ev.returned:
@@ -2708,6 +2807,9 @@ class JarvisApp:
             # not say "Welcome back, sir" a second time.
             self._greet_return("phone")
             return
+        seq = getattr(self, "_departure_seq", None)
+        if seq is not None:
+            seq.home(at=time.time())      # a genuine second outing is a new one
         # Home but not a return (a poll that merely confirms he is here):
         # the console gets the state, nothing is spoken.
         bus.publish(Status(text="Home", kind="info"))
@@ -2743,6 +2845,7 @@ class JarvisApp:
         spend it.
         """
         self._door_from_room(ev)
+        self._departure_seq_room(ev)
         # A NAME, never a frame. _eye_identity answers "" for a camera
         # that is off, blind, or inside its 21:00-07:00 curfew, and "" is
         # no opinion rather than an absence.
@@ -2754,13 +2857,26 @@ class JarvisApp:
         self._settle(room=getattr(ev, "room", "") or "", camera=seen)
 
     def _door_from_room(self, ev) -> None:
-        """The door half of _on_room_changed. See its docstring."""
+        """The door half of _on_room_changed. See its docstring.
+
+        EVERY REFUSAL HERE NAMES ITS GATE, at INFO, once per reason.
+        On 2026-09-05 he walked in at 20:43:13, the fabric published the
+        kitchen, and nothing happened -- no arrival line, no greeting, and
+        no word anywhere on disk about which gate had said no. The refusal
+        was arguably correct (the sentinel had never reached "away",
+        because a latched office pinned the house occupied); the SILENCE
+        was the defect. DoorWatch.observe now writes the reason itself.
+        """
         door = getattr(self, "_door", None)
         if door is None:
             return
-        away = getattr(getattr(self, "presence", None), "state", "") == "away"
+        # The sentinel's own verdict WORD, not a bool: "home" and "unknown"
+        # both refuse here, and telling them apart in the log is the whole
+        # point at boot.
+        state = getattr(getattr(self, "presence", None), "state", "") or "unknown"
         try:
-            if not door.observe(room=getattr(ev, "room", ""), away=away):
+            if not door.observe(room=getattr(ev, "room", ""),
+                                away=(state == "away"), state=state):
                 return
         except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
             log.exception("arrival: the door watch failed")
@@ -2768,6 +2884,65 @@ class JarvisApp:
         log.info("arrival: %s is the door and the house was away",
                  getattr(ev, "room", "?"))
         self._greet_return("room:%s" % (getattr(ev, "room", "") or "?"))
+
+    def _make_departure_seq(self):
+        """office -> kitchen -> the phone drops. None if it cannot be built:
+        a missing sequence costs the log line, never the presence leg."""
+        try:
+            from jarvis import presencevote
+            get = self.assistant.get if self.assistant is not None else \
+                (lambda k, d=None: d)
+            return presencevote.DepartureSequence(
+                # ``presence.desk_room``, NOT ``presence.desk`` -- the
+                # latter is deskpresence.py's boolean switch and is True on
+                # his box, which made this sequence compare every room
+                # against "True" and never arm. Same key ``self._desk``
+                # already uses. tests/test_presence_desk_key.py pins it.
+                desk_room=str(get("presence.desk_room",
+                                  arrival_mod.DEFAULT_DESK_ROOM)
+                              or arrival_mod.DEFAULT_DESK_ROOM),
+                door_room=str(get("presence.door_room",
+                                  arrival_mod.DEFAULT_DOOR_ROOM)
+                              or arrival_mod.DEFAULT_DOOR_ROOM))
+        except Exception:  # noqa: BLE001 - optional lane
+            log.exception("departure: the sequence could not be built")
+            return None
+
+    def _departure_seq_room(self, ev) -> None:
+        """HIS departure rule: "if you see office sensor then kitchen then
+        phone disconnect assume he left the building".
+
+        An ORDERED sequence with a window, not three independent facts --
+        three facts that merely happen to be true together would fire on
+        him making coffee and then his phone napping in his pocket. The
+        ORDER is what makes it a departure, because his flat is a corridor
+        and leaving means passing the kitchen after the office and then
+        going out of range. See presencevote.DepartureSequence for the two
+        windows and why they are 120 s and 900 s.
+
+        SILENT. There is no speak path here and there must never be one:
+        arrival.py is explicit that a valediction to an empty room is a
+        notification pretending to be a presence.
+        """
+        seq = getattr(self, "_departure_seq", None)
+        if seq is None:
+            return
+        try:
+            seq.room(room=getattr(ev, "room", ""), at=time.time())
+        except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
+            log.debug("departure: the sequence failed", exc_info=True)
+
+    def _departure_seq_phone(self, ev) -> None:
+        """The third step: his phone stopped answering."""
+        seq = getattr(self, "_departure_seq", None)
+        if seq is None:
+            return
+        try:
+            import jarvis.presencevote as _pv
+            if seq.phone_gone(at=time.time()):
+                log.info("%s", _pv.departure_note(seq))
+        except Exception:  # noqa: BLE001
+            log.debug("departure: the sequence failed", exc_info=True)
 
     # ------------------------------------------------------ departure
     def _cancel_departure(self) -> None:
@@ -3116,6 +3291,19 @@ class JarvisApp:
             except Exception:
                 log.exception("barge-in interrupt failed")
         self.turns.mark("wake")            # accepted: this turn starts now
+        # THE MIC IS THE FOURTH LEG, and it is the one corroboration source
+        # neither the phone nor the camera can supply: he just spoke, so he
+        # is in the flat whatever his phone's radio is doing. It feeds the
+        # stuck-room detector (jarvis/stuckroom.py), which is what tells a
+        # radar latched on by a fan apart from a man sitting still at his
+        # desk. arrival.departure_ready already reads the same ledger for
+        # its own 10-minute veto.
+        try:
+            presence = getattr(self, "presence", None)
+            if presence is not None and hasattr(presence, "corroborate"):
+                presence.corroborate("mic")
+        except Exception:  # noqa: BLE001 - never block a turn
+            log.debug("presence: mic corroboration failed", exc_info=True)
         # The power-up sweep's fallback trigger. Presence is idle until
         # phone_ip is configured (it is not, on this box), so without this
         # the feature would never fire on the machine that runs it. The date
