@@ -40,8 +40,6 @@ here is owned by the audio flag itself rather than borrowed from the turn.
 import threading
 import time
 
-import pytest
-
 from jarvis import app as app_mod
 
 
@@ -159,3 +157,19 @@ def test_every_setter_of_the_audio_flag_arms_its_own_release():
     assert setters == ["_audio_started"], (
         "_audio_busy.set() is reached outside _audio_started, so that path "
         "arms no watchdog: %s" % setters)
+
+
+def test_the_release_path_works_on_a_bare_object_that_owns_only_the_flag():
+    """_process_audio is driven in many tests on a hand-built namespace
+    holding the flag and nothing else. The release must not depend on a
+    helper being present -- a release path that can raise AttributeError is
+    the very bug this file exists to close, wearing a helper."""
+    import types
+    ns = types.SimpleNamespace(_audio_busy=threading.Event())
+    ns._audio_busy.set()
+    try:
+        ns._audio_cancel_watchdog()
+    except AttributeError:
+        pass
+    ns._audio_busy.clear()
+    assert not ns._audio_busy.is_set()

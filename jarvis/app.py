@@ -5597,7 +5597,20 @@ class JarvisApp:
             # word a no-op, which looks exactly like a dead microphone.
             # A `finally` covers a RAISE and NOT A HANG, which is why
             # _audio_started arms a watchdog as well -- see _audio_timed_out.
-            self._audio_finished()
+            #
+            # REACHED DEFENSIVELY, and that is the point rather than a
+            # concession. This whole commit exists because the flag was not
+            # released; a release path that can itself raise AttributeError
+            # would be the same bug wearing a helper. The direct clear is
+            # the floor and always runs. (It is also what lets the many
+            # tests that drive this function on a hand-built namespace --
+            # one that owns the flag and nothing else -- keep working
+            # without teaching each of them about the watchdog.)
+            try:
+                self._audio_cancel_watchdog()
+            except AttributeError:
+                pass
+            self._audio_busy.clear()
 
     # The Tier-1 probe is a whole-utterance matcher ("volume 40",
     # "cancel my alarm", "full brightness"), not a keyword search, so a
