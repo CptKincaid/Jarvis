@@ -30,6 +30,9 @@ class Stub:
     _people_open_unlock = app_mod.JarvisApp._people_open_unlock
     _people_write = app_mod.JarvisApp._people_write
     _people_write_now = app_mod.JarvisApp._people_write_now
+    # The ONE administrative decision, asked by all seven doors now
+    # rather than written out inside _people_write_now.
+    _people_decide = app_mod.JarvisApp._people_decide
     people_snapshot = app_mod.JarvisApp.people_snapshot
     people_unlock = app_mod.JarvisApp.people_unlock
     people_add = app_mod.JarvisApp.people_add

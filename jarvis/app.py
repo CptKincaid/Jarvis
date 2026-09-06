@@ -71,6 +71,7 @@ from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
+from jarvis import enrolentry
 from jarvis import gate as gate_mod
 from jarvis import honorific as honorific_mod
 from jarvis import passphrase as pp
@@ -317,6 +318,47 @@ ARRIVAL_MAIL_LIMIT = 25
 # (see speak_catch_up: it is not even taken until this has passed).
 ARRIVAL_CATCH_UP_LATENESS_S = 10.0
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
+# The SAME rule for the other flag, and it is not the same number. This one
+# bounds a Whisper decode plus the routing behind it, and a long clip on
+# this box's CPU path measures ~20 s, so the bar is well clear of an
+# honest slow turn and still short enough that he does not sit there
+# saying the wake word into a dead microphone. MEASURED 2026-09-06: he
+# was locked out for 62 minutes because nothing bounded this at all.
+AUDIO_TIMEOUT_S = 90.0          # watchdog: a hung decode must not wedge the mic
+
+
+def _stuck_thread_stack(thread) -> list:
+    """The stack of ``thread`` as it stands NOW, one line per frame, innermost
+    last -- or one line saying why there is none. Pure and never raises: a
+    diagnostic that can itself fail inside a watchdog is worse than none.
+
+    ``sys._current_frames()`` is the whole trick: it needs no ptrace and no
+    root, only the thread's ident, so it works under the account that could
+    not run py-spy. The frame is a snapshot and may be a few instructions
+    stale by the time it is formatted; for "what is it waiting on" that is
+    more than enough.
+    """
+    import sys
+    import traceback
+    if thread is None:
+        return ["no decode thread recorded"]
+    try:
+        if not thread.is_alive():
+            return ["the decode thread has already exited (name=%s)"
+                    % getattr(thread, "name", "?")]
+        frame = sys._current_frames().get(thread.ident)
+        if frame is None:
+            return ["the decode thread is alive but has no frame (ident=%r)"
+                    % thread.ident]
+        lines = traceback.format_stack(frame)
+        out = ["decode thread %r is standing here (innermost last):"
+               % getattr(thread, "name", "?")]
+        for chunk in lines[-12:]:
+            out.extend(ln.rstrip() for ln in chunk.splitlines() if ln.strip())
+        return out
+    except Exception as exc:                   # noqa: BLE001 - diagnostic
+        return ["the decode thread's stack could not be read: %s"
+                % type(exc).__name__]
 
 # The sources that arrive from somewhere other than this desk: a shell /
 # SSH / cron client and a clip sent over the command socket
@@ -5205,9 +5247,16 @@ class JarvisApp:
             self.turns.abandon("no_audio")
             self._nudge("no_audio")
             return
-        self._audio_busy.set()
-        threading.Thread(target=self._process_audio, args=(audio,),
-                         daemon=True).start()
+        self._audio_started()
+        t = threading.Thread(target=self._process_audio, args=(audio,),
+                             daemon=True, name="audio-decode")
+        # Remembered so the watchdog can print WHERE this thread is if it
+        # never comes back. On 2026-09-06 nobody could say where the decode
+        # hung -- py-spy needs a privilege this account does not have -- and
+        # the fix had to be a timeout over an unknown. Next time the log
+        # says which line it was standing on.
+        self._audio_thread = t
+        t.start()
 
     # ------------------------------------------------------- the owner gate
     def _face_running(self) -> bool:
@@ -5587,6 +5636,21 @@ class JarvisApp:
         finally:
             # Must run on every path: a leaked flag makes every future wake
             # word a no-op, which looks exactly like a dead microphone.
+            # A `finally` covers a RAISE and NOT A HANG, which is why
+            # _audio_started arms a watchdog as well -- see _audio_timed_out.
+            #
+            # REACHED DEFENSIVELY, and that is the point rather than a
+            # concession. This whole commit exists because the flag was not
+            # released; a release path that can itself raise AttributeError
+            # would be the same bug wearing a helper. The direct clear is
+            # the floor and always runs. (It is also what lets the many
+            # tests that drive this function on a hand-built namespace --
+            # one that owns the flag and nothing else -- keep working
+            # without teaching each of them about the watchdog.)
+            try:
+                self._audio_cancel_watchdog()
+            except AttributeError:
+                pass
             self._audio_busy.clear()
 
     # The Tier-1 probe is a whole-utterance matcher ("volume 40",
@@ -5855,7 +5919,94 @@ class JarvisApp:
         log.warning("turn watchdog fired after %.0fs; releasing the wake word",
                     self._turn_timeout_s)
         self._turn_finished()
+        # AND THE OTHER FLAG, because this line promises the wake word back.
+        # On 2026-09-06 it cleared _turn_busy, printed exactly that sentence,
+        # and left _audio_busy set -- so the wake word stayed dead and every
+        # hotword for the next two minutes logged "still transcribing the
+        # previous clip". Releasing one half of a two-flag gate is not
+        # releasing the gate.
+        self._audio_finished(reason="the turn watchdog")
         self.turns.abandon("timeout")
+
+    # ------------------------------------------- the audio flag and its clock
+    def _audio_started(self) -> None:
+        """Hold the microphone gate for this clip, and arm its release.
+
+        THE FLAG IS THE EASY HALF. `_process_audio` runs on its own daemon
+        thread and clears the flag in a `finally`, which covers every way
+        that function can RAISE and no way it can HANG. A hang is what
+        happened on 2026-09-06: the thread never returned, the finally never
+        ran, and `_should_record` dropped five wake words at 0.85-0.98
+        confidence over ninety seconds with the line "still transcribing the
+        previous clip". He described it as soft locked, and it stayed that
+        way for 62 minutes until the process was killed.
+
+        The watchdog is the half that survives a hang. It is armed here
+        rather than in the caller so there is ONE place that sets this flag
+        and it cannot be set without a release being armed -- pinned by the
+        census in tests/test_audio_busy_never_wedges.py.
+        """
+        self._audio_busy.set()
+        self._audio_cancel_watchdog()
+        try:
+            timeout = float(getattr(self, "_audio_timeout_s", AUDIO_TIMEOUT_S))
+            self._audio_watchdog = threading.Timer(timeout,
+                                                   self._audio_timed_out)
+            self._audio_watchdog.daemon = True
+            self._audio_watchdog.start()
+        except Exception:      # noqa: BLE001 - a timer we cannot arm is not
+            # a reason to refuse the clip; it is a reason to say so. The
+            # flag is still cleared by the finally on every non-hang path.
+            log.exception("audio watchdog could not be armed; a hung decode "
+                          "would wedge the wake word")
+
+    def _audio_finished(self, reason: str = "") -> None:
+        """Release the gate and disarm the clock. Safe to call twice."""
+        self._audio_cancel_watchdog()
+        if reason and self._audio_busy.is_set():
+            log.warning("audio flag released by %s", reason)
+        self._audio_busy.clear()
+
+    def _audio_cancel_watchdog(self) -> None:
+        t = getattr(self, "_audio_watchdog", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:  # noqa: BLE001 - a dead timer is already off
+                log.debug("audio watchdog cancel failed", exc_info=True)
+            self._audio_watchdog = None
+
+    def _audio_timed_out(self) -> None:
+        """The decode never came back. Give him his microphone.
+
+        The orphan thread is left to finish or not: it holds no lock, its
+        own finally clears an already-clear flag, and the turn machinery
+        stamps replies with a sequence so a late one cannot be mistaken for
+        an answer to the next question. Waiting for a thread that is by
+        definition stuck is the one thing that must not happen here.
+        """
+        self._audio_watchdog = None
+        if not self._audio_busy.is_set():
+            return
+        log.error("audio watchdog fired after %.0fs: the last clip never "
+                  "finished decoding. Releasing the wake word -- it was "
+                  "being dropped as 'still transcribing the previous clip'.",
+                  float(getattr(self, "_audio_timeout_s", AUDIO_TIMEOUT_S)))
+        # THE INSTRUMENT. Where is the decode thread standing right now?
+        # This is the question nobody could answer on 2026-09-06, and it is
+        # answerable from inside the process with no privilege at all.
+        for line in _stuck_thread_stack(getattr(self, "_audio_thread", None)):
+            log.error("audio watchdog: %s", line)
+        self._audio_busy.clear()
+        try:
+            bus.publish(Status(text="Sorry, sir -- I lost that one",
+                               kind="warn"))
+        except Exception:      # noqa: BLE001 - the UI is not the point here
+            log.debug("could not publish the lost-clip status", exc_info=True)
+        try:
+            self.turns.abandon("audio_timeout")
+        except Exception:      # noqa: BLE001 - the ledger is not the point
+            log.debug("could not abandon the turn", exc_info=True)
 
     def _turn_cancel_timers(self):
         for name in ("_turn_timer", "_turn_watchdog"):
@@ -6013,6 +6164,27 @@ class JarvisApp:
         but the arbiter is a depth counter rather than a mutex, so without the
         wait we would happily record Jarvis asking the question.
         """
+        # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens. The
+        # arbiter cannot do this: it is a re-entrant DEPTH COUNTER whose only
+        # job is pausing the hotword, so two consumers on two threads both
+        # get their context manager and both proceed, and record_fixed's own
+        # `self.recording` guard is a flag it never sets. Found by the
+        # verdict that cleared the enrolment lane, 2026-09-05: the new
+        # exclusion covered the two enrolment runs and `runs_live` appeared
+        # nowhere in this file, so the other two doors were never taught to
+        # ask. Pinned by tests/test_mic_one_consumer_everywhere.py, whose
+        # census fails on any new caller of record_fixed that does not ask.
+        try:
+            from jarvis.voicerun import runs_live
+            live = runs_live(getattr(self, "services", None))
+        except Exception:      # noqa: BLE001 - an unreadable seam is not a yes
+            log.debug("mic: could not ask which enrolments are live",
+                      exc_info=True)
+            live = ("unknown",)
+        if live:
+            log.info("uncertain: not asking aloud -- a %s enrolment is "
+                     "running and it owns the microphone", "/".join(live))
+            return
         try:
             if CONFIG.talkback:
                 self.tts.speak("Was that for me?", block=True)
@@ -6583,15 +6755,62 @@ class JarvisApp:
     def calibrate_noise(self):
         return self.recorder.calibrate_noise()
 
+    ENROLL_SPEAKER_GONE = (
+        "That button is gone, sir. Enrol your voice on the Users tab.")
+
     def enroll_speaker(self):
-        audio = self.recorder.record_fixed(15)
-        if audio is not None and len(audio) > 0:
-            ok, n = self.speaker.enroll_from_audio(audio)
-            bus.publish(Status(
-                text=f"Voice enrolled ({n} samples)" if ok else "Enrollment failed",
-                kind="ok" if ok else "error"))
+        """REMOVED, and it refuses rather than simply going missing.
+
+        WHAT IT USED TO DO, and it was one click deep in the settings drawer
+        next to a slider: record a fixed fifteen seconds of whatever the room
+        contained and hand it to ``speaker.enroll_from_audio``, which APPENDS
+        one embedding to ``voiceprint.npz``. No loudness floor. No cohesion
+        check. No separation check. No consent, no gate, no owner check, no
+        label -- and no undo, because that file is written tmp->replace with
+        no generations and nothing to roll back to. There was no way to tell
+        whose voice it took: the microphone arbiter is a re-entrant depth
+        counter rather than a mutex, TTS holds it for talkback, and there is
+        no AEC on this box, so pressing it while Jarvis was mid-sentence
+        appended JARVIS'S OWN VOICE to the file his identity rests on.
+
+        IT IS A REFUSAL RATHER THAN A DELETION because a method that simply
+        vanished would take an AttributeError somewhere at the worst moment,
+        and because a stale wiring elsewhere should be told what to use, not
+        silently do nothing.
+
+        The replacement is ``voice_enrol_start`` -- jarvis/voicerun.py: the
+        microphone taken once for the whole run, a loudness floor per take,
+        the pool judged by the SHARED bars before a single write, a stored
+        consent attestation, and a generation that can be rolled back.
+        """
+        log.warning("enroll_speaker: refused -- the unjudged 15 s append was "
+                    "removed; use the Users tab (voice_enrol_start)")
+        bus.publish(Status(text=self.ENROLL_SPEAKER_GONE, kind="warn"))
+        return False, self.ENROLL_SPEAKER_GONE
 
     def train_wakeword(self):
+        # ONE CONSUMER ON THE MICROPHONE, asked BEFORE a device opens. The
+        # arbiter cannot do this: it is a re-entrant DEPTH COUNTER whose only
+        # job is pausing the hotword, so two consumers on two threads both
+        # get their context manager and both proceed, and record_fixed's own
+        # `self.recording` guard is a flag it never sets. Found by the
+        # verdict that cleared the enrolment lane, 2026-09-05: the new
+        # exclusion covered the two enrolment runs and `runs_live` appeared
+        # nowhere in this file, so the other two doors were never taught to
+        # ask. Pinned by tests/test_mic_one_consumer_everywhere.py, whose
+        # census fails on any new caller of record_fixed that does not ask.
+        try:
+            from jarvis.voicerun import runs_live
+            live = runs_live(getattr(self, "services", None))
+        except Exception:      # noqa: BLE001 - an unreadable seam is not a yes
+            log.debug("mic: could not ask which enrolments are live",
+                      exc_info=True)
+            live = ("unknown",)
+        if live:
+            bus.publish(Status(
+                text="Finish the %s enrolment first" % "/".join(live),
+                kind="error"))
+            return
         from jarvis.hotword import train_verifier
         samples = []
         for _ in range(3):
@@ -6897,6 +7116,15 @@ class JarvisApp:
             out["gallery"] = list(gallery_labels())
         except Exception:                          # noqa: BLE001 - optional
             log.exception("users: the gallery labels could not be listed")
+        try:
+            # THE VOICE GALLERY'S LABELS TOO. Without them the tab cannot say
+            # who has a voice pool, and a chip that ASSERTED nobody but the
+            # owner could have one is exactly the stale sentence he caught in
+            # the foot note, one chip over. Labels are strings stored beside
+            # the embeddings; nothing here opens a microphone.
+            out["voices"] = list(voice_labels())
+        except Exception:                          # noqa: BLE001 - optional
+            log.exception("users: the voice labels could not be listed")
         return out
 
     def _people_registry(self) -> tuple:
@@ -7094,15 +7322,12 @@ class JarvisApp:
         registry, why = self._people_registry()
         if registry is None:
             return False, why
-        state, why = gate_mod.admin_gate(registry)
-        if state == gate_mod.ADMIN_REFUSE:
+        # THE DECISION IS ASKED ONCE, in one place, by all seven doors now
+        # -- see _people_decide. It was written out here and nowhere else,
+        # which was right while this was the only door.
+        ok, why, state = self._people_decide(registry, what, now)
+        if not ok:
             return False, why
-        if (state == gate_mod.ADMIN_CODE
-                and self._people_unlock_left(now=now) <= 0.0):
-            # The name of the action and nothing else. What was typed is
-            # not here to be logged, and must never become loggable.
-            log.info("users: %s refused -- the override code is owed", what)
-            return False, gate_mod.ADMIN_CODE_OWED
         try:
             ok, line = change(registry)
         except Exception:                          # noqa: BLE001 - a boundary
@@ -7173,12 +7398,20 @@ class JarvisApp:
         return self._people_write("set-role", change, now=now)
 
     def people_forget(self, label, *, now=None) -> tuple:
-        """Remove a row, and SAY WHAT SURVIVED IT.
+        """Remove a row, and SAY WHAT SURVIVED IT -- from the galleries
+        themselves, not from a guess.
 
         MEASURED in ``identity.Registry.forget``: it removes the row and
         nothing else. The face gallery entry is untouched, so a line that
         said only "forgotten" would leave him believing a gallery was
         scrubbed when it was not.
+
+        IT NAMED ONLY THE FACE HALF, and after the voice gallery merged that
+        was the same half-truth one store over: a pool under that label could
+        outlive the row with nothing in this line to say so. It is asked of
+        both galleries now, AFTER the write, and it names the store rather
+        than "that command" -- because by the time he reads this the row and
+        its buttons are gone, and the terminal is what is left.
         """
         who = str(label or "").strip().lower()
 
@@ -7186,11 +7419,291 @@ class JarvisApp:
             ok, why = registry.forget(who)
             if not ok:
                 return False, why
-            return True, ("%s is forgotten here. Their face measurements "
-                          "stay in the gallery until that command is run."
-                          % who)
+            return True, "%s is forgotten here.%s" % (who,
+                                                      _survivors_line(who))
 
         return self._people_write("forget", change, now=now)
+
+    # ------------------------------------------- the four things the tab may do
+    def _people_decide(self, registry, what, now) -> tuple:
+        """``(ok, line, state)`` for a registry we have already re-read.
+
+        THE ONE DECISION. It used to live inline in ``_people_write_now`` and
+        it is now asked by six more doors -- setting a passphrase, asking for
+        a new code, starting a face run, starting a voice run and the two
+        gallery purges -- so it is a function rather than a paragraph copied
+        seven times. A copy is how one of those doors comes to ask a slightly
+        different question, and the door that drifted would be the one nobody
+        was watching.
+        """
+        state, why = gate_mod.admin_gate(registry)
+        if state == gate_mod.ADMIN_REFUSE:
+            return False, why, state
+        if (state == gate_mod.ADMIN_CODE
+                and self._people_unlock_left(now=now) <= 0.0):
+            # The name of the action and nothing else. What was typed is not
+            # here to be logged, and must never become loggable.
+            log.info("users: %s refused -- the override code is owed", what)
+            return False, gate_mod.ADMIN_CODE_OWED, state
+        return True, "", state
+
+    def _people_gate(self, what: str, *, now=None) -> tuple:
+        """``(ok, line)`` -- may this keyboard change anything right now?
+
+        RE-READ FROM DISK, every time, for the same reason ``_people_write``
+        re-reads: the terminal tool is a separate process and a decision made
+        from a memory of the file is a decision about a file that may no
+        longer exist in that shape.
+
+        This is what the seams that are NOT registry writes ask -- starting a
+        camera, starting a microphone, destroying a gallery. Each of those is
+        a write to something at least as irreversible as the people book, so
+        none of them gets an easier question than ``forget`` does.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False, "the owner gate is not built; see the log"
+        registry, why = self._people_registry()
+        if registry is None:
+            return False, why
+        ok, line, _state = self._people_decide(registry, what, now)
+        return ok, line
+
+    def people_set_phrase(self, label, hashed, *, now=None) -> tuple:
+        """Store an ALREADY-HASHED spoken passphrase. ``(ok, line)``.
+
+        THE PLAINTEXT NEVER ARRIVES HERE. Hashing happens in the caller's own
+        frame -- ``ui.users_page.UsersSecretControl`` reads two masked boxes,
+        empties them, compares, hashes and deletes -- and this seam, like
+        ``identity.Registry.set_secret`` below it, cannot leak a passphrase
+        because it has never been handed one.
+
+        WHY THIS ONE MAY BE TYPED ON SCREEN WHEN THE OVERRIDE CODE MAY NOT,
+        and the distinction is the feature rather than an inconsistency: the
+        spoken passphrase is SAID OUT LOUD in normal use, and
+        ``scripts/jarvis_people.py`` says so in its own text -- "it can be
+        overheard; that is accepted". A secret whose threat model already
+        accepts being overheard is not made materially worse by a masked box
+        on his own console. The code exists precisely because it never touches
+        a microphone, so that argument does not transfer and there is no
+        seam here that sets one.
+
+        AN EMPTY HASH IS REFUSED. Clearing a phrase looks exactly like setting
+        one from the outside and it takes away a way back in; removing it is
+        the terminal's job, where the refusal can be spelled out.
+        """
+        who = str(label or "").strip().lower()
+        hashed = str(hashed or "")
+        if not hashed:
+            return False, ("nothing was changed, sir: an empty passphrase "
+                           "would take away a way back in rather than set "
+                           "one")
+
+        def change(registry):
+            ok, why = registry.set_secret(who, "phrase_hash", hashed)
+            if not ok:
+                return False, why
+            return True, ("Set, sir. It is stored salted-hashed; nothing "
+                          "here can read it back.")
+
+        return self._people_write("set-phrase", change, now=now)
+
+    def people_new_code(self, *, mail=None, smtp=None, now=None) -> tuple:
+        """"Send me a new code", from the tab. ``(ok, line)``.
+
+        NO SECOND ROTATE IS WRITTEN. ``_knightfall_rotate`` already gets the
+        order right in a way that cannot be reordered by accident -- generate,
+        MAIL FIRST, store only on a returned Message-ID, re-read the registry
+        immediately before writing, and put the old hash back in memory when
+        the store fails -- and every one of its failure paths leaves a code
+        that works. This adds the administrative gate in front of it and
+        nothing else.
+
+        ``ok`` IS READ OFF THE LINE THE ROTATE RETURNED, never off "the call
+        did not raise": ``KNIGHTFALL_NEW_OK_LINE`` is the one answer that
+        means a code both left this machine and was stored.
+
+        AND IT CAN CHANGE WHAT THE MICROPHONE DOES. ``gate._mode_unsafe``
+        downgrades enforce to SHADOW while no owner row carries a code,
+        because a wrong verdict would otherwise have no way back in. Setting
+        the FIRST code lifts that downgrade -- so on a box configured
+        ``owner.mode=enforce`` but running in shadow for want of a code, this
+        press starts refusing turns. It is stated on the panel BEFORE he
+        presses (``ui.users_page.code_panel_lines``) and logged here when it
+        happens; it is not closed by refusing, because a box with no code is
+        the state that most needs one.
+        """
+        ok, line = self._people_gate("new-code", now=now)
+        if not ok:
+            return False, line
+        before = self._gate_mode_quietly()
+        line = self.knightfall_new_code(mail=mail, smtp=smtp, now=now)
+        landed = (line == KNIGHTFALL_NEW_OK_LINE)
+        after = self._gate_mode_quietly()
+        if landed and before != after:
+            log.warning("users: the new code lifted the enforce->shadow "
+                        "downgrade; the owner gate is now %s (was %s)",
+                        after, before)
+            line = line + " The gate is now %s: it was running in %s because " \
+                          "no code was set." % (after, before)
+        return landed, line
+
+    def _gate_mode_quietly(self) -> str:
+        """The live gate mode, or "" -- never a raise. Read either side of a
+        code being stored so the tab can SAY when the press changed it."""
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return ""
+        try:
+            return str(gate.effective_mode())
+        except Exception:                          # noqa: BLE001 - a read
+            log.debug("users: the gate mode could not be read", exc_info=True)
+            return ""
+
+    # ------------------------------------------------------ enrolling, in app
+    def face_enrol_start(self, *, now=None) -> tuple:
+        """Start the in-app FACE enrolment from the tab. ``(ok, line)``.
+
+        IT TAKES NO LABEL, and that is structural rather than an omission.
+        ``enrolrun`` forces ``identity.owner_label`` by construction, for a
+        reason a window cannot get round: enrolling somebody else stores a
+        measurement of them, so they must read what is kept and type their own
+        name, and a dialog is driven by whoever is already logged in. A seam
+        that ACCEPTED a label would be the door round that, so it has not got
+        one. A guest row hands over the command instead.
+
+        THE BUTTON IS STRICTER THAN THE VOICE PATH TO THE SAME WRITE, and he
+        is told rather than left to find it. Asking Jarvis out loud to enrol
+        his face still commits on one typed word and never asks for the
+        override code; this asks. That asymmetry is the right direction and it
+        is written on the tab (``users_page.ENROL_ASYMMETRY``) rather than
+        closed by loosening the button.
+        """
+        ok, line = self._people_gate("face-enrol", now=now)
+        if not ok:
+            return False, line
+        services = getattr(self, "services", None)
+        ok, reply, _run = _launch_face_run(
+            cfg=getattr(self, "assistant", None), services=services,
+            sensing=getattr(self, "sensing", None), say=self._enrol_say)
+        return bool(ok), reply
+
+    def face_enrol_stop(self) -> tuple:
+        """Stop a running face enrolment. ``(ok, line)``.
+
+        NEVER GATED. Stopping is the safe direction and takes the widest door
+        -- the rule ``Commander._enrol_control`` already follows for the
+        spoken stop. A code owed must never be the reason a lens stays open.
+        """
+        return self._stop_run("enrol_run", "the camera is off")
+
+    def voice_enrol_start(self, *, now=None) -> tuple:
+        """Start the in-app VOICE enrolment from the tab. ``(ok, line)``.
+
+        Same shape and the same reasoning as the face seam, plus the one the
+        camera does not have: the microphone is taken for the whole run, so
+        the wake word is deaf and his abort has to be the Stop button. The run
+        says that out loud before the first take.
+        """
+        ok, line = self._people_gate("voice-enrol", now=now)
+        if not ok:
+            return False, line
+        return _launch_voice_run(self, now=now)
+
+    def voice_enrol_stop(self) -> tuple:
+        return self._stop_run("voice_run", "the microphone is back")
+
+    def _stop_run(self, slot: str, tail: str) -> tuple:
+        services = getattr(self, "services", None)
+        run = getattr(services, slot, None)
+        if run is None:
+            return False, "Nothing is running, sir."
+        try:
+            run.abort()
+        except Exception:                          # noqa: BLE001 - a run
+            log.exception("users: %s could not be stopped", slot)
+            return False, "That would not stop, sir; see the log."
+        return True, "Stopped, sir. Nothing was written and %s." % tail
+
+    def _enrol_say(self, text: str) -> None:
+        """The run's spoken channel, through the app's own speaker."""
+        try:
+            self.speak(text)
+        except Exception:                          # noqa: BLE001 - TTS
+            log.debug("users: the enrolment line could not be spoken",
+                      exc_info=True)
+
+    # ------------------------------------------------- destroying a gallery
+    def people_purge_face(self, label, *, now=None) -> tuple:
+        """Destroy one person's FACE measurements, everywhere. ``(ok, line)``.
+
+        ``ok`` IS ``complete`` AND NOTHING ELSE. ``facegallery.purge_label``
+        destroys no file until the embeddings it held, MINUS theirs, have been
+        read back off disk from the new generation by name and by sample
+        count -- and it reports, in numbers, every generation it could not
+        read, that another model wrote, or that holds a bystander it could not
+        carry. A surface that rounded an incomplete purge up to "done" would
+        be exactly the class of defect the foot note was just corrected for,
+        so the line is built from those numbers and the answer is the
+        invariant's own verdict.
+        """
+        return self._purge("face", label, now=now)
+
+    def people_purge_voice(self, label, *, now=None) -> tuple:
+        """The same, for the voice gallery. A face purge that left a voice
+        pool behind would be a half-truth of the same shape."""
+        return self._purge("voice", label, now=now)
+
+    def _purge(self, kind: str, label, *, now=None) -> tuple:
+        who = str(label or "").strip().lower()
+        ok, line = self._people_gate("purge-%s" % kind, now=now)
+        if not ok:
+            return False, line
+        if not who:
+            return False, "nobody was named, sir, so nothing was touched"
+        opener = _open_face_gallery if kind == "face" else _open_voice_gallery
+        try:
+            gallery = opener()
+        except Exception:                          # noqa: BLE001 - a store
+            log.exception("users: the %s gallery could not be opened", kind)
+            return False, ("the %s gallery could not be opened, sir; nothing "
+                           "was touched" % kind)
+        if gallery is None:
+            return False, ("there is no %s gallery on this box, sir, so there "
+                           "is nothing to remove" % kind)
+        try:
+            report = gallery.purge_label(who, reason="users tab")
+        except Exception:                          # noqa: BLE001 - a store
+            log.exception("users: the %s purge failed", kind)
+            return False, ("that purge did not run, sir; nothing was "
+                           "destroyed. See the log.")
+        line = enrolentry.purge_line(report, kind=kind)
+        complete = bool((report or {}).get("complete"))
+        log.info("users: %s purge for %s -- complete=%s, removed=%s",
+                 kind, who, complete, (report or {}).get("removed"))
+        # THE LIVE PREVIEW HOLDS A GALLERY IN MEMORY. enrolrun stops the
+        # worker after a save for exactly this reason: a console that goes on
+        # recognising somebody who was destroyed thirty seconds ago is a lie
+        # with a face on it. Stop it, or say "restart to apply" -- never
+        # neither.
+        if kind == "face" and complete and not self._stop_preview_worker():
+            line = line + " Restart Jarvis for the live preview to stop "\
+                          "matching against the old generation."
+        return complete, line
+
+    def _stop_preview_worker(self) -> bool:
+        """Stop the preview's capture so it drops the gallery it is holding.
+        True if it was stopped; False means the caller must say "restart"."""
+        services = getattr(self, "services", None)
+        worker = getattr(services, "preview_worker", None)
+        if worker is None:
+            return False
+        try:
+            worker.stop()
+        except Exception:                          # noqa: BLE001 - a worker
+            log.exception("users: the preview worker would not stop")
+            return False
+        return True
 
     def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
         """THE BOOTSTRAP: "Email me a new Knightfall code". The same
@@ -7445,8 +7958,26 @@ class JarvisApp:
             people_forget=self.people_forget,
             people_admin_state=self.people_admin_state,
             people_relock=self.people_relock,
+            # The eight the USERS tab's enrolment work adds.
+            # people_set_phrase takes a HASH: the plaintext is compared,
+            # hashed and deleted in the page's own frame, so it never crosses
+            # into the app. There is deliberately NO people_set_code -- the
+            # override code's value is that it is GENERATED rather than
+            # chosen, and people_new_code() asks the existing mail-first
+            # rotate for a fresh one instead.
+            people_set_phrase=self.people_set_phrase,
+            people_new_code=self.people_new_code,
+            face_enrol_start=self.face_enrol_start,
+            face_enrol_stop=self.face_enrol_stop,
+            voice_enrol_start=self.voice_enrol_start,
+            voice_enrol_stop=self.voice_enrol_stop,
+            people_purge_face=self.people_purge_face,
+            people_purge_voice=self.people_purge_voice,
             calibrate_noise=self.calibrate_noise,
-            enroll_speaker=self.enroll_speaker,
+            # enroll_speaker IS DELIBERATELY NOT WIRED any
+            # more; see the method for why. The judged
+            # replacement is voice_enrol_start, on the
+            # USERS tab, under the override code.
             train_wakeword=self.train_wakeword,
             open_terminal=self.open_terminal,
             alarm_action=self.alarm_action,
@@ -7489,6 +8020,55 @@ class JarvisApp:
         )
 
 
+def voice_labels() -> tuple:
+    """Every label the VOICE gallery holds, or () -- never a raise.
+
+    Strings beside the embeddings. Nothing here opens a microphone, reads a
+    recording or loads a model, and there is no recording to open: the audio
+    became 192 numbers at the microphone and was thrown away.
+    """
+    try:
+        from jarvis import voicegallery as vg
+        gallery = vg.VoiceGallery()
+        gallery.load()
+        return tuple(gallery.labels())
+    except Exception:                              # noqa: BLE001 - absent
+        log.debug("users: the voice gallery could not be listed",
+                  exc_info=True)
+        return ()
+
+
+def _survivors_line(who: str) -> str:
+    """"" when nothing is left, else what is STILL on the disk under ``who``,
+    named store by store.
+
+    NEVER RAISES and never claims more than it read: a gallery that could not
+    be listed is reported as unknown rather than quietly dropped, because
+    "forgotten" with a silent omission is the exact shape of the sentence
+    this lane exists to stop.
+    """
+    kept, unknown = [], []
+    for kind, lister in (("face measurements", gallery_labels),
+                         ("voice pool", voice_labels)):
+        try:
+            if who in {str(x) for x in lister()}:
+                kept.append(kind)
+        except Exception:                              # noqa: BLE001 - a store
+            log.exception("users: the %s could not be listed after a forget",
+                          kind)
+            unknown.append(kind)
+    out = ""
+    if kept:
+        out += (" Their %s stay on the disk; the row and its buttons are gone,"
+                " so removing them now needs a terminal." % " and their ".join(kept))
+    if unknown:
+        out += (" I could not read the %s, so I can't say whether anything of"
+                " theirs is left there." % " or the ".join(unknown))
+    if not kept and not unknown:
+        out += " Nothing of theirs is left in either gallery."
+    return out
+
+
 def gallery_labels() -> tuple:
     """The face gallery's LABELS, with no lens involved at all.
 
@@ -7508,6 +8088,137 @@ def gallery_labels() -> tuple:
         log.debug("users: the face gallery could not be listed",
                   exc_info=True)
         return ()
+
+
+
+# ---------------------------------------------------- the in-app enrolments
+# MODULE-LEVEL AND THIN ON PURPOSE. These are the places the suite substitutes
+# a stand-in so a seam can be exercised with no camera, no microphone, no
+# model and no gallery on disk. That is not a convenience: the whole feature
+# is verified from NUMBERS -- counts, RMS floors, cosines, generations -- and
+# never by looking at a frame or listening to a take, and a method reaching
+# straight into jarvis.enrolrun would leave no seam to do that through.
+def _launch_face_run(*, cfg, services, sensing, say):
+    """One in-app face enrolment. ``(ok, reply, run)``.
+
+    The SEQUENCE lives in ``enrolrun.launch`` so the tab's button and the
+    spoken offer cannot drift apart; this only hands it the two test seams.
+    """
+    from jarvis import enrolrun as er
+    return er.launch(cfg=cfg, services=services, sensing=sensing, say=say,
+                     preflight_fn=_face_preflight, build_fn=_build_face_run)
+
+
+def _face_preflight(cfg, *, sensing=None, worker=None, services=None):
+    from jarvis import enrolrun as er
+    return er.preflight(cfg, sensing=sensing, worker=worker, services=services)
+
+
+def _build_face_run(**kw):
+    from jarvis import enrolrun as er
+    return er.EnrolRun(**kw)
+
+
+def _open_face_gallery():
+    """The face gallery at its real root, or None on a box without one."""
+    try:
+        from jarvis import facegallery as fg
+        return fg.FaceGallery()
+    except Exception:                              # noqa: BLE001 - absent
+        log.exception("users: the face gallery could not be opened")
+        return None
+
+
+def _open_voice_gallery():
+    try:
+        from jarvis import voicegallery as vg
+        return vg.VoiceGallery()
+    except Exception:                              # noqa: BLE001 - absent
+        log.exception("users: the voice gallery could not be opened")
+        return None
+
+
+def _voiceprint_vectors_quietly():
+    """His stored voiceprint, as the anchor the shared bars measure against.
+    ``[]`` means "no anchor" and every check that uses it stands down."""
+    try:
+        from jarvis import voiceenrol as ve
+        return ve.voiceprint_vectors(PATHS.VOICEPRINT)
+    except Exception:                              # noqa: BLE001 - absent
+        log.debug("users: the voiceprint could not be read as an anchor",
+                  exc_info=True)
+        return []
+
+
+def _speech_seconds(audio) -> float:
+    """Seconds of SPEECH in a take, silence trimmed -- the same measure the
+    terminal script stores, so the two enrolments' numbers are comparable."""
+    from jarvis.speaker import SAMPLE_RATE, trim_silence
+    return float(len(trim_silence(audio))) / float(SAMPLE_RATE)
+
+
+def _launch_voice_run(app, *, now=None) -> tuple:
+    """Preflight, build, park and start ONE in-app voice enrolment.
+
+    THE OWNER ENROLLING HIMSELF IS THE ONLY CASE THIS DOOR OPENS, and the
+    attestation stored with the pool says exactly that -- ``consent.HOW_OWNER``
+    and never "typed", because a console run claiming a terminal ceremony
+    would be a false record on disk and worse than no record at all.
+    """
+    from jarvis import consent as cs
+    from jarvis import earcons as earcons_mod
+    from jarvis import voicerun as vr
+    services = getattr(app, "services", None)
+    cfg = getattr(app, "assistant", None)
+    label = identity_mod.owner_label(cfg)
+    if not label:
+        return False, ("I don't know whose voice that would be, sir -- no "
+                       "owner is set.")
+    recorder = getattr(app, "recorder", None)
+    tts = getattr(app, "tts", None)
+    pre = vr.preflight(recorder=recorder, tts=tts, services=services,
+                       label=label, owner=label, consent_how=cs.HOW_OWNER)
+    if not pre["ok"]:
+        return False, str(pre["reply"])
+    gallery = _open_voice_gallery()
+    if gallery is None:
+        return False, ("there is no voice gallery on this box, sir, so there "
+                       "is nowhere to put it")
+    try:
+        gallery.load()
+    except Exception:                              # noqa: BLE001 - a store
+        log.exception("users: the voice gallery could not be read")
+        return False, ("the voice gallery could not be read, sir; nothing "
+                       "was recorded")
+    speaker = getattr(app, "speaker", None)
+    embed = getattr(speaker, "_extract_embedding", None)
+    if not callable(embed):
+        return False, ("the speaker model isn't loaded, sir, so there is "
+                       "nothing to turn a take into numbers")
+    run = vr.VoiceRun(
+        label=label, gallery=gallery, recorder=recorder, embed=embed,
+        tts=tts, services=services, owner=label, consent_how=cs.HOW_OWNER,
+        say=app._enrol_say,
+        # DISPLAY-ONLY, the same mechanism enrolrun uses: a JarvisReply with
+        # speak=False does not go through context.add_exchange, so the card
+        # of numbers never enters the plaintext journal.
+        card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
+        earcon=lambda name: earcons_mod.play(name, cooldown_s=0.0),
+        owner_vectors=_voiceprint_vectors_quietly(),
+        speech_seconds=_speech_seconds)
+    try:
+        services.voice_run = run
+    except Exception:                              # noqa: BLE001 - slim
+        log.debug("users: could not park the voice run", exc_info=True)
+        return False, "that could not start, sir; see the log"
+    if not run.start():
+        try:
+            if getattr(services, "voice_run", None) is run:
+                services.voice_run = None
+        except Exception:                          # noqa: BLE001 - slim
+            log.debug("users: could not unpark the voice run", exc_info=True)
+        return False, "that could not start, sir; see the log"
+    return True, vr.V1
 
 
 def build_ui_services(services_cls, kwargs: dict):
