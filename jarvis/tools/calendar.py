@@ -2225,9 +2225,15 @@ def coerce_range(value, now: datetime = None) -> str:
     if dated:
         return dated
     # "on monday", "for Monday", "this monday" -- and "next monday", which
-    # keeps its old meaning here: the COMING Monday, the day "monday" names.
-    # DEFAULT LEFT FOR HIM (round three, 2026-09-05): to some ears "next
-    # Monday" is the Monday after that.  Not changed without his say.
+    # means the COMING Monday, the day "monday" names.
+    # HIS RULING, 2026-09-06, asked directly and answered in his own words:
+    # "Next Monday is the the coming Mondays".  This was carried as an open
+    # default from round three (2026-09-05) because to some ears "next
+    # Monday" is the Monday after that; it is now SETTLED and is not to be
+    # changed back.  jarvis/tools/timekeeper.py already reads it the same
+    # way (tests/test_timekeeper.py pins "next monday" from a Wednesday to
+    # the Monday five days later), so the two agree by his ruling rather
+    # than by luck.
     for day in WEEKDAYS:
         if re.search(rf"\b{day}\b", text):
             return day

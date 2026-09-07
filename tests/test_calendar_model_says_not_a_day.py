@@ -19,7 +19,7 @@ guard for that below); every phrase is invented.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -172,3 +172,37 @@ def test_the_exposure_is_a_bare_ordinal_and_is_named():
 def test_the_rule_does_not_move_with_the_clock(now):
     assert _derive("the 3rd rehearsal", "week", now) == "week"
     assert _derive("the 2nd standup", "today", now) == "today"
+
+
+# ---- HIS RULING on "next monday", 2026-09-06 -------------------------
+@pytest.mark.parametrize("now, want", [
+    (datetime(2026, 9, 6, 14, 0), date(2026, 9, 7)),    # a Sunday -> tomorrow
+    (datetime(2026, 9, 2, 9, 0), date(2026, 9, 7)),     # a Wednesday
+    (datetime(2026, 9, 8, 9, 0), date(2026, 9, 14)),    # a Tuesday -> six days
+    (datetime(2026, 12, 31, 9, 0), date(2027, 1, 4)),   # across a year
+])
+def test_next_monday_is_the_coming_monday(now, want):
+    """HIS RULING, 2026-09-06, in his own words: "Next Monday is the the
+    coming Mondays".
+
+    Carried as an open default since round three because to some ears
+    "next Monday" means the Monday after that.  Settled now, and pinned
+    here so nobody reopens it.  Driven end to end: the reader answers the
+    weekday, and format_events resolves it to the next day of that name,
+    so an event ON that day is the one he is told about.
+
+    NOT settled by his ruling and deliberately not asserted: what "next
+    monday" means when today IS a Monday.  The code answers TODAY
+    (``(want - today.weekday()) % 7``); most ears would say the Monday
+    after.  A separate question, and his to rule on if it ever bites.
+    """
+    assert C.coerce_range("next monday", now) == "monday"
+
+    def _event(day):
+        return C.Event(start=datetime(day.year, day.month, day.day, 9, 0),
+                       end=datetime(day.year, day.month, day.day, 10, 0),
+                       title="INVENTED-%s" % day.isoformat())
+    wanted, decoy = _event(want), _event(want + timedelta(days=7))
+    said = C.format_events([wanted, decoy], "monday", now=now)
+    assert wanted.title in said, (now.date(), said)
+    assert decoy.title not in said, (now.date(), said)
