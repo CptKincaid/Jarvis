@@ -143,6 +143,26 @@ DESK_UNKNOWN = "desk-unknown"  # no idle monitor, unreadable, nonsense
 
 _DESKS = (DESK_AT, DESK_IDLE, DESK_UNKNOWN)
 
+# HOW OLD THE IDLE READING ITSELF MAY BE, which is a different question
+# from how idle it says he is and was missing until 2026-09-06.
+#
+# ``DeskSentinel.idle_s`` handed out a cache written only on a SUCCESSFUL
+# poll, so a dead idle monitor left the last good number standing for ever:
+# measured, 400 no-signal polls (3 h 20 min) later it still answered 5.0 s,
+# which is DESK_AT, which vetoes away in every cell -- a permanent false
+# home while he is out. That is fixed at the sentinel; this is the BELT, and
+# it is the same bound ``eye.Attention.usable`` puts on the camera for the
+# same reason: a leg may only vote from a measurement it actually took.
+#
+# THE NUMBER IS REPRODUCIBLE IN THIS TREE: two of deskpresence's own
+# ``DEFAULT_POLL_S`` (30.0 s), matching its ``STALE_AFTER_POLLS`` exactly --
+# one poll to refresh the reading and one for a poll that was late or spent
+# up to CALL_TIMEOUT_S timing out. It is written as a literal rather than
+# imported because this module is a pure function over enums and imports
+# nothing that owns a thread or a subprocess;
+# tests/test_presence_stale_legs.py asserts the two numbers are equal.
+DESK_MAX_AGE_S = 60.0
+
 # ------------------------------------------------- the recency window
 # HOW FRESH AN AGREEMENT HAS TO BE for cell 6 to keep saying "he is here".
 #
@@ -198,12 +218,20 @@ DEFAULT_MIC_WINDOW_S = 10 * 60.0
 # ``presence.desk_away_after_min`` (25 min), deskpresence.py's own
 # threshold. It is the wrong question -- it asks "is the CHAIR empty", not
 # "is he in the FLAT" -- and the cost of the mismatch was measured on a fake
-# clock, rooms clear and his phone gone: away landed 36.8 minutes after he
-# walked out instead of 11.8. Every errand shorter than about forty minutes
-# would have earned silence on his return. At the recency window it lands at
-# ~15 min, which is three minutes past the phone's own 12-minute grace, and
-# THAT is the real price of this leg: about three minutes of extra latency
-# on "away" in exchange for the two false aways of 2026-09-06.
+# clock, rooms clear, his phone gone and his last keystroke at the moment he
+# walked out:
+#
+#   desk leg off                       away at 11.8 min
+#   window 900 s  (recency, shipped)   away at 15.0 min
+#   window 1500 s (desk_away_after)    away at 25.0 min
+#
+# so every errand shorter than about twenty-five minutes would have earned
+# silence on his return. THE 36.8 THIS COMMENT USED TO CLAIM FOR THE 25-MIN
+# WINDOW IS NO LONGER REPRODUCIBLE and has been corrected: it was measured
+# before ``Verdict.witness_s_ago`` existed, when the desk window and the
+# sentinel's own 12-minute grace still stacked. The real price of this leg
+# is the 11.8 -> 15.0 line: about three minutes of extra latency on "away"
+# in exchange for the two false aways of 2026-09-06.
 #
 # CHOSEN, NOT MEASURED: nobody has timed how long he sits still at that
 # desk. One edit moves it, and it moves the corroboration window with it,
@@ -235,12 +263,26 @@ class Verdict:
     # PresenceSentinel.tick, which stamps ``last_seen`` at that moment
     # rather than at this poll.
     #
-    # WITHOUT IT THE TWO CLOCKS STACK, measured: rooms clear, his phone
-    # gone, the desk vouching for him from a keystroke 11 minutes old. The
-    # veto answers HOME, the sentinel reads HOME as "seen NOW", and its own
-    # 12-minute away grace restarts -- so "away" landed 26.8 minutes after
-    # he walked out instead of the 15 the window costs. He was last seen
-    # eleven minutes ago; saying so is both truer and cheaper.
+    # WITHOUT IT THE TWO CLOCKS STACK. MEASURED IN THIS TREE, on a fake
+    # clock: he walks out, his phone stops answering, his last keystroke is
+    # the moment he left, and the rooms are clear. The veto answers HOME,
+    # the sentinel reads HOME as "seen NOW", and its own 12-minute away
+    # grace restarts at every poll:
+    #
+    #   no stamp    away at 26.8 min
+    #   stamped     away at 15.0 min      (the desk window, and nothing more)
+    #
+    # He was last seen when the keystroke landed; saying so is both truer
+    # and cheaper. THE SCENARIO IN THE EARLIER VERSION OF THIS COMMENT --
+    # "a keystroke 11 minutes old" -- DOES NOT PRODUCE THOSE NUMBERS and
+    # has been corrected: with a keystroke already 11 min old when he
+    # leaves, the desk has only four minutes of window left and away lands
+    # at 11.8 min either way.
+    #
+    # SET BY BOTH HALVES, since 2026-09-06: the away guard in ``decide``,
+    # and cell 6's own witness branch, which returned a bare (state,
+    # reason) and left this None. On a latched office that cost 26.8 min to
+    # away where the rooms-clear path had already been fixed to 15.0.
     witness_s_ago: Optional[float] = None
 
     @property
@@ -330,7 +372,8 @@ def camera_leg(*, identity: str = "", faces: Optional[int] = None,
         return CAM_BLIND
 
 
-def desk_leg(*, idle_s, window_s: float = DEFAULT_DESK_WINDOW_S) -> str:
+def desk_leg(*, idle_s, window_s: float = DEFAULT_DESK_WINDOW_S,
+             age_s=None, max_age_s: float = DESK_MAX_AGE_S) -> str:
     """The desk's vote FROM ONE NUMBER: seconds since the last input event.
 
     ``idle_s`` is ``deskpresence.desk_idle_s()`` -- Mutter's idle time off
@@ -344,9 +387,27 @@ def desk_leg(*, idle_s, window_s: float = DEFAULT_DESK_WINDOW_S) -> str:
     Zero would read as "sitting right there" and is exactly the wrong
     failure. Anything that is not a finite, non-negative number is UNKNOWN
     for the same reason.
+
+    ``age_s`` IS HOW OLD THE READING IS, not how idle he is, and a reading
+    older than ``max_age_s`` is UNKNOWN whatever it says -- the bound
+    ``Attention.usable`` already puts on the camera. None means the caller
+    could not say, which keeps a box with no age reader voting exactly as
+    it did; the SENTINEL's own expiry (deskpresence.idle_reading) is the
+    guard there and this is the belt. An age that is not a usable
+    non-negative number is treated as no measurement at all, because an
+    unreadable age is not a fresh one.
     """
     if idle_s is None:
         return DESK_UNKNOWN
+    if age_s is not None:
+        try:
+            age, bound = float(age_s), float(max_age_s)
+        except (TypeError, ValueError):
+            return DESK_UNKNOWN
+        if not (math.isfinite(age) and math.isfinite(bound)):
+            return DESK_UNKNOWN
+        if age < 0.0 or age > bound:
+            return DESK_UNKNOWN
     try:
         idle, window = float(idle_s), float(window_s)
     except (TypeError, ValueError):
@@ -670,7 +731,24 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
           desk: str = DESK_UNKNOWN, desk_s_ago=None,
           pre_existing: bool = False, mic_reason: str = "") -> tuple:
     """Cell 6: a room reads occupied, his phone did not answer past the
-    grace, and the camera could not look. Returns ``(state, reason)``.
+    grace, and the camera could not look.
+
+    Returns ``(state, reason, witness_s_ago)``. THE THIRD FIELD IS NOT
+    DECORATION and it was missing until 2026-09-06: ``decide``'s away guard
+    and ``decide_rooms_only`` both stamp ``Verdict.witness_s_ago`` when a
+    stale keystroke or turn is what withheld an away, and this cell -- which
+    has its OWN witness branch -- returned a bare pair and left it None.
+    MEASURED with a 660 s keystroke: cell 15 said 660.0, the sensor-only
+    path said 660.0, cell 6 said None. The sentinel therefore read cell 6's
+    HOME as "seen NOW" and restarted its own 12-minute grace at every poll,
+    so on a latched office away landed at 26.8 min instead of 15.0.
+
+    The mic-versus-desk mirror test could not see it: in this cell the two
+    were EQUALLY wrong and so still matched. A mirror test that cannot see
+    a one-sided defect is the pattern wearing the costume of its own cure,
+    and the pin that catches this one is CROSS-CELL
+    (tests/test_presence_stale_legs.py::
+    test_every_cell_a_witness_rescued_says_how_old_that_witness_is).
 
     THE CELL 2026-09-05 LANDED IN, and the one his three rules cannot reach.
     Rule 1 needs a camera that LOOKED; a camera that could not look is not
@@ -718,8 +796,11 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
     seen = _witness(mic=mic, mic_s_ago=mic_s_ago,
                     desk=desk, desk_s_ago=desk_s_ago)
     if seen is not None:
+        # seen[2] IS THE AGE, and it travels with the verdict: without it
+        # the sentinel treats an eleven-minute-old keystroke as "now".
         return (HOME, "a room sees somebody and %s, so he is in the flat "
-                      "whatever his phone's radio is doing" % seen[0])
+                      "whatever his phone's radio is doing" % seen[0],
+                seen[2])
     if pre_existing and agreed_s_ago is None:
         # A RUN THAT BEGAN BEFORE THIS PROCESS DID. The radar's latch may
         # be seconds or hours old and the box genuinely cannot tell, so
@@ -737,26 +818,26 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
                          "going before Jarvis restarted, so its age says "
                          "nothing and nothing has agreed with it since; "
                          "holding rather than guessing (%s)"
-                % _mic_words(mic, mic_reason))
+                % _mic_words(mic, mic_reason), None)
     if agreed_s_ago is None:
         return (HOME, "a room sees somebody and its run has no history yet "
                       "to hold against it (%s window); absence of history "
-                      "is not a fault" % win)
+                      "is not a fault" % win, None)
     try:
         age = float(agreed_s_ago)
     except (TypeError, ValueError):
         return (HOME, "a room sees somebody and its history could not be "
-                      "read; never away on that")
+                      "read; never away on that", None)
     if age < window:
         return (HOME, "a room sees somebody and something else agreed with "
                       "that run %s ago, inside the %s window, so the radar "
                       "is telling the truth and his phone is napping"
-                % (_mins(age), win))
+                % (_mins(age), win), None)
     silence = _mic_words(mic, mic_reason)
     return (AWAY, "a room reads occupied but nothing has agreed with that "
                   "run for %s -- not his phone, not the camera, not the mic "
                   "(%s) -- past the %s window, and the radar is the one leg "
-                  "that can latch; %s" % (_mins(age), silence, win, _P2))
+                  "that can latch; %s" % (_mins(age), silence, win, _P2), None)
 
 
 def decide(*, phone: str, camera: str, rooms: str,
@@ -790,9 +871,14 @@ def decide(*, phone: str, camera: str, rooms: str,
     mic = mic if mic in _MICS else MIC_UNKNOWN
     desk = desk if desk in _DESKS else DESK_UNKNOWN
     hold = state == UNKNOWN and rooms == ROOMS_ON
+    # HOW LONG AGO THE EVIDENCE LANDED, when it is not "now". Cell 6 fills
+    # it from its own witness branch; the away guard below fills it from
+    # its. BOTH HALVES, which is the whole of the 2026-09-06 finding.
+    seen_ago = None
 
     if state == _CELL6:
-        state, reason = cell6(agreed_s_ago=agreed_s_ago, recency_s=recency_s,
+        state, reason, seen_ago = cell6(
+                              agreed_s_ago=agreed_s_ago, recency_s=recency_s,
                               mic=mic, mic_s_ago=mic_s_ago,
                               desk=desk, desk_s_ago=desk_s_ago,
                               mic_reason=mic_reason,
@@ -854,7 +940,7 @@ def decide(*, phone: str, camera: str, rooms: str,
                                     "asked. A leg he switched off is BLIND, "
                                     "never a NO; holding the last verdict"
                             % (cell, reason), cell, hold=True)
-    return Verdict(state, reason, cell, hold=hold)
+    return Verdict(state, reason, cell, hold=hold, witness_s_ago=seen_ago)
 
 
 def decide_rooms_only(*, rooms: str, camera: str = CAM_BLIND,

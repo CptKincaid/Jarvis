@@ -1133,6 +1133,13 @@ class JarvisApp:
         if legs is None:
             return False
         legs.desk = self._desk_idle_leg
+        # AND HOW OLD THAT NUMBER IS. Without it a reading that stopped
+        # being refreshed voted DESK_AT for ever -- measured, 400 no-signal
+        # polls (3 h 20 min) still answering 5.0 s, and AWAY never firing in
+        # six hours with the rooms clear and his phone gone. The sentinel
+        # now expires its own reading; this hands the voter the age so the
+        # belt in ``presencevote.desk_leg`` can refuse a stale one too.
+        legs.desk_age = self._desk_idle_age
         return True
 
     def _desk_idle_leg(self):
@@ -1150,6 +1157,23 @@ class JarvisApp:
             return None
         try:
             return idle()
+        except Exception:  # noqa: BLE001 - the monitor must not cost the vote
+            return None
+
+    def _desk_idle_age(self):
+        """How old the number ``_desk_idle_leg`` just handed over is.
+
+        ``DeskSentinel.idle_age_s()`` or None. Late-bound for the same
+        reason its twin above is: ``self.desk`` is built after presence.
+        A sentinel from before this existed simply has no such method and
+        the leg votes exactly as it did.
+        """
+        desk = getattr(self, "desk", None)
+        age = getattr(desk, "idle_age_s", None)
+        if not callable(age):
+            return None
+        try:
+            return age()
         except Exception:  # noqa: BLE001 - the monitor must not cost the vote
             return None
 

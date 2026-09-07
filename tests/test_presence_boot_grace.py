@@ -207,7 +207,7 @@ def test_a_rising_edge_after_boot_is_an_ordinary_run(tmp_path):
 def test_cell6_holds_unknown_on_a_pre_existing_run_nothing_agrees_with():
     """NEVER home -- that is an unearned 15-minute window. NEVER away -- a
     false away on a man at his desk after a restart is the worse error."""
-    state, reason = pv.cell6(agreed_s_ago=None, pre_existing=True,
+    state, reason, _ = pv.cell6(agreed_s_ago=None, pre_existing=True,
                              mic=pv.MIC_SILENT)
     assert state == pv.UNKNOWN
     assert "restart" in reason or "before" in reason
@@ -228,7 +228,8 @@ def test_one_corroboration_hands_a_pre_existing_run_back_to_the_arithmetic(tmp_p
     row = stuck.status()["office"]
     assert row["pre_existing"] is False
     assert row["corroborated_s_ago"] == 0.0
-    state, _ = pv.cell6(agreed_s_ago=0.0, pre_existing=False, mic=pv.MIC_SILENT)
+    state, _, _ = pv.cell6(agreed_s_ago=0.0, pre_existing=False,
+                           mic=pv.MIC_SILENT)
     assert state == pv.HOME
 
 

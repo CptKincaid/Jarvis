@@ -254,10 +254,22 @@ class Eye:
         DARK -- "could not look", which never votes -- whenever any of:
         nothing has been published yet; the burst produced no frame for any
         reason at all; the detector was missing or fell over; a deny edge
-        has fired since the publish; or the reading is older than
-        ``max_age_s``. ``camera_leg`` reads dark as CAM_BLIND and a live
-        zero as CAM_LOOKED, and the difference between those two is the
-        difference between "I did not look" and "the room is empty".
+        has fired since the publish; SENSING SAYS NO RIGHT NOW; or the
+        reading is older than ``max_age_s``. ``camera_leg`` reads dark as
+        CAM_BLIND and a live zero as CAM_LOOKED, and the difference between
+        those two is the difference between "I did not look" and "the room
+        is empty".
+
+        THE PERMISSION IS RE-READ HERE, AND IT WAS NOT UNTIL 2026-09-06.
+        ``_reading_dark`` is stamped at PUBLISH time and cleared to True by
+        ``_go_blind``, which only ever runs out of ``capture()``. Between
+        bursts nothing captures BY DESIGN -- jarvis/eyeloop.py: "the lens is
+        dark in between" -- so when he said "camera off for ten minutes"
+        with no burst in flight, nothing invalidated the last reading and it
+        went on voting for the full 30 s presence window. His own privacy
+        switch has to reach the CONSUMER, not just the device, and the only
+        place that can be true for a reading nobody is refreshing is the
+        read itself. A sensing owner that raises is not permission either.
         """
         reading = self._reading
         if reading is None:
@@ -267,7 +279,8 @@ class Eye:
         except (TypeError, ValueError):
             bound = PRESENCE_MAX_AGE_S
         age = max(0.0, self._now() - self._reading_at)
-        dark = bool(reading.dark or self._reading_dark or age > bound)
+        dark = bool(reading.dark or self._reading_dark or age > bound
+                    or not self.permitted())
         return replace(reading, age_s=age, dark=dark)
 
     # ------------------------------------------------------------ the gate

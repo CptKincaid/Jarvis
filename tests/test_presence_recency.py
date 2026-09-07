@@ -129,8 +129,9 @@ def test_a_run_with_no_history_at_all_is_not_held_against_the_radar():
 # ====================================================================
 def test_the_mic_alone_keeps_him_home_with_the_corroboration_long_stale():
     """He spoke four minutes ago. Nothing else has agreed for an hour."""
-    state, reason = pv.cell6(agreed_s_ago=3600.0, recency_s=900.0,
-                             mic=pv.MIC_HEARD, mic_s_ago=240.0)
+    state, reason, ago = pv.cell6(agreed_s_ago=3600.0, recency_s=900.0,
+                                  mic=pv.MIC_HEARD, mic_s_ago=240.0)
+    assert ago == 240.0, "the sentinel is told how old that turn is"
     assert state == pv.HOME
     assert "mic" in reason
 

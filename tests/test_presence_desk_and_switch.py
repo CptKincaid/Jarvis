@@ -248,18 +248,31 @@ def test_cell_6_takes_the_desk_exactly_as_it_takes_the_mic():
     """THE 15:28:13 AND 17:07:28 LINES. Phone napping, camera dark, mic
     silent past its window, the 15-minute corroboration expired -- and him
     typing."""
-    away, _ = pv.cell6(agreed_s_ago=9999.0, mic=pv.MIC_SILENT)
+    away, _, _ = pv.cell6(agreed_s_ago=9999.0, mic=pv.MIC_SILENT)
     assert away == pv.AWAY, "the line he actually got"
-    state, reason = pv.cell6(agreed_s_ago=9999.0, mic=pv.MIC_SILENT,
-                             desk=pv.DESK_AT, desk_s_ago=660.0)
+    state, reason, ago = pv.cell6(agreed_s_ago=9999.0, mic=pv.MIC_SILENT,
+                                  desk=pv.DESK_AT, desk_s_ago=660.0)
     assert state == pv.HOME
     assert "11 min" in reason, "say how stale the evidence is"
+    assert ago == 660.0, "and hand that staleness to the sentinel"
 
 
 def test_the_mic_and_the_desk_are_one_guard_with_two_inputs():
     """THE SYMMETRY PIN. Four defects in two days on this repo came from a
     guard built for one of a pair and never applied to its twin. For every
-    cell, a heard turn and a moved mouse must land on the same verdict."""
+    cell, a heard turn and a moved mouse must land on the same verdict --
+    AND ON THE SAME WITNESS AGE.
+
+    WIDENED 2026-09-06, because as written this test could not see the
+    defect it was named for. Cell 6's witness branch returned a bare
+    ``(state, reason)`` and left ``witness_s_ago`` None; the mic and the
+    desk were EQUALLY wrong there, so they matched and the pin stayed
+    green. A mirror test that cannot see a one-sided defect is the pattern
+    wearing the costume of its own cure. Comparing the age catches a future
+    drift between the pair; the CROSS-CELL pin in
+    tests/test_presence_stale_legs.py is what catches the drift between one
+    cell and the rest.
+    """
     for rooms, phone, camera in itertools.product(
             (pv.ROOMS_ON, pv.ROOMS_CLEAR, pv.ROOMS_UNREACHABLE),
             (pv.PHONE_YES, pv.PHONE_NO, pv.PHONE_UNKNOWN),
@@ -272,6 +285,9 @@ def test_the_mic_and_the_desk_are_one_guard_with_two_inputs():
                           desk_s_ago=60.0)
         assert heard.state == typed.state, (rooms, phone, camera)
         assert heard.cell == typed.cell
+        assert heard.witness_s_ago == typed.witness_s_ago, (rooms, phone,
+                                                            camera)
+        assert heard.hold == typed.hold
 
 
 def test_a_leg_value_this_voter_does_not_know_cannot_cost_the_vote():
