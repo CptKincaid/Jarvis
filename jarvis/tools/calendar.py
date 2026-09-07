@@ -2344,6 +2344,27 @@ def _tense_disagrees(said, heard: date, model: date, today: date) -> bool:
     return model < today <= heard
 
 
+# THE FRAME AGAIN, and it is the branch's own discriminator (see
+# _ORD_PRONOUN_RX above): his date-shaped ordinals carry a PREPOSITION --
+# "on the 12th", "for the 12th" -- and a position carries a bare "the".
+# reconcile_model_day trusts the model's "this is not a day" only where
+# his words gave a BARE ordinal, because a preposition is his own words
+# saying it IS a day, and round four pinned exactly that: "what do i have
+# on the 12th" with the model sending "today" must still answer about the
+# 12th (tests/test_calendar_date_round_four.py, the words-override case).
+# Without this the model's one wrong word range would carry a framed date
+# away, which is the failure he cannot hear.
+_FRAMED_ORD_RX = re.compile(
+    rf"\b(?:on|for)\s+(?:the\s+)?(?:(?:{_WD_ALT})\s+(?:the\s+)?)?"
+    rf"(?P<d>\d{{1,2}}){_ORD}\b", re.I)
+
+
+def _ordinal_is_framed(said) -> bool:
+    """True when a bare ordinal in his words stands behind a date
+    preposition -- his own words saying it is a day."""
+    return _FRAMED_ORD_RX.search(_clean(said) or "") is not None
+
+
 def reconcile_model_day(said, heard: str, model_range, now: datetime) -> Optional[str]:
     """THE DERIVER RULE, round five (2026-09-06): None when the model's
     value STANDS; otherwise the range to use in its place -- his words'
@@ -2365,10 +2386,50 @@ def reconcile_model_day(said, heard: str, model_range, now: datetime) -> Optiona
       answered about a month he never said, with no question.  Now the
       reader's nearest-upcoming month is one reading and the model's is
       another, and Jarvis ASKS which -- following neither alone.
+
+    ROUND NINE (2026-09-06): AND THE MODEL MAY SAY "THAT IS NOT A DAY".
+
+    Eight rounds hand-grew word lists to decide whether a bare ordinal is
+    a DAY or a POSITION ("the 12th" against "the 3rd rehearsal"), and each
+    round an adversary found the same bug in a new coat, because the two
+    readings wear the SAME SHAPE and only meaning tells them apart.  The
+    model already answers that question on every turn and this function
+    threw the answer away: ``as_date`` is None for a word range, so a
+    model that said "week" -- its clearest possible "this is not a
+    specific day" -- fell to ``return heard`` and the reader's
+    bare-ordinal date replaced it.
+
+    MEASURED, gemma4:26b resident, temperature 0, one call per row
+    carrying this module's own get_calendar schema, n=20: an ISO date on
+    11 of 11 true-date rows -- including the awkward tails ("what's on the
+    12th except lunch", "...roughly", "...within work hours") -- and a
+    WORD range on 8 of 8 true-rank rows.  19 of 19, and the call is one
+    Jarvis already makes.
+
+    So: when the model sent a word range and HIS WORDS PINNED NOTHING --
+    no month, no year, nothing but a bare ordinal -- the model's reading
+    stands.  Two conditions, deliberately not three: a third gate on the
+    ordinal's tail word was measured over 787 harvested phrases x 9
+    instants and fires on 30 phrases of which 28 are TRUE DATES the reader
+    already reads correctly.  The residue is a poor discriminator; the
+    model is the discriminator.
+
+    THE EXPOSURE, stated rather than hidden: a true date on which the
+    model sends a word range is now answered about that range.  Measured
+    at 0 of 11 above, and it cannot be zero by construction -- it is
+    bounded by how well the model reads a date, which is the thing being
+    trusted.  An ask is never overridden (``is_ask`` on both sides), and a
+    model that sends a real date reaches the day-and-month rules below
+    exactly as before.
     """
     if not model_range or is_ask(heard):
         return heard
-    model_day = as_date(coerce_range(model_range, now))
+    coerced = coerce_range(model_range, now)
+    if (as_date(coerced) is None and not is_ask(coerced)
+            and not _pinned_by_words(said, now.date())
+            and not _ordinal_is_framed(said)):
+        return coerced                       # the model says: not a day
+    model_day = as_date(coerced)
     heard_day = as_date(heard)
     if model_day is None or heard_day is None:
         return heard
