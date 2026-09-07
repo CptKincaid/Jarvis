@@ -685,14 +685,18 @@ class ThreeLegProbe:
             drop = {pv._slug(r) for r in (faulted or ())}
             live = {pv._slug(r): v for r, v in dict(readings or {}).items()
                     if pv._slug(r) not in drop}
-            if key not in {pv._slug(r) for r in dict(readings or {})}:
+            names = dict(readings or {})
+            if names and key not in {pv._slug(r) for r in names}:
+                # Only once the fabric has actually answered: an empty
+                # readings dict is a fabric that has not polled yet, not a
+                # box whose desk room has no sensor.
                 if not self._desk_room_said:
                     self._desk_room_said = True
                     log.info("presence: the lens is in %r, which is not one "
                              "of the configured rooms (%s), so a room change "
                              "cannot arm a look. presence.desk_room names it.",
                              self.desk_room,
-                             ", ".join(sorted(dict(readings or {}))) or "none")
+                             ", ".join(sorted(names)))
                 return False
             return live.get(key) is True
         except Exception:  # noqa: BLE001 - never cost the vote
