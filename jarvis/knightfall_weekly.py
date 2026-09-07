@@ -24,11 +24,57 @@ THE SHAPE: PUSH FROM THE SPARK, TWO-PHASE, WITH A RECEIPT.
       sends, deletes the spool and writes a receipt. No spool -> the
       email is byte-for-byte what it always was.
   Sun 09:30 UTC   the Spark (jarvis-knightfall-pull.timer, Sun..Wed ->
-      ``pull``) fetches the receipt. "sent" and the id matches -> the
+      ``pull``) READS the receipt, writes the registry, and only then
+      ACKS it so Oracle may delete it. "sent" and the id matches -> the
       pending hash is PROMOTED to current and the previous one is gone.
       "failed" / "stale" / "error" -> the pending is dropped and the old
       code stands. No receipt by Wednesday 09:30 UTC -> dropped, and the
       caption says so.
+
+THE FOUR THINGS THE 09-06 ADVERSARY PASS FOUND, and what they are now.
+None was a lockout -- each left the code in his hand working -- and each
+was a way for a WEEK to be lost quietly.
+
+  (A) A PUSH THAT CANNOT ARRIVE IN TIME IS REFUSED. Oracle discards a
+      spool more than ORACLE_FRESH_S old, so a ``--force`` before
+      ``earliest_push(for_day)`` (Friday 20:30 UTC for a Sunday 08:30 UTC
+      compose) could only write a spool that would be thrown away unread
+      -- and the pending it stored then REFUSED the scheduled push and
+      was dropped at the pull. It is refused now, with the hour it
+      becomes possible in the line. The other half: the scheduled push
+      REPLACES a pending Oracle can only discard, instead of standing
+      down behind it for ever.
+  (B) THE RECEIPT IS READ, AND DELETED ONLY ONCE IT IS WRITTEN DOWN HERE.
+      Oracle's ``receipt`` verb used to print and delete in one step, so
+      a pull that fetched it and then failed to write people.json had
+      lost it for good and Wednesday dropped a code that HAD been sent.
+      ``receipt`` now reads; ``receipt --ack <id>`` deletes. An ack that
+      does not land is remembered in the state file and retried by the
+      next pull.
+  (C) A MANUAL ROTATE BEATS THE WEEKLY CODE. If ``current_fp`` has
+      changed between the push and the receipt he rotated at the drawer,
+      and the code in his hand is the one he was handed MOST RECENTLY;
+      promoting Sunday's email over it retired the newer one. The pending
+      is dropped instead and the caption says why.
+  (D) THE GAP BETWEEN THE PUT AND THE STORE IS NARRATED. A push killed
+      after a clean put and before the store left no state line at all,
+      so the caption could not say what had happened. An "in flight,
+      unstored (id ...)" entry is written the moment the put succeeds and
+      replaced by the final one.
+
+WHO BURNS A TYPED WEEKLY CODE (his decision #3, 2026-09-06, written down
+because it is a real asymmetry and not an oversight). All three typed
+paths PROMOTE this week's pending code the moment it is typed -- he can
+only have it from the email, so typing it is the receipt in person. What
+they do next differs:
+
+  the DRAWER (Settings -> Privacy -> Knightfall) also ROTATES: it mails
+      the next code to his notice address, exactly as it does for any
+      accepted code. A typed weekly code is BURNED there.
+  the USERS TAB's unlock and scripts/jarvis_people.py do NOT rotate and
+      mail nothing. They are administrative unlocks; an unlock that
+      posted a new code every time he typed one would send him a code for
+      every `forget` he ran.
 
 WHY THE PLAINTEXT NEVER TOUCHES THE SPARK'S DISK. It is made here, written
 into an ssh child's stdin, and deleted. It lives in exactly two places:
@@ -105,12 +151,23 @@ WINDOW_CLOSE = (8, 15)
 # No receipt by the Wednesday after the push, 09:30 UTC -> dropped.
 DEADLINE_DAYS = 3
 DEADLINE_TIME = (9, 30)
+# ORACLE'S TWO NUMBERS, MIRRORED. Its knightfall-backup.timer composes at
+# 08:30 UTC and deploy/oracle/jarvis_override.py discards any spool more
+# than FRESH_S = 36 h old, unread. This side refuses a push that could
+# only make such a spool (defect A), so the two constants have to agree;
+# tests/test_knightfall_weekly_defects.py greps the Oracle file for the
+# same 36 h so they cannot drift apart.
+ORACLE_COMPOSE = (8, 30)
+ORACLE_FRESH_S = 36 * 3600
 # The far side. The forced-command key (deploy/oracle/) ignores the
 # command and reads the verb out of SSH_ORIGINAL_COMMAND, so this string
 # has to end in the verb either way.
 REMOTE_DIR = "/home/opc/knightfall"
 REMOTE_PYTHON = ".venv/bin/python"
 REMOTE_MODULE = "app.jarvis_override"
+# "receipt" alone READS; "receipt --ack <8 hex>" is what deletes it, and
+# it is sent only after this side has written the registry and its state
+# (defect B). ``revoke <8 hex>`` is the third two-word form.
 VERBS = ("put", "receipt", "ping")
 
 # ------------------------------------------------------------ the lines
@@ -122,9 +179,8 @@ LINE_PUSHED = ("Weekly: this week's code is in Sunday's backup email; both "
                "codes work until Jarvis confirms it went out.")
 LINE_PROMOTED = ("Weekly: this week's code took effect {t}; the previous code "
                  "no longer works.")
-LINE_PROMOTED_OVER_ROTATE = ("Weekly: this week's code took effect {t} and "
-                             "replaced the code from your rotate; older codes "
-                             "are dead.")
+LINE_DROPPED_ROTATED = ("Weekly: this week's code was not applied -- you "
+                        "rotated your own after {t}; that one stands.")
 LINE_PROMOTED_BY_USE = ("Weekly: this week's code took effect when you typed "
                         "it {t}; the previous code no longer works.")
 LINE_UNREACHABLE = ("Weekly: no code this week; Oracle was unreachable {t}; "
@@ -147,6 +203,10 @@ LINE_ORACLE_ERROR = ("Weekly: Oracle could not add the code on Sunday (error); "
                      "your current code stands.")
 LINE_UNREADABLE = ("Weekly: the people file could not be read; nothing was "
                    "changed; fix it at the keyboard.")
+LINE_TOO_EARLY = ("Weekly: too early -- Oracle discards a spool older than 36 h; "
+                  "not before {t}; your code stands.")
+LINE_IN_FLIGHT = ("Weekly: this week's code is in flight, unstored (id {id}); "
+                  "your current code stands.")
 
 
 # ------------------------------------------------------------- the seam
@@ -215,6 +275,21 @@ def in_window(now) -> bool:
     if t.weekday() == 6:
         return hm <= WINDOW_CLOSE
     return False
+
+
+def compose_at(day: date) -> datetime:
+    """When Oracle composes the backup email for ``day``: 08:30 UTC, the
+    hour its own knightfall-backup.timer has always fired at."""
+    return datetime(day.year, day.month, day.day, *ORACLE_COMPOSE,
+                    tzinfo=timezone.utc)
+
+
+def earliest_push(day: date) -> datetime:
+    """The first moment a push FOR ``day`` can still be emailed: exactly
+    ORACLE_FRESH_S before that compose (Friday 20:30 UTC for a Sunday).
+    A push before this makes a spool Oracle deletes unread -- defect (A),
+    and the reason ``--force`` refuses one."""
+    return compose_at(day) - timedelta(seconds=ORACLE_FRESH_S)
 
 
 def drop_deadline(since_iso) -> datetime:
@@ -292,6 +367,27 @@ def note_promoted_by_use(path, code_id, now=None) -> None:
     write_state(path, state)
     log.info("knightfall-weekly: id %s promoted by use at the keyboard; "
              "the previous code is retired", code_id)
+
+
+def _pending_is_dead(person, for_day: date) -> bool:
+    """Can the spool this pending belongs to still reach an email?
+
+    A pending is only worth standing down behind while Oracle would still
+    read its spool. Once ``compose_at(for_day)`` is more than
+    ORACLE_FRESH_S after the push that made it, Oracle will delete that
+    spool unread whatever happens -- so the pending is a hash that can
+    never be promoted, and before defect (A) was fixed it REFUSED every
+    scheduled push after it. An unreadable stamp counts as dead: a
+    pending nothing can date is a pending nothing can resolve.
+    """
+    since = str(getattr(person, "pending_code_since", "") or "")
+    try:
+        pushed = _utc(datetime.fromisoformat(since))
+    except Exception:  # noqa: BLE001 - an undatable pending is not one to keep
+        log.warning("knightfall-weekly: the pending stamp %r cannot be read; "
+                    "treating it as one Oracle can no longer send", since)
+        return True
+    return (compose_at(for_day) - pushed).total_seconds() > ORACLE_FRESH_S
 
 
 def _fp(hashed: str) -> str:
@@ -386,11 +482,53 @@ def push(lane: Lane, now=None, *, force: bool = False) -> Outcome:
     if person is None:
         log.error("knightfall-weekly: no owner is enrolled; no code was made")
         return Outcome(False, "no-owner", "no owner is enrolled")
-    if person.pending_code_hash and not force:
-        line = ("already pending (id %s, since %s); --force replaces it"
-                % (person.pending_code_id, person.pending_code_since or "?"))
-        log.warning("knightfall-weekly: refused: %s", line)
-        return Outcome(False, "refused", line)
+    for_day = target_sunday(now)
+    # (A) THE ONE THING --force MAY NOT DO. Everything else about a forced
+    # push is his to decide and is described to him; this one has no
+    # upside at all. Before ``earliest_push(for_day)`` the spool is
+    # already older than ORACLE_FRESH_S when Oracle looks at it, so the
+    # code CANNOT reach the email -- and the pending it stored then
+    # refused the scheduled push and was dropped at the pull. One
+    # exploratory --force cost the whole week, and the only thing the
+    # caption could say was "too late". It is a refusal at a keyboard,
+    # like "already pending": it CHANGES NOTHING, state file included, and
+    # names the hour the push becomes possible. Only ``--force`` can reach
+    # it -- the window opens Saturday 20:00 UTC, twelve hours before the
+    # compose and well inside the floor.
+    if force and now < earliest_push(for_day):
+        floor = earliest_push(for_day)
+        line = LINE_TOO_EARLY.format(t=floor.strftime("%Y-%m-%d %H:%M UTC"))
+        log.warning("knightfall-weekly: --force at %s is %.1f h before Oracle "
+                    "composes for %s, and Oracle discards a spool over %.0f h "
+                    "old unread: nothing was pushed and the current code "
+                    "stands. The earliest push for that email is %s.",
+                    now.isoformat(),
+                    (compose_at(for_day) - now).total_seconds() / 3600.0,
+                    for_day.isoformat(), ORACLE_FRESH_S / 3600.0,
+                    floor.isoformat())
+        return Outcome(False, "too-early", line)
+
+    # (A), the other half. A pending Oracle can only discard is not a
+    # reason to stand down: it used to refuse every scheduled push after
+    # it, for ever, which is how one stuck week turned the feature off.
+    # THE REFUSAL BELOW WRITES NO STATE, as it never has: a push that
+    # changed nothing must not rewrite the caption of the one in flight.
+    replaced = ""
+    if person.pending_code_hash:
+        if force:
+            replaced = person.pending_code_id
+        elif _pending_is_dead(person, for_day):
+            replaced = person.pending_code_id
+            log.warning("knightfall-weekly: the pending id %s (since %s) can no "
+                        "longer reach an email; replacing it with this week's "
+                        "push", person.pending_code_id,
+                        person.pending_code_since or "?")
+        else:
+            line = ("already pending (id %s, since %s); --force replaces it"
+                    % (person.pending_code_id, person.pending_code_since or "?"))
+            log.warning("knightfall-weekly: refused: %s", line)
+            return Outcome(False, "refused", line)
+
     if not in_window(now):
         # THE WINDOW IS THE TIMER'S GUARD, NOT HIS. Persistent=true fires a
         # missed Sunday at boot, and an automatic push after Oracle has
@@ -416,7 +554,6 @@ def push(lane: Lane, now=None, *, force: bool = False) -> Outcome:
                     "it has not, this spool will be stale by next Sunday. The "
                     "current code stands either way.", now.isoformat())
 
-    for_day = target_sunday(now)
     week = week_key(for_day)
     code = str(lane.new_code())
     length = len(code)
@@ -439,8 +576,18 @@ def push(lane: Lane, now=None, *, force: bool = False) -> Outcome:
                                       "at": now.isoformat()})
         return Outcome(False, "unreachable", line)
 
-    replaced = person.pending_code_id if (force and person.pending_code_hash) else ""
     since = now.isoformat()
+    # (D) THE GAP BETWEEN A CLEAN PUT AND THE STORE. The code is on Oracle
+    # from this line on; a kill between here and the store used to leave
+    # NO state entry at all, so the drawer's caption could not say that a
+    # code was in flight and unstored. This entry is written first and
+    # replaced by the final one a few milliseconds later -- the only way
+    # it survives is the way it is meant to: the process died in between.
+    write_state(lane.state_path, {
+        "status": "in-flight", "line": LINE_IN_FLIGHT.format(id=code_id),
+        "id": code_id, "week": week, "for": for_day.isoformat(),
+        "pushed_at": since, "replaced_id": replaced,
+        "current_fp": _fp(person.code_hash), "receipt": None})
     ok, why = identity.locked_update(
         lane.registry_path,
         lambda r: r.set_pending_code(owner, hashed, code_id, since))
@@ -484,6 +631,15 @@ def pull(lane: Lane, now=None) -> Outcome:
     """
     now = _utc(now)
     state = read_state(lane.state_path)
+    # (B) AN ACK THIS LANE STILL OWES. The receipt was read and written
+    # down here, and the ssh that would have let Oracle delete it did not
+    # land. Retry it before anything else, including on a pull that has
+    # nothing else to do: a receipt left on Oracle is the one next week's
+    # pull would read instead of its own.
+    owed = str(state.get("unacked") or "")
+    if owed:
+        _ack_receipt(lane, owed)
+        state = read_state(lane.state_path)
     reg = Registry.load(lane.registry_path)
     if not reg.usable:
         if reg.fault_kind in (FAULT_MALFORMED, FAULT_UNREADABLE):
@@ -514,17 +670,26 @@ def pull(lane: Lane, now=None) -> Outcome:
         return _drop_if_due(lane, now, owner, person, pending_id) or \
             _waiting(lane, pending_id)
 
-    # a receipt for THE pending push
+    # A receipt for THE pending push. THE ACK COMES AFTER THE WRITE, and
+    # only when the write succeeded (defect B): a promote or a drop that
+    # could not touch people.json leaves the receipt on Oracle so the next
+    # pull can act on it, instead of losing the only record that the email
+    # went out and dropping a live code on Wednesday.
     if pending_id and rid == pending_id:
         if rstatus == "sent":
-            return _promote(lane, now, state, owner, person, pending_id, receipt)
-        return _drop(lane, owner, pending_id, rstatus, receipt)
+            out = _promote(lane, now, state, owner, person, pending_id, receipt)
+        else:
+            out = _drop(lane, owner, pending_id, rstatus, receipt)
+        if out.ok:
+            _ack_receipt(lane, rid)
+        return out
 
     # a receipt for a push already promoted by typing it
     if by_use and rid == str(state.get("id") or ""):
         _update_state(lane.state_path, receipt=receipt)
         log.info("knightfall-weekly: receipt for id %s already handled (it was "
                  "promoted when typed)", rid)
+        _ack_receipt(lane, rid)
         return Outcome(True, "promoted-by-use", caption(lane.state_path))
 
     # a receipt for a push this week's --force replaced: the emailed code
@@ -534,14 +699,43 @@ def pull(lane: Lane, now=None) -> Outcome:
                     "--force replaced; the code in Sunday's email will not work",
                     rid)
         _update_state(lane.state_path, line=LINE_REPLACED, replaced_receipt=receipt)
+        _ack_receipt(lane, rid)
         return _drop_if_due(lane, now, owner, person, pending_id) or \
             Outcome(True, "replaced", LINE_REPLACED)
 
+    # A receipt this lane can apply to nothing. It is acked away rather
+    # than left where next week's pull would read it instead of its own;
+    # the pending, if there is one, goes on waiting for its own.
     log.warning("knightfall-weekly: receipt for id %s (%s) matched nothing "
-                "(pending is %s); ignored", rid or "?", rstatus,
+                "(pending is %s); acked away", rid or "?", rstatus,
                 pending_id or "none")
+    if rid:
+        _ack_receipt(lane, rid)
     return _drop_if_due(lane, now, owner, person, pending_id) or \
         _waiting(lane, pending_id)
+
+
+def _ack_receipt(lane: Lane, code_id: str) -> bool:
+    """Let Oracle delete the receipt: this side has written down what it
+    said. ``receipt --ack <id>`` deletes only that id's receipt.
+
+    An ack that does not land is not a failure of the week -- the registry
+    is already right -- so it is remembered in the state file and retried
+    by the next pull. NEVER RAISES.
+    """
+    if not code_id:
+        return True
+    reply = _ssh(lane, "receipt --ack %s" % code_id)
+    ok = bool(reply.ok and _json(reply.out).get("ok") is True)
+    if ok:
+        log.info("knightfall-weekly: receipt %s acked; Oracle may delete it",
+                 code_id)
+    else:
+        log.warning("knightfall-weekly: the receipt %s could not be acked (%s); "
+                    "Oracle still holds it and the next pull will try again",
+                    code_id, reply.reason or "no ok")
+    _update_state(lane.state_path, unacked=("" if ok else code_id))
+    return ok
 
 
 def _waiting(lane: Lane, pending_id: str) -> Outcome:
@@ -568,7 +762,12 @@ def _drop_if_due(lane, now, owner, person, pending_id) -> Optional[Outcome]:
     return _drop(lane, owner, pending_id, "no-receipt", None)
 
 
-def _drop(lane, owner, pending_id, why, receipt) -> Outcome:
+DROP_LINES = {"failed": LINE_SEND_FAILED, "stale": LINE_STALE,
+              "no-receipt": LINE_NO_RECEIPT}
+DROP_WHYS = ("failed", "stale", "no-receipt", "rotated")
+
+
+def _drop(lane, owner, pending_id, why, receipt, *, line="") -> Outcome:
     ok, fault = identity.locked_update(
         lane.registry_path, lambda r: r.drop_pending(owner, pending_id))
     if not ok:
@@ -577,9 +776,8 @@ def _drop(lane, owner, pending_id, why, receipt) -> Outcome:
         _update_state(lane.state_path, line=LINE_UNREADABLE)
         return Outcome(False, "unreadable", LINE_UNREADABLE)
     _reload(lane)
-    line = {"failed": LINE_SEND_FAILED, "stale": LINE_STALE,
-            "no-receipt": LINE_NO_RECEIPT}.get(why, LINE_ORACLE_ERROR)
-    status = "dropped-" + (why if why in ("failed", "stale", "no-receipt") else "error")
+    line = line or DROP_LINES.get(why, LINE_ORACLE_ERROR)
+    status = "dropped-" + (why if why in DROP_WHYS else "error")
     _update_state(lane.state_path, status=status, line=line, receipt=receipt,
                   id=pending_id)
     log.error("knightfall-weekly: dropped id %s (%s); the previous code stands",
@@ -588,8 +786,26 @@ def _drop(lane, owner, pending_id, why, receipt) -> Outcome:
 
 
 def _promote(lane, now, state, owner, person, pending_id, receipt) -> Outcome:
-    rotated = bool(state.get("current_fp")) and \
-        state.get("current_fp") != _fp(person.code_hash)
+    """The email went out. Retire the previous code -- UNLESS he has since
+    rotated it himself.
+
+    (C) ``current_fp`` is the fingerprint of the hash that was current when
+    the push was made. If it has changed, a manual rotate happened in
+    between and the code in his hand is the one he was handed MOST
+    RECENTLY; this used to promote Sunday's email straight over it, which
+    retired the newer code and left him holding a dead one. Sunday's code
+    is dropped instead and the caption says so. He never has zero: the
+    rotate's own code is untouched by everything here.
+    """
+    if bool(state.get("current_fp")) and \
+            state.get("current_fp") != _fp(person.code_hash):
+        when = _when(_safe_stamp(state.get("pushed_at")) or now)
+        log.warning("knightfall-weekly: id %s was sent, but the current code "
+                    "has been rotated since the push: dropping this week's "
+                    "code rather than retiring the one he was handed last",
+                    pending_id)
+        return _drop(lane, owner, pending_id, "rotated", receipt,
+                     line=LINE_DROPPED_ROTATED.format(t=when))
     ok, fault = identity.locked_update(
         lane.registry_path, lambda r: r.promote_pending(owner, pending_id))
     if not ok:
@@ -598,24 +814,36 @@ def _promote(lane, now, state, owner, person, pending_id, receipt) -> Outcome:
         _update_state(lane.state_path, line=LINE_UNREADABLE)
         return Outcome(False, "unreadable", LINE_UNREADABLE)
     _reload(lane)
-    line = (LINE_PROMOTED_OVER_ROTATE if rotated else LINE_PROMOTED).format(t=_when(now))
+    line = LINE_PROMOTED.format(t=_when(now))
     _update_state(lane.state_path, status="promoted", line=line, receipt=receipt,
                   id=pending_id, promoted_at=now.isoformat())
-    log.info("knightfall-weekly: promoted id %s; previous code retired%s",
-             pending_id, " (it had been rotated since the push)" if rotated else "")
+    log.info("knightfall-weekly: promoted id %s; previous code retired",
+             pending_id)
     return Outcome(True, "promoted", line)
+
+
+def _safe_stamp(text):
+    """An ISO stamp out of the state file, or None. NEVER RAISES: a caption
+    is not allowed to fail on a state file somebody hand-edited."""
+    try:
+        return _utc(datetime.fromisoformat(str(text)))
+    except Exception:  # noqa: BLE001 - see above
+        return None
 
 
 # ------------------------------------------------------------ real ssh
 def remote_command(verb: str) -> str:
     """The far side's command for one verb. Refuses anything that is not
-    exactly one of the four verbs (a revoke carries an 8-hex id), so no
-    string from a config or a receipt can ever become shell on Oracle."""
+    exactly one of the forms this lane sends -- the three bare verbs,
+    ``revoke <8 hex>`` and ``receipt --ack <8 hex>`` -- so no string from
+    a config or a receipt can ever become shell on Oracle."""
     verb = str(verb or "").strip()
     parts = verb.split()
     ok = (len(parts) == 1 and parts[0] in VERBS) or \
         (len(parts) == 2 and parts[0] == "revoke"
-         and identity.PENDING_ID_RX.match(parts[1]) is not None)
+         and identity.PENDING_ID_RX.match(parts[1]) is not None) or \
+        (len(parts) == 3 and parts[0] == "receipt" and parts[1] == "--ack"
+         and identity.PENDING_ID_RX.match(parts[2]) is not None)
     if not ok:
         raise ValueError("not a verb this lane sends: %r" % (verb,))
     return "cd %s && exec %s -m %s %s" % (REMOTE_DIR, REMOTE_PYTHON, REMOTE_MODULE, verb)
@@ -723,8 +951,9 @@ def lane_from_config() -> Optional[Lane]:
 # --------------------------------------------------------------- the CLI
 EXIT = {"pushed": 0, "promoted": 0, "promoted-by-use": 0, "waiting": 0,
         "idle": 0, "dropped-failed": 0, "dropped-stale": 0, "dropped-error": 0,
-        "dropped-no-receipt": 0, "replaced": 0,
+        "dropped-no-receipt": 0, "dropped-rotated": 0, "replaced": 0,
         "refused": 1, "missed": 1, "unstored": 1, "dead-code": 1, "no-owner": 1,
+        "too-early": 1,
         "unreachable": 2, "unreadable": 2}
 
 
@@ -739,7 +968,9 @@ def main(argv=None, *, lane: Optional[Lane] = None, now=None) -> int:
     ap.add_argument("--force", action="store_true",
                     help="push again this week, replacing the pending code. "
                          "After Oracle has composed (08:30 UTC) the code in "
-                         "Sunday's email DIES: it is the previous push's")
+                         "Sunday's email DIES: it is the previous push's. "
+                         "Refused entirely before Friday 20:30 UTC, where "
+                         "Oracle would discard the spool unread")
     ap.add_argument("--rehearse", action="store_true",
                     help="make and hash a code, print its length and hash "
                          "prefix, push and store nothing")
