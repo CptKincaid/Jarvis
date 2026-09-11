@@ -375,12 +375,19 @@ def test_outside_dir_refusal_offers_the_terminal_and_yes_opens_it(app):
     assert third.reply != "Up on screen, sir."
 
 
-def test_ambiguous_utterance_asks_exactly_one_question(app):
+def test_an_ambiguous_utterance_is_just_ANSWERED(app):
+    """HIS RULING, 2026-09-11 evening: "everything else go local first".
+    A classifier that says local and is merely unsure is ordinary
+    ambiguity -- Jarvis answers it and says nothing else. It used to stop
+    and ask which way to route it."""
     from jarvis.router import ROUTER_QUESTION
+    seen = []
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: \
+        seen.append(text)
     app.brain.classify_route = lambda text, timeout=None: ("local", 0.0)
-    result = app.dispatch_text("sort out the thing we talked about")
-    assert result.reply == ROUTER_QUESTION and result.speak
-    assert app.tts.spoken == [ROUTER_QUESTION]
+    app.dispatch_text("sort out the thing we talked about")
+    assert seen == ["sort out the thing we talked about"]
+    assert ROUTER_QUESTION not in app.tts.spoken
 
 
 def test_music_utterance_stays_local(app):

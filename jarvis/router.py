@@ -44,6 +44,28 @@ from jarvis.logs import get_logger
 log = get_logger("router")
 
 ROUTER_QUESTION = "Shall I hand that to Claude, sir, or is it a quick one for me?"
+# HIS RULING, 2026-09-11 EVENING, and it REVERSES ruling (a) of that
+# morning: "Anything with coding should go to claude automatically
+# everything else go local first." Refined a minute later: "il tell it if
+# it should route to claude but only on things its REALLY unsure about
+# should it offer".
+#
+# So a coding cue IS a licence to spend a billed session again, and this
+# line is no longer the answer to a coding cue. It survives for one case
+# only -- rule 6's classify-claude-unconfirmed exit, where the model said
+# CLAUDE and there is a cue but not enough of one to spend his money on.
+# Jarvis has a go, and then says this. Every other unsure sentence is
+# simply answered, silently: he asked for LESS talking, not more.
+#
+# The offer is not a refusal and not a question about routing -- the work
+# is already done by the time he hears it, which is what separates it from
+# ROUTER_QUESTION.
+CLAUDE_CHECK_OFFER = ("I've had a go at that myself, sir. I'd feel more "
+                      "comfortable having Claude check my work \u2014 shall I?")
+# ...and what "no" sounds like. It has to be SHORT: he has already had the
+# answer by the time the offer is spoken, so declining it is an
+# acknowledgement, not a second exchange.
+OFFER_DECLINED_LINE = "As you wish, sir."
 ASK_TTL_S = 90.0
 # Rule 6 is asymmetric on purpose: a wrong "local" costs one cheap Ollama
 # turn, a wrong "claude" spends the user's Claude credits with no
@@ -119,6 +141,12 @@ class RouteDecision:
     action: str = ""          # cancel | work_on | resume | new_project | set_model | fast_mode
     args: dict = field(default_factory=dict)
     confidence: float = 1.0
+    # TRUE when Jarvis is REALLY unsure -- rule 6's
+    # classify-claude-unconfirmed exit and nothing else. The commander
+    # answers locally and app._on_brain_tags speaks CLAUDE_CHECK_OFFER
+    # after the answer. Only ever set on a "local" decision; an explicit
+    # "ask Claude" is an instruction, not an offer.
+    offer_claude: bool = False
 
 
 @dataclass
@@ -130,6 +158,13 @@ class PendingAsk:
     # Without these the answer "yes" dispatches on the DEFAULT model, so
     # asking for the cheap model and saying yes bought the expensive one.
     args: dict = field(default_factory=dict)
+    # TRUE when this was parked by an OFFER (Jarvis has already answered
+    # and is asking whether Claude should check the work) rather than by a
+    # routing question (Jarvis has answered nothing yet). It changes what
+    # "no" MEANS: decline the check, versus "you do it". Without this the
+    # commander re-sends the same sentence to the brain and answers him
+    # twice. See commander._try_router_answer.
+    offer: bool = False
 
 
 # ---------------------------------------------------------------- helpers
@@ -1207,16 +1242,45 @@ class Router:
                                      project=project, args=args, confidence=conf)
         elif conf >= CLASSIFY_THRESHOLD:
             return RouteDecision("local", "classify", confidence=conf)
-        self._pending = PendingAsk(text=work, project=project or (active_project or ""),
-                                   at=self._now(), args=dict(args))
+        # EVERYTHING ELSE GOES LOCAL FIRST -- his evening ruling. This used
+        # to return "ask" on all three exits below, which is how "an apple a
+        # day keeps the doctor away or so they say" earned "Shall I hand
+        # that to Claude, sir, or is it a quick one for me?".
+        #
+        # Only the first exit is REALLY unsure, and it is the only one that
+        # says anything afterwards. The other two are ordinary ambiguity:
+        # answer them and be quiet.
         if self.classify is None:
             reason = "no-classifier"
         elif route == "claude":
             reason = "classify-claude-unconfirmed"
         else:
             reason = "classify-low"
-        return RouteDecision("ask", reason, prompt=work, project=project,
-                             args=args, confidence=conf)
+        # REALLY UNSURE TAKES BOTH HALVES, and the cue half was missing on
+        # the first cut: "an apple a day keeps the doctor away or so they
+        # say" with a classifier shouting CLAUDE at 1.0 got offered a
+        # second opinion, which is the exact sentence his ruling exists to
+        # silence. The model leaning Claude is not doubt about CODE unless
+        # there is some code in the sentence. Same cue test the money bar
+        # above uses, deliberately -- one definition, not two.
+        has_cue = bool(cues.code_weak or cues.code_strong or cues.code_verb)
+        if reason != "classify-claude-unconfirmed" or not has_cue:
+            # `work` rides along even though the local path answers `text`
+            # itself (commander._dispatch_route strips the address and uses
+            # that). It costs nothing and it keeps the decision readable in
+            # the route log, which is the only place a mangled sentence
+            # would show before it reached the model.
+            return RouteDecision("local", reason, prompt=work,
+                                 project=project, args=args, confidence=conf)
+        # The model leaned CLAUDE and there is a cue, but not enough of one
+        # to spend his money on (see the money bar above, which this does
+        # NOT lower). Park the ask so a following "yes" resolves through the
+        # machinery that already answers ROUTER_QUESTION -- no second
+        # protocol -- and let the commander speak the offer after the work.
+        self._pending = PendingAsk(text=work, project=project or (active_project or ""),
+                                   at=self._now(), args=dict(args), offer=True)
+        return RouteDecision("local", reason, prompt=work, project=project,
+                             args=args, confidence=conf, offer_claude=True)
 
 
 # ------------------------------------------------------------ answers

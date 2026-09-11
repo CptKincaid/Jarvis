@@ -34,6 +34,15 @@ FIXED 2026-08-26: PendingAsk carries an `args` dict, _tie_break() fills it,
 and commander._try_router_answer() rebuilds the decision with it, so "yes"
 runs the task on the model the user named.  This test is no longer xfail.
 """
+
+# HIS RULING, 2026-09-11 EVENING: "everything else go local first ... only
+# on things its REALLY unsure about should it offer". Rule 6 no longer
+# parks anything on ordinary ambiguity, so `classify=None` (which is what
+# these used) is now answered in silence. The PendingAsk this file is
+# about survives on the one exit that IS really unsure -- the classifier
+# leaning CLAUDE with a coding cue present -- so the router below is built
+# with exactly that and nothing else in the file changes.
+
 import pytest
 
 from jarvis.router import Router
@@ -43,9 +52,9 @@ ALIASES = ["haiku", "sonnet", "fable"]
 
 @pytest.mark.parametrize("alias", ALIASES)
 def test_the_remembered_question_keeps_the_model_choice(alias):
-    r = Router(None, classify=None)
+    r = Router(None, classify=lambda t: ("claude", 0.9))
     d = r.route(f"the calendar module is broken, use {alias}")
-    assert d.kind == "ask", (d.kind, d.reason)
+    assert d.offer_claude is True, (d.kind, d.reason)
     assert d.args.get("model") == alias, d.args
     pend = r.pending()
     assert pend is not None
@@ -57,7 +66,7 @@ def test_the_remembered_question_keeps_the_model_choice(alias):
 def test_the_ask_decision_itself_does_capture_the_alias():
     """Control: the alias IS captured on the way in, so the loss is in what
     PendingAsk remembers, not in the model regex."""
-    r = Router(None, classify=None)
+    r = Router(None, classify=lambda t: ("claude", 0.9))
     d = r.route("the calendar module is broken, use haiku")
-    assert d.kind == "ask", (d.kind, d.reason)
+    assert d.offer_claude is True, (d.kind, d.reason)
     assert d.args.get("model") == "haiku", d.args

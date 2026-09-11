@@ -171,7 +171,16 @@ def test_actions_route_to_the_session_manager(text, action, args):
 
 
 @pytest.mark.parametrize("text", AMBIGUOUS)
-def test_ambiguous_utterances_ask_exactly_one_question(text):
+def test_ambiguous_utterances_are_just_ANSWERED(text):
+    """HIS RULING, 2026-09-11 evening: "everything else go local first",
+    and only things it is REALLY unsure about get an offer. A classifier
+    that says LOCAL and is merely not confident is ordinary ambiguity, not
+    real doubt -- it is answered and nothing more is said. The old name
+    ("...ask_exactly_one_question") stated the rule that moved.
+
+    What has NOT changed, and is the reason this corpus exists: the model
+    is consulted exactly once. A second call per utterance is a second
+    Ollama turn on every ambiguous sentence he speaks."""
     calls = []
 
     def classify(t):
@@ -180,11 +189,11 @@ def test_ambiguous_utterances_ask_exactly_one_question(text):
 
     r = make_router(classify)
     d = r.route(text, "jarvis")
-    assert d.kind == "ask", (text, d)
+    assert d.kind == "local", (text, d)
+    assert d.reason == "classify-low", (text, d)
+    assert d.offer_claude is False, (text, d)
     assert len(calls) == 1
-    assert r.pending() is not None and r.pending().text == d.prompt
-    # asking again while pending does not stack questions
-    assert r.pending() is r.pending()
+    assert r.pending() is None, "a following 'yes' would have been a trap"
 
 
 # ------------------------------------------------------------ rule 6/7
@@ -195,9 +204,14 @@ def test_confident_classifier_routes_silently():
     assert d.kind == "local" and d.reason == "classify"
     # The claude direction bills the user's account, so it takes the higher
     # bar (fixed 2026-08-26, finding C1): 0.9 asks, 0.95 dispatches.
+    # 0.9 is the REALLY unsure case: the model said Claude and there is a
+    # cue, but not enough of one to spend his money on. Under his evening
+    # ruling it is answered here and the offer follows -- it no longer
+    # stops to ask which way to go.
     r = make_router(lambda t: ("claude", 0.9))
     d = r.route("sort out the thing we talked about", None)
-    assert d.kind == "ask" and d.reason == "classify-claude-unconfirmed"
+    assert d.kind == "local" and d.reason == "classify-claude-unconfirmed"
+    assert d.offer_claude is True
     assert r.pending() is not None
     r = make_router(lambda t: ("claude", 0.95))
     d = r.route("sort out the thing we talked about", None)
@@ -210,7 +224,11 @@ def test_a_confident_claude_still_needs_a_coding_cue():
     all, however sure the classifier says it is (finding C1)."""
     r = make_router(lambda t: ("claude", 1.0))
     d = r.route("an apple a day keeps the doctor away or so they say", None)
-    assert d.kind == "ask", (d.kind, d.reason)
+    # It may not reach Claude, and under his evening ruling it does not
+    # stop to ask about it either. This is the sentence that earned the
+    # ruling: there is nothing here to consult anybody about.
+    assert d.kind == "local", (d.kind, d.reason)
+    assert d.offer_claude is False, (d.kind, d.reason)
     # the control: "sort out" IS a coding verb, so this one may dispatch
     d = r.route("sort out the thing we talked about", None)
     assert d.kind == "claude", (d.kind, d.reason)
@@ -289,22 +307,24 @@ def test_media_requests_are_local_without_the_model():
 def test_the_ask_remembers_the_modifiers_it_was_given():
     """Answering "yes" must run the task the user described, on the model
     the user named (finding M1)."""
-    r = make_router(lambda t: ("local", 0.1))
+    r = make_router(lambda t: ("claude", 0.9))
     d = r.route("the calendar module is broken, use haiku", None)
-    assert d.kind == "ask" and d.args["model"] == "haiku"
+    assert d.offer_claude is True and d.args["model"] == "haiku"
     assert r.pending().args == {"model": "haiku"}
 
 
-def test_classifier_failure_or_absence_asks():
+def test_classifier_failure_or_absence_just_ANSWERS():
+    """RENAMED: the old name said "asks". With nothing to be unsure WITH,
+    there is no real doubt to report -- Ollama being down is not a reason
+    to put a routing question to him. Answer it."""
     def boom(t):
         raise RuntimeError("ollama down")
-    assert make_router(boom).route("sort out the thing we talked about",
-                                   None).kind == "ask"
-    assert make_router(None).route("sort out the thing we talked about",
-                                   None).kind == "ask"
-    # garbage answers are treated as no answer
-    assert make_router(lambda t: ("maybe", 0.99)).route(
-        "sort out the thing we talked about", None).kind == "ask"
+    for r in (make_router(boom), make_router(None),
+              make_router(lambda t: ("maybe", 0.99))):   # garbage = no answer
+        d = r.route("sort out the thing we talked about", None)
+        assert d.kind == "local", d
+        assert d.offer_claude is False, d
+        assert r.pending() is None, d
 
 
 def test_short_sentence_with_no_cue_is_local_without_asking():
@@ -319,14 +339,18 @@ def test_claude_needs_a_cue():
     # seven words, no cue: neither table fires, the model is asked
     r = make_router(lambda t: ("local", 0.1))
     d = r.route("make the downloads folder less of a disaster please", None)
-    assert d.kind == "ask"
+    # The subject is that no cue means NO CLAUDE, whatever the model says.
+    # Where it goes instead is his evening ruling's business: local, quietly.
+    assert d.kind == "local" and d.offer_claude is False, d
 
 
 # ------------------------------------------------------------ resolve
 def test_resolve_answer_yes_and_no():
-    r = make_router()
+    # The offer, not the old routing question, is what parks an ask now;
+    # resolving it is the same machinery and that is this test's subject.
+    r = make_router(lambda t: ("claude", 0.9))
     d = r.route("sort out the thing we talked about", "jarvis")
-    assert d.kind == "ask"
+    assert d.kind == "local" and d.offer_claude is True
     assert r.resolve_answer("yes") == "claude"
     assert r.pending() is None
     r.route("sort out the thing we talked about", "jarvis")
@@ -354,7 +378,10 @@ def test_resolve_answer_needs_a_pending_question():
 
 def test_pending_question_expires_after_ninety_seconds():
     clock = Clock(100.0)
-    r = make_router(clock=clock)
+    # A classifier that LEANS CLAUDE is what parks an ask now -- that is
+    # the only exit that is really unsure. The ninety seconds this test is
+    # about are unchanged.
+    r = make_router(lambda t: ("claude", 0.9), clock=clock)
     r.route("sort out the thing we talked about", "jarvis")
     clock.t += ASK_TTL_S - 1
     assert r.pending() is not None
@@ -376,7 +403,7 @@ def test_a_determiner_is_not_a_project_name():
 
 
 def test_pending_remembers_the_active_project():
-    r = make_router()
+    r = make_router(lambda t: ("claude", 0.9))
     r.route("sort out the thing we talked about", "haymaker")
     assert r.pending().project == "haymaker"
     r.clear_pending()
@@ -627,9 +654,15 @@ def test_modifier_is_a_directive_only_where_one_was_meant(text, prompt, model,
                                                           parallel):
     d = Router(None, classify=None).route(text)
     if prompt is NO_DIRECTIVE:
-        # Nothing may be deleted: what Claude is asked to do is byte-for-byte
+        # Nothing may be deleted: whatever acts on this gets byte-for-byte
         # what the user said.
-        assert d.kind in ("claude", "ask"), (text, d.kind, d.reason)
+        #
+        # The destination assertion that used to sit here named "claude" or
+        # "ask". His evening ruling added a third answer -- answered locally,
+        # quietly -- so this now asserts the two things a misread modifier
+        # would actually break: the sentence is intact, and nothing in it
+        # was mistaken for a DIRECTIVE.
+        assert d.action != "set_model", (text, d.kind, d.reason, d.action)
         assert d.prompt == text, (text, d.prompt)
     elif prompt == "":
         assert d.kind == "action" and d.action == "set_model", (text, d)
@@ -830,3 +863,150 @@ def test_a_local_errand_that_starts_with_where_is_untouched():
     for text in ("where's my next meeting", "where is my 3pm appointment"):
         d = r.route(text, "jarvis")
         assert d.kind == "local" and d.reason != "local:code-lookup", (text, d)
+
+
+# ==================================================================
+# HIS RULING, 2026-09-11 EVENING, and it REVERSES ruling (a)
+# ==================================================================
+# Verbatim: "Anything with coding should go to claude automatically
+# everything else go local first." And then, refining it: "il tell it if
+# it should route to claude but only on things its REALLY unsure about
+# should it offer".
+#
+# So the code-cue half is what it always was and stays untouched. What
+# moves is rule 6 -- the tie-break the rule ladder reaches when it found
+# no cue it recognises. That used to ASK on every one of its three exits,
+# which is how "an apple a day keeps the doctor away" got "Shall I hand
+# that to Claude, sir, or is it a quick one for me?".
+#
+# THREE EXITS, and only one of them is REALLY unsure:
+#
+#   classify-claude-unconfirmed  the model said CLAUDE and there is a
+#                                coding cue, but under the money bar.
+#                                That is the one. Answer it here, then
+#                                offer to have Claude check the work.
+#   classify-low                 the model said local and was not sure.
+#                                Ordinary ambiguity. Just answer.
+#   no-classifier                nothing to be unsure WITH. Just answer.
+def test_coding_still_goes_to_claude_automatically():
+    """The half of his ruling that was already true, pinned so nothing
+    quietly attempts it locally again."""
+    for text in ("fix the failing test in the parser", "run the tests",
+                 "refactor the router module", "merge the feature branch"):
+        d = Router(None, classify=None).route(text, "jarvis")
+        assert d.kind == "claude", (text, d.kind, d.reason)
+
+
+def test_an_ordinary_unsure_sentence_is_just_ANSWERED():
+    """No question, and no offer either. "an apple a day keeps the doctor
+    away" is not something to consult Claude about."""
+    r = make_router(lambda t: ("local", 0.2))
+    d = r.route("an apple a day keeps the doctor away or so they say", None)
+    assert d.kind == "local" and d.reason == "classify-low", d
+    assert d.offer_claude is False, d
+    assert r.pending() is None, "a 'yes' would have been a trap"
+
+
+def test_a_box_with_no_classifier_just_answers_too():
+    r = make_router(classify=None)
+    d = r.route("sort out the thing we talked about", None)
+    assert d.kind == "local" and d.reason == "no-classifier", d
+    assert d.offer_claude is False, d
+    assert r.pending() is None
+
+
+def test_REALLY_unsure_answers_and_then_offers():
+    """The model leaned Claude and there IS a coding cue, but not enough
+    of one to spend his money on. That is the whole definition of really
+    unsure, and it is the only exit that says anything afterwards."""
+    r = make_router(lambda t: ("claude", 0.9))
+    d = r.route("sort out the thing we talked about", "haymaker")
+    assert d.kind == "local", d
+    assert d.reason == "classify-claude-unconfirmed", d
+    assert d.offer_claude is True, d
+    # ...and a following "yes" reaches Claude through the machinery that
+    # already answers ROUTER_QUESTION. No second protocol.
+    assert r.pending() is not None and r.pending().project == "haymaker"
+
+
+def test_the_money_bar_is_not_lowered_by_any_of_this():
+    """0.95 with a cue still dispatches; 0.9 does not. He asked for less
+    asking, not for more spending."""
+    r = make_router(lambda t: ("claude", 0.95))
+    d = r.route("sort out the thing we talked about", None)
+    assert d.kind == "claude" and d.reason == "classify", d
+
+
+def test_a_shouting_classifier_with_NO_CUE_earns_no_offer():
+    """Found by the test above on the first cut. A classifier at 1.0 saying
+    "claude" about "an apple a day keeps the doctor away" is not doubt
+    about CODE -- there is no code in it. Really unsure needs both halves:
+    the model leaning Claude AND a coding cue in the sentence."""
+    r = make_router(lambda t: ("claude", 1.0))
+    for text in ("an apple a day keeps the doctor away or so they say",
+                 "his memory is going but his humour is intact"):
+        d = r.route(text, None)
+        assert d.kind == "local", (text, d)
+        assert d.offer_claude is False, (text, d)
+        assert r.pending() is None, (text, "a 'yes' would have been a trap")
+
+
+def test_the_HONEST_RESIDUE_of_the_offer_is_one_extra_sentence():
+    """What the cue gate does NOT catch, said out loud rather than left to
+    be discovered. "we always split the bill when we go out" carries
+    "split", which is a real CODE_VERB, so a classifier leaning Claude on
+    it earns an offer he does not need.
+
+    The bound is what matters and it is small: an offer costs one spoken
+    sentence after an answer he already has. It does NOT reach the paid
+    CLI -- ORDINARY_ENGLISH above pins that for this very sentence at the
+    0.90 the real gemma4:26b gave it on 2026-08-26. If he reports being
+    offered a second opinion about dinner, the lever is this cue test and
+    not the offer itself."""
+    r = make_router(lambda t: ("claude", 0.90))
+    d = r.route("we always split the bill when we go out", None)
+    assert d.kind == "local", d              # never the paid CLI
+    assert d.offer_claude is True, d         # ...but it does offer. Measured.
+
+
+def test_the_offer_line_is_an_offer_and_not_a_refusal():
+    from jarvis.router import CLAUDE_CHECK_OFFER
+    assert "had a go" in CLAUDE_CHECK_OFFER
+    assert CLAUDE_CHECK_OFFER != ROUTER_QUESTION
+
+
+def test_a_declined_offer_is_marked_so_nobody_answers_him_twice():
+    """THE BUG THIS CAUGHT, before it shipped. Under the old routing
+    question Jarvis had NOT answered yet, so resolving it to "local" meant
+    "you do it" and the commander sent the text to the brain. Under the
+    offer it HAS answered -- "no" means "don't bother Claude", and sending
+    the same sentence to the brain a second time would answer him twice.
+
+    The pending carries the distinction rather than the commander guessing
+    it, so the day something parks a real routing question again, its "no"
+    still means what it always meant."""
+    r = make_router(lambda t: ("claude", 0.9))
+    r.route("sort out the thing we talked about", "jarvis")
+    assert r.pending().offer is True
+
+
+def test_NOTHING_ROUTES_TO_ASK_ANY_MORE_and_that_is_on_purpose():
+    """THE CONSEQUENCE OF HIS EVENING RULING, pinned rather than left to be
+    discovered. Rule 6's tie-break was the only thing that ever produced
+    kind "ask", and all three of its exits are now local. So
+    ROUTER_QUESTION -- "Shall I hand that to Claude, sir, or is it a quick
+    one for me?" -- is never spoken.
+
+    The constant and the commander's ask branch are KEPT, not deleted: the
+    kind is still in RouteDecision's contract, resolve_answer still runs on
+    PendingAsk, and if he ever wants the question back it is one return
+    statement. This test is what tells the next reader the silence is a
+    decision and not a regression -- and it fails loudly the day something
+    starts asking again, which is the moment to check he still wants it.
+    """
+    r = make_router(lambda t: ("claude", 0.9))
+    seen = set()
+    for text in (LOCAL + CLAUDE + [t for t, *_ in AMBIGUOUS]):
+        seen.add(r.route(text, "jarvis").kind)
+        r.clear_pending()
+    assert "ask" not in seen, seen

@@ -127,7 +127,8 @@ from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
 from jarvis.tools import spotify as spotify_mod
 from jarvis import syllabus as syllabus_mod
-from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
+from jarvis.router import (OFFER_DECLINED_LINE, ROUTER_QUESTION, WEB_CUE_RX,
+                           RouteDecision,
                            estimate_size, local_cues, normalise)
 
 log = get_logger("commander")
@@ -13297,6 +13298,17 @@ class Commander:
             # A new subject: the question is dropped, the new text routes.
             router.clear_pending()
             return None
+        if kind == "local" and getattr(pend, "offer", False):
+            # "NO" MEANS TWO DIFFERENT THINGS and the pending knows which.
+            # After a routing QUESTION, Jarvis has answered nothing yet and
+            # "no, you do it" means do it yourself -- fall through and chat
+            # it. After an OFFER, the answer has already been spoken and
+            # "no" only declines the Claude check; chatting it again would
+            # answer him twice. (Found 2026-09-11 by the test of that name,
+            # before it shipped.)
+            log.info("route local (offer declined) %r", pend.text[:60])
+            return CommandResult(handled=True, reply=OFFER_DECLINED_LINE,
+                                 speak=True, status="Kept local")
         # The modifiers the utterance carried ("use haiku", "in parallel")
         # travel with the remembered question: without them "yes" runs the
         # task on the default model, which is the expensive one.
@@ -14401,6 +14413,22 @@ class Commander:
             return CommandResult(handled=False, reply=text,
                                  status="No route (no brain)")
         stripped = strip_address(text)
+        # HIS RULING, 2026-09-11 evening: only on things it is REALLY
+        # unsure about should it offer. The router sets offer_claude on
+        # exactly one exit -- the classifier leaned Claude AND there is a
+        # coding cue, but not enough of one to spend his money on. The
+        # offer is spoken by app._on_brain_tags AFTER the answer, so he
+        # hears the attempt first and the offer second, and the router has
+        # already parked the PendingAsk so a following "yes" resolves
+        # through the machinery that answers ROUTER_QUESTION.
+        if getattr(d, "offer_claude", False):
+            services = getattr(self, "services", None) or self._svc("services")
+            if services is not None:
+                try:
+                    services.claude_check_offer = True
+                except Exception:          # noqa: BLE001 - a namespace boundary
+                    log.debug("could not park the claude-check offer",
+                              exc_info=True)
         forced = forced_call(d.reason, stripped)
         if forced is not None:
             name, args = forced

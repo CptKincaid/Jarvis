@@ -146,13 +146,20 @@ def test_the_routers_hand_it_to_claude_question_holds_the_floor(app):
     the router owns, so question_open() did not know about it and the
     answer got the strict gate."""
     assert not app.commander.question_open()
-    # an unconfident "claude" guess is what parks the ask (router._tie_break)
-    app.services.router.classify = lambda text, timeout=None: ("claude", 0.2)
-    decision = app.services.router.route("cross the second one off the list")
-    assert decision.kind == "ask", f"expected the question, got {decision.kind}"
+    # HIS RULING, 2026-09-11 evening, retired the routing question itself --
+    # nothing produces kind "ask" any more. The OFFER parks the same
+    # PendingAsk and needs the same protection for exactly the same reason:
+    # his "yes" to it is the answer to a question Jarvis asked aloud, and
+    # the strict gate must not eat it. The vehicle moves to the one exit
+    # that still parks an ask; the subject does not move at all.
+    app.services.router.classify = lambda text, timeout=None: ("claude", 0.9)
+    decision = app.services.router.route("the calendar module is broken")
+    assert decision.offer_claude is True, \
+        f"expected the offer, got {decision.kind}/{decision.reason}"
     assert app.services.router.pending() is not None, "no ask was parked"
     assert app.commander.question_open(), (
-        "an unanswered 'Shall I hand that to Claude, sir?' is an open question")
+        "an unanswered offer to have Claude check the work is an open "
+        "question")
 
 
 def test_the_uncertain_intent_card_also_rescues_its_answer(app, monkeypatch):

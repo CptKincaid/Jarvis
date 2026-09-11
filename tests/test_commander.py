@@ -611,6 +611,22 @@ def rich(services, tmp_path, monkeypatch):
     return Commander(services)
 
 
+def _unsure(services):
+    """Rebuild the router so the classifier LEANS CLAUDE but not far enough
+    to spend money -- rule 6's classify-claude-unconfirmed exit, which is
+    the only one his 2026-09-11 evening ruling leaves an offer on. The
+    fixture's default (local, 0.2) is ordinary ambiguity and is now simply
+    answered, so it can no longer park anything to resolve."""
+    services.classify_calls = []
+
+    def classify(text):
+        services.classify_calls.append(text)
+        return ("claude", 0.9)
+
+    services.router = Router(services.assistant, classify=classify)
+    return services
+
+
 def _submitted(services):
     assert services.claude.submit.call_count == 1, \
         services.claude.submit.call_args_list
@@ -688,10 +704,16 @@ def test_nothing_pending_means_yes_is_an_ordinary_utterance(rich, services):
 
 
 # ------------------------------------------- (c) the pending router question
-def test_router_question_is_asked_once_then_resolved_to_claude(rich, services):
-    res = rich.handle("sort out the thing we talked about", source="typed")
-    assert res.reply == ROUTER_QUESTION and res.speak
+def test_the_offer_is_parked_once_then_resolved_to_claude(rich, services):
+    """RENAMED. His evening ruling retired the routing question entirely --
+    nothing produces kind "ask" any longer. The machinery underneath is the
+    same PendingAsk, and this test still pins the two things that matter:
+    the model is consulted ONCE, and a following "yes" runs the remembered
+    work on Claude."""
+    _unsure(services)
+    rich.handle("sort out the thing we talked about", source="typed")
     assert services.classify_calls == ["sort out the thing we talked about"]
+    assert getattr(services, "claude_check_offer", False) is True
     services.claude.submit.assert_not_called()
     res = rich.handle("yes", source="typed")
     args, kwargs = _submitted(services)
@@ -700,20 +722,26 @@ def test_router_question_is_asked_once_then_resolved_to_claude(rich, services):
     assert services.router.pending() is None
 
 
-def test_router_question_resolved_to_local_goes_to_the_brain(rich, services):
+def test_declining_the_offer_says_so_and_stops(rich, services):
+    """RETARGETED. Under the routing question, "no, you do it" meant DO IT
+    and the brain got the text. Under the offer the brain has already had
+    it, so "no" only declines the check and he hears one short line."""
+    from jarvis.router import OFFER_DECLINED_LINE
+    _unsure(services)
     rich.handle("sort out the thing we talked about", source="typed")
-    rich.handle("no, you do it", source="typed")
-    services.brain.chat.assert_called_once_with(
-        "sort out the thing we talked about")
+    res = rich.handle("no, you do it", source="typed")
+    assert res.reply == OFFER_DECLINED_LINE and res.speak
     services.claude.submit.assert_not_called()
 
 
-def test_a_new_subject_drops_the_router_question(rich, services):
+def test_a_new_subject_drops_the_pending_offer(rich, services):
+    _unsure(services)
     rich.handle("sort out the thing we talked about", source="typed")
+    before = services.brain.chat.call_count       # the attempt itself
     rich.handle("what's the weather", source="typed")
-    # one chat call for the new subject (the route short-cut may add
+    # one MORE chat call, for the new subject (the route short-cut may add
     # force_tool/force_args; tests/test_route_shortcut.py pins those)
-    assert services.brain.chat.call_count == 1
+    assert services.brain.chat.call_count == before + 1
     assert services.brain.chat.call_args.args == ("what's the weather",)
     assert services.router.pending() is None
     services.claude.submit.assert_not_called()
@@ -989,10 +1017,13 @@ def test_assistant_tier1_is_a_subset_of_the_registry_in_order():
 def test_discord_text_skips_the_intent_gate(rich, services):
     # Voice would discard this as background chat; "discord" is typed.
     res = rich.handle("she said no way lol haha dude", source="discord")
+    # The classifier being consulted at all IS the gate being skipped --
+    # that is this test's subject. What the router then does with the
+    # answer is his evening ruling's business (answered locally, quietly),
+    # so the ROUTER_QUESTION assertion that used to sit here is gone.
     assert services.classify_calls == ["she said no way lol haha dude"]
-    assert res.reply == ROUTER_QUESTION
+    assert "Ignored" not in (res.status or "")
     rich.handle("what's the weather", source="discord")
-    assert services.brain.chat.call_count == 1
     assert services.brain.chat.call_args.args == ("what's the weather",)
 
 
@@ -2899,3 +2930,35 @@ def test_a_sentence_puts_a_live_carry_down_but_a_cast_verb_does_not(rich, courie
 def test_a_slim_commander_with_no_services_survives_the_carry_hook():
     c = object.__new__(Commander)
     c._cast_spoken_over("anything at all")       # no services: a no-op
+
+
+# ==================================================================
+# HIS RULING, 2026-09-11 EVENING: the offer, end to end
+# ==================================================================
+def test_a_yes_to_the_offer_sends_the_remembered_work_to_claude(rich, services):
+    services.classify = lambda t, timeout=None: ("claude", 0.9)
+    services.router = Router(services.assistant,
+                             classify=lambda t: ("claude", 0.9))
+    rich.handle("sort out the thing we talked about", source="typed")
+    assert getattr(services, "claude_check_offer", False) is True, \
+        "nothing told the app to speak the offer"
+    services.claude.submit.assert_not_called()
+    rich.handle("yes", source="typed")
+    args, _ = _submitted(services)
+    assert args[0] == "sort out the thing we talked about"
+
+
+def test_a_NO_to_the_offer_does_not_answer_him_a_second_time(rich, services):
+    """The bug this lane caught before it shipped. Jarvis has already
+    answered by the time the offer is spoken; "no" declines the check, and
+    re-sending the same sentence to the brain would answer him twice."""
+    services.router = Router(services.assistant,
+                             classify=lambda t: ("claude", 0.9))
+    rich.handle("sort out the thing we talked about", source="typed")
+    first = services.brain.chat.call_count
+    res = rich.handle("no, you do it", source="typed")
+    assert services.brain.chat.call_count == first, \
+        "it answered the same question twice"
+    services.claude.submit.assert_not_called()
+    assert services.router.pending() is None
+    assert res.speak and res.reply

@@ -1701,7 +1701,8 @@ class JarvisApp:
             log.debug("setup lines unavailable", exc_info=True)
         # Fixed lines owned by the assistant modules (spec 3.4).
         for modname, names in (
-                ("jarvis.router", ("ROUTER_QUESTION",)),
+                ("jarvis.router", ("ROUTER_QUESTION", "CLAUDE_CHECK_OFFER",
+                                  "OFFER_DECLINED_LINE")),
                 # BUSY_LINE is a {project} template — never prewarmed.
                 ("jarvis.claude_session", ("CANCELLED_LINE", "NO_PROJECT_LINE",
                                            "OUTSIDE_LINE", "UNSAFE_DIR_LINE",
@@ -2332,6 +2333,20 @@ class JarvisApp:
             self._followup_after_speech = True
         self._say(sentence)
 
+    def _take_claude_check_offer(self) -> bool:
+        """True ONCE when this reply is a local attempt at work Jarvis is
+        REALLY unsure about (commander._dispatch_route parks it). Cleared
+        on the way out so the offer is made exactly once per turn, whatever
+        else the batch of tags carries."""
+        services = getattr(self, "services", None)
+        if services is None or not getattr(services, "claude_check_offer", False):
+            return False
+        try:
+            services.claude_check_offer = False
+        except Exception:                  # noqa: BLE001 - a namespace boundary
+            log.debug("could not clear the claude-check offer", exc_info=True)
+        return True
+
     def _on_brain_tags(self, tags):
         """Port of the monolith's _on_brain_response: act on [TAG] tuples.
         A ("BRIEFING", json) tag turns that turn's SPEAK into ONE
@@ -2405,6 +2420,18 @@ class JarvisApp:
                         offer = ""
                         # the answer window opens whatever the source: the
                         # question was put to him aloud
+                        self._followup_after_speech = True
+                    elif self._take_claude_check_offer():
+                        # HIS RULING, 2026-09-11 evening: "only on things
+                        # its REALLY unsure about should it offer". The
+                        # attempt has just been spoken; this is the second
+                        # half of the sentence, joined the way the
+                        # briefing's wake-alarm offer is.
+                        from jarvis.router import CLAUDE_CHECK_OFFER
+                        self._say(self._thin_address(
+                            [content, CLAUDE_CHECK_OFFER])[-1])
+                        # the answer window opens whatever the source: the
+                        # offer was put to him aloud
                         self._followup_after_speech = True
                     # brain._remember has already recorded this exchange;
                     # recording it here too rendered every turn twice.
