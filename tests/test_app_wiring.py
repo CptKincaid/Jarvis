@@ -375,12 +375,19 @@ def test_outside_dir_refusal_offers_the_terminal_and_yes_opens_it(app):
     assert third.reply != "Up on screen, sir."
 
 
-def test_ambiguous_utterance_asks_exactly_one_question(app):
+def test_an_ambiguous_utterance_is_just_ANSWERED(app):
+    """HIS RULING, 2026-09-11 evening: "everything else go local first".
+    A classifier that says local and is merely unsure is ordinary
+    ambiguity -- Jarvis answers it and says nothing else. It used to stop
+    and ask which way to route it."""
     from jarvis.router import ROUTER_QUESTION
+    seen = []
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: \
+        seen.append(text)
     app.brain.classify_route = lambda text, timeout=None: ("local", 0.0)
-    result = app.dispatch_text("sort out the thing we talked about")
-    assert result.reply == ROUTER_QUESTION and result.speak
-    assert app.tts.spoken == [ROUTER_QUESTION]
+    app.dispatch_text("sort out the thing we talked about")
+    assert seen == ["sort out the thing we talked about"]
+    assert ROUTER_QUESTION not in app.tts.spoken
 
 
 def test_music_utterance_stays_local(app):
@@ -1857,10 +1864,21 @@ def test_walking_away_is_never_announced(app):
     assert app.tts.spoken == []
 
 
-def test_services_hand_out_a_live_desk_reading_not_a_stale_number(app):
+def _desk_reading(app, idle_s):
+    """Write a reading the way a POLL would: the number AND the clock it
+    was read on. ``DeskSentinel.idle_s`` refuses an unstamped cache since
+    2026-09-06, when a reading with no age was found to be a permanent
+    false home -- 400 no-signal polls later it still answered 5.0 s and
+    "away" never fired (tests/test_presence_stale_legs.py)."""
+    app.desk.last_idle = float(idle_s)
+    app.desk.last_idle_at = app.desk._now()
+
+
+def test_services_hand_out_a_live_desk_reading_not_a_stale_number(app, monkeypatch):
+    monkeypatch.delenv("JARVIS_DESK_PRESENCE", raising=False)
     assert callable(app.services.desk_idle_s)
     assert app.services.desk_idle_s() is None       # no reading in the suite
-    app.desk.last_idle = 42.0
+    _desk_reading(app, 42.0)
     assert app.services.desk_idle_s() == 42.0
 
 
@@ -1952,18 +1970,19 @@ def test_a_return_after_the_damper_is_greeted_again(app):
     assert app.tts.spoken.count(WELCOME_LINE) == 2
 
 
-def test_the_power_up_sweep_applies_the_overnight_gap_gate(app):
+def test_the_power_up_sweep_applies_the_overnight_gap_gate(app, monkeypatch):
     """`_maybe_power_up` probed `getattr(self, "desk_idle_s")` — a name the
     app has never had — so `idle` was always None and the "left alone for
     gap_h hours" gate was skipped on every box."""
     from jarvis.events import PowerUp
+    monkeypatch.delenv("JARVIS_DESK_PRESENCE", raising=False)
     seen = []
     bus.subscribe(PowerUp, seen.append)
     try:
-        app.desk.last_idle = 600.0             # ten minutes: not a night
+        _desk_reading(app, 600.0)              # ten minutes: not a night
         assert app._maybe_power_up("hotword") is False
         assert seen == []
-        app.desk.last_idle = 8 * 3600.0        # a night
+        _desk_reading(app, 8 * 3600.0)         # a night
         assert app._maybe_power_up("hotword") is True
     finally:
         bus.unsubscribe(PowerUp, seen.append)
@@ -1979,7 +1998,7 @@ def test_the_console_is_handed_the_live_desk_probe(app, monkeypatch):
     assert app.desk.enabled
     fn = app.ui_service_kwargs()["desk_idle_s"]
     assert callable(fn)
-    app.desk.last_idle = 42.0
+    _desk_reading(app, 42.0)
     assert fn() == 42.0
 
 
@@ -2415,3 +2434,54 @@ def test_restart_still_restarts_when_the_spoken_line_raises(app, paths):
                          sleep=clock.sleep, clock=clock)
     assert helper == 7
     assert order == ["spawn", "close"]
+
+
+# ==================================================================
+# THE STANDBY SLAB'S DUE ROW IS A FROZEN SENTENCE (his bug #7)
+# ==================================================================
+# "the due and whats next dates for items in the standby screen do not
+# update after the date passes". NEXT re-renders its day word against a
+# fresh clock on every call (_room_next_event); DUE is a PRE-RENDERED
+# sentence -- "BIOSENSORS - Lab 3 report, today 11:59 pm" -- built by the
+# Canvas fact sheet at fetch time and then handed back unchanged for
+# CANVAS_TTL_S. Two rows on one panel with different freshness rules.
+#
+# And the TTL is measured on time.monotonic(), which does not advance
+# across a suspend-to-RAM, so a box that sleeps overnight can satisfy it
+# on the first probe after waking.
+def test_the_canvas_cache_is_dropped_when_the_DAY_turns_over(app, monkeypatch):
+    """23:59 to 00:04 is four minutes by the TTL and a different date by
+    the calendar. The cached sentence still says "today"."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    midnight = _t.mktime((2026, 9, 11, 23, 59, 50, 0, 0, -1))
+    app._board_canvas_lines(now=1_000.0, wall=midnight)
+    app._board_canvas_lines(now=1_060.0, wall=midnight + 300.0)   # 00:04:50
+    assert len(calls) == 2, "the DUE row still says today about yesterday"
+
+
+def test_the_canvas_cache_is_dropped_when_the_WALL_CLOCK_jumps(app, monkeypatch):
+    """Suspend-to-RAM: monotonic barely moved, nine hours passed."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    evening = _t.mktime((2026, 9, 11, 23, 0, 0, 0, 0, -1))
+    app._board_canvas_lines(now=1_000.0, wall=evening)
+    app._board_canvas_lines(now=1_002.0, wall=evening + 9 * 3600.0)
+    assert len(calls) == 2, "the morning slab served last night's sheet"
+
+
+def test_the_canvas_cache_still_serves_three_ticks_inside_one_window(
+        app, monkeypatch):
+    """The saving this cache exists for is not given up to fix the above."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    noon = _t.mktime((2026, 9, 11, 12, 0, 0, 0, 0, -1))
+    for step in (0.0, 5.0, 10.0):
+        app._board_canvas_lines(now=1_000.0 + step, wall=noon + step)
+    assert calls == [1]

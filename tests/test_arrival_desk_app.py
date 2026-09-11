@@ -368,10 +368,43 @@ def test_a_box_with_no_zone_source_and_no_camera_has_no_legs():
 
 
 def test_a_camera_feed_is_the_camera_leg():
+    """UPDATED 2026-09-06 and deliberately TIGHTENED. A feed alone was
+    enough while nothing on the tree ever attached one -- the leg could
+    not be counted, so the gate could not be wrong. Now that the app owns
+    a feed, all three of the things that would actually have to publish
+    this leg are checked: the feed, the producer that looks through it,
+    and a gallery that can put a NAME to what it sees. A leg counted here
+    that cannot fire is his mail question silently never being asked."""
+    a = make_app(legs=None,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          camera_feed=object(),
+                                          eyeloop=object()))
+    a._camera_can_name_cache = True
+    assert a._settle_legs() == ("camera",)
+
+
+def test_a_feed_with_no_producer_is_not_a_camera_leg():
+    """A feed nothing looks through never publishes a reading, so
+    _eye_identity answers "" for ever and the catch-up would wait for a
+    settle that cannot arrive."""
     a = make_app(legs=None,
                  services=SimpleNamespace(panel_wake=None, briefing_offer=None,
                                           camera_feed=object()))
-    assert a._settle_legs() == ("camera",)
+    a._camera_can_name_cache = True
+    assert a._settle_legs() == ()
+
+
+def test_a_camera_that_cannot_name_anybody_is_not_a_camera_leg():
+    """This leg is delivered by a NAME. With identity off, nobody
+    enrolled, or an enrolment belonging to a model that is no longer the
+    active one (a real state on this box since the 09-03 backend swap),
+    the producer counts faces and names nobody -- which never settles."""
+    a = make_app(legs=None,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          camera_feed=object(),
+                                          eyeloop=object()))
+    a._camera_can_name_cache = False
+    assert a._settle_legs() == ()
 
 
 def test_a_zone_source_with_NO_ZONES_CONFIG_is_not_a_leg():
@@ -520,3 +553,49 @@ def test_the_door_does_not_re_arm_on_a_drop(monkeypatch):
     a._dispatch_gen += 1
     _finish(a, gate)
     assert a._desk.armed is False
+
+
+# ==================================================================
+# THE NAP GATE, WIRED (jarvis/app.py)
+# ==================================================================
+def test_a_phone_return_before_the_confirm_closed_says_nothing():
+    """Seven times in two days, measured: away, then home(returned) ten
+    seconds later, then "Welcome back, sir" to a man who never left."""
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    a._greet_return("phone")
+    assert a.tts.spoken == [], "the false welcome is still spoken"
+    assert a.quiet.frags == HELD, "a nap drained the backlog he was owed"
+
+
+def test_the_same_return_once_the_confirm_has_closed_is_greeted():
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = False
+    a._greet_return("phone")
+    assert a.tts.spoken == [WELCOME_LINE]
+
+
+def test_a_door_return_is_greeted_even_with_the_confirm_still_armed():
+    """The radar saw a body. Only the radio is doubted."""
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    a._greet_return("room:kitchen")
+    assert a.tts.spoken == [WELCOME_LINE]
+
+
+def test_the_refused_nap_is_logged_by_name(caplog):
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    with caplog.at_level(logging.INFO, logger="jarvis.app"):
+        a._greet_return("phone")
+    assert any("nap" in r.getMessage() for r in caplog.records), \
+        "it refused anonymously, which is the defect this lane exists for"
+
+
+def test_cancelling_an_armed_confirm_reports_that_it_was_pending():
+    a = make_app()
+    a._departure_timer = SimpleNamespace(cancel=lambda: None)
+    assert a._cancel_departure() is True
+    assert a._departure_pending is True
+    assert a._cancel_departure() is False
+    assert a._departure_pending is False

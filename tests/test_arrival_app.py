@@ -1096,3 +1096,30 @@ def test_a_TTS_FAILURE_gives_a_REAL_policy_its_lines_back_and_they_are_SPOKEN():
     p._set("quiet.dnd_until", 0)               # the window is over
     text = p.tick()
     assert "The build passed" in text and said == [text]
+
+
+# ==================================================================
+# A NAP IS NOT A RETURN (_on_presence)
+# ==================================================================
+def test_a_ten_second_round_trip_neither_greets_nor_burns_the_power_up():
+    """His measured failure, 2026-09-11: away at 11:32:26, home(returned)
+    at 11:32:36. Ten seconds is one presence.poll_s_away; his phone
+    answered the next poll. Nothing left and nothing came back."""
+    a = make_app()
+    a._departure_timer = SimpleNamespace(cancel=lambda: None)
+    swept, greeted = [], []
+    a._maybe_power_up = lambda why: swept.append(why)
+    a._greet_return = lambda src: greeted.append(src)
+    a._on_presence(SimpleNamespace(home=True, returned=True, since=2_000.0))
+    assert greeted == [], "it welcomed a man who had not moved"
+    assert swept == [], "a napping radio burned the once-a-day sweep"
+
+
+def test_a_return_after_the_confirm_closed_still_greets_and_sweeps():
+    a = make_app()
+    a._departure_timer = None
+    swept, greeted = [], []
+    a._maybe_power_up = lambda why: swept.append(why)
+    a._greet_return = lambda src: greeted.append(src)
+    a._on_presence(SimpleNamespace(home=True, returned=True, since=2_000.0))
+    assert greeted == ["phone"] and swept == ["presence"]

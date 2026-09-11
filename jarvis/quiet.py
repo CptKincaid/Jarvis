@@ -78,7 +78,46 @@ FREE_LINE = "Very good, sir."
 # through a three-hour block would arrive five deep. Held -> expired.
 # "nudge" here is an interval reminder (timekeeper.NUDGE_KIND), not the
 # app's "Sir?" cue -- that one is an answer and never reaches this gate.
-EPHEMERAL_KINDS = ("nudge",)
+#
+# "audio-route" JOINED IT ON 2026-09-11, and he is the one who reported
+# why. A soundbar that drops and comes back is a TRANSITION: the line is
+# worth saying as it happens ("I'm coming out of the monitor, sir") and
+# worth nothing afterwards, because by the time he hears the digest the
+# sound is wherever it now is and he can hear that for himself. Filed as
+# "warning", every transition queued, and a spell of flapping came back
+# at him as news. HIS WORDS, and this is one held backlog read out
+# verbatim:
+#
+#   "i never left and he said While you were out: three warnings. The
+#    soundbar is back; I'm still coming out of the soundbar. I'm coming
+#    out of the monitor; the soundbar has dropped. The soundbar is back;
+#    I'm still coming out of the soundbar."
+#
+# Three warnings, all of them about the same speaker, none of them true
+# any more. The digest is for things he MISSED; this is a thing he cannot
+# miss, because the room is making the sound.
+EPHEMERAL_KINDS = ("nudge", "audio-route")
+
+# HIS RULING, 2026-09-11: "missed reminders shouldnt be read back if the
+# reminder is 30 mins outdated." The earlier half of the same report is why
+# he said it: "If the event has passed then he doesnt need to tell me about
+# it if i come back."
+#
+# EPHEMERAL_KINDS above expires a line at the moment it is HELD -- it never
+# joins the backlog at all. This is the other half: a line that was worth
+# holding when it fired and has since gone stale sitting in the queue. A
+# leave-time heads-up read back an hour later is about a walk that has
+# already happened or already been missed.
+#
+# SCOPED TO THE KINDS WHOSE VALUE IS THEIR MOMENT. A warning ("the disk is
+# nearly full") is as true an hour later as it was, and a message he was
+# sent does not expire; those still keep. An alarm never reaches this queue
+# at all -- it rings regardless of quiet hours.
+STALE_AFTER_S = 30 * 60.0
+# "nudge" is deliberately NOT here: it is in EPHEMERAL_KINDS above, so it
+# never joins the backlog in the first place and can never go stale in it.
+# Listing it would have implied a window it never reaches.
+MOMENT_KINDS = ("reminder", "timer")
 
 _KIND_NOUNS = {
     "reminder": ("reminder", "reminders"),
@@ -488,6 +527,31 @@ class QuietPolicy:
         log.info("quiet: held (%s): %.80s", kind, text)
         return True
 
+    def _drop_stale(self, items) -> list:
+        """The held lines minus the ones whose moment has gone (his ruling,
+        2026-09-11 -- see STALE_AFTER_S).
+
+        Done at DRAIN time, not at hold time: when a reminder fires nobody
+        knows how long he will be away, and holding it was right. What is
+        wrong is reading it out afterwards. Dropped here they are also
+        dropped from ``put_back``, which is the point -- a line nothing
+        should say is not a line to hand back to the queue.
+        """
+        now = self._now()
+        fresh, stale = [], []
+        for row in items:
+            at, text, kind = row
+            try:
+                age = float(now) - float(at)
+            except (TypeError, ValueError):
+                age = 0.0                  # cannot date it: keep it
+            (stale if kind in MOMENT_KINDS and age > STALE_AFTER_S
+             else fresh).append(row)
+        for at, text, kind in stale:
+            log.info("quiet: dropped a stale %s (%.0f min old): %.80s",
+                     kind, (float(now) - float(at)) / 60.0, text)
+        return fresh
+
     @property
     def held(self) -> list:
         with self._lock:
@@ -518,6 +582,7 @@ class QuietPolicy:
             items = list(self._held)
             self._held.clear()
             reason = self._last_reason
+        items = self._drop_stale(items)
         done = [False]
 
         def put_back() -> int:

@@ -402,10 +402,19 @@ class SoundbarSentinel:
             log.info("soundbar: %s", line)
             return
         try:
-            # proactive: quiet hours hold it for the digest like any other
-            # line he did not ask for. A dead speaker at 3 am is not urgent
-            # -- he is not listening to it either way.
-            self._say(line, proactive=True, kind="warning")
+            # proactive: quiet hours may hold it, like any other line he
+            # did not ask for. A dead speaker at 3 am is not urgent -- he
+            # is not listening to it either way.
+            #
+            # "audio-route", NOT "warning", since 2026-09-11: this is a
+            # TRANSITION and quiet.EPHEMERAL_KINDS expires it rather than
+            # queueing it. Filed as a warning, a spell of flapping was
+            # read back to him on his return as "three warnings" about a
+            # speaker that had long since settled -- see the note beside
+            # EPHEMERAL_KINDS for his own account of it. Saying it as it
+            # happens is the whole value; saying it later is noise about a
+            # fact the room is already telling him.
+            self._say(line, proactive=True, kind="audio-route")
         except Exception:                          # noqa: BLE001 - the tick survives TTS
             log.exception("soundbar: speak failed")
 

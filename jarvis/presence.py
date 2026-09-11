@@ -81,7 +81,53 @@ log = get_logger("presence")
 DEFAULT_AWAY_MIN = 12
 DEFAULT_POLL_S = 60.0
 DEFAULT_AWAY_POLL_S = 10.0     # see the poll_s docstring: arrival must be prompt
+# How long the FIRST vote may wait for the room fabric to complete one poll.
+# MEASURED NEED: on 2026-09-06 the fabric started at 10:49:02.4 and named the
+# office at 10:49:04.9, while the sentinel's first tick published a verdict at
+# 10:49:03.5 -- 1.4 s before the rooms had anything to say. Room.value starts
+# None, so the leg read UNREACHABLE and cell 24 is AWAY. Three poll periods at
+# his rooms_poll_s of 2.0 covers that race four times over, and it is bounded
+# so a fabric that never answers costs six seconds ONCE and then votes without
+# the rooms, honestly and out loud.
+DEFAULT_BOOT_GRACE_S = 6.0
 PING_TIMEOUT_S = 3.0
+# THE TWO PROBES. The second one is a PARTIAL mitigation, measured, and
+# the comment says how partial because the next reader will be tempted to
+# believe it closed the case.
+#
+# A single unsolicited ICMP echo with a one-second deadline is a very weak
+# question to ask an iPhone. The radio sleeps between DTIM beacons and the
+# access point buffers for it. This module already knew that -- see the
+# power-save note on ``phone_leg`` -- and then classified the miss as
+# "asked, and no answer", which is AWAY.
+#
+# MEASURED on his box 2026-09-11, 25 samples 20 s apart, phone on the desk:
+#
+#     one `ping -c1 -W1` answered            14 / 25
+#     of the 11 misses, `-c3 -W2` rescued     1 / 11
+#
+# So three harder packets buy about nine percent. Worth taking, because it
+# costs nothing on the positive path -- the same discipline as the gateway
+# canary below -- but it is not the answer, and the log's eleven
+# consecutive misses would still have happened.
+#
+# WHERE THE ANSWER ACTUALLY IS, measured the same day, 30 samples:
+#
+#     ICMP answered                           7 / 30
+#     kernel ARP resolution answered         15 / 15
+#
+# Every DELAY row that probe created was REACHABLE by the next sample.
+# ARP is answered by the radio firmware; ICMP by an OS that is asleep. The
+# right probe is therefore to ping (which makes the kernel resolve), let
+# the resolution settle, and read the NEIGHBOUR STATE rather than the echo
+# reply. That is NOT done here yet, deliberately: it is only safe if a
+# genuine departure still reaches FAILED, and nobody has measured his
+# table while he is actually out. scripts/phone_trace.py collects exactly
+# that. Until it comes back, the audible damage is held by
+# arrival.nap_refusal instead.
+PING_FIRST = ("ping", "-c", "1", "-W", "1")
+PING_RETRY = ("ping", "-c", "3", "-W", "2")
+PING_RETRY_TIMEOUT_S = 8.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
 WELCOME_LINE = "Welcome back, sir."
 
@@ -137,8 +183,11 @@ def probe_state(ip: str = "", mac: str = "",
 
     THE RULE HERE: distinguish the two failures concretely.
 
-      * the ping SUBPROCESS ran and got no reply -> ``False``. A real
-        "asked, and no answer".
+      * the ping SUBPROCESS ran, TWICE, and got no reply either time ->
+        ``False``. A real "asked, and no answer". The second ask is the
+        harder one (PING_RETRY) and it is what makes "asked" mean
+        something a napping radio can actually satisfy; a single lost
+        packet was reading as a departure until 2026-09-11.
       * it raised, timed out, or could not be launched at all -> ``None``.
       * ``ip -4 neigh`` itself failed -> ``None``, before anything else.
       * no address configured at all -> ``None``. An unconfigured leg says
@@ -178,9 +227,17 @@ def probe_state(ip: str = "", mac: str = "",
         # "no address to ping" is not evidence that he is out.
         return None
     try:
-        res = run(["ping", "-c", "1", "-W", "1", ip], timeout=PING_TIMEOUT_S)
+        res = run([*PING_FIRST, ip], timeout=PING_TIMEOUT_S)
     except Exception:  # noqa: BLE001 - TimeoutExpired, FileNotFoundError...
         log.debug("presence: ping %s could not run", ip, exc_info=True)
+        return None
+    if getattr(res, "returncode", 1) == 0:
+        return True
+    # ONE LOST PACKET IS NOT AN ANSWER. Ask harder before saying he is out.
+    try:
+        res = run([*PING_RETRY, ip], timeout=PING_RETRY_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - could not ask twice either
+        log.debug("presence: the retry ping %s could not run", ip, exc_info=True)
         return None
     if getattr(res, "returncode", 1) == 0:
         return True
@@ -188,7 +245,7 @@ def probe_state(ip: str = "", mac: str = "",
     if not gateway:
         return None
     try:
-        res = run(["ping", "-c", "1", "-W", "1", gateway], timeout=PING_TIMEOUT_S)
+        res = run([*PING_FIRST, gateway], timeout=PING_TIMEOUT_S)
     except Exception:  # noqa: BLE001
         return None
     if getattr(res, "returncode", 1) != 0:
@@ -425,9 +482,18 @@ class ThreeLegProbe:
     def __init__(self, fabric=None, cfg=None, stuck=None,
                  phone: Callable = probe_state, eye: Optional[Callable] = None,
                  mic: Optional[Callable] = None,
+                 desk: Optional[Callable] = None,
+                 desk_age: Optional[Callable] = None,
+                 look: Optional[Callable] = None,
+                 away_s: Optional[Callable] = None,
+                 sensing_off: Optional[Callable] = None,
                  door_room: str = "kitchen", desk_room: str = "office",
                  recency_s: Optional[float] = None,
-                 mic_window_s: Optional[float] = None):
+                 mic_window_s: Optional[float] = None,
+                 desk_window_s: Optional[float] = None,
+                 grace_s: Optional[float] = None,
+                 boot_grace_s: Optional[float] = None,
+                 now: Callable[[], float] = time.monotonic):
         from jarvis import presencevote as pv
         self.fabric = fabric
         self._cfg = cfg
@@ -435,21 +501,179 @@ class ThreeLegProbe:
         self.phone = phone
         self.eye = eye
         self.mic = mic
+        # SECONDS SINCE THE KEYBOARD OR MOUSE MOVED, or None. The MIC'S
+        # TWIN, and the fix for 15:28:13 and 17:07:28 on 2026-09-06 -- two
+        # "away (cell 6)" lines with him at the desk, his phone napping,
+        # the camera leg dark and the mic quiet past its window. He had
+        # typed a command at 15:17 and no leg was reading it.
+        # ``deskpresence.DeskSentinel.idle_s`` on the live box; a number,
+        # never a keystroke, and there is nothing on this path that could
+        # carry one.
+        self.desk = desk
+        # HOW OLD THAT NUMBER IS, or None on a box that cannot say.
+        #
+        # THE BELT OVER THE SEVENTH GUARD-ONE-HALF DEFECT, 2026-09-06.
+        # ``DeskSentinel.idle_s`` handed out a cache written only on a
+        # SUCCESSFUL poll, so a dead idle monitor left the last good number
+        # standing for ever -- measured, 400 no-signal polls (3 h 20 min)
+        # and it still answered 5.0 s, which is DESK_AT, which vetoes away
+        # in every cell; at the sentinel, rooms clear and his phone gone
+        # from t=0, AWAY NEVER FIRED in six hours. The sentinel now expires
+        # its own reading, and ``presencevote.desk_leg`` refuses a stale one
+        # even if a different reader lets one through.
+        self.desk_age = desk_age
+        # "IS SENSING SWITCHED OFF?" -- a callable, or None to read it off
+        # the fabric. See ``_sensing_off``. Named ``_fn`` because the
+        # method of that name is what the vote calls.
+        self._sensing_off_fn = sensing_off
+        # ARM THE LENS AND WAIT, BOUNDED -- jarvis/eyeloop.EyeLoop.wait_for_look.
+        # Called for the two cells his rule 1 cannot reach (see __call__).
+        self.look = look
+        # Seconds the house has been AWAY, or None. The bedroom split needs
+        # it because its office branch is a CONTINUITY argument and
+        # continuity is unavailable after an absence.
+        self.away_s = away_s
         self.door_room = door_room
         self.desk_room = desk_room
-        self.grace_s = 0.0
+        # THE PHONE'S OWN GRACE, AND IT WAS 0.0 UNTIL 2026-09-06.
+        #
+        # ``phone_leg`` was written to read a False inside the grace as
+        # UNKNOWN -- "an iPhone drops off Wi-Fi power-save for minutes at a
+        # time and a napping radio is not a departure" -- and this class
+        # set ``grace_s = 0.0`` and never wrote it again, so ``0.0 >= 0.0``
+        # made the FIRST unanswered ping a hard PHONE_NO. The guard was
+        # built and never applied to the leg it was built for.
+        #
+        # The cost was measured, not imagined: at 10:49:03 on 2026-09-06,
+        # five seconds after a restart with him standing in the flat, the
+        # voter published "away (cell 24) -- phone-only away past the
+        # grace". There was no grace. The sentence was false.
+        #
+        # It is ``presence.away_after_min`` (720 s on his box) because that
+        # is the number that already means "long enough that a silent radio
+        # is a departure", and re-deriving it here is how two clocks drift
+        # apart. ``presence.phone_grace_s`` overrides it.
+        # An EXPLICIT grace is honoured verbatim, zero included: a test
+        # that means "no grace, I am exercising a different cell" must be
+        # able to say so, and _seconds treats zero as nonsense (rightly --
+        # a config that says 0 is a typo, not a policy).
+        if grace_s is not None:
+            self.grace_s = max(0.0, float(grace_s))
+        else:
+            self.grace_s = _seconds(
+                _cfg_get(cfg, "presence.phone_grace_s", None),
+                self._away_after_s(), floor_s=0.0)
+        # How long the FIRST vote may wait for the room fabric's first
+        # poll. Three poll periods at his rooms_poll_s of 2.0. The race it
+        # closes was measured at 1.4 s.
+        self.boot_grace_s = DEFAULT_BOOT_GRACE_S if boot_grace_s is None \
+            else max(0.0, float(boot_grace_s))
         self.recency_s = _seconds(recency_s, pv.DEFAULT_RECENCY_S)
         self.mic_window_s = _seconds(mic_window_s, pv.DEFAULT_MIC_WINDOW_S)
+        # ONE NUMBER, ONE MEANING -- the same discipline the mic window
+        # follows. The desk window IS the corroboration recency window: a
+        # keystroke is independent agreement, and that key already means
+        # "how fresh does agreement have to be to keep saying he is here".
+        #
+        # NOT ``presence.desk_away_after_min``, which was the first choice
+        # and is the wrong question -- it asks whether the CHAIR is empty.
+        # RE-MEASURED IN THIS TREE on a fake clock, rooms clear, his phone
+        # gone and his last keystroke at the moment he walked out: the leg
+        # off gives away at 11.8 min, the shipped 900 s window 15.0, and the
+        # 1500 s window 25.0. (The 36.8 this comment used to claim is no
+        # longer reproducible -- it predates Verdict.witness_s_ago, when the
+        # desk window and the sentinel's grace still stacked.) So every
+        # errand under about twenty-five minutes would have earned
+        # silence on his return. At the recency window it lands at ~15.
+        self.desk_window_s = _seconds(
+            desk_window_s if desk_window_s is not None else self.recency_s,
+            pv.DEFAULT_DESK_WINDOW_S)
         self.verdict = None
         self.legs: dict = {}
         self._said = ""
+        # True while the ONLY thing holding this leg back from PHONE_NO is
+        # its own grace: the phone was asked and did not answer. The
+        # sentinel reads it so the two graces cannot STACK -- see
+        # PresenceSentinel.tick.
+        self.grace_running = False
+        # How long ago the evidence behind the last HOME actually landed.
+        # Zero unless a witness veto is holding the away off -- see
+        # ``__call__`` and PresenceSentinel.tick.
+        self.seen_s_ago = 0.0
+        self._now = now
+        self._started = None       # first call, on the monotonic clock
+        self._last_yes = None      # the last tick the phone actually answered
+        self._rooms_waited = False
+        self._rooms_said = False
+        # Said ONCE, not every poll: the desk room is not a configured
+        # sensor, or a room is occupied and it is not the one the lens can
+        # see. Both are reasons a look did NOT happen, and a refusal with
+        # no line on disk is the 2026-09-05 defect in miniature.
+        self._desk_room_said = False
+        self._other_room_said = False
+
+    def _away_after_s(self) -> float:
+        """``presence.away_after_min`` in seconds -- the sentinel's own
+        number, read the same way it reads it."""
+        try:
+            mins = float(_cfg_get(self._cfg, "presence.away_after_min",
+                                  DEFAULT_AWAY_MIN))
+        except (TypeError, ValueError):
+            mins = DEFAULT_AWAY_MIN
+        return max(60.0, mins * 60.0)
 
     # ------------------------------------------------------- the legs
+    def _wait_for_rooms(self) -> None:
+        """ONCE, on the first vote: let the fabric finish one poll.
+
+        Bounded, on the presence daemon thread, and it cannot deadlock --
+        the fabric's own thread is what sets the event and this waits on it
+        with a timeout. It is deliberately NOT in ``PresenceSentinel.start``:
+        that runs on the startup thread and would delay the whole boot.
+
+        Only when the fabric's thread is actually running. With no thread
+        (a test, or a build that only wants the leg) ``_rooms_leg`` ticks
+        the fabric itself a few lines below, so there is nothing to wait for.
+        """
+        if self._rooms_waited:
+            return
+        self._rooms_waited = True
+        fabric = self.fabric
+        if fabric is None or self.boot_grace_s <= 0.0:
+            return
+        if not getattr(fabric, "running", False):
+            return
+        wait = getattr(fabric, "wait_ready", None)
+        if not callable(wait):
+            return
+        try:
+            if wait(self.boot_grace_s):
+                return
+        except Exception:  # noqa: BLE001 - a broken fabric is not a verdict
+            log.debug("presence: the boot wait failed", exc_info=True)
+            return
+        if not self._rooms_said:
+            self._rooms_said = True
+            log.info("presence: the rooms had not answered within %.1fs of "
+                     "the first vote; voting without the rooms",
+                     self.boot_grace_s)
+
     def _rooms_leg(self):
-        """(leg, last_room, age). Never raises."""
+        """(leg, last_room, age, desk_room_occupied). Never raises.
+
+        THE FOURTH VALUE IS WHAT THE LENS IS ALLOWED TO OPEN FOR, added
+        2026-09-06. The leg itself is a HOUSE answer -- ROOMS_ON means SOME
+        room reads occupied -- and the burst used to be armed off exactly
+        that. But the lens is in the OFFICE and his flat is a corridor, so
+        him in the kitchen with the office empty armed a burst to look at a
+        room he was not in: MEASURED at 90 bursts, 2250 frames and 90 device
+        opens per hour of votes. This says whether the DESK ROOM itself --
+        the room the lens can actually see -- reads occupied.
+        """
         from jarvis import presencevote as pv
         if self.fabric is None:
-            return pv.ROOMS_UNREACHABLE, "", None
+            return pv.ROOMS_UNREACHABLE, "", None, False
+        self._wait_for_rooms()
         try:
             # The same rule ``HouseView.read`` follows, and for the same
             # reason: when the fabric's own 2 s thread is running we read
@@ -464,7 +688,7 @@ class ThreeLegProbe:
             faulted = set(self.fabric.stuck_rooms())
         except Exception:  # noqa: BLE001 - a broken fabric is not a verdict
             log.debug("presence: the fabric could not be read", exc_info=True)
-            return pv.ROOMS_UNREACHABLE, "", None
+            return pv.ROOMS_UNREACHABLE, "", None, False
         if self.stuck is not None:
             try:
                 for room, value in readings.items():
@@ -472,11 +696,60 @@ class ThreeLegProbe:
                 faulted |= set(self.stuck.faulted())
             except Exception:  # noqa: BLE001
                 log.debug("presence: the stuck detector failed", exc_info=True)
+        # THE HINT MUST NOT NAME A SENSOR THE VOTE HAS ALREADY THROWN OUT.
+        # At 14:05:47.969 cell 12 printed "the last room to see anybody was
+        # the office ... so he never left the office", and at that instant
+        # rooms_leg had computed CLEAR precisely BECAUSE the office was
+        # faulted. One verdict, two contradictory readings of one sensor.
+        # last_seen_room takes max(last_true) over every room, and the
+        # latched office's last_true was ~0 s old.
         try:
-            last_room, age = self.fabric.last_seen_room()
+            last_room, age = self.fabric.last_seen_room(skip=faulted)
+        except TypeError:      # a fabric from before the skip existed
+            try:
+                last_room, age = self.fabric.last_seen_room()
+                from jarvis.presencevote import _slug as _sl
+                if _sl(last_room) in {_sl(r) for r in faulted}:
+                    last_room, age = "", None
+            except Exception:  # noqa: BLE001
+                last_room, age = "", None
         except Exception:  # noqa: BLE001
             last_room, age = "", None
-        return pv.rooms_leg(readings, faulted=faulted), last_room, age
+        return (pv.rooms_leg(readings, faulted=faulted), last_room, age,
+                self._desk_room_on(readings, faulted))
+
+    def _desk_room_on(self, readings, faulted) -> bool:
+        """Does the room the LENS IS IN read occupied right now?
+
+        Same faulted-drop as ``rooms_leg`` so the two cannot disagree about
+        which sensors are in play. A desk room that is not a configured
+        sensor at all answers False and says so ONCE at INFO -- a box that
+        cannot tell the lens there is something to look at must not guess,
+        and a silently dark leg is the failure this file keeps paying for.
+        """
+        from jarvis import presencevote as pv
+        try:
+            key = pv._slug(self.desk_room)
+            drop = {pv._slug(r) for r in (faulted or ())}
+            live = {pv._slug(r): v for r, v in dict(readings or {}).items()
+                    if pv._slug(r) not in drop}
+            names = dict(readings or {})
+            if names and key not in {pv._slug(r) for r in names}:
+                # Only once the fabric has actually answered: an empty
+                # readings dict is a fabric that has not polled yet, not a
+                # box whose desk room has no sensor.
+                if not self._desk_room_said:
+                    self._desk_room_said = True
+                    log.info("presence: the lens is in %r, which is not one "
+                             "of the configured rooms (%s), so a room change "
+                             "cannot arm a look. presence.desk_room names it.",
+                             self.desk_room,
+                             ", ".join(sorted(names)))
+                return False
+            return live.get(key) is True
+        except Exception:  # noqa: BLE001 - never cost the vote
+            log.debug("presence: the desk room could not be read", exc_info=True)
+            return False
 
     def _camera_leg(self):
         """A NAME AND A COUNT, never a frame.
@@ -497,24 +770,125 @@ class ThreeLegProbe:
         return pv.camera_leg(identity=identity, faces=faces, live=live)
 
     def _mic_leg(self):
-        """(leg, seconds ago). ONE NUMBER OFF THE TURN LEDGER, never audio.
+        """(leg, seconds ago, WHY). ONE NUMBER OFF THE LEDGER, never audio.
 
         ``mic()`` is ``TurnLedger.idle_s`` on the live box: seconds since
         the microphone last completed a turn, or None if it never has. No
         reader at all -- any box where the app has not wired the ledger in
         -- is UNKNOWN, which never votes; a reader that raises is the same.
         Nothing here opens a device or touches a sample.
+
+        THE THIRD RETURN VALUE IS THE 2026-09-06 WORDING FIX. MIC_UNKNOWN
+        has three quite different causes and ``cell6`` printed "the mic
+        ledger could not be read" for all of them -- including the one that
+        is true at EVERY boot, where the ledger is perfectly readable and
+        simply holds no turn yet (``TurnLedger.idle_s`` returns None until
+        the first one). Every cell-6 line in his log on 09-06, 11:05:19
+        included, printed the wrong one of the three. The leg VALUE is
+        unchanged in all three -- it must not vote either way -- and only
+        the sentence differs.
         """
         from jarvis import presencevote as pv
         if self.mic is None:
-            return pv.MIC_UNKNOWN, None
+            return pv.MIC_UNKNOWN, None, pv.MIC_WHY_NO_READER
         try:
             s_ago = self.mic()
         except Exception:  # noqa: BLE001 - a broken ledger is not a verdict
             log.debug("presence: the mic ledger could not be read", exc_info=True)
-            return pv.MIC_UNKNOWN, None
+            return pv.MIC_UNKNOWN, None, pv.MIC_WHY_UNREADABLE
+        if s_ago is None:
+            return pv.MIC_UNKNOWN, None, pv.MIC_WHY_NO_TURN
         leg = pv.mic_leg(s_ago=s_ago, window_s=self.mic_window_s)
-        return leg, (float(s_ago) if leg != pv.MIC_UNKNOWN else None)
+        if leg == pv.MIC_UNKNOWN:
+            return leg, None, pv.MIC_WHY_NONSENSE
+        return leg, float(s_ago), ""
+
+    def _desk_leg(self):
+        """(leg, seconds ago). ONE NUMBER OFF THE IDLE MONITOR.
+
+        THE MIC'S TWIN, and written directly beneath it on purpose: these
+        two answer the same question -- "has anything actually had him in
+        the flat?" -- and a change to one that is not made to the other is
+        the defect shape this repo has paid for four times in two days.
+
+        ``desk()`` is ``DeskSentinel.idle_s`` on the live box: seconds
+        since the last keyboard or mouse event off Mutter's idle monitor,
+        or None when there is no signal. NOT A KEYSTROKE, not a window
+        title, not a command -- a duration, and nothing on this path could
+        carry anything else.
+
+        No reader, a reader that raises, or a nonsense number is
+        DESK_UNKNOWN, which votes nothing. An IDLE desk is DESK_IDLE, which
+        also votes nothing: he reads papers at that desk and the bedroom
+        has no sensor, so an empty chair is not an empty flat. Only
+        DESK_AT ever changes a verdict, and only ever away -> home.
+        """
+        from jarvis import presencevote as pv
+        if self.desk is None:
+            return pv.DESK_UNKNOWN, None
+        try:
+            idle = self.desk()
+        except Exception:  # noqa: BLE001 - a broken monitor is not a verdict
+            log.debug("presence: the desk idle monitor could not be read",
+                      exc_info=True)
+            return pv.DESK_UNKNOWN, None
+        leg = pv.desk_leg(idle_s=idle, window_s=self.desk_window_s,
+                          age_s=self._desk_age())
+        if leg != pv.DESK_AT:
+            return leg, None
+        try:
+            return leg, float(idle)
+        except (TypeError, ValueError):     # unreachable via desk_leg
+            return pv.DESK_UNKNOWN, None
+
+    def _desk_age(self):
+        """HOW OLD the idle number is, or None when the box cannot say.
+
+        Read immediately after the value, off the same sentinel, so the two
+        come from the same poll in every case that matters. A box with no
+        age reader keeps voting exactly as it did -- the SENTINEL's own
+        expiry is the guard there and this is the belt.
+        """
+        fn = self.desk_age
+        if not callable(fn):
+            return None
+        try:
+            age = fn()
+        except Exception:  # noqa: BLE001 - a broken monitor is not a verdict
+            log.debug("presence: the desk reading's age could not be read",
+                      exc_info=True)
+            return None
+        return None if age is None else age
+
+    def _sensing_off(self) -> bool:
+        """Has HE switched the sensors off? Never raises.
+
+        A leg the privacy switch darkened did not fail to see him -- it was
+        not asked -- and on 2026-09-06 at 15:10:57 the voter read exactly
+        that as a phone-only away, with him at the desk talking to it.
+
+        The rooms' OWN word is the source (``RoomFabric.blocked``, which is
+        non-empty only while EVERY configured room is blocked), because the
+        radar is the leg the switch actually removes from the vote: a
+        camera that cannot look is already CAM_BLIND and already votes
+        nothing. An injected ``sensing_off`` callable overrides it, which
+        is how a box with a different set of governed sensors says so.
+        """
+        get = self._sensing_off_fn
+        if callable(get):
+            try:
+                return bool(get())
+            except Exception:  # noqa: BLE001 - a broken switch is not a vote
+                log.debug("presence: the sensing switch could not be read",
+                          exc_info=True)
+                return False
+        fabric = self.fabric
+        if fabric is None:
+            return False
+        try:
+            return bool(getattr(fabric, "blocked", ""))
+        except Exception:  # noqa: BLE001 - a fabric from before `blocked`
+            return False
 
     def _agreed_s_ago(self):
         """Seconds since anything independent last agreed with an OPEN
@@ -529,33 +903,128 @@ class ThreeLegProbe:
         and then latched kept him "home" for as long as it took the
         45-minute stuck fault to drop the room. Measured: a trip of an hour
         was not greeted. The window is applied in ``presencevote.cell6``.
+
+        THE THIRD STATE, ADDED 2026-09-06 AND MEASURED FROM THE LIVE FILE.
+        A run that was ALREADY LATCHED when Jarvis started has no honest
+        age at all. His roomruns.json held exactly one run that morning --
+        ``office started 10:50:03, corroborated 14:17:53`` -- and the run
+        on the books BEGAN 65 SECONDS AFTER BOOT, because a radar latched
+        since before the restart was re-aged to zero on its first
+        post-boot observation. That is why cell 6 at 10:50:04 said
+        "something else agreed with that run 1 s ago" and granted a full
+        15-minute HOME window to a sensor nothing had agreed with, and why
+        "away" did not arrive until 11:05:19 -- about fourteen minutes
+        after he actually walked out.
+
+        Neither available answer is right. Ageing from boot invents a
+        number; answering None reads in ``cell6`` as HOME for ever. So the
+        flag travels beside the age and the cell holds UNKNOWN on it.
+        Returns ``(seconds, pre_existing)``.
         """
         if self.stuck is None:
-            return None
+            return None, False
         try:
-            ages = []
+            ages, pre = [], False
             for row in self.stuck.status().values():
-                if not row.get("run_s"):
-                    continue
                 since = row.get("corroborated_s_ago")
-                ages.append(float(row["run_s"] if since is None else since))
-            return min(ages) if ages else None
+                if row.get("pre_existing") and since is None:
+                    # The latch may be seconds or hours old and the box
+                    # genuinely does not know. It contributes NO age.
+                    pre = True
+                    continue
+                run_s = row.get("run_s")
+                if not run_s:
+                    continue
+                ages.append(float(run_s if since is None else since))
+            return (min(ages) if ages else None), pre
         except Exception:  # noqa: BLE001 - unreadable history is not a fault
             log.debug("presence: the run history could not be read", exc_info=True)
-            return None
+            return None, False
 
     # -------------------------------------------------------- the vote
     def __call__(self, ip: str = "", mac: str = "") -> Optional[bool]:
         from jarvis import presencevote as pv
-        rooms, last_room, age = self._rooms_leg()
+        now = self._now()
+        if self._started is None:
+            self._started = now
+        rooms, last_room, age, desk_room_on = self._rooms_leg()
         camera = self._camera_leg()
-        mic, mic_s_ago = self._mic_leg()
+        mic, mic_s_ago, mic_reason = self._mic_leg()
+        desk, desk_s_ago = self._desk_leg()
         try:
             answer = self.phone(ip, mac) if (ip or mac) else None
         except Exception:  # noqa: BLE001 - the phone must not break the vote
             log.debug("presence: the phone probe failed", exc_info=True)
             answer = None
-        phone = pv.phone_leg(answer=answer, unseen_s=0.0, grace_s=self.grace_s)
+        if answer is True:
+            self._last_yes = now
+        # HOW LONG THE PHONE HAS BEEN SILENT, which this class never
+        # measured. See ``grace_s`` in __init__ for the 10:49:03 line that
+        # a hardcoded 0.0 produced. A phone that has NEVER answered is aged
+        # from the first vote, not from zero.
+        anchor = self._last_yes if self._last_yes is not None else self._started
+        phone = pv.phone_leg(answer=answer, unseen_s=max(0.0, now - anchor),
+                             grace_s=self.grace_s)
+        # THE TWO GRACES MUST NOT STACK, and in exactly one case they did.
+        # Normally they cannot: the sentinel measures ``away_after_s`` from
+        # ``last_seen``, which froze the moment the phone stopped
+        # answering -- the same instant this leg's clock started -- so
+        # "away" lands at the same minute it always did (MEASURED: the
+        # 26-minute desk residual in tests/test_presence_recency.py is
+        # unchanged by this grace).
+        #
+        # The exception is a start where the phone has NEVER answered.
+        # ``last_seen`` is None then, the sentinel falls back to
+        # ``_started_at``, and ``_started_at`` is only set on a non-None
+        # answer -- so it began when THIS grace expired and away took 25
+        # minutes instead of 13 (measured on a fake clock, both ways).
+        # This flag lets the sentinel start its own clock while the phone
+        # is definitively silent, without weakening the rule it has for a
+        # leg that has said NOTHING (a sensor-only box whose sensor is
+        # down), which is a different thing and still holds everything.
+        self.grace_running = (answer is False and phone == pv.PHONE_UNKNOWN)
+
+        # THE TWO CELLS WHERE THE LENS EARNS "NUMBER ONE". Rooms and phone
+        # are both known by now, and a room reading occupied with a phone
+        # that is silent (cell 6) or unaskable (cell 9) is exactly where
+        # his rule 1 has no precondition today -- a camera that could not
+        # look is not evidence of an empty room, so the rules fall silent
+        # and history has to break the tie. Every cell-6 line in his log on
+        # 2026-09-06 (10:50:04, 11:05:19, 14:07:49) would have been decided
+        # by the lens instead. Bounded inside the producer; a timeout costs
+        # nothing, because BLIND is what the leg already answers.
+        #
+        # AND ONLY FOR THE ROOM THE LENS IS IN, since 2026-09-06. The arm
+        # used to read ROOMS_ON, which is a HOUSE answer: him in the kitchen
+        # with the office empty opened the device to look at a room he was
+        # not in. MEASURED with a fake opener and synthetic arrays -- office
+        # empty, kitchen occupied, phone unaskable, one hour of votes: 90
+        # bursts, 2250 frames, 90 device opens, and every one of them scored
+        # as "looked and saw nobody" FOR THE WHOLE FLAT, because CAM_LOOKED
+        # carries no room. It is his lamp and his lens; the leg gains
+        # nothing from a room it cannot see.
+        #
+        # A LATCHED DESK ROOM STILL ARMS, and that is deliberate: a latched
+        # office IS cell 6, and the lens is the one leg that can end that
+        # argument. That look is the cost of the leg doing its job.
+        if (camera == pv.CAM_BLIND and rooms == pv.ROOMS_ON
+                and phone in (pv.PHONE_NO, pv.PHONE_UNKNOWN)
+                and callable(self.look)):
+            if not desk_room_on:
+                if not self._other_room_said:
+                    self._other_room_said = True
+                    log.info("presence: a room reads occupied but %r does "
+                             "not, and the lens is in %r -- not opening it "
+                             "to look at a room it cannot see",
+                             self.desk_room, self.desk_room)
+            else:
+                try:
+                    if self.look(why="the desk room is occupied and the "
+                                     "phone is quiet"):
+                        camera = self._camera_leg()
+                except Exception:  # noqa: BLE001 - a broken lens is not a verdict
+                    log.debug("presence: the lens could not be armed",
+                              exc_info=True)
 
         if self.stuck is not None:
             # Corroboration: something independent agreed that somebody is
@@ -580,28 +1049,73 @@ class ThreeLegProbe:
         # Cell 6 needs to know how RECENTLY any occupied room's run was
         # agreed with -- not whether it ever was. Read only when a room is
         # on; the other 26 cells never see it.
-        agreed_s_ago = self._agreed_s_ago() if rooms == pv.ROOMS_ON else None
+        agreed_s_ago, agreed_pre = (self._agreed_s_ago()
+                                    if rooms == pv.ROOMS_ON else (None, False))
+
+        # HIS OWN PRIVACY SWITCH, read once and handed to both paths. A
+        # leg he switched off is BLIND, never a NO -- 15:10:57.
+        off = self._sensing_off()
 
         if not (ip or mac):
             # No phone leg configured AT ALL -- a sensor-only install, not
             # his box. See presencevote.decide_rooms_only for why P2 has
             # to yield when there is nothing to outvote the radar with.
-            verdict = pv.decide_rooms_only(rooms=rooms, camera=camera)
+            verdict = pv.decide_rooms_only(rooms=rooms, camera=camera,
+                                           mic=mic, mic_s_ago=mic_s_ago,
+                                           desk=desk, desk_s_ago=desk_s_ago,
+                                           sensing_off=off)
         else:
             verdict = pv.decide(phone=phone, camera=camera, rooms=rooms,
                                 agreed_s_ago=agreed_s_ago,
+                                agreed_pre_existing=agreed_pre,
                                 recency_s=self.recency_s,
                                 mic=mic, mic_s_ago=mic_s_ago,
+                                mic_reason=mic_reason,
+                                desk=desk, desk_s_ago=desk_s_ago,
+                                sensing_off=off,
                                 last_room=last_room, last_room_age_s=age,
                                 door_room=self.door_room,
-                                desk_room=self.desk_room)
+                                desk_room=self.desk_room,
+                                away_s=self._away_now())
         self.verdict = verdict
         self.legs = {"phone": phone, "camera": camera, "rooms": rooms,
-                     "mic": mic}
+                     "mic": mic, "desk": desk}
         self._log(verdict)
+        # WHEN THE EVIDENCE ACTUALLY LANDED, for the sentinel's away clock.
+        # 0.0 -- "now" -- for every ordinary verdict; the witness's own age
+        # when a stale keystroke or turn is what withheld an away. See
+        # presencevote.Verdict.witness_s_ago for the measured 26.8 -> 15.0
+        # this saves, and for the half of it cell 6 was still missing on
+        # 2026-09-06.
+        try:
+            self.seen_s_ago = max(0.0, float(verdict.witness_s_ago or 0.0))
+        except (TypeError, ValueError):
+            self.seen_s_ago = 0.0
         if verdict.state == pv.UNKNOWN:
             return None
         return verdict.state != pv.AWAY
+
+    def _away_now(self):
+        """Seconds the house has been AWAY, or None. Never raises.
+
+        The bedroom split's office branch is a CONTINUITY argument -- "he
+        never left the office and the radar dropped a still body" -- and
+        continuity is unavailable after an absence. At 14:05:47.969 on
+        2026-09-06 the voter printed that sentence and then, at .970,
+        "presence: home (returned)" for a man who had been out two and a
+        half hours. Both lines came from the same tick.
+        """
+        get = self.away_s
+        if not callable(get):
+            return None
+        try:
+            out = get()
+        except Exception:  # noqa: BLE001 - the sentinel must not cost the vote
+            return None
+        try:
+            return None if out is None else max(0.0, float(out))
+        except (TypeError, ValueError):
+            return None
 
     def _log(self, verdict) -> None:
         """The reason, at INFO, once per change.
@@ -616,10 +1130,11 @@ class ThreeLegProbe:
             return
         self._said = key
         log.info("presence: %s (cell %d) -- %s [phone %s, camera %s, rooms %s, "
-                 "mic %s]",
+                 "mic %s, desk %s]",
                  verdict.state, verdict.cell, verdict.reason,
                  self.legs.get("phone"), self.legs.get("camera"),
-                 self.legs.get("rooms"), self.legs.get("mic"))
+                 self.legs.get("rooms"), self.legs.get("mic"),
+                 self.legs.get("desk"))
 
 
 def make_probe(sensor, phone: Callable = probe) -> Callable:
@@ -705,16 +1220,34 @@ class PresenceSentinel:
                 lambda key, default=None: _cfg_get(cfg, key, default))
         except Exception:  # noqa: BLE001 - the default is the same number
             mic_window_s = None
+        # A DEFAULT TAKEN FOR HIM, AND IT NOW DECIDES MORE THAN IT DID.
+        # ``presence.desk_room`` is UNSET on his box, so "office" is a code
+        # default -- and since 2026-09-06 it is also the room whose radar
+        # may OPEN THE LENS. The key was a tie-breaker for the bedroom
+        # split when it was chosen; it is a privacy-shaped decision now, so
+        # the boot log names it rather than letting it stay implicit.
+        desk_room = _cfg_get(cfg, "presence.desk_room", None)
+        if desk_room in (None, ""):
+            from jarvis.arrival import DEFAULT_DESK_ROOM
+            desk_room = DEFAULT_DESK_ROOM
+            log.info("presence: presence.desk_room is unset, so %r is a CODE "
+                     "DEFAULT -- it names the room whose radar may arm the "
+                     "camera and the room the bedroom split reasons from. "
+                     "Set presence.desk_room to overrule it.", desk_room)
+        desk_room = str(desk_room)
         try:
             legs = ThreeLegProbe(
                 fabric=self.fabric, cfg=cfg, stuck=self.stuck,
+                # The bedroom split needs to know a return from continuity;
+                # only the sentinel holds that. See ThreeLegProbe._away_now.
+                away_s=self._away_for_legs,
                 door_room=str(_cfg_get(cfg, "presence.door_room", "kitchen")),
                 # ``presence.desk_room``, NOT ``presence.desk``.
                 # ``presence.desk`` is deskpresence.py's BOOLEAN switch and
                 # it is True on his box, so reading it here gave the room
                 # name "True" and the bedroom split lost its office branch
                 # outright. tests/test_presence_desk_key.py pins it.
-                desk_room=str(_cfg_get(cfg, "presence.desk_room", "office")),
+                desk_room=desk_room,
                 recency_s=recency_s, mic_window_s=mic_window_s)
         except Exception:  # noqa: BLE001
             log.exception("presence: the three-leg voter could not be built; "
@@ -724,7 +1257,33 @@ class PresenceSentinel:
                  "the mic breaks cell 6) -- an agreement counts for %d min, "
                  "a turn for %d min; set presence.three_legs false to go back",
                  int(legs.recency_s // 60), int(legs.mic_window_s // 60))
+        # SAID OUT LOUD because it CHANGES WHAT AWAY MEANS on a live box.
+        # Until 2026-09-06 the phone leg's grace was hardcoded 0.0 and the
+        # first unanswered ping was a hard "no" -- so "away" could arrive a
+        # few seconds after a restart, which is exactly what happened at
+        # 10:49:03. With a real grace it cannot arrive for %d minutes after
+        # a start where the phone has never answered. That is the intended,
+        # safe outcome (nothing is greeted and nothing is muted while the
+        # state is unknown), and it is his to overrule with
+        # presence.phone_grace_s.
+        log.info("presence: the phone leg now waits %d min before a silent "
+                 "radio counts as away (presence.phone_grace_s); the first "
+                 "unanswered ping used to be a hard no, and the verdict "
+                 "sentence that said otherwise was false",
+                 int(legs.grace_s // 60))
         return legs
+
+    def _away_for_legs(self):
+        """Seconds the house has been AWAY, or None. Read WITHOUT the lock
+        being held by the caller: ``tick`` calls the probe outside it."""
+        with self._lock:
+            if self.home is not False or not self.since:
+                return None
+            since = self.since
+        try:
+            return max(0.0, self._now() - since)
+        except Exception:  # noqa: BLE001 - a broken clock is not a verdict
+            return None
 
     @property
     def verdict(self):
@@ -820,6 +1379,18 @@ class PresenceSentinel:
             # blackout with no end: see _blacked_out.
             if self._blacked_out():
                 self._forget()
+            elif getattr(self._probe, "grace_running", False):
+                # ...and the OTHER exception, added 2026-09-06. The voter
+                # is holding purely because its own phone grace has not
+                # expired, which means the phone WAS asked and did not
+                # answer. That is evidence, not a blank, and starting the
+                # clock here is what stops the two graces stacking into 25
+                # minutes on a start where the phone has never answered.
+                # last_seen is deliberately NOT touched: he has not been
+                # seen, and pretending otherwise would delay away instead.
+                with self._lock:
+                    if self._started_at is None:
+                        self._started_at = now
             return None
         present = bool(answer)
         event = None
@@ -831,7 +1402,24 @@ class PresenceSentinel:
                 self._started_at = now
                 self.last_seen = now if present else None
             if present:
-                self.last_seen = now
+                # STAMPED WHEN HE WAS ACTUALLY SEEN, not when we polled. It
+                # is "now" for every ordinary answer; a witness veto -- a
+                # keystroke or a turn that is minutes old and is all that
+                # is holding an away off -- says how old, and stamping THAT
+                # is what stops its window and this grace from stacking.
+                # MEASURED IN THIS TREE: rooms clear, phone gone, his
+                # last keystroke at the moment he walked out -> away at
+                # 15.0 min stamped, 26.8 unstamped. (A keystroke ALREADY 11
+                # min old when he leaves is a different scenario and lands
+                # at 11.8 either way -- an earlier version of this comment
+                # attached the numbers to that one, wrongly.)
+                seen_ago = 0.0
+                try:
+                    seen_ago = max(0.0, float(
+                        getattr(self._probe, "seen_s_ago", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    seen_ago = 0.0
+                self.last_seen = now - seen_ago
                 if self.home is not True:
                     returned = self.home is False
                     self.home, self.since = True, now

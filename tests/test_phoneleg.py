@@ -42,7 +42,10 @@ def _runner(neigh="", route=ROUTE, pings=None, raise_on=()):
             ip = argv[-1]
             if ip in raise_on:
                 raise subprocess.TimeoutExpired(argv, timeout or 1)
-            return _Res(pings.get(ip, 1))
+            rc = pings.get(ip, 1)
+            if isinstance(rc, list):      # a SEQUENCE: first packet, then the retry
+                rc = rc.pop(0) if rc else 1
+            return _Res(rc)
         return _Res(1)
     return run
 
@@ -61,10 +64,74 @@ def test_a_stale_row_falls_through_to_the_ping_and_that_is_the_nap_case():
 
 
 # --------------------------------------------------------------- absent
-def test_a_ping_that_ran_and_got_no_reply_is_a_real_no():
-    run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": 1,
+# HIS MEASURED FAILURE, 2026-09-11. One `ping -c1 -W1` with no reply was
+# read as "he left the flat". An iPhone on Wi-Fi power-save routinely
+# drops a single unsolicited echo -- this module's own docstring says so
+# -- and the log shows eleven consecutive single-packet misses while he
+# sat in the office, followed by a reply on the very next poll. Seven
+# false departures in two days came out of that one line.
+#
+# "Asked, and no answer" is still False. The fix is what counts as ASKED.
+def test_one_lost_packet_is_not_an_answer_and_the_probe_asks_again():
+    run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": [1, 0],
+                                            "192.168.50.1": 0})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is True
+
+
+def test_a_phone_that_misses_the_retry_TOO_is_a_real_no():
+    run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": [1, 1],
                                             "192.168.50.1": 0})
     assert presence.probe_state(ip="192.168.50.34", run=run) is False
+
+
+def test_the_retry_really_does_ask_HARDER_than_the_first_packet():
+    """Anti-drift. Nothing stops a later edit making the retry identical
+    to the probe it exists to second-guess, and the suite would stay
+    green while the bug came back."""
+    sent = []
+
+    def run(argv, timeout=None):
+        if argv[0] == "ping":
+            sent.append(argv)
+            return _Res(1)
+        return _Res(0, NEIGH_STALE if "neigh" in argv else ROUTE)
+
+    presence.probe_state(ip="192.168.50.34", run=run)
+    first, retry = sent[0], sent[1]
+
+    def count(argv, flag):
+        return float(argv[argv.index(flag) + 1])
+
+    assert count(retry, "-c") > count(first, "-c"), "the retry sends no more packets"
+    assert count(retry, "-W") > count(first, "-W"), "the retry waits no longer"
+
+
+def test_the_retry_costs_nothing_when_the_first_packet_lands():
+    pings = []
+
+    def run(argv, timeout=None):
+        if argv[0] == "ping":
+            pings.append(argv)
+            return _Res(0)
+        return _Res(0, NEIGH_STALE if "neigh" in argv else ROUTE)
+
+    assert presence.probe_state(ip="192.168.50.34", run=run) is True
+    assert len(pings) == 1, "a phone that answered was pinged twice"
+
+
+def test_a_retry_that_could_not_RUN_is_unknown_and_never_away():
+    """Same rule as the first packet: could-not-ask is not an answer."""
+    calls = []
+
+    def run(argv, timeout=None):
+        if argv[0] == "ping":
+            calls.append(argv)
+            if len(calls) == 1:
+                return _Res(1)
+            raise subprocess.TimeoutExpired(argv, timeout or 1)
+        return _Res(0, NEIGH_STALE if "neigh" in argv else ROUTE)
+
+    assert presence.probe_state(ip="192.168.50.34", run=run) is None
 
 
 # -------------------------------------------------------------- unknown
@@ -80,7 +147,7 @@ def test_a_missing_ping_binary_is_unknown_and_never_away():
 
 def test_the_gateway_canary_turns_a_dead_network_into_unknown():
     """The Spark's own Wi-Fi dropped. That is not a departure."""
-    run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": 1,
+    run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": [1, 1],
                                             "192.168.50.1": 1})
     assert presence.probe_state(ip="192.168.50.34", run=run) is None
 

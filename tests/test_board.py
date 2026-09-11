@@ -10,7 +10,10 @@ no Tk widget is constructed anywhere in this file.
 """
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from jarvis import board
 from jarvis.ui import board as ui_board
@@ -121,8 +124,13 @@ def test_an_empty_ledger_says_so_rather_than_drawing_a_flat_line():
 
 
 # ------------------------------------------------------------- sessions
-def session(slug, title=""):
-    return SimpleNamespace(slug=slug, title=title, first_user="", mtime=0.0)
+def session(slug, title="", age_s=90.0):
+    """A session touched ``age_s`` ago. The default is minutes, not the
+    epoch: since 2026-09-11 the panel drops anything older than
+    SESSION_MAX_AGE_S, so a fixture at mtime=0.0 is 56 years of history
+    and correctly does not appear."""
+    return SimpleNamespace(slug=slug, title=title, first_user="",
+                           mtime=time.time() - age_s)
 
 
 def test_a_running_task_outranks_its_own_session_row():
@@ -138,8 +146,49 @@ def test_a_waiting_task_is_the_loudest_thing_on_the_panel():
 
 
 def test_recent_sessions_fill_in_under_the_live_ones():
-    p = board.sessions_panel([session("vss", "detector work")], {})
-    assert p.rows == [("VSS", "detector work")] and p.tone == "idle"
+    """The VALUE is a fact about state, not the conversation's title.
+
+    HIS BUG, 2026-09-11: "random stuff still showing up in the bar like my
+    schedule but its not its just dialogue". The value column carried an
+    AI-written title of a coding conversation, beside live rows whose
+    values are real statuses ("RUNNING"), so his panel read "HUNTERP
+    Terminal closed" and "TEST  Next class" -- one looks like a status the
+    console is reporting, the other like a diary entry, and neither is
+    either. The slug already says which project it is."""
+    p = board.sessions_panel([session("vss", "detector work", age_s=90.0)], {})
+    assert p.rows == [("VSS", "1 min ago")] and p.tone == "idle"
+
+
+def test_a_title_never_reaches_the_panel():
+    """The pin: whatever a session calls itself, the panel says when."""
+    p = board.sessions_panel([session("vss", "Next class", age_s=120.0)], {})
+    assert all("Next class" not in value for _slug, value in p.rows), p.rows
+
+
+@pytest.mark.parametrize("age_s, want", [
+    (5.0, "just now"), (59.0, "just now"), (61.0, "1 min ago"),
+    (3599.0, "59 min ago"), (3601.0, "1 h ago"), (7200.0, "2 h ago"),
+])
+def test_the_age_reads_as_an_age(age_s, want):
+    assert board.session_age_words(age_s) == want
+
+
+def test_a_session_from_last_week_is_history_not_the_room():
+    """His panel was carrying sessions six, seven and nine days old, which
+    also pushed live rows off a four-row panel."""
+    old = session("vss", "detector work", age_s=board.SESSION_MAX_AGE_S + 60.0)
+    assert board.sessions_panel([old], {}).tone == "off"
+
+
+def test_a_session_that_cannot_date_itself_is_not_recent_work():
+    undated = SimpleNamespace(slug="vss", title="x", first_user="", mtime=None)
+    assert board.sessions_panel([undated], {}).tone == "off"
+
+
+def test_a_live_task_is_still_a_status_not_an_age():
+    """The half that was always right must stay right."""
+    p = board.sessions_panel([], {"jarvis": "running"})
+    assert p.rows == [("JARVIS", "RUNNING")]
 
 
 def test_no_sessions_at_all_is_a_dark_panel():

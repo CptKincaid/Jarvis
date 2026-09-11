@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -105,6 +105,21 @@ MIN_DWELL_S = 0.4
 # Older than this and the camera is describing a different moment than the
 # microphone is. The wake buffer is 2 s; 1.5 s keeps them the same event.
 MAX_AGE_S = 1.5
+# THE PRESENCE BAR, WHICH IS A DIFFERENT QUESTION AND THEREFORE A DIFFERENT
+# NUMBER. ``MAX_AGE_S`` above asks "is the camera describing the same
+# EVENT as this wake word", and 1.5 s is right for that. "Is he in the
+# flat" is asked on a 60 s poll while he is home and a 10 s poll while he
+# is out, so a reading thrown away at 1.5 s would mean the leg was blind
+# at almost every vote -- which is today's bug reached from the other
+# side. Half the home poll is the bound: fresh enough that he cannot have
+# left and come back inside it, slack enough that a 3 s burst armed by a
+# room change still counts at the next vote.
+#
+# TWO CONSUMERS, TWO TOLERANCES, STATED EXPLICITLY. ``Attention.usable``
+# takes the bar as an argument for exactly this reason, and
+# ``app._eye_leg`` must PASS this one -- calling ``usable()`` bare there
+# silently applies the wake bar to the presence question.
+PRESENCE_MAX_AGE_S = 30.0
 # Body re-identification is dominated by clothing, so an anchor taken this
 # morning says nothing this afternoon. Fifteen minutes is short enough that he
 # has not plausibly changed and left and come back unseen.
@@ -179,10 +194,12 @@ class Eye:
 
     def __init__(self, allow: Optional[Callable[[], bool]],
                  open_device: Callable[[], object],
-                 on_blind: Optional[Callable[[], None]] = None):
+                 on_blind: Optional[Callable[[], None]] = None,
+                 now: Callable[[], float] = time.monotonic):
         self._allow = allow
         self._open_device = open_device
         self._on_blind = on_blind
+        self._now = now
         self._device = None
         # True until a frame is actually returned: nothing has been seen yet,
         # so there is nothing for a first deny to invalidate.
@@ -191,6 +208,80 @@ class Eye:
         self.denials = 0
         self.reads_dropped = 0    # frames grabbed and then thrown away
         self.blind_edges = 0      # deny transitions; on_blind fired this often
+        # THE PUBLISHED READING -- the whole reason the presence leg can
+        # vote. It is an ``Attention`` and nothing else (``publish`` refuses
+        # anything else by type), so no code path can put a frame here, and
+        # therefore no consumer can acquire one by accident.
+        self._reading: Optional[Attention] = None
+        self._reading_at = 0.0
+        # A published reading that a deny has since invalidated. Separate
+        # from ``_blind`` because a FAILED GRAB is not a blind edge (see
+        # _go_blind) but does leave the reading describing an older moment.
+        self._reading_dark = True
+        self.publishes = 0
+
+    # ------------------------------------------------------ the reading
+    def publish(self, attention: "Attention") -> None:
+        """Store what a producer just measured. NUMBERS ONLY, BY TYPE.
+
+        ``Attention`` is counts, booleans, floats and a label -- there is
+        no field on it that can hold a pixel -- and refusing anything else
+        at this door is what makes "no frame can reach a consumer" a
+        property of the code rather than of a review.
+
+        A publish that lands while sensing says NO is stored as BLIND
+        whatever it claims. That closes the one race the producer cannot:
+        a deny arriving between the grab and this call would otherwise
+        publish a reading taken a millisecond before somebody said stop.
+        It is a permission read and not the ``_blind`` device flag on
+        purpose -- a reading DERIVED from the console's own capture (the
+        producer borrows it rather than opening a second reader on one
+        v4l2 node) is a real look through a device this object never held.
+        """
+        if not isinstance(attention, Attention):
+            raise TypeError(
+                "the eye publishes an Attention -- counts, scores and a "
+                "label -- and never a %s" % type(attention).__name__)
+        blind = not self.permitted()
+        self._reading = Attention(dark=True) if blind else attention
+        self._reading_at = self._now()
+        self._reading_dark = bool(blind)
+        self.publishes += 1
+
+    def state(self, max_age_s: float = PRESENCE_MAX_AGE_S) -> Attention:
+        """The latest reading with its age filled in, or a DARK one.
+
+        DARK -- "could not look", which never votes -- whenever any of:
+        nothing has been published yet; the burst produced no frame for any
+        reason at all; the detector was missing or fell over; a deny edge
+        has fired since the publish; SENSING SAYS NO RIGHT NOW; or the
+        reading is older than ``max_age_s``. ``camera_leg`` reads dark as
+        CAM_BLIND and a live zero as CAM_LOOKED, and the difference between
+        those two is the difference between "I did not look" and "the room
+        is empty".
+
+        THE PERMISSION IS RE-READ HERE, AND IT WAS NOT UNTIL 2026-09-06.
+        ``_reading_dark`` is stamped at PUBLISH time and cleared to True by
+        ``_go_blind``, which only ever runs out of ``capture()``. Between
+        bursts nothing captures BY DESIGN -- jarvis/eyeloop.py: "the lens is
+        dark in between" -- so when he said "camera off for ten minutes"
+        with no burst in flight, nothing invalidated the last reading and it
+        went on voting for the full 30 s presence window. His own privacy
+        switch has to reach the CONSUMER, not just the device, and the only
+        place that can be true for a reading nobody is refreshing is the
+        read itself. A sensing owner that raises is not permission either.
+        """
+        reading = self._reading
+        if reading is None:
+            return Attention(dark=True)
+        try:
+            bound = float(max_age_s)
+        except (TypeError, ValueError):
+            bound = PRESENCE_MAX_AGE_S
+        age = max(0.0, self._now() - self._reading_at)
+        dark = bool(reading.dark or self._reading_dark or age > bound
+                    or not self.permitted())
+        return replace(reading, age_s=age, dark=dark)
 
     # ------------------------------------------------------------ the gate
     def permitted(self) -> bool:
@@ -245,8 +336,16 @@ class Eye:
         hiccup, not an absence, and clearing the anchor on every hiccup would
         make the anchor useless; the TTL is the backstop for a camera that
         quietly stops working. A deny is different in kind -- somebody, or the
-        clock, said stop, and nobody says how long for."""
+        clock, said stop, and nobody says how long for.
+
+        THE PUBLISHED READING DIES HERE TOO, before the edge test, so that
+        a curfew or an offline edge (a) drops the body anchor and (b) stops
+        the presence leg voting off a look taken before the deny -- in the
+        same instant, off the same callback. A leg still answering "he is
+        there" from a frame the curfew has since forbidden is the privacy
+        control reaching the device and not the consumer."""
         self.close()
+        self._reading_dark = True
         if self._blind:
             return
         self._blind = True

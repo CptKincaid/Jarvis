@@ -56,6 +56,7 @@ from jarvis.events import (
     RecordingStopped,
     ReminderFired,
     RoomChanged,
+    RoomGlimpsed,
     Status,
     Transcribed,
     UncertainResolved,
@@ -198,6 +199,19 @@ FILLER_DELAY_MAX_S = 8.0
 # the only network source on the Board and Spotify the only one on the
 # slab, so both are gated here rather than in the surfaces that draw them.
 CANVAS_TTL_S = 300.0          # the Board's Canvas half, cached 5 minutes
+
+
+def _same_day(a: float, b: float) -> bool:
+    """Are two wall-clock stamps the same LOCAL calendar day?
+
+    A cached sentence carries its own day word ("today 11:59 pm"), so it
+    expires at midnight however few seconds old it is. Local, not UTC:
+    the word was rendered against his clock.
+    """
+    if a <= 0.0 or b <= 0.0:
+        return False
+    fa, fb = time.localtime(a), time.localtime(b)
+    return (fa.tm_year, fa.tm_yday) == (fb.tm_year, fb.tm_yday)
 BOARD_SESSIONS = 6            # Claude sessions read off disk per poll
 ROOM_SPOTIFY_ACTIVE_S = 10.0  # playback poll while something IS playing
 ROOM_SPOTIFY_IDLE_S = 60.0    # …and once it has gone quiet
@@ -481,6 +495,44 @@ class _Speculation:
         return self.error is None and (self.rejected or self.result is not None)
 
 
+
+def _eye_usable(state) -> bool:
+    """Is this camera reading a MEASUREMENT, on the PRESENCE clock?
+
+    ``Attention.usable`` takes the bar as an argument because there are two
+    consumers with two tolerances, and calling it BARE here is the trap:
+    the default is ``eye.MAX_AGE_S`` (1.5 s, matched to the 2 s wake
+    buffer), which would throw away every burst older than a second and a
+    half -- and the presence vote runs on a 60 s poll while he is home. The
+    presence bound is ``eye.PRESENCE_MAX_AGE_S``, half that poll.
+
+    The duck-typed ``usable`` may take no argument at all (a stub in a
+    test, a future feed), so the bound is offered and the bare call is the
+    fallback. Anything that raises is NO OPINION, which is today's
+    behaviour byte for byte.
+    """
+    usable = getattr(state, "usable", None)
+    if not callable(usable):
+        try:
+            return bool(usable)
+        except Exception:                          # noqa: BLE001 - the eye
+            return False
+    try:
+        from jarvis.eye import PRESENCE_MAX_AGE_S
+    except Exception:                              # noqa: BLE001
+        PRESENCE_MAX_AGE_S = 30.0
+    try:
+        return bool(usable(PRESENCE_MAX_AGE_S))
+    except TypeError:
+        pass
+    except Exception:                              # noqa: BLE001 - the eye
+        return False
+    try:
+        return bool(usable())
+    except Exception:                              # noqa: BLE001 - the eye
+        return False
+
+
 class JarvisApp:
     # Class-level defaults for the state __init__ sets, so a test that
     # builds a partial app (tests/test_destructive_readback.py uses
@@ -574,6 +626,17 @@ class JarvisApp:
         # not live in assistant.json, whose loader recreates a corrupt file
         # from DEFAULTS and would therefore fail ONLINE.
         self.sensing = self._construct("sensing", self._make_sensing)
+        # ---- the camera leg's ONE feed, and the producer that fills it ----
+        # BEFORE presence, for two reasons. The boot line _wire_camera_leg
+        # prints has to be able to tell "no feed at all" from "a feed that
+        # has not looked yet", and the sentinel is built inside
+        # _make_presence. And there must be exactly ONE feed on the box:
+        # SensingPolicy.attach replaces by NAME, so a second one built
+        # later (campreview does exactly that today, and says so in his log
+        # at 10:30, 10:48 and 14:05) leaves the curfew reaching only the
+        # newer of the two. That is a privacy hole, not untidiness.
+        self.camera_feed, self.camera_feed_why = self._make_camera_feed()
+        self.eyeloop = self._construct("camera producer", self._make_eyeloop)
 
         # ---- ambient: quiet hours / DND and presence ----------------------
         # Both read services lazily (calendar, presence) because services is
@@ -781,6 +844,15 @@ class JarvisApp:
         # _greet_return as the phone and the desk, so the damper below is
         # shared and the choreography is not written twice.
         bus.subscribe(RoomChanged, self._on_room_changed)
+        # A GLIMPSE IS NOT AN ARRIVAL, and it reaches exactly ONE consumer.
+        # RoomGlimpsed is a room that lit for too few polls to become the
+        # active room; it must not move the active room, greet, arm the
+        # door watch or move the bedroom hint. The departure sequence asks
+        # a weaker question -- did he walk PAST the kitchen -- and that is
+        # what a pass-through looks like. On 2026-09-06 the kitchen
+        # produced no room line at all while he left, so the sequence never
+        # left the desk and "away" arrived about fourteen minutes late.
+        bus.subscribe(RoomGlimpsed, self._on_room_glimpsed)
         self._wire_roomtone()
         bus.subscribe(DeskState, self._on_desk)
         self._last_greeted = 0.0        # GREET_DAMPER_S, shared by both probes
@@ -796,6 +868,9 @@ class JarvisApp:
         # HIS DEPARTURE RULE, as an ordered sequence. Pure and silent; see
         # _departure_seq_room.
         self._departure_seq = self._make_departure_seq()
+        # True while the departure confirm timer is armed -- see
+        # _cancel_departure and arrival.nap_refusal.
+        self._departure_pending = False
         # A radar whose gates have gone back to 0 sees 0.75 m and reads the
         # room as EMPTY -- measured twice on real hardware, 2026-09-03. The
         # check is a daemon thread that waits before its first read (the
@@ -894,6 +969,111 @@ class JarvisApp:
         return mod.SensingPolicy(cfg=self.assistant,
                                  path=PATHS.MEMORY_DIR / "sensing.json")
 
+    def _make_camera_feed(self):
+        """``(feed, why)`` -- the app's own gated camera, or None with a reason.
+
+        Everything that wants pixels on this box goes through this one
+        object: the presence producer (jarvis/eyeloop.py) and the console's
+        preview, which already prefers ``services.camera_feed`` and returns
+        ``owned=False`` so it cannot shut a feed it borrowed
+        (campreview.resolve_feed / PreviewPipeline.close).
+
+        ``on_blind`` is the wire that ties the curfew to the body anchor:
+        a deny edge drops ``SessionIdentity``'s vector AND invalidates the
+        published reading in the same instant, so the leg cannot keep
+        voting off a look taken before somebody said stop.
+        """
+        cam = _import_optional("jarvis.camera")
+        if cam is None:
+            return None, "the camera lane is not installed"
+        policy = getattr(self, "sensing", None)
+        if policy is None:
+            # The same fail-to-offline reasoning as _make_presence: a
+            # sensor whose owner could not be built does not sense.
+            sens = _import_optional("jarvis.sensing")
+            policy = None if sens is None else sens.DENIED
+        anchor = None
+        eye_mod = _import_optional("jarvis.eye")
+        if eye_mod is not None:
+            try:
+                anchor = eye_mod.SessionIdentity(
+                    match_min=eye_mod.BODY_MATCH_MIN)
+            except Exception:  # noqa: BLE001 - the anchor is optional
+                anchor = None
+        self._body_anchor = anchor
+        try:
+            feed, why = cam.build(
+                self.assistant, policy,
+                on_blind=(anchor.room_empty if anchor is not None else None))
+        except Exception as exc:  # noqa: BLE001 - a camera cannot end the app
+            log.warning("camera: the feed could not be built (%s)", exc)
+            return None, str(exc)
+        if feed is None:
+            log.info("camera: no feed (%s); the camera leg stays dark", why)
+        else:
+            warn = ""
+            try:
+                warn = cam.identity_min_warning(self.assistant)
+            except Exception:  # noqa: BLE001 - a diagnostic must not raise
+                warn = ""
+            if warn:
+                # REPORTED, NOT RETUNED. That number needs his face and
+                # scripts/face_model_compare.py; guessing a replacement is
+                # the same mistake in the other direction.
+                log.warning("camera: %s", warn)
+        return feed, why
+
+    def _make_eyeloop(self):
+        """The producer for the camera leg (jarvis/eyeloop.py), or None.
+
+        The detector and the identifier are built LAZILY on the first
+        burst: loading ONNX weights here would put the whole face lane on
+        the startup path of a box that may never arm one.
+        """
+        feed = getattr(self, "camera_feed", None)
+        if feed is None:
+            return None
+        mod = _import_optional("jarvis.eyeloop")
+        if mod is None:
+            return None
+        cam = _import_optional("jarvis.camera")
+        if cam is None:
+            return None
+        return mod.EyeLoop(
+            feed, cfg=self.assistant,
+            make_detector=lambda: cam.detector_from_config(self.assistant)[0],
+            make_identifier=self._make_face_identifier,
+            on_named=self._settle_from_eye,
+            preview=lambda: getattr(getattr(self, "services", None),
+                                    "preview_worker", None))
+
+    def _make_face_identifier(self):
+        """The enrolled gallery asked "who is this", or None.
+
+        None whenever identity cannot honestly be offered -- the switch is
+        off, no weights, nobody enrolled for the ACTIVE model -- and the
+        leg then counts faces without naming anybody, which is CAM_SAW
+        without the outright win.
+        """
+        cam = _import_optional("jarvis.camera")
+        eye_mod = _import_optional("jarvis.eye")
+        if cam is None or eye_mod is None:
+            return None
+        gallery, why = cam.gallery_from_config(self.assistant)
+        if gallery is None:
+            log.info("camera: no identity for the presence leg (%s)", why)
+            return None
+        rec, why = cam.recogniser_from_config(self.assistant)
+        if rec is None:
+            log.info("camera: no face recogniser (%s)", why)
+            return None
+        get = self.assistant.get
+        return eye_mod.FaceIdentifier(
+            gallery, rec,
+            min_conf=float(get("camera.min_conf", 0.6) or 0.6),
+            match_min=float(get("camera.identity_min", 0.363) or 0.363),
+            owner="hunter", session=getattr(self, "_body_anchor", None))
+
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
         if mod is None:
@@ -916,6 +1096,7 @@ class JarvisApp:
             # fabric, so no legs, so nothing to wire.
             self._wire_camera_leg(legs)
             self._wire_mic_leg(legs)
+            self._wire_desk_leg(legs)
         return sentinel
 
     def _wire_mic_leg(self, legs) -> bool:
@@ -950,6 +1131,75 @@ class JarvisApp:
         except Exception:  # noqa: BLE001 - the ledger must not cost the vote
             return None
 
+    def _wire_desk_leg(self, legs) -> bool:
+        """Attach the desk leg: SECONDS SINCE THE KEYBOARD OR MOUSE MOVED.
+
+        THE MIC LEG'S TWIN, written next to it because they answer the same
+        question and a change to one that is not made to the other is the
+        defect shape this repo keeps paying for.
+
+        On 2026-09-06 the voter printed "away (cell 6)" at 15:28:13 and
+        again at 17:07:28 with him sitting at his desk: phone napping,
+        camera leg dark, mic silent past its window, the corroboration
+        window expired. HE HAD TYPED A COMMAND AT 15:17.
+        ``jarvis/deskpresence.py`` had that number the whole time -- Mutter's
+        idle monitor, off the session bus, already polled every 30 s -- and
+        no leg was reading it. A man typing is in the flat.
+
+        Late-bound for the same reason the mic is: ``self.desk`` is built
+        AFTER presence (app.__init__ lines 622 and 627), so the leg looks
+        the sentinel up at CALL time rather than capturing an attribute
+        that does not exist yet. Capturing it here would wire None for ever
+        and the leg would answer DESK_UNKNOWN at every vote -- which is
+        precisely the silent-dark-leg failure the camera line warns about.
+        """
+        if legs is None:
+            return False
+        legs.desk = self._desk_idle_leg
+        # AND HOW OLD THAT NUMBER IS. Without it a reading that stopped
+        # being refreshed voted DESK_AT for ever -- measured, 400 no-signal
+        # polls (3 h 20 min) still answering 5.0 s, and AWAY never firing in
+        # six hours with the rooms clear and his phone gone. The sentinel
+        # now expires its own reading; this hands the voter the age so the
+        # belt in ``presencevote.desk_leg`` can refuse a stale one too.
+        legs.desk_age = self._desk_idle_age
+        return True
+
+    def _desk_idle_leg(self):
+        """``DeskSentinel.idle_s()`` or None. A DURATION, never a keystroke.
+
+        None whenever there is no signal -- deskpresence answers None for a
+        missing gdbus, a nonzero rc, a timeout or unparsable stdout, and
+        the voter reads None as UNKNOWN, which votes nothing. It must never
+        become 0.0 on the way through here: zero reads as "sitting right
+        there".
+        """
+        desk = getattr(self, "desk", None)
+        idle = getattr(desk, "idle_s", None)
+        if not callable(idle):
+            return None
+        try:
+            return idle()
+        except Exception:  # noqa: BLE001 - the monitor must not cost the vote
+            return None
+
+    def _desk_idle_age(self):
+        """How old the number ``_desk_idle_leg`` just handed over is.
+
+        ``DeskSentinel.idle_age_s()`` or None. Late-bound for the same
+        reason its twin above is: ``self.desk`` is built after presence.
+        A sentinel from before this existed simply has no such method and
+        the leg votes exactly as it did.
+        """
+        desk = getattr(self, "desk", None)
+        age = getattr(desk, "idle_age_s", None)
+        if not callable(age):
+            return None
+        try:
+            return age()
+        except Exception:  # noqa: BLE001 - the monitor must not cost the vote
+            return None
+
     def _wire_camera_leg(self, legs) -> bool:
         """Attach the camera leg and SAY OUT LOUD whether it can answer.
 
@@ -958,22 +1208,36 @@ class JarvisApp:
         sensor." The voter obeys that -- a camera that NAMES him ends the
         vote in every one of the 27 cells.
 
-        BUT NOTHING IN THIS TREE EVER ASSIGNS ``services.camera_feed``
-        (grep for "camera_feed ="), so ``_eye_leg`` answers BLIND
-        unconditionally today, and BLIND is "could not look", which never
-        votes. That makes the running voter a TWO-leg voter wearing a
-        three-leg name, and the one thing it must not do is claim
-        otherwise: this is his number one signal, and he is entitled to
-        know it is dark rather than to find out from a missed greeting.
-        So the dark case is a WARNING that names the missing wiring and
-        says what the vote is actually standing on.
+        THERE ARE THREE HONEST STATES AND THEY MUST BE TOLD APART. Until
+        2026-09-06 there were two, and the missing one is the whole reason
+        this line has to change with the producer: a WORKING producer that
+        has simply not looked yet would otherwise be announced as DARK at
+        every single boot, which is the silence-is-the-defect bug
+        re-created from the other side.
 
-        The slot is wired either way, so the leg goes live the moment
-        something finally attaches a feed -- no second restart.
+          1. no feed at all -- the state his box was in until today. A
+             WARNING that names the missing wiring and says what the vote
+             is actually standing on. He is entitled to know his number one
+             signal is dark rather than to find out from a missed greeting.
+          2. a feed attached, no look yet -- INFO. The leg votes from its
+             first burst, which is armed by the fabric naming his office or
+             by an ambiguous vote, not by a clock.
+          3. a fresh reading already -- INFO, live.
+
+        The slot is wired in all three, so the leg goes live the moment
+        anything attaches a feed -- no second restart.
         """
         if legs is None:
             return False
         legs.eye = self._eye_leg
+        # THE ARMING SEAM. The voter calls this, bounded, for the two cells
+        # his rule 1 cannot reach today (a room occupied with the phone
+        # silent or unaskable). Without it the lens only ever looks when a
+        # room CHANGES, and those two cells are exactly the votes that went
+        # wrong on 09-05 and again on 09-06.
+        loop = getattr(self, "eyeloop", None)
+        if loop is not None:
+            legs.look = loop.wait_for_look
         live = False
         try:
             identity, faces, live = self._eye_leg()
@@ -983,6 +1247,40 @@ class JarvisApp:
             log.info("presence: the camera leg is live -- his number one "
                      "signal can vote")
             return True
+        if getattr(self, "camera_feed", None) is not None:
+            # ATTACHED IS NOT THE SAME AS ABLE TO SEE, and the old build's
+            # loud line went away with the wiring. HIS REPORT, 2026-09-11,
+            # one minute after I told him the leg was live: "camera is not
+            # connected" -- and /dev/video* did not exist at all. The leg
+            # degrades correctly (every vote that hour reads "cam-blind",
+            # and a blind camera never says he is out), but nothing said
+            # WHY, which is the failure this project keeps paying for:
+            # arrival._door_from_room, presencevote's mic wording and the
+            # outing refusals were all the same defect.
+            from jarvis import camera as camera_mod
+            try:
+                nodes = camera_mod.device_nodes()
+            except Exception:              # noqa: BLE001 - a probe, not a gate
+                nodes = []
+            if not nodes:
+                log.warning(
+                    "presence: the camera leg is attached but THERE IS NO "
+                    "CAMERA. No %s exists, so every look answers \"could "
+                    "not look\" and the leg never votes -- which is the "
+                    "right answer, not a wrong one: a camera that cannot "
+                    "look must never be read as an empty room. The verdict "
+                    "stands on the phone, the rooms, the mic and the desk. "
+                    "Plug one in and it votes from its first look, with no "
+                    "restart.", camera_mod.DEVICE_GLOB)
+                return False
+            log.info(
+                "presence: the camera leg is attached and votes from its "
+                "first look. Nothing is looking yet by design -- a burst is "
+                "armed when a room change names the office, or when the "
+                "vote is close; the lens is dark in between%s.",
+                (" (curfew %s)" % loop.status().get("curfew", ""))
+                if loop is not None and loop.curfew else "")
+            return False
         log.warning(
             "presence: HIS NUMBER ONE SIGNAL IS DARK. Nothing on this tree "
             "assigns services.camera_feed, so the camera leg answers "
@@ -1403,7 +1701,8 @@ class JarvisApp:
             log.debug("setup lines unavailable", exc_info=True)
         # Fixed lines owned by the assistant modules (spec 3.4).
         for modname, names in (
-                ("jarvis.router", ("ROUTER_QUESTION",)),
+                ("jarvis.router", ("ROUTER_QUESTION", "CLAUDE_CHECK_OFFER",
+                                  "OFFER_DECLINED_LINE")),
                 # BUSY_LINE is a {project} template — never prewarmed.
                 ("jarvis.claude_session", ("CANCELLED_LINE", "NO_PROJECT_LINE",
                                            "OUTSIDE_LINE", "UNSAFE_DIR_LINE",
@@ -1623,6 +1922,13 @@ class JarvisApp:
             # reach for a camera nobody is holding.
             preview_worker=None,
             preview_lease=None,
+            # THE APP'S ONE CAMERA. ``_eye_leg`` and ``_eye_identity`` read
+            # it here; ``campreview.resolve_feed`` reads the UI Services'
+            # copy (see ui_service_kwargs). BOTH have to be set from this
+            # one object -- setting only one leaves either the leg dark or
+            # the preview building a second feed the curfew cannot reach.
+            camera_feed=getattr(self, "camera_feed", None),
+            eyeloop=getattr(self, "eyeloop", None),
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share
@@ -1963,11 +2269,7 @@ class JarvisApp:
                 state = state()
             except Exception:                      # noqa: BLE001 - the eye
                 return ""
-        usable = getattr(state, "usable", None)
-        try:
-            if callable(usable) and not usable():
-                return ""
-        except Exception:                          # noqa: BLE001 - the eye
+        if not _eye_usable(state):
             return ""
         return str(getattr(state, "identity", "") or "")
 
@@ -1998,12 +2300,7 @@ class JarvisApp:
                 return ("", None, False)
         if state is None:
             return ("", None, False)
-        usable = getattr(state, "usable", None)
-        try:
-            live = bool(usable()) if callable(usable) else bool(usable)
-        except Exception:                          # noqa: BLE001 - the eye
-            return ("", None, False)
-        if not live:
+        if not _eye_usable(state):
             return ("", None, False)
         faces = getattr(state, "faces", None)
         try:
@@ -2035,6 +2332,20 @@ class JarvisApp:
         if self._last_source == "voice":
             self._followup_after_speech = True
         self._say(sentence)
+
+    def _take_claude_check_offer(self) -> bool:
+        """True ONCE when this reply is a local attempt at work Jarvis is
+        REALLY unsure about (commander._dispatch_route parks it). Cleared
+        on the way out so the offer is made exactly once per turn, whatever
+        else the batch of tags carries."""
+        services = getattr(self, "services", None)
+        if services is None or not getattr(services, "claude_check_offer", False):
+            return False
+        try:
+            services.claude_check_offer = False
+        except Exception:                  # noqa: BLE001 - a namespace boundary
+            log.debug("could not clear the claude-check offer", exc_info=True)
+        return True
 
     def _on_brain_tags(self, tags):
         """Port of the monolith's _on_brain_response: act on [TAG] tuples.
@@ -2109,6 +2420,18 @@ class JarvisApp:
                         offer = ""
                         # the answer window opens whatever the source: the
                         # question was put to him aloud
+                        self._followup_after_speech = True
+                    elif self._take_claude_check_offer():
+                        # HIS RULING, 2026-09-11 evening: "only on things
+                        # its REALLY unsure about should it offer". The
+                        # attempt has just been spoken; this is the second
+                        # half of the sentence, joined the way the
+                        # briefing's wake-alarm offer is.
+                        from jarvis.router import CLAUDE_CHECK_OFFER
+                        self._say(self._thin_address(
+                            [content, CLAUDE_CHECK_OFFER])[-1])
+                        # the answer window opens whatever the source: the
+                        # offer was put to him aloud
                         self._followup_after_speech = True
                     # brain._remember has already recorded this exchange;
                     # recording it here too rendered every turn twice.
@@ -2343,6 +2666,17 @@ class JarvisApp:
         is the feature, not the line.
         """
         now = time.monotonic()
+        # THE NAP GATE FIRST, because it is not "the same return twice" but
+        # "there was no return". The departure half already spends the
+        # confirm window doubting a sleeping radio; this is its twin.
+        nap = arrival_mod.nap_refusal(
+            source=source,
+            departure_pending=bool(getattr(self, "_departure_pending", False)),
+            confirm_s=arrival_mod.confirm_s(self.assistant.get))
+        if nap:
+            log.info("arrival: no greeting -- %s", nap)
+            bus.publish(Status(text="Home", kind="info"))
+            return
         last = getattr(self, "_last_greeted", 0.0)
         if last:
             why = arrival_mod.greet_refusal(source=source, since_s=now - last,
@@ -2421,14 +2755,20 @@ class JarvisApp:
           ``note_zone_verdict``) AND his desk room's zone map actually
           names the desk band. A verdict lane pointed at a room with no
           map, or a map with no such band, never reaches the desk zone.
-        * ``camera`` -- a camera feed is attached
-          (``services.camera_feed``, which ``_eye_identity`` reads). It
-          answers with a NAME or "", so the curfew and offline mode close
-          it by answering "" rather than by being asked about here.
+        * ``camera`` -- a feed is attached (``services.camera_feed``), a
+          PRODUCER is filling it (``services.eyeloop``), AND the box can
+          actually put a NAME to a face. All three, because
+          ``_eye_identity`` delivers this leg by returning a name and
+          nothing else: a feed with no producer never looks, and a
+          producer with no usable gallery counts faces without naming
+          anybody. Either of those counted here is his mail question
+          silently never being asked, which is the exact failure the rule
+          above exists to prevent -- and it became reachable the day a
+          feed started being attached (2026-09-06). The curfew and offline
+          mode are correctly NOT checked here: they close the leg by
+          answering "" at the moment it is asked, not by removing it.
 
-        Nothing attaches either on this tree today, so this is ``()`` on
-        the live box and the arrival cue is byte for byte the one that
-        shipped. Never raises: a config that cannot be read is no leg.
+        Never raises: a config that cannot be read is no leg.
         """
         watch = getattr(self, "_desk", None)
         if watch is None:
@@ -2438,9 +2778,42 @@ class JarvisApp:
         if getattr(services, "zone_source", None) is not None and \
                 self._desk_band_configured(watch):
             legs.append(arrival_mod.LEG_RADAR)
-        if getattr(services, "camera_feed", None) is not None:
+        if getattr(services, "camera_feed", None) is not None and \
+                getattr(services, "eyeloop", None) is not None and \
+                self._camera_can_name():
             legs.append(arrival_mod.LEG_CAMERA)
         return tuple(legs)
+
+    def _camera_can_name(self) -> bool:
+        """Can this box put a NAME to a face at all? Cached, and cheap.
+
+        Reads the gallery INDEX (a small json), never the ONNX weights --
+        the models are loaded lazily by the producer on its first burst and
+        this must not drag them onto the arrival path. False whenever
+        identity cannot honestly be offered: the switch is off, nobody is
+        enrolled, or the enrolment on disk belongs to a model that is no
+        longer the active one (which is a real state on this box -- the
+        backend moved to insightface/arcface_mbf on 2026-09-03).
+        """
+        cached = getattr(self, "_camera_can_name_cache", None)
+        if cached is not None:
+            return cached
+        out = False
+        try:
+            if bool(self.assistant.get("camera.identity", False)):
+                cam = _import_optional("jarvis.camera")
+                if cam is not None:
+                    gallery, why = cam.gallery_from_config(self.assistant)
+                    out = gallery is not None
+                    if not out:
+                        log.info("arrival: the camera cannot name anybody "
+                                 "(%s), so the settle will not wait on it", why)
+        except Exception:  # noqa: BLE001 - an unreadable gallery is no leg
+            log.debug("arrival: the face gallery could not be read",
+                      exc_info=True)
+            out = False
+        self._camera_can_name_cache = out
+        return out
 
     def _desk_band_configured(self, watch) -> bool:
         """Does his desk room's zone map name the band he sits in?
@@ -3122,6 +3495,18 @@ class JarvisApp:
             self._arm_departure(ev)
             return
         if ev.returned:
+            # A NAP IS NOT A RETURN, so it must not burn the once-a-day
+            # power-up latch either. Same pure gate _greet_return uses;
+            # checked here because the sweep runs before the greeting and
+            # the documented order is not worth disturbing.
+            nap = arrival_mod.nap_refusal(
+                source="phone",
+                departure_pending=bool(getattr(self, "_departure_pending", False)),
+                confirm_s=arrival_mod.confirm_s(self.assistant.get))
+            if nap:
+                log.info("presence: not a return -- %s", nap)
+                bus.publish(Status(text="Home", kind="info"))
+                return
             # The power-up sweep's proper trigger: the away->home edge is
             # the moment he actually sits down. Once a day, latched
             # (_maybe_power_up); the wake-word fallback covers a box where
@@ -3174,6 +3559,13 @@ class JarvisApp:
         """
         self._door_from_room(ev)
         self._departure_seq_room(ev)
+        # ARM THE LENS -- his flat is a corridor and the lens is in the
+        # office, so the fabric naming the office is the one moment there
+        # is something to look at. Bounded, so the answer below is off THIS
+        # burst rather than off a reading from before he walked in; the
+        # bound is small because a greeting that arrives late reads worse
+        # than one that arrives without the camera's opinion.
+        self._arm_eye(getattr(ev, "room", "") or "")
         # A NAME, never a frame. _eye_identity answers "" for a camera
         # that is off, blind, or inside its 21:00-07:00 curfew, and "" is
         # no opinion rather than an absence.
@@ -3183,6 +3575,58 @@ class JarvisApp:
             log.debug("arrival: the eye could not be asked", exc_info=True)
             return
         self._settle(room=getattr(ev, "room", "") or "", camera=seen)
+
+    def _arm_eye(self, room: str) -> bool:
+        """Ask for a burst when the fabric names his DESK room. Never raises.
+
+        Only the desk room: the lens points at the office, and arming on a
+        kitchen change would light the lamp for a room it cannot see.
+
+        IT MUST NOT WAIT, AND THIS IS NOT A STYLE POINT. ``bus.publish``
+        queues for the TK THREAD once a window is attached, so a
+        RoomChanged subscriber runs on the UI thread on his live box -- a
+        bounded 1.5 s wait here would be 1.5 s of frozen console. With no
+        UI it is delivered inline on the ROOM FABRIC's thread, inside the
+        fabric's own lock, which would stall every reader of it for the
+        same 1.5 s. The presence daemon is the one thread that may block
+        on a look, and ``ThreeLegProbe`` does exactly that there.
+
+        So this arms and returns, and the burst's answer comes back
+        through ``_settle_from_eye`` on the producer's own thread.
+        """
+        loop = getattr(self, "eyeloop", None)
+        if loop is None or not room:
+            return False
+        try:
+            desk = str(self.assistant.get("presence.desk_room", "office")
+                       or "office")
+            if arrival_mod._room_key(room) != arrival_mod._room_key(desk):
+                return False
+            return bool(loop.arm("the fabric named the office"))
+        except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
+            log.debug("eyeloop: the burst could not be armed", exc_info=True)
+            return False
+
+    def _settle_from_eye(self, label: str) -> None:
+        """A burst NAMED somebody. Deliver the catch-up he is owed.
+
+        On the producer's thread -- not Tk and not the fabric's -- which is
+        why the arm above can return immediately. Without this the office
+        RoomChanged would arm a burst whose answer arrived a second later
+        with nothing left to ask it: the settle had already been taken with
+        an empty name, and a deferred catch-up would wait for a second
+        office change that may not come for hours.
+
+        ``DeskWatch`` enforces one delivery, so calling this on every
+        naming burst is safe; the latch is spent once and the rest are
+        no-ops.
+        """
+        try:
+            room = str(self.assistant.get("presence.desk_room", "office")
+                       or "office")
+            self._settle(room=room, camera=str(label or ""))
+        except Exception:  # noqa: BLE001 - the producer must not be broken
+            log.debug("arrival: the eye's settle failed", exc_info=True)
 
     def _door_from_room(self, ev) -> None:
         """The door half of _on_room_changed. See its docstring.
@@ -3260,6 +3704,27 @@ class JarvisApp:
         except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
             log.debug("departure: the sequence failed", exc_info=True)
 
+    def _on_room_glimpsed(self, ev) -> None:
+        """The ONLY consumer of RoomGlimpsed. See the subscription above.
+
+        Nothing is spoken and nothing is greeted -- ``DepartureSequence``
+        has no speak path and must never grow one, because a valediction
+        spoken to an empty room is a notification pretending to be a
+        presence (arrival.py's own words).
+        """
+        seq = getattr(self, "_departure_seq", None)
+        if seq is None:
+            return
+        try:
+            seq.room(room=getattr(ev, "room", ""), at=time.time(),
+                     glimpse=True)
+        except TypeError:
+            # A sequence from before the glimpse step existed. The glimpse
+            # is simply dropped rather than being fed in as a real change.
+            log.debug("departure: this sequence takes no glimpse")
+        except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
+            log.debug("departure: the glimpse failed", exc_info=True)
+
     def _departure_seq_phone(self, ev) -> None:
         """The third step: his phone stopped answering."""
         seq = getattr(self, "_departure_seq", None)
@@ -3273,10 +3738,20 @@ class JarvisApp:
             log.debug("departure: the sequence failed", exc_info=True)
 
     # ------------------------------------------------------ departure
-    def _cancel_departure(self) -> None:
+    def _cancel_departure(self) -> bool:
+        """Cancel the confirm timer; True when one was still pending.
+
+        The answer is EVIDENCE, not bookkeeping. A timer still armed means
+        the away state has not outlived the confirm window, which is the
+        one fact ``arrival.nap_refusal`` needs to tell a homecoming from a
+        radio waking up. Stamped on the app because _on_presence cancels
+        before it dispatches, so _greet_return cannot ask the timer itself.
+        """
         timer, self._departure_timer = getattr(self, "_departure_timer", None), None
+        self._departure_pending = timer is not None
         if timer is not None:
             timer.cancel()
+        return self._departure_pending
 
     def _arm_departure(self, ev) -> None:
         """Schedule the confirm check. Nothing is spoken, then or later."""
@@ -4270,7 +4745,9 @@ class JarvisApp:
         # one turn in which the camera named Mara must not make tonight's
         # reminder and tomorrow's briefing come out addressed to her.
         self._gate_who_ts = -1e9
-        self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
+        # (monotonic, lines, wall) — see _board_canvas_lines on why two
+        # clocks; and _last_nudge_ts on why the sentinel is not 0.0.
+        self._canvas_due_cache = (-1e9, [], -1e9)
         self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
         self._room_playing_text = ""
@@ -5457,14 +5934,38 @@ class JarvisApp:
     # cached or gated HERE and never in the pure layer: health.snapshot()
     # spawns nvidia-smi with a 5 s timeout and canvas_due is a Canvas REST
     # call, while the Board polls every 5 s.
-    def _board_canvas_lines(self) -> list:
+    def _board_canvas_lines(self, now=None, wall=None) -> list:
         """Canvas items due soon, cached for CANVAS_TTL_S.
 
         Reached through the TOOL REGISTRY, not by import: canvas_due is a
         closure defined inside tools/canvas.make_tools and registered as a
         tool, exactly as tools/briefing.py calls it. Silent (and empty)
-        when the token is unset — a box with no Canvas must not nag."""
-        now = time.monotonic()
+        when the token is unset — a box with no Canvas must not nag.
+
+        TWO CLOCKS, and they were one until his bug #7: "the due and whats
+        next dates for items in the standby screen do not update after the
+        date passes". What comes back here is a PRE-RENDERED SENTENCE —
+        "BIOSENSORS - Lab 3 report, today 11:59 pm" — with its day word
+        baked in by the Canvas fact sheet at fetch time. Its neighbour on
+        the same slab, _room_next_event, recomputes its day word against a
+        fresh clock on every call. So the row could still be saying TODAY
+        about yesterday, and nothing re-rendered it.
+
+          * time.monotonic() bounds how often the REST call is made. It is
+            the right clock for that and the wrong one for everything else:
+            it does not advance across suspend-to-RAM, so a box that slept
+            at 23:00 satisfied the TTL on its first probe at 08:00 and
+            served last night's sheet to the morning's first standby face.
+          * the WALL clock bounds how stale the WORDS may be, and a day
+            rollover drops the cache outright however few seconds old it
+            is. A sentence fetched at 23:59:50 is four minutes old at
+            00:04:50 and wrong about the only thing it says.
+
+        Both are parameters so a test can state a date instead of waiting
+        for one; the defaults are the real clocks.
+        """
+        now = time.monotonic() if now is None else float(now)
+        wall = time.time() if wall is None else float(wall)
         # The TTL is on the TIMESTAMP, never on the payload: `if lines and
         # ...` could not be satisfied by a stored EMPTY result, so a Canvas
         # with nothing due (or one erroring) re-issued a live REST call on
@@ -5472,8 +5973,11 @@ class JarvisApp:
         # -1e9 rather than 0.0 because time.monotonic() is uptime-based: a
         # 0.0 default would serve the empty cache for the first 300 s after
         # boot instead of fetching once.
-        at, lines = getattr(self, "_canvas_due_cache", (-1e9, []))
-        if now - at < CANVAS_TTL_S:
+        at, lines, wall_at = getattr(self, "_canvas_due_cache",
+                                     (-1e9, [], -1e9))
+        if (now - at < CANVAS_TTL_S
+                and 0.0 <= wall - wall_at < CANVAS_TTL_S
+                and _same_day(wall, wall_at)):
             return lines
         from jarvis.tools.briefing import _due_lines
         try:
@@ -5481,7 +5985,7 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - tool boundary
             log.debug("board: canvas_due failed", exc_info=True)
             lines = []
-        self._canvas_due_cache = (now, lines)
+        self._canvas_due_cache = (now, lines, wall)
         return lines
 
     def _board_sessions(self) -> list:
@@ -7125,6 +7629,11 @@ class JarvisApp:
         # sensing first: the clock-driven privacy guard (jarvis/sensing.py)
         # has to be walking the devices before the legs that poll them run.
         for name, obj in (("sensing", getattr(self, "sensing", None)),
+                          # ...and the camera leg's producer with it: it
+                          # sleeps on an Event and opens nothing until
+                          # something arms it, so starting it costs a
+                          # thread and no device.
+                          ("camera producer", getattr(self, "eyeloop", None)),
                           ("presence", self.presence), ("desk", self.desk),
                           ("quiet", self.quiet),
                           # arc after those: its first tick should see the
@@ -7557,6 +8066,11 @@ class JarvisApp:
                           ("focus", getattr(self, "focus", None)),
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
+                          # The producer BEFORE sensing: its stop() drops
+                          # the feed, so the lens is shut by its own owner
+                          # rather than left to the enforcement thread that
+                          # is about to be stopped itself.
+                          ("camera producer", getattr(self, "eyeloop", None)),
                           # Stops the enforcement thread only: quitting is
                           # not consent, so the switch itself is left where
                           # the state file has it.
@@ -8721,6 +9235,13 @@ class JarvisApp:
             # feature was missing, not broken.
             history_prev=self.history.prev,
             history_next=self.history.next,
+            # THE MIRROR OF services.camera_feed above, and the reason the
+            # console stops building a second gated feed of its own (the
+            # "no services.camera_feed" warning in his log at 10:30:00,
+            # 10:48:58 and 14:05:47). campreview.resolve_feed prefers this
+            # one and returns owned=False, so the preview borrows it and
+            # PreviewPipeline.close refuses to shut it.
+            camera_feed=getattr(self, "camera_feed", None),
             dispatch_text=self.dispatch_text,
             toggle_hotword=self.toggle_hotword,
             quit=self.quit,

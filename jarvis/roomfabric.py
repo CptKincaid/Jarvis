@@ -309,6 +309,20 @@ class Room:
     last_answer: float = 0.0       # the last moment it had an opinion at all
     stuck: bool = False
     gap_limit_s: float = 30.0      # a silence longer than this ends the run
+    # THE WALK-OUT INSTRUMENT. On 2026-09-06 the kitchen produced no room
+    # line at all while he walked out of the flat, and the log could not
+    # tell "the kitchen never saw him" from "we never got an answer from
+    # the kitchen" -- opposite diagnoses that looked identical. These are
+    # what separate them, and they are counts, not durations, because at a
+    # 2.0 s poll a one-poll run measures 0.0 s and inventing 0.8 would be
+    # a number with no source.
+    true_polls: int = 0            # consecutive True polls in the run
+    none_polls: int = 0            # cumulative unanswered polls
+    none_run: int = 0              # consecutive unanswered polls right now
+    none_since: float = 0.0        # when the current silence began
+    was_active: bool = False       # did THIS run ever become the active room
+    glimpse: Optional[tuple] = None   # (polls, seconds) pending a log line
+    gap_said: bool = False
     _run: Optional[bool] = field(default=None, repr=False)
     _warned_stuck: bool = field(default=False, repr=False)
 
@@ -329,20 +343,44 @@ class Room:
         """
         if value is None:
             self.value = None
+            self.none_polls += 1
+            self.none_run += 1
+            if not self.none_since:
+                self.none_since = now
             return
+        # A DEFINITE answer ends any silence. ``none_run`` is what the
+        # unanswered line counts and ``gap_said`` is what keeps it to one
+        # line per silence rather than one per poll.
+        self.none_since, self.none_run, self.gap_said = 0.0, 0, False
         if self.last_answer and now - self.last_answer > self.gap_limit_s:
+            # The run is ended by the SILENCE, not by an edge, so no
+            # glimpse is recorded: we do not know what happened in it.
             self._run = None
+            self.true_polls = 0
         self.last_answer = now
         if value:
             if self._run is not True:
                 self.true_since = now
+                self.true_polls = 1
+                self.was_active = False
+            else:
+                self.true_polls += 1
             self.last_true = now
-        elif self._run is not False:
-            self.false_since = now
-            if self.stuck:
-                log.info("roomfabric: %s is reading empty again; back in the "
-                         "picture", self.name)
-            self.stuck, self._warned_stuck = False, False
+        else:
+            if self._run is True and not self.was_active:
+                # A TRUE RUN THAT ENDED WITHOUT EVER BECOMING THE ACTIVE
+                # ROOM -- which is what a pass-through looks like. Measured
+                # honestly: last_true - true_since, so a single poll is
+                # 0.0 s and says so.
+                self.glimpse = (self.true_polls,
+                                max(0.0, self.last_true - self.true_since))
+            self.true_polls = 0
+            if self._run is not False:
+                self.false_since = now
+                if self.stuck:
+                    log.info("roomfabric: %s is reading empty again; back in "
+                             "the picture", self.name)
+                self.stuck, self._warned_stuck = False, False
         self._run = self.value = value
 
     def check_stuck(self, now: float, after_s: float) -> None:
@@ -410,6 +448,17 @@ class RoomFabric:
         self._switched_at = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # THE BOOT RACE, MEASURED. The sentinel's first tick beat the
+        # fabric's first stored reading by 1.4 s on 2026-09-06, and the
+        # verdict that came out of it was a false AWAY on a man standing in
+        # the flat: Room.value starts None, so the rooms leg read
+        # UNREACHABLE and cell 24 is away. ``polls`` and ``ready`` let the
+        # voter WAIT, bounded, for one honest answer instead of voting on a
+        # blank.
+        self.polls = 0
+        self.glimpses = 0
+        self.unanswered = 0
+        self._ready = threading.Event()
         for r in self.rooms:
             # Long enough that a couple of dropped polls are a hiccup, short
             # enough that a real outage does not preserve a stale edge.
@@ -442,7 +491,105 @@ class RoomFabric:
                 value = None
             r.observe(value, now)
             r.check_stuck(now, self.stuck_after_s)
+            self._note_edges(r, now)
+        self.polls += 1
+        if self.ready:
+            self._ready.set()
         return self._resolve(now)
+
+    # -------------------------------------------------- the privacy switch
+    @property
+    def blocked(self) -> str:
+        """Why the WHOLE house cannot be sensed right now ("" = it can be).
+
+        Every configured room has to be blocked before the house is: one
+        radar still allowed to look is still a leg, and reporting the house
+        blind while a room can see would throw away the only evidence there
+        is. The reason returned is the first room's own word ("offline",
+        "policy", "stopped"), because presence.py logs it and the rooms are
+        all blocked by the same policy in practice.
+
+        IT LIVES HERE, NOT ONLY ON ``HouseView``, BECAUSE THE VOTER NEEDS
+        IT. ``ThreeLegProbe`` holds the fabric and not the view, and on
+        2026-09-06 at 15:10:57 that gap cost a false away: "camera off for
+        ten minutes" switched the radars off with the lens, the rooms leg
+        went UNREACHABLE, and the voter read a leg HE had switched off as a
+        leg answering "no". One rule, one implementation, two readers.
+        """
+        rooms = self.rooms
+        if not rooms:
+            return ""
+        reasons = [str(getattr(r.sensor, "blocked", "") or "") for r in rooms]
+        return reasons[0] if all(reasons) else ""
+
+    # ------------------------------------------------- the boot readiness
+    @property
+    def ready(self) -> bool:
+        """Has every configured room answered at least once? An
+        unconfigured fabric is trivially ready: there is nothing to wait
+        for, and a wait that never ends is worse than a blank vote."""
+        with self._lock:
+            rooms = [r for r in self.rooms
+                     if getattr(r.sensor, "configured", True)]
+            return all(r.last_answer > 0.0 for r in rooms) if rooms else True
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Block, BOUNDED, until every room has answered once. True if it
+        did. Called on the presence daemon thread and nowhere else -- the
+        fabric's own thread is what sets the event, so there is no cycle
+        and no way for this to outlive its timeout."""
+        if self.ready:
+            return True
+        try:
+            return bool(self._ready.wait(max(0.0, float(timeout_s))))
+        except (TypeError, ValueError):
+            return self.ready
+
+    # ------------------------------------------------- the walk-out lines
+    def _note_edges(self, room, now: float) -> None:
+        """THE TWO LINES THAT WOULD HAVE ANSWERED 2026-09-06 IN THE LOG.
+
+        A GLIMPSE -- a True run that ended without ever becoming the active
+        room. That is what a pass-through looks like, and it is invisible
+        today: ``RoomChanged`` is published only after the enter hold, so
+        his walk to the front door left no trace at all and the departure
+        sequence never left the desk.
+
+        AN UNANSWERED ROOM -- polls that came back None for longer than the
+        gap limit. "The kitchen never saw him" and "we never got an answer
+        from the kitchen" are OPPOSITE diagnoses and they looked identical
+        in his log. Never raises: a log line is not worth a poll.
+        """
+        pending, room.glimpse = room.glimpse, None
+        if pending is not None:
+            polls, run_s = pending
+            self.glimpses += 1
+            log.info("roomfabric: %s glimpsed -- %d poll%s occupied, %.1f s "
+                     "measured (poll %.1f s), under the %.1f s enter hold; "
+                     "not the active room", room.name, polls,
+                     "" if polls == 1 else "s", run_s, self.poll_s,
+                     self.enter_hold_s)
+            self._publish_glimpse(room, polls, run_s)
+        if room.none_since and not room.gap_said and \
+                now - room.none_since >= room.gap_limit_s:
+            room.gap_said = True
+            self.unanswered += 1
+            log.info("roomfabric: %s has not answered for %.0f s (%d polls); "
+                     "we do not know whether anybody is in it, which is not "
+                     "the same as the room seeing nobody",
+                     room.name, now - room.none_since, room.none_run)
+
+    def _publish_glimpse(self, room, polls: int, run_s: float) -> None:
+        if self._publish is None:
+            return
+        try:
+            from jarvis.events import RoomGlimpsed
+            self._publish(RoomGlimpsed(
+                room=room.name, label=room.spec.spoken, polls=int(polls),
+                run_s=float(run_s), hold_s=float(self.enter_hold_s),
+                poll_s=float(self.poll_s), at=time.time()))
+        except Exception:  # noqa: BLE001 - the bus must not break the poll
+            log.debug("roomfabric: glimpse publish failed", exc_info=True)
 
     # -------------------------------------------------------- the fusion
     def _candidates(self, now: float) -> list:
@@ -487,6 +634,9 @@ class RoomFabric:
             return self._where(now)
 
     def _set_active(self, room, now: float) -> None:
+        # The run has become the active room, so its end is an ordinary
+        # departure from a room and never a glimpse.
+        room.was_active = True
         previous, self._active = self._active, room.name
         self._active_since = self._switched_at = now
         log.info("roomfabric: %s%s", room.name,
@@ -526,7 +676,7 @@ class RoomFabric:
         with self._lock:
             return self._where(self._now())
 
-    def last_seen_room(self) -> tuple:
+    def last_seen_room(self, skip=()) -> tuple:
         """(room name, seconds since it last saw anybody) -- ("", None) if
         no room has ever seen anyone.
 
@@ -542,11 +692,24 @@ class RoomFabric:
         every tick that sees anybody, never cleared while the process
         lives, and unbounded in age. Zero new state, zero new polling.
         See ``presencevote.bedroom_split`` for what the hint buys.
+
+        A STUCK OR FAULTED ROOM IS NOT A HINT, and until 2026-09-06 it was.
+        At 14:05:47.969 cell 12 printed "the last room to see anybody was
+        the office ... so he never left the office" at the exact instant
+        the rooms leg had computed CLEAR *because* the office was faulted:
+        this method took ``max(last_true)`` over EVERY room, and a latched
+        office's ``last_true`` is always about zero seconds old. One
+        verdict, two contradictory readings of one sensor. ``skip`` is the
+        caller's own faulted set -- the stuck DETECTOR's, which the fabric
+        cannot see -- on top of the fabric's own ``stuck``.
         """
+        drop = {_slug(r) for r in (skip or ())}
         with self._lock:
             now = self._now()
-            best = max((r for r in self.rooms if r.last_true),
-                       key=lambda r: r.last_true, default=None)
+            live = [r for r in self.rooms
+                    if r.last_true and not r.stuck
+                    and _slug(r.name) not in drop]
+            best = max(live, key=lambda r: r.last_true, default=None)
             if best is None:
                 return ("", None)
             return (best.name, now - best.last_true)
@@ -692,18 +855,13 @@ class HouseView:
     def blocked(self) -> str:
         """Why the WHOLE house cannot be sensed right now ("" = it can be).
 
-        Every configured room has to be blocked before the house is: one
-        radar still allowed to look is still a leg, and reporting the house
-        blind while a room can see would throw away the only evidence
-        there is. The reason returned is the first room's own word
-        ("offline", "policy", "stopped"), because presence.py logs it and
-        the rooms are all blocked by the same policy in practice.
+        ONE RULE, ONE IMPLEMENTATION: see ``RoomFabric.blocked``, which the
+        three-leg voter also reads. This wrapper exists because ``blocked``
+        is part of the ``RoomSensor`` shape presence.py composes against,
+        and it shipped without one on 2026-09-03 -- see the class docstring
+        for what that silence cost.
         """
-        rooms = self.fabric.rooms
-        if not rooms:
-            return ""
-        reasons = [str(getattr(r.sensor, "blocked", "") or "") for r in rooms]
-        return reasons[0] if all(reasons) else ""
+        return self.fabric.blocked
 
     @property
     def last_value(self) -> Optional[bool]:

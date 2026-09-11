@@ -637,3 +637,104 @@ def test_a_fake_without_the_standby_seam_still_changes_mode():
         win._on_console_mode(STANDBY)             # no AttributeError
     finally:
         _ModeWin._apply_standby = lambda self, at_desk: self.alphas.append(at_desk)
+
+
+# ==================================================================
+# THE 5 s WORKER: one bad pass must not be permanent (his bug #7)
+# ==================================================================
+# Two defects, and together they are the only thing that can freeze BOTH
+# standby dates at once, which is what he actually reported.
+#
+#  * _temps_worker's loop body had no try/except at all. _read_temps,
+#    _read_mem and _probe_llm are unguarded, so one escape ends the
+#    thread silently and for ever -- no watchdog, no log line -- while
+#    the slab goes on repainting the last dict it was handed at 1 Hz.
+#    (_probe_room and _probe_sensing guard themselves. Three of five did
+#    not: guard-one-half, again.)
+#  * _probe_room keeps the previous dict on failure and says so at DEBUG
+#    only, so a provider that is down stays invisible and its last answer
+#    is served for ever. The same shape as the desk cache that answered
+#    "5 seconds ago" through 400 dead polls.
+class _Loop(_Pass):
+    """The worker loop bound with no Tk root and no sleeping."""
+
+    _temps_worker = MainWindow._temps_worker
+    _temps_pass = MainWindow._temps_pass
+    _pass_failed = MainWindow._pass_failed
+
+    def __init__(self, services, passes=3):
+        super().__init__(services)
+        self._left = passes
+        self._closing = False
+        self.seen = 0
+
+    def _probe_devices(self):
+        pass
+
+
+def test_a_bad_pass_does_not_kill_the_five_second_thread(monkeypatch):
+    import jarvis.ui.main_window as mw
+    monkeypatch.setattr(mw.time, "sleep", lambda s: None)
+    loop = _Loop(SimpleNamespace(room_state=lambda gpu_pct=None: {}))
+
+    def boom(beat):
+        loop.seen += 1
+        loop._left -= 1
+        if loop._left <= 0:
+            loop._closing = True
+        raise RuntimeError("nvidia-smi went away")
+
+    loop._temps_pass = boom
+    loop._temps_worker()
+    assert loop.seen == 3, "the thread died on the first bad pass"
+
+
+def test_a_room_probe_down_for_a_minute_stops_repainting_a_stale_slab(
+        monkeypatch):
+    import jarvis.ui.main_window as mw
+    clock = [1_000.0]
+    monkeypatch.setattr(mw.time, "time", lambda: clock[0])
+    good = {"due": "BIO - Lab 3, today 11:59 pm", "next": "SEMINAR 2:00 pm"}
+    box = {"fn": lambda gpu_pct=None: dict(good)}
+    p = _Pass(SimpleNamespace(room_state=lambda gpu_pct=None: box["fn"]()))
+    p._probe_room()
+    assert p._room_data == good
+
+    def boom():
+        raise RuntimeError("the provider is down")
+    box["fn"] = boom
+
+    clock[0] += 30.0
+    p._probe_room()
+    assert p._room_data == good, "thirty seconds is not stale yet"
+
+    clock[0] += 40.0
+    p._probe_room()
+    assert p._room_data == {}, "a dead provider's last answer is painted for ever"
+
+
+def test_after_tolerates_a_window_on_its_way_IN_as_well_as_OUT():
+    """MEASURED on his box, 2026-09-11 17:33:15, on the first pass after a
+    restart -- and it is the cause of his bug #7.
+
+    _after guarded tk.TclError ("a window on its way out") and nothing
+    else. The SAME call raises RuntimeError("main thread is not in main
+    loop") on a window on its way IN: the 5 s worker starts before Tk's
+    mainloop does, and _probe_sensing's _after(0, ...) is the first thing
+    to reach it. Guard-one-half -- one direction of one lifecycle.
+
+    What it cost: that RuntimeError escaped _temps_pass and killed the
+    worker thread on pass 0 of EVERY boot. _probe_room runs just before
+    _probe_sensing, so _room_data was filled once at startup and then
+    never again -- which is exactly "the due and whats next dates in the
+    standby screen do not update after the date passes". The loop's new
+    net (this commit's parent) makes the thread survive; this stops the
+    traceback and lets pass 0 finish.
+    """
+    class Root:
+        def after(self, ms, fn):
+            raise RuntimeError("main thread is not in main loop")
+
+    w = object.__new__(MainWindow)
+    w.root = Root()
+    w._after(0, lambda: None)          # must not raise

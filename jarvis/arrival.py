@@ -92,7 +92,8 @@ GREET_DAMPER_S = 600.0
 # greeting, and nothing at all in the log saying which gate had declined.
 # The silence was the defect, not the refusal -- a refusal is often right,
 # but it must always be legible.
-DOOR_GATES = ("no-room", "wrong-room", "not-away", "already-greeted", "damper")
+DOOR_GATES = ("no-room", "wrong-room", "not-away", "already-greeted",
+              "damper", "nap")
 
 
 def arrival_plan(*, returned: bool = False, home: bool = True,
@@ -284,6 +285,52 @@ def greet_refusal(*, source: str = "", since_s: float = 0.0,
     return ("damper: the %s probe reached the door %ds after the last "
             "greeting and the damper is %ds, so this is the same return"
             % (source or "presence", int(since), int(damper)))
+
+
+# Which sources the nap gate below applies to. A radio is a guess about
+# where a body is; a radar is a body. Closed, and named, so that a leg
+# added later is refused BY NAME here rather than silently trusted.
+RADIO_SOURCES = ("phone", "presence")
+
+
+def nap_refusal(*, source: str = "", departure_pending: bool = False,
+                confirm_s: float = 0.0) -> str:
+    """His radio woke up; nobody walked in. "" means it may speak.
+
+    THE TWIN OF THE DEPARTURE CONFIRM WINDOW, and it was missing for a
+    week. ``app._on_presence`` spends ``confirm_s`` (300 s by default)
+    plus a mic-silence veto before it will believe a departure, and its
+    own docstring says why: "a sleeping phone radio faking a departure
+    while he is in the room is the failure worth spending latency on".
+    The ARRIVAL half spent nothing at all, so the same napping radio that
+    was not trusted to say he left WAS trusted to say he came back.
+
+    MEASURED on his box, 2026-09-11: seven times in two days the sentinel
+    published away and then home(returned) TEN SECONDS later -- exactly
+    one ``presence.poll_s_away`` -- and greeted a man who had not moved.
+    Twelve "Welcome back, sir" in one day, eight of them off this leg.
+
+    ``departure_pending`` is the honest question and costs no new clock:
+    the confirm timer is still armed, so the away state has lasted less
+    than ``confirm_s``. A real outing outlives it.
+
+    The gate is on the RADIO ONLY. His flat is a corridor and the kitchen
+    radar sees a body on the doorstep inside one poll (see the DoorWatch
+    note below, and his own words there); a radar return three minutes
+    after the away edge is a man walking in, and refusing it would trade
+    one silence for another.
+    """
+    if not departure_pending:
+        return ""
+    if (source or "presence") not in RADIO_SOURCES:
+        return ""
+    try:
+        confirm = float(confirm_s)
+    except (TypeError, ValueError):
+        confirm = 0.0
+    return ("nap: the %s probe answered again before the %ds departure "
+            "confirm even closed, so his radio woke up rather than a door "
+            "opening" % (source or "presence", int(confirm)))
 
 
 class DoorWatch:

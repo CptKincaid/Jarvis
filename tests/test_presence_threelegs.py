@@ -12,6 +12,16 @@ import pytest
 from jarvis import presence, presencevote as pv, roomfabric
 
 
+class Cfg:
+    """A config the sentinel can read dotted keys out of."""
+
+    def __init__(self, **kw):
+        self._d = dict(kw)
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+
 class FakeSensor:
     configured = True
     blocked = ""
@@ -85,15 +95,58 @@ def test_an_unknown_verdict_is_none_so_the_sentinel_holds(stuck):
 
 
 def test_the_sentinel_keeps_the_grace_and_the_voter_does_not_double_it(stuck):
-    """The voter's phone leg runs with a zero grace ON PURPOSE: the
-    sentinel's away_after_min is the one and only hysteresis, and two
-    graces stacked would make "away" take 24 minutes."""
+    """TWO GRACES MUST NOT STACK -- and the way this was achieved until
+    2026-09-06 was a hardcoded ``grace_s = 0.0`` that nothing ever wrote,
+    which made the FIRST unanswered ping a hard PHONE_NO. That is how the
+    voter published "away (cell 24) -- phone-only away past the grace" five
+    seconds after a restart with him standing in the flat, printing a
+    sentence about a grace that did not exist.
+
+    The leg has a real grace now (``presence.away_after_min``), and the
+    non-stacking property is asserted DIRECTLY instead of via the bug: the
+    sentinel measures ``away_after_s`` from ``last_seen``, which freezes
+    the moment the phone stops answering -- the same instant the leg's own
+    clock starts. MEASURED both ways on a fake clock: away lands at minute
+    13 from a start where the phone never answers, and the 26-minute desk
+    residual in tests/test_presence_recency.py is unchanged.
+    """
+    clock = {"t": 9000.0}
     fab = build_fabric(office=False, kitchen=False)
     fab.tick()
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False)
+                                 phone=lambda ip, mac: False,
+                                 now=lambda: clock["t"])
+    assert leg.grace_s >= 700.0, "the grace must be real, not zero"
+    assert leg("1.2.3.4", "") is None, "one missed ping is not a departure"
+    assert leg.grace_running is True
+    clock["t"] += leg.grace_s + 1.0
     assert leg("1.2.3.4", "") is False
-    assert leg.grace_s == 0.0
+    assert leg.grace_running is False
+
+
+def test_the_two_graces_do_not_stack_on_a_phone_that_never_answered(stuck):
+    """The one case where they DID: ``last_seen`` is None at a fresh start,
+    so the sentinel falls back to ``_started_at`` -- which is only stamped
+    on a non-None answer, i.e. after the voter's own grace had already run.
+    MEASURED before the fix: away at minute 25. After: minute 13."""
+    clock = {"t": 5_000_000.0}
+    now = lambda: clock["t"]
+    fab = build_fabric(office=False, kitchen=False)
+    fab.tick()
+    leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
+                                 phone=lambda ip, mac: False, now=now)
+    s = presence.PresenceSentinel(
+        Cfg(**{"presence.phone_ip": "1.2.3.4", "presence.enabled": True}),
+        publish=lambda e: None, probe_fn=leg, now=now, poll_s=60.0)
+    flipped = None
+    for minute in range(1, 40):
+        clock["t"] += 60.0
+        fab.tick()
+        s.tick()
+        if s.state == "away":
+            flipped = minute
+            break
+    assert flipped == 13, flipped
 
 
 def test_a_camera_that_is_not_wired_is_blind_and_never_votes_no(stuck):
@@ -210,9 +263,13 @@ def test_a_faulted_room_stops_pinning_the_house_occupied(clocked):
     stuck, now = clocked
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
+    # grace_s=0.0: this test is about a FAULTED ROOM, not the phone grace
+    # (which has its own tests two functions up). He has been out long
+    # enough for the fault to fire, so a real grace would have expired.
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False)
+                                 phone=lambda ip, mac: False, grace_s=0.0)
     # Corroborated by nothing, and the run runs out.
+    stuck.observe("office", False)
     stuck.observe("office", True)
     now["t"] += 3000.0
     stuck.observe("office", True)
@@ -270,8 +327,10 @@ def test_tonight_the_latched_office_no_longer_costs_him_the_greeting(clocked):
 
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
+    # grace_s=0.0: he has been out for 96 minutes, so the phone grace has
+    # long since expired; this test is about the LATCH.
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False,
+                                 phone=lambda ip, mac: False, grace_s=0.0,
                                  mic=lambda: 96 * 60.0)
     assert leg("192.168.50.34", "") is False
     assert leg.verdict.strictly_away is True
@@ -297,8 +356,9 @@ def test_the_same_latch_after_a_short_trip_also_reaches_away(clocked):
 
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
+    # grace_s=0.0: a thirty-minute errand is past the twelve-minute grace.
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False,
+                                 phone=lambda ip, mac: False, grace_s=0.0,
                                  mic=lambda: 30 * 60.0)
     assert leg("192.168.50.34", "") is False
     assert leg.verdict.cell == 6
@@ -317,8 +377,10 @@ def test_the_same_cell_with_him_at_the_desk_does_not_call_him_out(clocked):
 
     fab = build_fabric(office=True, kitchen=False)
     fab.tick()
+    # grace_s=0.0: the phone has been asleep well past the grace; the
+    # question here is whether the RUN's history keeps him home.
     leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
-                                 phone=lambda ip, mac: False,
+                                 phone=lambda ip, mac: False, grace_s=0.0,
                                  mic=lambda: 60.0)
     assert leg("192.168.50.34", "") is True
     assert leg.verdict.cell == 6

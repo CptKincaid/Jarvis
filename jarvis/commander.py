@@ -127,7 +127,8 @@ from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
 from jarvis.tools import spotify as spotify_mod
 from jarvis import syllabus as syllabus_mod
-from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
+from jarvis.router import (OFFER_DECLINED_LINE, ROUTER_QUESTION, WEB_CUE_RX,
+                           RouteDecision,
                            estimate_size, local_cues, normalise)
 
 log = get_logger("commander")
@@ -1462,7 +1463,8 @@ def _h_greeting(c, t, m):
 _QUIET_RX = re.compile(
     r"^" + _JV + r"(?:stop(?: it| now| there| talking| speaking| reading)?|"
     r"be quiet|quiet|hush|shush|shh+|shut up|shut it|silence|that's enough|"
-    r"that'll do|enough|never ?mind|cancel that|stop that|zip it|pipe down)"
+    r"that'll do|enough|never ?mind|cancel(?: that)?|stop that|zip it|"
+    r"pipe down)"
     r"(?:[,]?\s*jarvis)?[?.!…\s]*$", re.I)
 _REPEAT_RX = re.compile(
     r"^" + _JV + r"(?:say (?:that |it )?again|repeat (?:that|it)|come again|"
@@ -1548,8 +1550,43 @@ def _cut_speech(c):
             log.exception("tts interrupt failed")
 
 
+def _cancel_brain(c) -> None:
+    """Cut the model job in flight, the way _try_correction already does.
+
+    HIS BUG, 2026-09-11: "locked me out by keep saying one moment", and
+    "he refused to listen to voice commands and said one moment working.
+    i had to type cancel to stop him."
+
+    ``_cut_speech`` silenced the REPLY and ``claude.cancel()`` stopped the
+    Claude task, and NOTHING here touched the brain: its ``_busy`` guard
+    stayed set, so every utterance for the next ``BUSY_MAX_S`` (180 s) was
+    answered "Still on the last one, sir. One moment." -- and when the job
+    finally landed it spoke an answer he had already abandoned. Measured
+    on this tree before the fix: brain.cancel called 0 times for "stop",
+    "cancel", "cancel that", "stop working", "stop the task", "abort
+    that", "quiet" and "never mind" alike.
+
+    It is the rule the filled-pause lane wrote down at eighteen grammar
+    anchors and this guard was never brought under: BAR WHERE ACTING IS
+    IRREVERSIBLE, NEVER WHERE NOT ACTING IS. A stop word stops.
+
+    Cancelling is right for the quiet half too, not only the cancel half:
+    _cut_speech has already thrown that reply away, so a job left running
+    can only come back and say it.
+    """
+    brain = c._svc("brain")
+    cancel = getattr(brain, "cancel", None)
+    if not callable(cancel):
+        return
+    try:
+        cancel()
+    except Exception:                      # noqa: BLE001 - a stop always stops
+        log.exception("brain cancel failed")
+
+
 def _h_quiet(c, t, m):
     _cut_speech(c)
+    _cancel_brain(c)
     claude = c._svc("claude")
     if claude is not None and cancel_kind(t):
         try:
@@ -1579,7 +1616,28 @@ def _h_repeat(c, t, m):
         return CommandResult(handled=True,
                              reply="I haven't said anything yet, sir.",
                              speak=True, status="Nothing to repeat")
-    said_at = getattr(c, "_owner_said_at", None)
+    # THE AGE OF THE LINE, not the age of his last answered turn.
+    #
+    # HIS BUG, 2026-09-11: "said welcome back and then when i asked say
+    # that again he said that was a while ago ask me again."
+    #
+    # ``_owner_said_at`` is stamped in ONE place -- the end of his own
+    # command turn -- so a PROACTIVE line (the arrival greeting, a
+    # reminder, a soundbar line) never touches it, while ``tts.last_text``
+    # holds that very line. Greeted after three hours away, the thing he
+    # had just heard was refused as stale by a clock that was measuring
+    # something else. The two halves tracked different events; the one
+    # that matters is when the LINE was said, and the TTS is what knows.
+    # A NUMBER or nothing. A stand-in TTS (a MagicMock in several suites)
+    # answers every attribute, so the value has to be TYPE-CHECKED rather
+    # than merely present -- otherwise the comparison below raises and the
+    # repeat rung dies on exactly the tests that exercise it.
+    said_at = getattr(tts, "last_text_at", None)
+    if not isinstance(said_at, (int, float)) or isinstance(said_at, bool) \
+            or said_at <= 0.0:
+        said_at = getattr(c, "_owner_said_at", None)   # the old bound
+    if not isinstance(said_at, (int, float)) or isinstance(said_at, bool):
+        said_at = None                    # nothing trustworthy: no bound
     if said_at is not None and (time.monotonic() - said_at) > REPEAT_MAX_AGE_S:
         return CommandResult(handled=True, reply=REPEAT_STALE_LINE,
                              speak=True, status="Nothing to repeat (stale)")
@@ -9050,12 +9108,20 @@ _CAST_SIDE_RX = re.compile(
 # object, and this one requires a named machine.
 _CAST_MACHINE = (r"(?P<where>spark|hpcomputer|hp\s*computer|"
                  r"(?:the\s+)?(?:windows\s+(?:machine|box)|pc))")
+# THE DESTINATION IS OPTIONAL, and that is the whole of his 09-11 bug:
+# "Jarvis does not cast the screen when asked". "cast the screen", "cast my
+# screen" and "cast screen" -- the three ways anybody actually says it --
+# matched NOTHING and fell through to the model, so nothing cast and
+# nothing was refused either. The handler's own docstring already had the
+# reason it is safe: "there are two machines", so a sentence that names no
+# destination names the other one by elimination. Naming it still works
+# and still wins.
 _CAST_SCREEN_RX = re.compile(
     r"^(?:cast|show|mirror|put)\s+(?:the\s+|my\s+)?"
     r"(?:spark|hpcomputer|hp\s*computer|windows(?:\s+machine)?|pc|screen|"
-    r"desktop)(?:'s)?(?:\s+screen|\s+desktop)?\s+"
-    r"(?:on|onto|to|up\s+on|over\s+to|across\s+to)\s+(?:the\s+)?"
-    + _CAST_MACHINE + r"(?:'s)?(?:\s+screen)?[.!]*$", re.I)
+    r"desktop)(?:'s)?(?:\s+screen|\s+desktop)?"
+    r"(?:\s+(?:on|onto|to|up\s+on|over\s+to|across\s+to)\s+(?:the\s+)?"
+    + _CAST_MACHINE + r"(?:'s)?(?:\s+screen)?)?[.!]*$", re.I)
 _CAST_STOP_RX = re.compile(
     r"^(?:stop|end|close|drop|kill)\s+(?:the\s+|that\s+)?"
     r"(?:cast|casting|screen\s+cast|mirror(?:ing)?)[.!]*$", re.I)
@@ -9119,7 +9185,9 @@ def _h_cast_screen(c, t, m):
     if courier is None:
         return None
     try:
-        line, status = courier.cast_screen(m.group("where"))
+        # "" when he named no destination: the courier resolves it to the
+        # machine that is not this one.
+        line, status = courier.cast_screen(m.groupdict().get("where") or "")
     except Exception:                            # noqa: BLE001 - service boundary
         log.exception("screen cast by voice failed")
         return CommandResult(handled=True, status="Cast",
@@ -13336,6 +13404,17 @@ class Commander:
             # A new subject: the question is dropped, the new text routes.
             router.clear_pending()
             return None
+        if kind == "local" and getattr(pend, "offer", False):
+            # "NO" MEANS TWO DIFFERENT THINGS and the pending knows which.
+            # After a routing QUESTION, Jarvis has answered nothing yet and
+            # "no, you do it" means do it yourself -- fall through and chat
+            # it. After an OFFER, the answer has already been spoken and
+            # "no" only declines the Claude check; chatting it again would
+            # answer him twice. (Found 2026-09-11 by the test of that name,
+            # before it shipped.)
+            log.info("route local (offer declined) %r", pend.text[:60])
+            return CommandResult(handled=True, reply=OFFER_DECLINED_LINE,
+                                 speak=True, status="Kept local")
         # The modifiers the utterance carried ("use haiku", "in parallel")
         # travel with the remembered question: without them "yes" runs the
         # task on the default model, which is the expensive one.
@@ -14440,6 +14519,22 @@ class Commander:
             return CommandResult(handled=False, reply=text,
                                  status="No route (no brain)")
         stripped = strip_address(text)
+        # HIS RULING, 2026-09-11 evening: only on things it is REALLY
+        # unsure about should it offer. The router sets offer_claude on
+        # exactly one exit -- the classifier leaned Claude AND there is a
+        # coding cue, but not enough of one to spend his money on. The
+        # offer is spoken by app._on_brain_tags AFTER the answer, so he
+        # hears the attempt first and the offer second, and the router has
+        # already parked the PendingAsk so a following "yes" resolves
+        # through the machinery that answers ROUTER_QUESTION.
+        if getattr(d, "offer_claude", False):
+            services = getattr(self, "services", None) or self._svc("services")
+            if services is not None:
+                try:
+                    services.claude_check_offer = True
+                except Exception:          # noqa: BLE001 - a namespace boundary
+                    log.debug("could not park the claude-check offer",
+                              exc_info=True)
         forced = forced_call(d.reason, stripped)
         if forced is not None:
             name, args = forced

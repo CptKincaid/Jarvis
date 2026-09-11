@@ -131,8 +131,13 @@ def test_the_number_reaches_the_voters_mic_leg_once_the_ledger_exists():
     a.assistant = his_config_with_the_voter_on()
     a._eye_leg = lambda: ("", None, False)
     s = a._make_presence()
-    assert s.legs._mic_leg() == (pv.MIC_UNKNOWN, None)      # no ledger yet
+    # UPDATED 2026-09-06: the leg now carries WHY it is unknown as a third
+    # value. The leg VALUE is untouched in every case -- an unknown mic must
+    # not vote -- and only the sentence cell 6 prints changes. Before this,
+    # a live ledger holding no turn yet (true at every single boot) was
+    # reported as "the mic ledger could not be read".
+    assert s.legs._mic_leg() == (pv.MIC_UNKNOWN, None, pv.MIC_WHY_NO_TURN)
     a.turns = Turns(30.0)                                    # _wire_turn_clock
-    assert s.legs._mic_leg() == (pv.MIC_HEARD, 30.0)
+    assert s.legs._mic_leg() == (pv.MIC_HEARD, 30.0, "")
     a.turns = Turns(30.0 * 60.0)                             # half an hour on
-    assert s.legs._mic_leg() == (pv.MIC_SILENT, 1800.0)
+    assert s.legs._mic_leg() == (pv.MIC_SILENT, 1800.0, "")

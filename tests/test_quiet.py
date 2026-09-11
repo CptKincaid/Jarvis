@@ -506,6 +506,13 @@ def test_welcome_back_once_per_return_with_the_held_lines(monkeypatch):
     assert a.tts.spoken == []
     a._on_presence(Presence(home=False, since=1.0, returned=False))
     assert a.tts.spoken == []                          # leaving is silent
+    # HE REALLY WENT OUT, so the 300 s departure confirm closed while he
+    # was gone -- which is what _settle_if_gone leaves behind. Without it
+    # this return is a NAP (arrival.nap_refusal) and the welcome is
+    # correctly withheld; that gate is the 2026-09-11 fix for seven false
+    # "Welcome back, sir" in two days, not a regression here. This test's
+    # subject is the HELD LINES riding out on the welcome.
+    a._departure_timer = None
     home[0] = True
     a._on_presence(Presence(home=True, since=2.0, returned=True))
     assert a.tts.spoken[0] == "Welcome back, sir."

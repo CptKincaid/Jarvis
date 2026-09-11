@@ -28,10 +28,30 @@ class Legs:
         self.eye = None
 
 
-def bare_app(eye_leg):
+def bare_app(eye_leg, feed=None, loop=None):
     a = object.__new__(app_mod.JarvisApp)
     a._eye_leg = eye_leg
+    if feed is not None:
+        a.camera_feed = feed
+    if loop is not None:
+        a.eyeloop = loop
     return a
+
+
+class Loop:
+    """Stands in for jarvis.eyeloop.EyeLoop: it owns the arming seam."""
+
+    curfew = ((21, 0), (7, 0))
+
+    def __init__(self):
+        self.waits = 0
+
+    def wait_for_look(self, timeout_s=1.5, why=""):
+        self.waits += 1
+        return False
+
+    def status(self):
+        return {"curfew": "21:00-07:00"}
 
 
 DARK = lambda: ("", None, False)                       # noqa: E731
@@ -123,3 +143,77 @@ def test_no_legs_object_is_not_an_error(logs):
     ``legs`` at all, and boot must not care."""
     a = bare_app(DARK)
     assert a._wire_camera_leg(None) is False
+
+
+# ---------------------------------------------------------------------
+# UPDATED 2026-09-06 -- NOT relaxed. With a producer on the tree there are
+# THREE honest states, not two, and the one that did not exist before is
+# the dangerous one: a WORKING producer that has simply not looked yet.
+# Announcing that as DARK at every boot would re-create the
+# silence-is-the-defect bug from the other side -- a true-sounding warning
+# about a leg that is in fact fine.
+# ---------------------------------------------------------------------
+class Feed:
+    """Stands in for camera.CameraFeed. It is never read here; its mere
+    presence is what tells "no feed at all" from "no look yet"."""
+
+
+@pytest.fixture
+def a_camera(monkeypatch):
+    """A camera DEVICE exists. Since 2026-09-11 the attached-but-not-yet-
+    looking line is only said when one does: a feed wired to nothing
+    answers the louder "there is no camera" instead, because "votes from
+    its first look" is a promise an absent lens cannot keep (his report,
+    "camera is not connected"). These two tests are about the branch where
+    the lens is real and simply idle, so they say so."""
+    from jarvis import camera as camera_mod
+    monkeypatch.setattr(camera_mod, "device_nodes", lambda: ["/dev/video0"])
+
+
+def test_a_feed_with_no_look_yet_is_attached_and_not_dark(logs, a_camera):
+    a = bare_app(DARK, feed=Feed())
+    assert a._wire_camera_leg(Legs()) is False      # it cannot vote YET
+    text = logs.text.lower()
+    assert "attached" in text
+    # The line may say the LENS is dark between bursts -- that is the
+    # privacy fact he should be able to read. What it must never say is
+    # that the LEG is dark, which is the "nothing is wired" warning.
+    assert "number one signal is dark" not in text
+    assert "camera_feed" not in text
+    assert not [r for r in logs.records if r.levelno >= logging.WARNING], \
+        "a working producer must not warn at every boot"
+
+
+def test_the_attached_line_says_the_lens_is_dark_between_bursts(logs, a_camera):
+    """He will see the lamp. The line has to say when it lights and why."""
+    a = bare_app(DARK, feed=Feed(), loop=Loop())
+    a._wire_camera_leg(Legs())
+    text = logs.text.lower()
+    assert "armed" in text or "burst" in text
+    assert "curfew" in text
+
+
+def test_with_no_feed_at_all_the_warning_is_exactly_as_it_was(logs):
+    """The state his box was actually in. This line must not soften."""
+    a = bare_app(DARK)
+    assert a._wire_camera_leg(Legs()) is False
+    assert "dark" in logs.text.lower()
+    assert any(r.levelno >= logging.WARNING for r in logs.records)
+
+
+def test_the_arming_seam_is_handed_to_the_voter(logs):
+    """Without it the lens only ever looks when a room CHANGES, and the two
+    cells his rule 1 cannot reach never get an opinion at all."""
+    loop = Loop()
+    legs = Legs()
+    a = bare_app(DARK, feed=Feed(), loop=loop)
+    a._wire_camera_leg(legs)
+    assert legs.look == loop.wait_for_look
+
+
+def test_a_box_with_no_producer_still_wires_the_leg(logs):
+    legs = Legs()
+    a = bare_app(DARK, feed=Feed())
+    a._wire_camera_leg(legs)
+    assert legs.eye == a._eye_leg
+    assert getattr(legs, "look", None) is None
