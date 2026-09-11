@@ -78,7 +78,25 @@ FREE_LINE = "Very good, sir."
 # through a three-hour block would arrive five deep. Held -> expired.
 # "nudge" here is an interval reminder (timekeeper.NUDGE_KIND), not the
 # app's "Sir?" cue -- that one is an answer and never reaches this gate.
-EPHEMERAL_KINDS = ("nudge",)
+#
+# "audio-route" JOINED IT ON 2026-09-11, and he is the one who reported
+# why. A soundbar that drops and comes back is a TRANSITION: the line is
+# worth saying as it happens ("I'm coming out of the monitor, sir") and
+# worth nothing afterwards, because by the time he hears the digest the
+# sound is wherever it now is and he can hear that for himself. Filed as
+# "warning", every transition queued, and a spell of flapping came back
+# at him as news. HIS WORDS, and this is one held backlog read out
+# verbatim:
+#
+#   "i never left and he said While you were out: three warnings. The
+#    soundbar is back; I'm still coming out of the soundbar. I'm coming
+#    out of the monitor; the soundbar has dropped. The soundbar is back;
+#    I'm still coming out of the soundbar."
+#
+# Three warnings, all of them about the same speaker, none of them true
+# any more. The digest is for things he MISSED; this is a thing he cannot
+# miss, because the room is making the sound.
+EPHEMERAL_KINDS = ("nudge", "audio-route")
 
 _KIND_NOUNS = {
     "reminder": ("reminder", "reminders"),
