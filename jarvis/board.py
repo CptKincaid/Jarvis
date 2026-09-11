@@ -59,6 +59,23 @@ SPARK_WIDTH = 28          # sparkline columns; ~2.5 minutes of turns
 TURN_WINDOW = 40          # ledger records read back for the sparkline
 SLOW_WAIT_S = 4.0         # a turn slower than this tints the panel amber
 SESSION_ROWS = 4          # recent Claude sessions listed
+# How old a session may be and still count as RECENT WORK. Past this it is
+# history, not the state of the room, and it was pushing a live row off a
+# four-row panel. HIS BUG, 2026-09-11: "random stuff still showing up in
+# the bar like my schedule but its not its just dialogue" -- his panel was
+# carrying sessions from six, seven and nine days ago.
+SESSION_MAX_AGE_S = 36 * 3600.0
+# WHAT THE VALUE COLUMN MEANS, and it is the other half of the same bug.
+# A live task's value is its STATE ("RUNNING", "WAITING"). A recent
+# session's value used to be its TITLE -- and a title is prose written by
+# a model about a conversation, so beside a column of states it read as
+# one. His two rows on 09-11 were "HUNTERP  Terminal closed" and "TEST
+# Next class": the first reads as a status the console is reporting, the
+# second as a diary entry. Neither is either. Every value in this panel is
+# now a fact about state -- a status or an age -- and the slug already
+# says WHICH project it is.
+SESSION_AGE_WORDS = ((60.0, "just now"), (3600.0, "%d min ago"),
+                     (86400.0, "%d h ago"))
 DEADLINE_ROWS = 4
 LOW_MEM_GB = 16.0         # below this the vitals panel goes amber
 CRIT_MEM_GB = 8.0         # …and below this, red
@@ -311,6 +328,29 @@ def turns_panel(turns) -> Panel:
     return p
 
 
+def _session_age_s(info, now: float):
+    """Seconds since that session was last touched, or None when it does
+    not say. A row that cannot date itself is not recent work."""
+    mtime = getattr(info, "mtime", None)
+    if not isinstance(mtime, (int, float)) or isinstance(mtime, bool):
+        return None
+    return max(0.0, float(now) - float(mtime))
+
+
+def session_age_words(age_s: float) -> str:
+    """"just now" / "12 min ago" / "5 h ago" -- upper-cased by the panel.
+
+    A FACT ABOUT STATE, which is what every other value in this panel is.
+    See SESSION_AGE_WORDS for why a title is not."""
+    for bound, form in SESSION_AGE_WORDS:
+        if age_s < bound:
+            if "%d" not in form:
+                return form
+            unit = 60.0 if bound <= 3600.0 else 3600.0
+            return form % max(1, int(age_s // unit))
+    return "%d h ago" % max(1, int(age_s // 3600.0))
+
+
 def sessions_panel(sessions, tasks=None) -> Panel:
     """Live Claude work first (ClaudeTaskState the window already sees),
     then the most recent sessions on disk. A running task outranks its own
@@ -322,14 +362,16 @@ def sessions_panel(sessions, tasks=None) -> Panel:
     running = [s for s in live.values() if s in ("running", "queued")]
     waiting = [s for s in live.values() if s == "waiting"]
     seen = set(live)
-    for info in list(sessions or [])[:SESSION_ROWS]:
+    now = time.time()
+    for info in list(sessions or []):
         slug = str(getattr(info, "slug", "") or "")
         if not slug or slug in seen:
             continue
+        age = _session_age_s(info, now)
+        if age is None or age > SESSION_MAX_AGE_S:
+            continue                       # history, not the state of the room
         seen.add(slug)
-        title = str(getattr(info, "title", "") or
-                    getattr(info, "first_user", "") or "")
-        p.rows.append((slug.upper()[:14], (title[:26] or "—")))
+        p.rows.append((slug.upper()[:14], session_age_words(age)))
         if len(p.rows) >= SESSION_ROWS + len(live):
             break
     if not p.rows:
