@@ -1548,8 +1548,43 @@ def _cut_speech(c):
             log.exception("tts interrupt failed")
 
 
+def _cancel_brain(c) -> None:
+    """Cut the model job in flight, the way _try_correction already does.
+
+    HIS BUG, 2026-09-11: "locked me out by keep saying one moment", and
+    "he refused to listen to voice commands and said one moment working.
+    i had to type cancel to stop him."
+
+    ``_cut_speech`` silenced the REPLY and ``claude.cancel()`` stopped the
+    Claude task, and NOTHING here touched the brain: its ``_busy`` guard
+    stayed set, so every utterance for the next ``BUSY_MAX_S`` (180 s) was
+    answered "Still on the last one, sir. One moment." -- and when the job
+    finally landed it spoke an answer he had already abandoned. Measured
+    on this tree before the fix: brain.cancel called 0 times for "stop",
+    "cancel", "cancel that", "stop working", "stop the task", "abort
+    that", "quiet" and "never mind" alike.
+
+    It is the rule the filled-pause lane wrote down at eighteen grammar
+    anchors and this guard was never brought under: BAR WHERE ACTING IS
+    IRREVERSIBLE, NEVER WHERE NOT ACTING IS. A stop word stops.
+
+    Cancelling is right for the quiet half too, not only the cancel half:
+    _cut_speech has already thrown that reply away, so a job left running
+    can only come back and say it.
+    """
+    brain = c._svc("brain")
+    cancel = getattr(brain, "cancel", None)
+    if not callable(cancel):
+        return
+    try:
+        cancel()
+    except Exception:                      # noqa: BLE001 - a stop always stops
+        log.exception("brain cancel failed")
+
+
 def _h_quiet(c, t, m):
     _cut_speech(c)
+    _cancel_brain(c)
     claude = c._svc("claude")
     if claude is not None and cancel_kind(t):
         try:
