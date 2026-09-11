@@ -1626,9 +1626,16 @@ def _h_repeat(c, t, m):
     # had just heard was refused as stale by a clock that was measuring
     # something else. The two halves tracked different events; the one
     # that matters is when the LINE was said, and the TTS is what knows.
-    said_at = getattr(tts, "last_text_at", 0.0) or None
-    if said_at is None:                   # a TTS that does not stamp: fall
-        said_at = getattr(c, "_owner_said_at", None)   # back to the old bound
+    # A NUMBER or nothing. A stand-in TTS (a MagicMock in several suites)
+    # answers every attribute, so the value has to be TYPE-CHECKED rather
+    # than merely present -- otherwise the comparison below raises and the
+    # repeat rung dies on exactly the tests that exercise it.
+    said_at = getattr(tts, "last_text_at", None)
+    if not isinstance(said_at, (int, float)) or isinstance(said_at, bool) \
+            or said_at <= 0.0:
+        said_at = getattr(c, "_owner_said_at", None)   # the old bound
+    if not isinstance(said_at, (int, float)) or isinstance(said_at, bool):
+        said_at = None                    # nothing trustworthy: no bound
     if said_at is not None and (time.monotonic() - said_at) > REPEAT_MAX_AGE_S:
         return CommandResult(handled=True, reply=REPEAT_STALE_LINE,
                              speak=True, status="Nothing to repeat (stale)")
