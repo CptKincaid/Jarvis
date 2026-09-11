@@ -1463,7 +1463,8 @@ def _h_greeting(c, t, m):
 _QUIET_RX = re.compile(
     r"^" + _JV + r"(?:stop(?: it| now| there| talking| speaking| reading)?|"
     r"be quiet|quiet|hush|shush|shh+|shut up|shut it|silence|that's enough|"
-    r"that'll do|enough|never ?mind|cancel that|stop that|zip it|pipe down)"
+    r"that'll do|enough|never ?mind|cancel(?: that)?|stop that|zip it|"
+    r"pipe down)"
     r"(?:[,]?\s*jarvis)?[?.!…\s]*$", re.I)
 _REPEAT_RX = re.compile(
     r"^" + _JV + r"(?:say (?:that |it )?again|repeat (?:that|it)|come again|"

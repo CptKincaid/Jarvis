@@ -388,3 +388,27 @@ def test_barge_in_works_during_the_render_gap(monkeypatch, tmp_path):
     a._tts_active = False                               # the edge has not risen yet
     a._on_hotword(0.9)
     assert cut == [1]
+
+
+def test_a_BARE_cancel_is_a_stop_word_because_it_is_the_word_he_used():
+    """HIS BUG, 2026-09-11, verbatim: "he refused to listen to voice
+    commands and said one moment working. i had to type cancel to stop
+    him."
+
+    _cancel_brain was built for exactly this and is reached from _h_quiet
+    -- but _QUIET_RX carried "cancel that" and "stop that" and not the
+    bare word. So the one word he actually reached for was the one word
+    the grammar did not know, and he had to type it.
+
+    The anchors do the safety work: _QUIET_RX is ^...$ so "cancel my
+    alarm" and "cancel the schedule" are untouched, and a ringing alarm
+    claims the floor on an earlier rung than this one.
+    """
+    import jarvis.commander as C
+    assert C._QUIET_RX.match("cancel"), "the word he used is still not a stop"
+    assert C._QUIET_RX.match("cancel, jarvis")
+    assert C._QUIET_RX.match("jarvis, cancel")
+    # ...and nothing that NAMES a thing to cancel is swallowed by it
+    for other in ("cancel my alarm", "cancel the schedule",
+                  "cancel my 7am alarm", "cancel the timer"):
+        assert not C._QUIET_RX.match(other), other

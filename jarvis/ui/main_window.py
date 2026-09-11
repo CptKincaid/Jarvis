@@ -2260,11 +2260,30 @@ class MainWindow:
         threading.Thread(target=run, daemon=True, name="tmux-clients").start()
 
     def _after(self, ms: int, fn):
-        """root.after that tolerates a window on its way out."""
+        """root.after that tolerates a window on its way out OR IN.
+
+        BOTH ENDS OF THE LIFECYCLE, and it only guarded one. tk.TclError is
+        the window on its way out. The window on its way IN raises
+        RuntimeError("main thread is not in main loop") instead: the 5 s
+        worker thread starts before Tk's mainloop does, and _probe_sensing
+        is the first thing to call this.
+
+        MEASURED on his box 2026-09-11 17:33:15, pass 0 of a fresh boot.
+        That RuntimeError escaped _temps_pass and killed the worker thread
+        at every startup. _probe_room runs one line before _probe_sensing,
+        so the ambient slab was filled once at boot and never refreshed
+        again -- his bug #7, "the due and whats next dates in the standby
+        screen do not update after the date passes".
+
+        Dropping the callback is the right answer for both ends: the next
+        5 s pass repaints whatever this one could not.
+        """
         try:
             self.root.after(ms, fn)
         except tk.TclError:
             log.debug("after() on a dead window", exc_info=True)
+        except RuntimeError:
+            log.debug("after() before the mainloop was up", exc_info=True)
 
     def _refresh_placeholder(self):
         """The command-bar placeholder is the ONE idle hint; it mentions

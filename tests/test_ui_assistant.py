@@ -711,3 +711,30 @@ def test_a_room_probe_down_for_a_minute_stops_repainting_a_stale_slab(
     clock[0] += 40.0
     p._probe_room()
     assert p._room_data == {}, "a dead provider's last answer is painted for ever"
+
+
+def test_after_tolerates_a_window_on_its_way_IN_as_well_as_OUT():
+    """MEASURED on his box, 2026-09-11 17:33:15, on the first pass after a
+    restart -- and it is the cause of his bug #7.
+
+    _after guarded tk.TclError ("a window on its way out") and nothing
+    else. The SAME call raises RuntimeError("main thread is not in main
+    loop") on a window on its way IN: the 5 s worker starts before Tk's
+    mainloop does, and _probe_sensing's _after(0, ...) is the first thing
+    to reach it. Guard-one-half -- one direction of one lifecycle.
+
+    What it cost: that RuntimeError escaped _temps_pass and killed the
+    worker thread on pass 0 of EVERY boot. _probe_room runs just before
+    _probe_sensing, so _room_data was filled once at startup and then
+    never again -- which is exactly "the due and whats next dates in the
+    standby screen do not update after the date passes". The loop's new
+    net (this commit's parent) makes the thread survive; this stops the
+    traceback and lets pass 0 finish.
+    """
+    class Root:
+        def after(self, ms, fn):
+            raise RuntimeError("main thread is not in main loop")
+
+    w = object.__new__(MainWindow)
+    w.root = Root()
+    w._after(0, lambda: None)          # must not raise
