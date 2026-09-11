@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from jarvis.tools import timekeeper as tk_mod
+
 from jarvis import commander
 from jarvis import leavetime as lt_mod
 from jarvis.commander import (ASSISTANT_TIER1, LEAVE_ANSWER_WINDOW_S,
@@ -261,8 +263,16 @@ def test_a_known_walk_files_one_leave_heads_up(tmp_path):
     due, text = w.tk.reminders[0]
     # 40 min out, a 12 min walk, 5 min of notice -> fires in 23 minutes
     assert due == pytest.approx((DAY + timedelta(minutes=23)).timestamp())
-    assert text == ("You want to be walking in 5 minutes, sir; "
-                    "Wisenbaker is a 12 minute walk.")
+    # VERBATIM-MARKED since 2026-09-11: leave_line is already a finished,
+    # addressed sentence, so the timekeeper speaks it as it is instead of
+    # wrapping it in "Sir, this is your reminder." -- he heard the
+    # announcement twice and "sir" twice. The marker is stripped for
+    # display and for speech; what changes is only that it is not wrapped.
+    assert tk_mod.is_verbatim(text), text
+    assert tk_mod.verbatim_text(text) == (
+        "You want to be walking in 5 minutes, sir; "
+        "Wisenbaker is a 12 minute walk.")
+    assert tk_mod.display_label(text) == tk_mod.verbatim_text(text)
     assert w.tick() == 0                       # filed once, never twice
 
 

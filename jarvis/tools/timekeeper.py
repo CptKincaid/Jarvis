@@ -68,6 +68,21 @@ KINDS = ("reminder", "timer", "alarm")
 # A label prefix rather than a new column so the items table (and its
 # salvage / quarantine path) is untouched.
 SILENT_PREFIX = "focus:"
+# A LABEL THAT IS ALREADY THE WHOLE SENTENCE. Same idea as SILENT_PREFIX and
+# the same mechanism (a prefix, not a new column), but the opposite half:
+# silent means "the owner will speak"; this means "speak it exactly, do not
+# wrap it".
+#
+# HIS BUG, 2026-09-11: "he will say here is your reminder in addition to
+# telling me i already have a reminder that i need to get moving."
+# jarvis/leavetime.py files its heads-up as a reminder whose LABEL is a
+# finished, addressed sentence -- "You want to be walking in 5 minutes, sir;
+# Wisenbaker is a 10 minute walk." -- and REMINDER_LINE then wrapped it, so
+# what he actually heard was "Sir, this is your reminder. You want to be
+# walking in 5 minutes, sir; ..." -- the announcement twice and "sir" twice.
+# The comment beside is_silent already names this exact failure for timers
+# ("would double every announcement"); reminders had no way to say it.
+VERBATIM_PREFIX = "said:"
 ACTIVE_STATES = ("pending", "ringing", "snoozed")
 STATES = ACTIVE_STATES + ("done", "missed", "cancelled")
 REPEATS = ("", "daily", "weekdays")     # the FIXED repeats; intervals are "<N>m"
@@ -209,9 +224,23 @@ def is_silent(label) -> bool:
     return str(label or "").lower().startswith(SILENT_PREFIX)
 
 
-def display_label(label) -> str:
-    """'focus: block 1' -> 'focus block 1' for the schedule read-out."""
+def is_verbatim(label) -> bool:
+    """True when the label IS the sentence -- speak it, do not wrap it."""
+    return str(label or "").lower().startswith(VERBATIM_PREFIX)
+
+
+def verbatim_text(label) -> str:
+    """The sentence inside a verbatim label, without its marker."""
     text = str(label or "")
+    return text[len(VERBATIM_PREFIX):].strip() if is_verbatim(text) else text
+
+
+def display_label(label) -> str:
+    """'focus: block 1' -> 'focus block 1' for the schedule read-out, and a
+    verbatim label read out as the sentence it is."""
+    text = str(label or "")
+    if is_verbatim(text):
+        return verbatim_text(text)
     if is_silent(text):
         return (SILENT_PREFIX.rstrip(":") + " " + text[len(SILENT_PREFIX):].strip()).strip()
     return text
@@ -1879,6 +1908,9 @@ class Timekeeper:
         else:
             if late:
                 line = LATE_LINE.format(label=item.label, time=_when_words(due_dt, now_dt))
+            elif is_verbatim(item.label):
+                # Already a finished sentence: say it, do not announce it.
+                line = verbatim_text(item.label)
             else:
                 line = REMINDER_LINE.format(text=sentence_case(item.label))
             text = item.label

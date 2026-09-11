@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from jarvis.logs import get_logger
+from jarvis.tools import timekeeper as tk_mod
 
 log = get_logger("leavetime")
 
@@ -593,7 +594,12 @@ class LeaveTimes:
                 said = notice
             text = leave_line(said, speech_name(key), lead)
             try:
-                self._tk.add_reminder(due.timestamp(), text)
+                # VERBATIM: leave_line is already a finished, addressed
+                # sentence, so the timekeeper must not wrap it in "Sir,
+                # this is your reminder." -- he heard the announcement
+                # twice and "sir" twice (his report, 2026-09-11).
+                self._tk.add_reminder(due.timestamp(),
+                                      tk_mod.VERBATIM_PREFIX + " " + text)
             except Exception:  # noqa: BLE001 - one event must not kill the tick
                 log.exception("leavetime: reminder for %r failed", title)
                 continue
