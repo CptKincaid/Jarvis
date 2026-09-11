@@ -667,9 +667,18 @@ class GestureCast:
         if not self.screen_cast_on:
             return NO_SCREEN_CAST_LINE, "refused"
         name = str(target or "").strip().lower()
-        dest = name if name in screens_mod.MACHINES else \
-            (screens_mod.HPCOMPUTER
-             if cast_mod.sink_alias(name) == "hpcomputer" else "")
+        if not name:
+            # HE NAMED NO DESTINATION, 2026-09-11. There are exactly two
+            # machines (screens.MACHINES), so the one that is not the one
+            # he is talking to is the only thing he can mean. The docstring
+            # above already rests on that same fact for its safety.
+            here = getattr(self, "this_machine", screens_mod.SPARK)
+            others = [m for m in screens_mod.MACHINES if m != here]
+            dest = others[0] if len(others) == 1 else ""
+        else:
+            dest = name if name in screens_mod.MACHINES else \
+                (screens_mod.HPCOMPUTER
+                 if cast_mod.sink_alias(name) == "hpcomputer" else "")
         if dest not in self.views:
             return NO_VOICE_SINK_LINE.format(name=str(target).strip()), "refused"
         source = [m for m in screens_mod.MACHINES if m != dest][0]

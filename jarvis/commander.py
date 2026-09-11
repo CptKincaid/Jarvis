@@ -9106,12 +9106,20 @@ _CAST_SIDE_RX = re.compile(
 # object, and this one requires a named machine.
 _CAST_MACHINE = (r"(?P<where>spark|hpcomputer|hp\s*computer|"
                  r"(?:the\s+)?(?:windows\s+(?:machine|box)|pc))")
+# THE DESTINATION IS OPTIONAL, and that is the whole of his 09-11 bug:
+# "Jarvis does not cast the screen when asked". "cast the screen", "cast my
+# screen" and "cast screen" -- the three ways anybody actually says it --
+# matched NOTHING and fell through to the model, so nothing cast and
+# nothing was refused either. The handler's own docstring already had the
+# reason it is safe: "there are two machines", so a sentence that names no
+# destination names the other one by elimination. Naming it still works
+# and still wins.
 _CAST_SCREEN_RX = re.compile(
     r"^(?:cast|show|mirror|put)\s+(?:the\s+|my\s+)?"
     r"(?:spark|hpcomputer|hp\s*computer|windows(?:\s+machine)?|pc|screen|"
-    r"desktop)(?:'s)?(?:\s+screen|\s+desktop)?\s+"
-    r"(?:on|onto|to|up\s+on|over\s+to|across\s+to)\s+(?:the\s+)?"
-    + _CAST_MACHINE + r"(?:'s)?(?:\s+screen)?[.!]*$", re.I)
+    r"desktop)(?:'s)?(?:\s+screen|\s+desktop)?"
+    r"(?:\s+(?:on|onto|to|up\s+on|over\s+to|across\s+to)\s+(?:the\s+)?"
+    + _CAST_MACHINE + r"(?:'s)?(?:\s+screen)?)?[.!]*$", re.I)
 _CAST_STOP_RX = re.compile(
     r"^(?:stop|end|close|drop|kill)\s+(?:the\s+|that\s+)?"
     r"(?:cast|casting|screen\s+cast|mirror(?:ing)?)[.!]*$", re.I)
@@ -9175,7 +9183,9 @@ def _h_cast_screen(c, t, m):
     if courier is None:
         return None
     try:
-        line, status = courier.cast_screen(m.group("where"))
+        # "" when he named no destination: the courier resolves it to the
+        # machine that is not this one.
+        line, status = courier.cast_screen(m.groupdict().get("where") or "")
     except Exception:                            # noqa: BLE001 - service boundary
         log.exception("screen cast by voice failed")
         return CommandResult(handled=True, status="Cast",
