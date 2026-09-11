@@ -91,6 +91,43 @@ DEFAULT_AWAY_POLL_S = 10.0     # see the poll_s docstring: arrival must be promp
 # the rooms, honestly and out loud.
 DEFAULT_BOOT_GRACE_S = 6.0
 PING_TIMEOUT_S = 3.0
+# THE TWO PROBES. The second one is a PARTIAL mitigation, measured, and
+# the comment says how partial because the next reader will be tempted to
+# believe it closed the case.
+#
+# A single unsolicited ICMP echo with a one-second deadline is a very weak
+# question to ask an iPhone. The radio sleeps between DTIM beacons and the
+# access point buffers for it. This module already knew that -- see the
+# power-save note on ``phone_leg`` -- and then classified the miss as
+# "asked, and no answer", which is AWAY.
+#
+# MEASURED on his box 2026-09-11, 25 samples 20 s apart, phone on the desk:
+#
+#     one `ping -c1 -W1` answered            14 / 25
+#     of the 11 misses, `-c3 -W2` rescued     1 / 11
+#
+# So three harder packets buy about nine percent. Worth taking, because it
+# costs nothing on the positive path -- the same discipline as the gateway
+# canary below -- but it is not the answer, and the log's eleven
+# consecutive misses would still have happened.
+#
+# WHERE THE ANSWER ACTUALLY IS, measured the same day, 30 samples:
+#
+#     ICMP answered                           7 / 30
+#     kernel ARP resolution answered         15 / 15
+#
+# Every DELAY row that probe created was REACHABLE by the next sample.
+# ARP is answered by the radio firmware; ICMP by an OS that is asleep. The
+# right probe is therefore to ping (which makes the kernel resolve), let
+# the resolution settle, and read the NEIGHBOUR STATE rather than the echo
+# reply. That is NOT done here yet, deliberately: it is only safe if a
+# genuine departure still reaches FAILED, and nobody has measured his
+# table while he is actually out. scripts/phone_trace.py collects exactly
+# that. Until it comes back, the audible damage is held by
+# arrival.nap_refusal instead.
+PING_FIRST = ("ping", "-c", "1", "-W", "1")
+PING_RETRY = ("ping", "-c", "3", "-W", "2")
+PING_RETRY_TIMEOUT_S = 8.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
 WELCOME_LINE = "Welcome back, sir."
 
@@ -146,8 +183,11 @@ def probe_state(ip: str = "", mac: str = "",
 
     THE RULE HERE: distinguish the two failures concretely.
 
-      * the ping SUBPROCESS ran and got no reply -> ``False``. A real
-        "asked, and no answer".
+      * the ping SUBPROCESS ran, TWICE, and got no reply either time ->
+        ``False``. A real "asked, and no answer". The second ask is the
+        harder one (PING_RETRY) and it is what makes "asked" mean
+        something a napping radio can actually satisfy; a single lost
+        packet was reading as a departure until 2026-09-11.
       * it raised, timed out, or could not be launched at all -> ``None``.
       * ``ip -4 neigh`` itself failed -> ``None``, before anything else.
       * no address configured at all -> ``None``. An unconfigured leg says
@@ -187,9 +227,17 @@ def probe_state(ip: str = "", mac: str = "",
         # "no address to ping" is not evidence that he is out.
         return None
     try:
-        res = run(["ping", "-c", "1", "-W", "1", ip], timeout=PING_TIMEOUT_S)
+        res = run([*PING_FIRST, ip], timeout=PING_TIMEOUT_S)
     except Exception:  # noqa: BLE001 - TimeoutExpired, FileNotFoundError...
         log.debug("presence: ping %s could not run", ip, exc_info=True)
+        return None
+    if getattr(res, "returncode", 1) == 0:
+        return True
+    # ONE LOST PACKET IS NOT AN ANSWER. Ask harder before saying he is out.
+    try:
+        res = run([*PING_RETRY, ip], timeout=PING_RETRY_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - could not ask twice either
+        log.debug("presence: the retry ping %s could not run", ip, exc_info=True)
         return None
     if getattr(res, "returncode", 1) == 0:
         return True
@@ -197,7 +245,7 @@ def probe_state(ip: str = "", mac: str = "",
     if not gateway:
         return None
     try:
-        res = run(["ping", "-c", "1", "-W", "1", gateway], timeout=PING_TIMEOUT_S)
+        res = run([*PING_FIRST, gateway], timeout=PING_TIMEOUT_S)
     except Exception:  # noqa: BLE001
         return None
     if getattr(res, "returncode", 1) != 0:
