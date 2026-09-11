@@ -2360,9 +2360,31 @@ def _tense_disagrees(said, heard: date, model: date, today: date) -> bool:
 # 12th (tests/test_calendar_date_round_four.py, the words-override case).
 # Without this the model's one wrong word range would carry a framed date
 # away, which is the failure he cannot hear.
+# WIDENED 2026-09-11, and the narrowness was the same defect this lane
+# has already been bitten by twice: a closed list written from ONE family
+# of phrasings. "on the 12th" and "for the 12th" were the only frames it
+# knew, so three of his own corpus rows read as BARE ordinals and the
+# model's "today" carried the date away:
+#
+#     "is the 12th free"                  the ordinal is the SUBJECT
+#     "does the 12th work"                       "
+#     "what's on fifteen days after the 12th"    a different preposition
+#
+# Two frames now, both grown only from measured rows:
+#   (a) a DATE PREPOSITION in front of it -- on/for, and the span words
+#       after/before/from/until/through/by, which is what row three needed.
+#   (b) an AVAILABILITY question around it -- "is the 12th free/open/
+#       clear/busy/available", "does the 12th work/suit". Those are not
+#       incidental ordinals; "free" and "work" are calendar words, and a
+#       sentence has to be about a diary to use them this way.
+_ORD_PREP = r"on|for|after|before|from|until|untill|til|till|through|by"
+_ORD_FREE = r"free|open|clear|busy|available|work|works|suit|suits|good"
 _FRAMED_ORD_RX = re.compile(
-    rf"\b(?:on|for)\s+(?:the\s+)?(?:(?:{_WD_ALT})\s+(?:the\s+)?)?"
-    rf"(?P<d>\d{{1,2}}){_ORD}\b", re.I)
+    rf"\b(?:(?:{_ORD_PREP})\s+(?:the\s+)?(?:(?:{_WD_ALT})\s+(?:the\s+)?)?"
+    rf"(?P<d>\d{{1,2}}){_ORD}\b"
+    rf"|\b(?:is|are|does|do|would|will)\s+(?:the\s+)?"
+    rf"(?:(?:{_WD_ALT})\s+(?:the\s+)?)?"
+    rf"(?P<d2>\d{{1,2}}){_ORD}\b[^.?!]*?\b(?:{_ORD_FREE})\b)", re.I)
 
 
 def _ordinal_is_framed(said) -> bool:
