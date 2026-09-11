@@ -1493,6 +1493,12 @@ class TTS:
         self._breeze_warm_thread: threading.Thread | None = None
         self.last_text = ""                    # last cleaned utterance queued
         self.last_shown = ""                   # ...as the transcript showed it
+        # WHEN last_text was queued (time.monotonic), 0.0 for never. The
+        # repeat rung used to bound "say that again" by the age of his last
+        # ANSWERED TURN, which a proactive line never updates -- so the
+        # greeting he had just heard was refused as stale. The line's own
+        # age is the honest bound and it lives with the line.
+        self.last_text_at = 0.0
         self.interrupts = 0                    # barge-ins that cut speech
         self._worker = threading.Thread(
             target=self._worker_loop, daemon=True, name="tts-worker")
@@ -1849,6 +1855,7 @@ class TTS:
         self.last_shown = shown
         self._note_divergence(shown, text, "cleaning")
         self.last_text = text
+        self.last_text_at = time.monotonic()
         done = threading.Event()
         self._q.put((text, done))
         if block:

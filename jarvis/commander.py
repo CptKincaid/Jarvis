@@ -1614,7 +1614,21 @@ def _h_repeat(c, t, m):
         return CommandResult(handled=True,
                              reply="I haven't said anything yet, sir.",
                              speak=True, status="Nothing to repeat")
-    said_at = getattr(c, "_owner_said_at", None)
+    # THE AGE OF THE LINE, not the age of his last answered turn.
+    #
+    # HIS BUG, 2026-09-11: "said welcome back and then when i asked say
+    # that again he said that was a while ago ask me again."
+    #
+    # ``_owner_said_at`` is stamped in ONE place -- the end of his own
+    # command turn -- so a PROACTIVE line (the arrival greeting, a
+    # reminder, a soundbar line) never touches it, while ``tts.last_text``
+    # holds that very line. Greeted after three hours away, the thing he
+    # had just heard was refused as stale by a clock that was measuring
+    # something else. The two halves tracked different events; the one
+    # that matters is when the LINE was said, and the TTS is what knows.
+    said_at = getattr(tts, "last_text_at", 0.0) or None
+    if said_at is None:                   # a TTS that does not stamp: fall
+        said_at = getattr(c, "_owner_said_at", None)   # back to the old bound
     if said_at is not None and (time.monotonic() - said_at) > REPEAT_MAX_AGE_S:
         return CommandResult(handled=True, reply=REPEAT_STALE_LINE,
                              speak=True, status="Nothing to repeat (stale)")
