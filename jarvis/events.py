@@ -406,6 +406,31 @@ class RoomChanged(Event):
 
 
 @dataclass
+class RoomGlimpsed(Event):
+    """A room lit for too few polls to become the active room.
+
+    NOT a RoomChanged and deliberately a different event: this one has NOT
+    survived the enter hold, so it must never move the active room, fire
+    DoorWatch, move the bedroom hint or re-trigger the greeter -- the hold
+    exists for exactly those. What it IS good for is the one question that
+    asks something weaker: his flat is a corridor and leaving means walking
+    past the kitchen, and a pass-through is precisely what a glimpse looks
+    like (jarvis/presencevote.DepartureSequence.room).
+
+    Numbers only, and the counts are counts rather than durations on
+    purpose: at a 2.0 s poll a one-poll run measures 0.0 s, and a line
+    claiming 0.8 s would be sub-poll precision nobody measured.
+    """
+    room: str = ""
+    label: str = ""
+    polls: int = 0                    # consecutive occupied polls
+    run_s: float = 0.0                # last_true - true_since; 0.0 for one poll
+    hold_s: float = 0.0               # the enter hold it was under
+    poll_s: float = 0.0               # the poll period it was measured at
+    at: float = 0.0
+
+
+@dataclass
 class DeskState(Event):
     """He sat down at / walked away from the keyboard (jarvis/deskpresence.py,
     GNOME's Mutter idle monitor). Published only on a threshold crossing;

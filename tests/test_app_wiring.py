@@ -1857,10 +1857,21 @@ def test_walking_away_is_never_announced(app):
     assert app.tts.spoken == []
 
 
-def test_services_hand_out_a_live_desk_reading_not_a_stale_number(app):
+def _desk_reading(app, idle_s):
+    """Write a reading the way a POLL would: the number AND the clock it
+    was read on. ``DeskSentinel.idle_s`` refuses an unstamped cache since
+    2026-09-06, when a reading with no age was found to be a permanent
+    false home -- 400 no-signal polls later it still answered 5.0 s and
+    "away" never fired (tests/test_presence_stale_legs.py)."""
+    app.desk.last_idle = float(idle_s)
+    app.desk.last_idle_at = app.desk._now()
+
+
+def test_services_hand_out_a_live_desk_reading_not_a_stale_number(app, monkeypatch):
+    monkeypatch.delenv("JARVIS_DESK_PRESENCE", raising=False)
     assert callable(app.services.desk_idle_s)
     assert app.services.desk_idle_s() is None       # no reading in the suite
-    app.desk.last_idle = 42.0
+    _desk_reading(app, 42.0)
     assert app.services.desk_idle_s() == 42.0
 
 
@@ -1952,18 +1963,19 @@ def test_a_return_after_the_damper_is_greeted_again(app):
     assert app.tts.spoken.count(WELCOME_LINE) == 2
 
 
-def test_the_power_up_sweep_applies_the_overnight_gap_gate(app):
+def test_the_power_up_sweep_applies_the_overnight_gap_gate(app, monkeypatch):
     """`_maybe_power_up` probed `getattr(self, "desk_idle_s")` — a name the
     app has never had — so `idle` was always None and the "left alone for
     gap_h hours" gate was skipped on every box."""
     from jarvis.events import PowerUp
+    monkeypatch.delenv("JARVIS_DESK_PRESENCE", raising=False)
     seen = []
     bus.subscribe(PowerUp, seen.append)
     try:
-        app.desk.last_idle = 600.0             # ten minutes: not a night
+        _desk_reading(app, 600.0)              # ten minutes: not a night
         assert app._maybe_power_up("hotword") is False
         assert seen == []
-        app.desk.last_idle = 8 * 3600.0        # a night
+        _desk_reading(app, 8 * 3600.0)         # a night
         assert app._maybe_power_up("hotword") is True
     finally:
         bus.unsubscribe(PowerUp, seen.append)
@@ -1979,7 +1991,7 @@ def test_the_console_is_handed_the_live_desk_probe(app, monkeypatch):
     assert app.desk.enabled
     fn = app.ui_service_kwargs()["desk_idle_s"]
     assert callable(fn)
-    app.desk.last_idle = 42.0
+    _desk_reading(app, 42.0)
     assert fn() == 42.0
 
 

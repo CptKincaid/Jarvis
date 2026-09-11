@@ -26,6 +26,20 @@ Three rules the rest of the app depends on:
   0.0, which would read as "sitting right there", and never "away". The
   Mutter interface is not guaranteed across sessions and a failure must
   degrade to silence, not to a wrong answer.
+* AND A READING GOES STALE, which is the same rule one layer up and was
+  missing until 2026-09-06. ``DeskSentinel.idle_s()`` used to hand out
+  ``last_idle``, a cache written ONLY on a successful poll, so a None
+  reading returned early and left the last good number standing FOR EVER.
+  MEASURED: one poll at 5.0 s, then 400 no-signal polls -- 3 h 20 min of
+  fake clock -- and it still answered 5.0 s, which ``presencevote`` reads
+  as DESK_AT, which vetoes away in every cell; at the sentinel, with the
+  rooms clear and his phone gone from t=0, AWAY NEVER FIRED in six hours.
+  Its twin ``turnclock.TurnLedger.idle_s`` computes ``clock() - last_mark``
+  and so AGES to silent on its own -- the guard-one-half shape again. Every
+  reading is now stamped with the clock it was taken on and expires at
+  ``stale_after_s``; ``enabled`` False and a stopped sentinel answer None
+  outright. None already reads as DESK_UNKNOWN and votes nothing, which is
+  what the first rule above asks for.
 * The sentinel only ever SUPPRESSES. It never says "nobody's home" out
   loud: the away signal feeds the quiet policy's existing
   ``hold_when_away`` seam (``QuietPolicy(is_home=...)``) rather than a
@@ -62,6 +76,13 @@ DEFAULT_POLL_S = 30.0
 # start holding proactive speech in unrelated tests.
 ENV_OFF = "JARVIS_DESK_PRESENCE"
 _OFF_VALUES = ("0", "off", "false", "no")
+# HOW MANY POLL PERIODS A READING MAY SURVIVE ITS OWN POLL. Two: one for
+# the poll that should have refreshed it, and one for a poll that was late
+# or spent up to CALL_TIMEOUT_S (4 s) timing out on gdbus. At his
+# ``presence.desk_poll_s`` of 30 that is 60 s, which is also
+# ``presencevote.DESK_MAX_AGE_S`` -- one number, one meaning, and
+# tests/test_presence_stale_legs.py pins the arithmetic between the two.
+STALE_AFTER_POLLS = 2.0
 CALL_TIMEOUT_S = 4.0
 IDLE_ARGV = [
     "gdbus", "call", "--session",
@@ -136,6 +157,10 @@ class DeskSentinel:
         self.at_desk: Optional[bool] = None
         self.since: float = 0.0
         self.last_idle: Optional[float] = None
+        # WHEN ``last_idle`` WAS READ. Without it the cache had no age and
+        # a dead idle monitor was a permanent "he is at his desk"; see the
+        # module docstring's second rule for the measurement.
+        self.last_idle_at: Optional[float] = None
         self._logged_no_signal = False
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -177,15 +202,60 @@ class DeskSentinel:
             return "at-desk" if self.at_desk else "away"
 
     def is_at_desk(self) -> bool:
-        """True unless a reading has established the chair is empty."""
+        """True unless a reading has established the chair is empty.
+
+        DELIBERATELY NOT AGED, and this is not the guard-one-half shape
+        wearing a disguise. This answer FAILS OPEN: a stale True is byte
+        for byte the no-reading default, and a stale False can only go on
+        SUPPRESSING proactive speech, which is the safe direction and the
+        only thing this flag drives. ``idle_s`` is different in kind --
+        it is the number that VOTES on whether he is in the flat -- and
+        that is why the expiry is there and not here.
+        """
         with self._lock:
             return self.at_desk is not False
 
-    def idle_s(self) -> Optional[float]:
-        """The last reading in seconds; None when there is no signal.
-        This is what ``services.desk_idle_s()`` hands out."""
+    @property
+    def stale_after_s(self) -> float:
+        """How old a reading may be and still be handed out. Two poll
+        periods -- see ``STALE_AFTER_POLLS``."""
+        return max(1.0, STALE_AFTER_POLLS * self.poll_s)
+
+    def idle_reading(self):
+        """``(seconds idle, age of that reading)``, or ``(None, None)``.
+
+        ONE ATOMIC READ, so the value and its age cannot come from two
+        different polls. None -- no reading yet, a reading nothing has
+        refreshed for ``stale_after_s``, a leg he switched off, or a
+        stopped sentinel -- reads downstream as DESK_UNKNOWN and votes
+        nothing, which is the correct degradation and this module's own
+        first rule.
+        """
+        if not self.enabled or self._stop.is_set():
+            return None, None
         with self._lock:
-            return self.last_idle
+            idle, at = self.last_idle, self.last_idle_at
+        if idle is None or at is None:
+            return None, None
+        age = max(0.0, self._now() - at)
+        if age > self.stale_after_s:
+            return None, None
+        return idle, age
+
+    def idle_s(self) -> Optional[float]:
+        """The last FRESH reading in seconds; None when there is no signal.
+        This is what ``services.desk_idle_s()`` hands out."""
+        return self.idle_reading()[0]
+
+    def idle_age_s(self) -> Optional[float]:
+        """How old the number ``idle_s()`` just answered with is, or None.
+
+        The belt half of the staleness guard: ``presencevote.desk_leg``
+        takes it and refuses DESK_AT on a stale reading, the way
+        ``eye.Attention.usable`` already bounds the camera. The braces half
+        is ``idle_reading`` above, which simply stops answering.
+        """
+        return self.idle_reading()[1]
 
     # -------------------------------------------------------------- tick
     def tick(self) -> Optional[DeskState]:
@@ -209,7 +279,8 @@ class DeskSentinel:
         now, threshold = self._now(), self.away_after_s
         at_desk = idle < threshold
         with self._lock:
-            self.last_idle = idle
+            # STAMPED, not merely stored. See idle_reading.
+            self.last_idle, self.last_idle_at = idle, now
             if self.at_desk is at_desk:
                 return None
             returned = at_desk and self.at_desk is False

@@ -1095,6 +1095,43 @@ class CameraFeed:
         # grab/retrieve -- which the preview prints as "drain off" rather
         # than as a healthy zero.
         self.drain: dict = {}
+        # WHO IS USING THE DEVICE RIGHT NOW, by name. Two readers of one
+        # v4l2 node is safe from corruption already (``_GatedDevice.read``
+        # holds ``read_lock`` across the grab and ``CameraGate.open`` is
+        # locked and idempotent) but it is NOT safe from a close: a
+        # ``close()`` from one reader bumps the gate epoch and invalidates
+        # the other's in-flight handle. So a holder releases its claim and
+        # only the LAST one out closes the device.
+        self._holders: set = set()
+
+    # ------------------------------------------------------------ holders
+    def hold(self, name: str) -> None:
+        """Claim the device for ``name``. Idempotent."""
+        with self._lock:
+            self._holders.add(str(name))
+
+    def drop(self, name: str, close: bool = True) -> bool:
+        """Release ``name``'s claim; close only when it was the last one.
+
+        ``close=False`` gives the claim up WITHOUT closing -- for the
+        caller that has just noticed somebody else started capturing and
+        would rather leave the lens to them than bump the epoch under it.
+        Returns True when the device was actually closed here.
+        """
+        with self._lock:
+            self._holders.discard(str(name))
+            last = not self._holders
+        if last and close:
+            # Outside the lock: close() reaches the gate, which reaches the
+            # policy, and the one lock order that exists is gate -> read.
+            self.close()
+            return True
+        return False
+
+    @property
+    def holders(self) -> tuple:
+        with self._lock:
+            return tuple(sorted(self._holders))
 
     # -------------------------------------------------------------- wiring
     def _allowed(self) -> bool:
@@ -1175,6 +1212,7 @@ class CameraFeed:
                    "frames": self.frames, "dropped": self.frames_dropped,
                    "stale_dropped": self.stale_dropped,
                    "drain": dict(self.drain) or {"on": False},
+                   "holders": len(self._holders),
                    "blind_edges": self.eye.blind_edges})
         return st
 

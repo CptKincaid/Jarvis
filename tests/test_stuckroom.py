@@ -217,9 +217,25 @@ def test_the_duration_only_fallback_clears_his_measured_session():
 
 
 def test_status_is_numbers_only(board):
+    """UPDATED 2026-09-06, not relaxed: a room whose FIRST post-boot reading
+    is True has a latch of unknown age, and ``run_s`` says None rather than
+    stamping "now" and calling that a beginning. An ordinary rising edge
+    still measures exactly as it did."""
     sr, _ = board
     sr.observe("office", True, at=1_000_000.0)
     st = sr.status(now=1_000_100.0)
-    assert st["office"]["run_s"] == pytest.approx(100.0)
+    assert st["office"]["run_s"] is None
+    assert st["office"]["pre_existing"] is True
     assert st["office"]["corroborated_s_ago"] is None
     assert st["office"]["faulted"] is False
+
+
+def test_status_measures_an_ordinary_run_exactly_as_it_always_did(board):
+    sr, _ = board
+    sr.observe("kitchen", False, at=999_990.0)
+    sr.observe("kitchen", True, at=1_000_000.0)
+    st = sr.status(now=1_000_100.0)
+    assert st["kitchen"]["run_s"] == pytest.approx(100.0)
+    assert st["kitchen"]["pre_existing"] is False
+    assert st["kitchen"]["corroborated_s_ago"] is None
+    assert st["kitchen"]["faulted"] is False

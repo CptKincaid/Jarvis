@@ -121,6 +121,17 @@ class _Run:
     corroborated: float = 0.0
     faulted: bool = False
     said: bool = False
+    # THE RUN WAS ALREADY GOING WHEN THIS PROCESS STARTED, and therefore
+    # ``started`` is when we FIRST SAW it and not when it began. Measured
+    # from his live roomruns.json on 2026-09-06: the file held one run,
+    # ``office started 10:50:03``, 65 s after a 10:48:58 boot -- for a
+    # radar that had been latched since before the restart. The voter then
+    # aged that run from 10:50:03 and granted a stuck sensor a full
+    # 15-minute HOME window. A restart must not be able to launder a latch,
+    # which is the same promise the wall-clock stamps make one paragraph
+    # up; this is the half of it that a persisted file cannot supply,
+    # because there was no file to persist.
+    pre_existing: bool = False
 
     def clock_from(self) -> float:
         """The moment the uncorroborated stretch began."""
@@ -145,6 +156,11 @@ class StuckRooms:
         self._now = now
         self.fault_after_s = float(fault_after_s)
         self.runs: dict = {}
+        # Rooms this PROCESS has observed at least once. A room's first
+        # post-boot reading being True, with no persisted run behind it, is
+        # a latch of unknown age; the same True after a False is an
+        # ordinary rising edge and is aged normally.
+        self._seen: set = set()
         self._load()
 
     # ------------------------------------------------------------ state
@@ -158,7 +174,8 @@ class StuckRooms:
                     started=float(raw.get("started") or 0.0),
                     corroborated=float(raw.get("corroborated") or 0.0),
                     faulted=bool(raw.get("faulted")),
-                    said=bool(raw.get("said")))
+                    said=bool(raw.get("said")),
+                    pre_existing=bool(raw.get("pre_existing")))
         except FileNotFoundError:
             pass
         except Exception:  # noqa: BLE001 - corrupt, unreadable, wrong shape
@@ -172,7 +189,8 @@ class StuckRooms:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps({"runs": {
                 room: {"started": r.started, "corroborated": r.corroborated,
-                       "faulted": r.faulted, "said": r.said}
+                       "faulted": r.faulted, "said": r.said,
+                       "pre_existing": r.pre_existing}
                 for room, r in self.runs.items()}}, indent=1), encoding="utf-8")
             os.replace(tmp, self.path)
         except Exception:  # noqa: BLE001 - state is a nicety, not the feature
@@ -197,6 +215,10 @@ class StuckRooms:
         for room, run in self.runs.items():
             if run.started and run.corroborated < at:
                 run.corroborated = at
+                # Something independent has now agreed with this run, so
+                # its unknown beginning no longer matters: the ordinary
+                # arithmetic has a real clock to work from.
+                run.pre_existing = False
                 touched = True
                 if run.faulted:
                     self._clear(room, run,
@@ -216,6 +238,11 @@ class StuckRooms:
         room = str(room)
         if occupied is None:
             return None
+        # A DEFINITE answer -- True or False -- is this room answering.
+        # ``None`` is no opinion and does not count, the same rule the
+        # edges follow two lines up.
+        first = room not in self._seen
+        self._seen.add(room)
         run = self.runs.get(room)
         if not occupied:
             if run is not None and run.started:
@@ -225,7 +252,10 @@ class StuckRooms:
                 self._save()
             return None
         if run is None or not run.started:
-            run = _Run(started=at)
+            # A room whose FIRST reading of this process is True, with
+            # nothing persisted behind it, has a latch of unknown age. Say
+            # so rather than stamping "now" and calling it a beginning.
+            run = _Run(started=at, pre_existing=first)
             self.runs[room] = run
             self._save()
             return None
@@ -248,10 +278,17 @@ class StuckRooms:
         now = self._now() if now is None else float(now)
         out = {}
         for room, run in self.runs.items():
+            # ``run_s`` is None -- not 0.0 -- for a run whose beginning is
+            # unknown. Zero would be a measurement; None is the truth, and
+            # ``ThreeLegProbe._agreed_s_ago`` reads the pair rather than
+            # inventing an age from either.
+            uncorroborated_pre = run.pre_existing and not run.corroborated
             out[room] = {
-                "run_s": round(now - run.started, 1) if run.started else 0.0,
+                "run_s": (None if uncorroborated_pre else
+                          round(now - run.started, 1) if run.started else 0.0),
                 "corroborated_s_ago": (round(now - run.corroborated, 1)
                                        if run.corroborated else None),
+                "pre_existing": bool(uncorroborated_pre),
                 "faulted": run.faulted,
             }
         return out
