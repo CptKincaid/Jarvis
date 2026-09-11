@@ -1232,6 +1232,31 @@ class JarvisApp:
                      "signal can vote")
             return True
         if getattr(self, "camera_feed", None) is not None:
+            # ATTACHED IS NOT THE SAME AS ABLE TO SEE, and the old build's
+            # loud line went away with the wiring. HIS REPORT, 2026-09-11,
+            # one minute after I told him the leg was live: "camera is not
+            # connected" -- and /dev/video* did not exist at all. The leg
+            # degrades correctly (every vote that hour reads "cam-blind",
+            # and a blind camera never says he is out), but nothing said
+            # WHY, which is the failure this project keeps paying for:
+            # arrival._door_from_room, presencevote's mic wording and the
+            # outing refusals were all the same defect.
+            from jarvis import camera as camera_mod
+            try:
+                nodes = camera_mod.device_nodes()
+            except Exception:              # noqa: BLE001 - a probe, not a gate
+                nodes = []
+            if not nodes:
+                log.warning(
+                    "presence: the camera leg is attached but THERE IS NO "
+                    "CAMERA. No %s exists, so every look answers \"could "
+                    "not look\" and the leg never votes -- which is the "
+                    "right answer, not a wrong one: a camera that cannot "
+                    "look must never be read as an empty room. The verdict "
+                    "stands on the phone, the rooms, the mic and the desk. "
+                    "Plug one in and it votes from its first look, with no "
+                    "restart.", camera_mod.DEVICE_GLOB)
+                return False
             log.info(
                 "presence: the camera leg is attached and votes from its "
                 "first look. Nothing is looking yet by design -- a burst is "

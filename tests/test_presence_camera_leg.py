@@ -158,7 +158,19 @@ class Feed:
     presence is what tells "no feed at all" from "no look yet"."""
 
 
-def test_a_feed_with_no_look_yet_is_attached_and_not_dark(logs):
+@pytest.fixture
+def a_camera(monkeypatch):
+    """A camera DEVICE exists. Since 2026-09-11 the attached-but-not-yet-
+    looking line is only said when one does: a feed wired to nothing
+    answers the louder "there is no camera" instead, because "votes from
+    its first look" is a promise an absent lens cannot keep (his report,
+    "camera is not connected"). These two tests are about the branch where
+    the lens is real and simply idle, so they say so."""
+    from jarvis import camera as camera_mod
+    monkeypatch.setattr(camera_mod, "device_nodes", lambda: ["/dev/video0"])
+
+
+def test_a_feed_with_no_look_yet_is_attached_and_not_dark(logs, a_camera):
     a = bare_app(DARK, feed=Feed())
     assert a._wire_camera_leg(Legs()) is False      # it cannot vote YET
     text = logs.text.lower()
@@ -172,7 +184,7 @@ def test_a_feed_with_no_look_yet_is_attached_and_not_dark(logs):
         "a working producer must not warn at every boot"
 
 
-def test_the_attached_line_says_the_lens_is_dark_between_bursts(logs):
+def test_the_attached_line_says_the_lens_is_dark_between_bursts(logs, a_camera):
     """He will see the lamp. The line has to say when it lights and why."""
     a = bare_app(DARK, feed=Feed(), loop=Loop())
     a._wire_camera_leg(Legs())
