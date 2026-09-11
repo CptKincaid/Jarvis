@@ -10230,12 +10230,18 @@ def place_in(text: str) -> Optional[str]:
     return ""
 
 
-def calendar_range(text: str) -> str:
+def calendar_range(text: str, now=None) -> str:
     """coerce_range over the whole utterance, with one repair: "when's my
     meeting" carries no day, and today is the wrong default for a "when"
-    question -- the first upcoming event is."""
+    question -- the first upcoming event is.
+
+    Since 2026-09-05 the value may also be an ISO date or an ask (see
+    tools/calendar.coerce_range); both pass through get_calendar's own
+    coercion unchanged, which is why that one has to be a fixed point.
+    ``now`` is the seam tests inject.
+    """
     from jarvis.tools.calendar import coerce_range
-    rng = coerce_range(text)
+    rng = coerce_range(text, now)
     t = (text or "").lower()
     if rng == "today" and re.match(r"^\s*when", t) and not re.search(
             r"\btoday\b|tonight|this (?:morning|afternoon|evening)|later", t):
@@ -10276,16 +10282,18 @@ def _route_recognised(d) -> bool:
         and reason != "local:topic"
 
 
-def forced_call(reason: str, text: str) -> Optional[tuple]:
+def forced_call(reason: str, text: str, now=None) -> Optional[tuple]:
     """(tool, args) when the router's reason names the tool and the
-    utterance carries its arguments; None to run the full tool loop."""
+    utterance carries its arguments; None to run the full tool loop.
+
+    ``now`` is the clock seam calendar_range needs to resolve a date."""
     t = (text or "").strip()
     if not t or _CLAUSE_RX.search(t):
         return None
     if reason == "local:calendar":
         if not _CAL_READ_RX.search(t) or _CAL_WRITE_RX.search(t):
             return None
-        return "get_calendar", {"range": calendar_range(t)}
+        return "get_calendar", {"range": calendar_range(t, now)}
     if reason == "local:weather":
         place = place_in(t)
         if place is None:
@@ -10338,6 +10346,89 @@ _DAY_ANCHOR_RX = re.compile(
     r"saturday|sunday)\b", re.I)
 
 
+# "on saturday, september 12": the comma between the weekday and the date
+# kept the weekday in place -- "on saturday, Sunday the 13th" (round five).
+_DAY_BEFORE_DATE_RX = re.compile(
+    r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*$", re.I)
+# ...and the weekday said AFTER the date, "the 8th of sept, a tuesday".
+_DAY_AFTER_DATE_RX = re.compile(
+    r"^\s*,?\s*(?:a\s+|on\s+)?(?:monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\b", re.I)
+
+
+def _shift_named_day(prev: str, today) -> Optional[str]:
+    """``prev`` with the day it names moved on by one; "" when it names a
+    QUESTION rather than a day (nothing to move until he answers it); None
+    when it names no specific day at all (a weekday word alone is the
+    caller's job).  The new day is written out in full -- "Wednesday the
+    9th", "Thursday the 1st of October" -- so every downstream reader lands
+    on exactly that day."""
+    from jarvis.tools.calendar import (as_date, date_span, date_words,
+                                       digit_ordinals, full_date_words, is_ask,
+                                       sentence_date, without_step)
+
+    def _rewrite(source: str, span, words: str) -> str:
+        """``source`` with the day at ``span`` replaced by ``words``."""
+        start, end = span
+        # "on tuesday the 8th": the weekday is part of the same phrase and
+        # would contradict the new day if it stayed.
+        lead = _DAY_BEFORE_DATE_RX.search(source[:start])
+        if lead:
+            start = lead.start()
+        trail = _DAY_AFTER_DATE_RX.match(source[end:])
+        if trail:
+            end += trail.end()
+        return source[:start] + words + source[end:]
+
+    def _names(candidate: str, want) -> bool:
+        """Does the rewritten sentence read back as exactly the day meant?"""
+        return as_date(sentence_date(candidate, today) or "") == want
+
+    text = digit_ordinals(prev)
+    found = date_span(text, today)
+    if found is None:
+        return None
+    value, start, end = found
+    day = as_date(value)
+    if is_ask(value) or day is None:
+        return ""
+    moved = day + timedelta(days=1)
+    # A moved day that lies BEFORE today is named in full: "Friday the 4th"
+    # past the 4th is next month's to every reader, and "the 3rd of the
+    # month" moved on became a question about a Sunday in October (round
+    # five, 2026-09-06).
+    words = full_date_words(moved) if moved < today else date_words(moved, today)
+    out = _rewrite(text, (start, end), words)
+    if _names(out, moved):
+        return out
+    # THE DOUBLE STEP (round seven, 2026-09-06).  The rewrite puts an
+    # ABSOLUTE date into a sentence that still carries the STEP that
+    # produced it: "in a month on the 12th" answers the 12th of October,
+    # and the rewrite made "in a month on Tuesday the 13th of October",
+    # which the reader stepped a SECOND time to the 6th.  MEASURED 246 of
+    # 324 trials across 17 phrasings, 6 follow-ups and 9 instants.
+    #
+    # The repair takes the step words out and re-reads; the CHECK above it
+    # is the part that matters, though.  Six rounds of this bug have each
+    # been a rewrite or a rule that looked right and was never read back,
+    # so this one reads its own output and refuses to hand over a sentence
+    # that does not name the day it meant -- whatever the next coat is.
+    plain = without_step(text)
+    if plain != text:
+        again = date_span(plain, today)
+        if again is not None:
+            # The stripped sentence need NOT still name the same day --
+            # the step is often what gave the ordinal its month ("in a
+            # month on the 12th" is October's 12th and "on the 12th"
+            # alone is September's).  The moved day is written out in
+            # full, so the words carry the month themselves; the read-back
+            # below is what proves it.
+            out = _rewrite(plain, (again[1], again[2]), words)
+            if _names(out, moved):
+                return out
+    return ""                    # cannot be said exactly: do not guess
+
+
 def day_shift_followup(prev_text: str, text: str,
                        today=None) -> Optional[str]:
     """His previous question re-asked one day later, or None.
@@ -10357,12 +10448,26 @@ def day_shift_followup(prev_text: str, text: str,
     prev = (prev_text or "").strip()
     if not prev:
         return None
+    today = today or date.today()
+    # A question that NAMED A DAY -- "tuesday the 8th", "the 12th",
+    # "september twelfth", "9/12", "the day after the 12th" -- moves that
+    # day, read by the one resolver both calendar doors use.  ROUND THREE
+    # 2026-09-05: this rewrite moved the WEEKDAY word alone, which worked
+    # only while coerce_range ignored the ordinal beside it.  Once "the 8th"
+    # was read, "tuesday the 8th" became "Wednesday the 8th", and the
+    # follow-up he had been using turned into a question about a weekday he
+    # never said ("The 8th of September is a Tuesday, sir, not a Wednesday
+    # ...").  A question is not a day to move: "" here means stop.
+    moved = _shift_named_day(prev, today)
+    if moved:
+        return moved
+    if moved == "":
+        return None
     hits = list(_DAY_ANCHOR_RX.finditer(prev))
     if not hits:
         return None
     m = hits[-1]                      # the day he ended on
     word = m.group(1).lower()
-    today = today or date.today()
     if word in ("today", "tonight"):
         base = today
     elif word == "tomorrow":

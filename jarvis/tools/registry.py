@@ -114,6 +114,14 @@ class ToolSpec:
     # SAID so (2026-09-02 review). With a deriver the words decide either
     # way, whichever door the turn came through.
     derive: Optional[Callable[[str], dict]] = None
+    # A deriver that also wants the MODEL'S args -- derive(utterance, args),
+    # the args after the reserved strip -- says so here.  get_calendar
+    # needs them: on 2026-09-06 its deriver read "january the 5th" as a
+    # bare 5th and REPLACED the model's correct 2027-01-05 with today,
+    # because a deriver could not see what it was overriding.  A deriver
+    # may refine a value the model got right; it may not throw it away
+    # for a worse one of its own -- and it cannot judge that blind.
+    derive_takes_args: bool = False
 
     def schema(self) -> dict:
         """Ollama /api/chat `tools` entry."""
@@ -261,7 +269,10 @@ class ToolRegistry:
             # for "he said nothing" (spotify_liked: shuffle=None, the
             # configured default).
             try:
-                extra = spec.derive(utterance or "") or {}
+                if spec.derive_takes_args:
+                    extra = spec.derive(utterance or "", dict(args)) or {}
+                else:
+                    extra = spec.derive(utterance or "") or {}
             except Exception:               # noqa: BLE001 - tool boundary
                 log.exception("tool %s: derive failed", name)
                 extra = {}

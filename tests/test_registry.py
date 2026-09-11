@@ -216,3 +216,38 @@ def test_a_spec_that_advertises_a_reserved_arg_is_a_warned_drift(caplog):
     assert said == ["tool drift advertises reserved argument(s) shuffle in its schema"]
     # the default spec reserves nothing and the schema is untouched
     assert ToolSpec("plain", "Plain.").reserved == frozenset()
+
+
+def test_a_deriver_that_asks_for_the_models_args_is_handed_them():
+    """ROUND FOUR of the calendar-date bug (2026-09-06): get_calendar's
+    deriver read "january the 5th" as a bare 5th and REPLACED the model's
+    correct 2027-01-05 with today, because a deriver could not see what
+    it was overriding.  A spec that says ``derive_takes_args`` gets the
+    model's args (after the reserved strip) as a second argument, and its
+    {} means "the model's value stands"."""
+    seen, handed = [], []
+    reg = ToolRegistry()
+
+    def handler(device="", shuffle=None, **_):
+        seen.append({"device": device, "shuffle": shuffle})
+        return ToolResult(text="ok")
+
+    def derive(utterance, args):
+        handed.append((utterance, dict(args)))
+        return {} if args.get("device") == "phone" else {"device": "spark"}
+
+    reg.register(ToolSpec("liked", "Play the liked songs.",
+                          {"type": "object",
+                           "properties": {"device": {"type": "string"}}},
+                          handler, reserved=frozenset({"shuffle"}),
+                          derive=derive, derive_takes_args=True))
+    reg.call("liked", {"device": "phone", "shuffle": True}, from_model=True,
+             utterance="on my phone")
+    # the reserved key was stripped BEFORE the deriver saw the args
+    assert handed == [("on my phone", {"device": "phone"})]
+    assert seen == [{"device": "phone", "shuffle": None}]
+    reg.call("liked", {"device": "tv"}, from_model=True, utterance="here")
+    assert seen[-1] == {"device": "spark", "shuffle": None}
+    # a forced call never reaches the deriver, args or no args
+    reg.call("liked", {"device": "tv"}, utterance="here")
+    assert seen[-1] == {"device": "tv", "shuffle": None} and len(handed) == 2
