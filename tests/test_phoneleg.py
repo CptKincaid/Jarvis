@@ -78,10 +78,21 @@ def test_one_lost_packet_is_not_an_answer_and_the_probe_asks_again():
     assert presence.probe_state(ip="192.168.50.34", run=run) is True
 
 
-def test_a_phone_that_misses_the_retry_TOO_is_a_real_no():
+def test_two_missed_pings_ALONE_are_no_longer_an_answer():
+    """MOVED 2026-09-11 by his measured trace, and this is the heart of it.
+
+    Both pings missing used to BE the answer. It is not one: he was in the
+    office for the whole of 18:33-18:35 and ICMP missed three of seven
+    there. What decides now is the neighbour state the kernel writes after
+    our packets make it resolve -- REACHABLE he is here, FAILED he is out,
+    and anything else is the question still being asked.
+
+    A row that is STILL STALE after two pings is that last case. In the
+    real kernel it cannot persist; in this fake it is the honest unknown,
+    and unknown is what the sentinel is built to hold."""
     run = _runner(neigh=NEIGH_STALE, pings={"192.168.50.34": [1, 1],
                                             "192.168.50.1": 0})
-    assert presence.probe_state(ip="192.168.50.34", run=run) is False
+    assert presence.probe_state(ip="192.168.50.34", run=run) is None
 
 
 def test_the_retry_really_does_ask_HARDER_than_the_first_packet():
@@ -211,3 +222,101 @@ def test_room_or_phone_still_lets_a_room_beat_a_silent_phone():
             return True
     leg = presence.RoomOrPhone(Sensor(), phone=lambda ip, mac: False)
     assert leg("1.2.3.4", "") is True
+
+
+# ==================================================================
+# THE NEIGHBOUR STATE, MEASURED ON HIS OWN NETWORK 2026-09-11 18:33-18:41
+# ==================================================================
+# He started scripts/phone_trace.py and walked out with his phone. 29
+# samples, 15 s apart, and the answer is not close:
+#
+#   while he was HOME (18:33:43-18:35:12)
+#       ICMP answered                    4 / 7
+#       ARP resolution answered          7 / 7   REACHABLE, PROBE, REACHABLE…
+#   after he LEFT (18:35:28 onward)
+#       ICMP answered                    0 / 22
+#       ARP resolution answered          0 / 22  FAILED, every single sample
+#
+#   last REACHABLE 18:34:42 -> first FAILED 18:35:28, so a real departure
+#   reaches FAILED in about 46 seconds.
+#
+# That settles the question this leg has been stuck on all day. ICMP is a
+# coin toss while he is in the room; the kernel's own neighbour resolution
+# is not, and it still says FAILED when he is genuinely gone -- which was
+# the one thing that had to be true before believing ARP over ping could
+# be safe. Believing it without this measurement would have risked a
+# presence that never goes AWAY again, the same bug pointing backwards.
+NEIGH_FAILED = "192.168.50.34 dev wlan0 lladdr aa:bb:cc:dd:ee:ff FAILED\n"
+NEIGH_INCOMPLETE = "192.168.50.34 dev wlan0  INCOMPLETE\n"
+NEIGH_PROBE = "192.168.50.34 dev wlan0 lladdr aa:bb:cc:dd:ee:ff PROBE\n"
+
+
+def _two_reads(first, second, pings=None, route=ROUTE):
+    """A runner whose `ip -4 neigh` changes after the ping, which is what
+    the kernel actually does: our packet moves a STALE row to DELAY, the
+    kernel probes, and the row lands on REACHABLE or FAILED."""
+    pings = dict(pings or {})
+    seen = {"neigh": 0}
+
+    def run(argv, timeout=None):
+        if argv[0] == "ip" and "neigh" in argv:
+            seen["neigh"] += 1
+            return _Res(0, first if seen["neigh"] == 1 else second)
+        if argv[0] == "ip" and "route" in argv:
+            return _Res(0, route)
+        if argv[0] == "ping":
+            return _Res(pings.get(argv[-1], 1))
+        return _Res(1)
+    return run
+
+
+def test_the_radio_answered_ARP_even_though_it_ignored_the_PING():
+    """HIS NAP, measured: 18:33:43 STALE, ping missed, REACHABLE. The
+    phone was on the desk the whole time."""
+    run = _two_reads(NEIGH_STALE, NEIGH_REACHABLE,
+                     pings={"192.168.50.1": 0})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is True
+
+
+def test_a_row_the_kernel_gave_up_on_is_a_real_absence():
+    """HIS DEPARTURE, measured: 18:35:28 onward, FAILED for 22 straight
+    samples. The kernel asked with ARP and got nothing."""
+    run = _two_reads(NEIGH_STALE, NEIGH_FAILED, pings={"192.168.50.1": 0})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is False
+
+
+def test_an_INCOMPLETE_row_is_absence_too():
+    run = _two_reads(NEIGH_STALE, NEIGH_INCOMPLETE, pings={"192.168.50.1": 0})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is False
+
+
+def test_a_row_STILL_BEING_ASKED_is_unknown_and_never_away():
+    """PROBE means the kernel is mid-question. An answer of "he is out"
+    there would be inventing one, and the next poll has the real one --
+    measured at 15 s in his trace."""
+    run = _two_reads(NEIGH_STALE, NEIGH_PROBE, pings={"192.168.50.1": 0})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is None
+
+
+def test_a_dead_network_still_beats_a_FAILED_row():
+    """The canary outranks it: if the router cannot be reached either, the
+    Spark's own Wi-Fi is down and that is not a departure."""
+    run = _two_reads(NEIGH_STALE, NEIGH_FAILED, pings={})
+    assert presence.probe_state(ip="192.168.50.34", run=run) is None
+
+
+def test_a_FAILED_row_BEFORE_we_ping_is_answered_without_pinging_twice():
+    """He has been out for a while: the kernel already knows. Asking again
+    is three packets to an address nobody is at, every ten seconds."""
+    pings = []
+
+    def run(argv, timeout=None):
+        if argv[0] == "ping":
+            pings.append(argv[-1])
+            return _Res(0 if argv[-1] == "192.168.50.1" else 1)
+        if argv[0] == "ip" and "neigh" in argv:
+            return _Res(0, NEIGH_FAILED)
+        return _Res(0, ROUTE)
+
+    assert presence.probe_state(ip="192.168.50.34", run=run) is False
+    assert "192.168.50.34" not in pings, "it pinged a row the kernel gave up on"

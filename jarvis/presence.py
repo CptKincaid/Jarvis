@@ -129,6 +129,26 @@ PING_FIRST = ("ping", "-c", "1", "-W", "1")
 PING_RETRY = ("ping", "-c", "3", "-W", "2")
 PING_RETRY_TIMEOUT_S = 8.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
+# THE KERNEL'S OWN VERDICT, and it is a better one than ours.
+#
+# MEASURED on his network 2026-09-11 18:33-18:41 (scripts/phone_trace.py;
+# he started it and walked out with his phone, 29 samples 15 s apart):
+#
+#   while he was HOME     ICMP answered  4/7    ARP resolution  7/7
+#   after he LEFT         ICMP answered  0/22   ARP resolution  0/22
+#   last REACHABLE 18:34:42 -> first FAILED 18:35:28  (about 46 s)
+#
+# ICMP is a coin toss while he is in the room -- the radio sleeps through
+# an unsolicited echo and the OS never sees it. ARP is answered by the
+# radio firmware itself, so it survives that sleep; and when he is
+# genuinely gone the kernel gives up and writes FAILED. BOTH halves had to
+# hold and both do. Believing ARP without the second half measured would
+# have risked a presence that never goes AWAY again -- the same bug
+# pointing backwards, which is why this waited on him rather than shipping.
+ABSENT_STATES = ("FAILED", "INCOMPLETE")
+# Everything else means the question is still open: STALE is "not checked
+# lately", DELAY and PROBE are "asking right now". None of the three is an
+# answer, and inventing one from them is how this leg earned its name.
 WELCOME_LINE = "Welcome back, sir."
 
 # A leg that does not answer "are you blocked?" at all, told apart from
@@ -220,6 +240,12 @@ def probe_state(ip: str = "", mac: str = "",
         if (ip and row["ip"] == ip) or (mac and row["mac"] == mac):
             if row["state"] in PRESENT_STATES:
                 return True
+            if row["state"] in ABSENT_STATES:
+                # The kernel has already asked and given up. Pinging again
+                # is three packets to an address nobody is at, every ten
+                # seconds for as long as he is out. Straight to the canary,
+                # the only thing that can still overturn it.
+                return _absent_unless_the_network_is_down(row["ip"] or ip, run)
             if not ip:
                 ip = row["ip"]                  # MAC-only config: ping what ARP knows
     if not ip:
@@ -241,6 +267,40 @@ def probe_state(ip: str = "", mac: str = "",
         return None
     if getattr(res, "returncode", 1) == 0:
         return True
+    # ASK THE KERNEL WHAT IT LEARNED. The two pings above just moved the
+    # row out of STALE and made it resolve; this READS the answer instead
+    # of inferring one from whether an echo came back. It is the whole fix
+    # -- see ABSENT_STATES for the measurement that made it safe.
+    try:
+        res = run(["ip", "-4", "neigh"], timeout=PING_TIMEOUT_S)
+        rows = parse_neigh(getattr(res, "stdout", "") or "")
+    except Exception:  # noqa: BLE001 - could not ask, so do not answer
+        log.debug("presence: the second ip neigh failed", exc_info=True)
+        return None
+    for row in rows:
+        if row["ip"] != ip:
+            continue
+        if row["state"] in PRESENT_STATES:
+            log.debug("presence: the ping went unanswered but ARP says %s",
+                      row["state"])
+            return True
+        if row["state"] in ABSENT_STATES:
+            return _absent_unless_the_network_is_down(ip, run)
+        break                        # STALE/DELAY/PROBE: still being asked
+    # Still resolving, or the row vanished between the two reads. Neither
+    # is an answer, and the next poll has the real one -- 15 s in his
+    # trace. The sentinel holds on None and counts nothing towards away.
+    return None
+
+
+def _absent_unless_the_network_is_down(ip: str, run: Callable):
+    """``False`` -- unless the GATEWAY is silent too, and then ``None``.
+
+    THE CANARY, and it costs a packet only on this path, which is the
+    negative one. It is the only thing that can overturn the kernel's
+    FAILED: if the router does not answer either, the Spark's own Wi-Fi
+    has dropped and that is not a departure.
+    """
     gateway = default_gateway(run)
     if not gateway:
         return None
