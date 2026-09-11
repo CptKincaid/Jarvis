@@ -21,6 +21,7 @@ import email
 import email.utils
 import html as _html
 import imaplib
+import time
 import mimetypes
 import os
 import re
@@ -45,6 +46,20 @@ DEFAULT_IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 15.0
 BODY_BYTES = 2000                      # partial body fetch (never the whole mail)
+# ...and the caps for READING ONE MESSAGE ALOUD, which is a different job.
+#
+# HIS BUG, 2026-09-11: "when asked to talk about email he talks about the
+# subject then doesnt work reading the rest". That was exact and literal:
+# a listing fetch asks for 2000 bytes and keeps 200 characters, so sender
+# and subject was genuinely all there was. There was no rest to read.
+#
+# These are deliberately NOT the listing's numbers. A browse touches every
+# mailbox and up to twenty messages, so 2 kB each is the right miserliness;
+# reading ONE message aloud touches one message once, and a 12,000-character
+# body is about ninety seconds of speech, which is already more than anyone
+# wants read at them. The reader chunks it and asks before going on.
+READ_BODY_BYTES = 60000
+READ_BODY_CHARS = 12000
 # One thread per mailbox, capped: Hunter runs three (personal, work,
 # school) and the cap only exists so a config that grows to a dozen does
 # not open a dozen sockets at once.
@@ -347,7 +362,8 @@ def _decode_str(value) -> str:
     return " ".join(str(value or "").split())
 
 
-def _parse_message(headers: bytes, body: bytes) -> Mail:
+def _parse_message(headers: bytes, body: bytes,
+                   body_chars: int = SNIPPET_CHARS) -> Mail:
     hdr = email.message_from_bytes(headers.rstrip(b"\r\n") + b"\r\n\r\n",
                                    policy=policy.default)
     try:
@@ -366,13 +382,16 @@ def _parse_message(headers: bytes, body: bytes) -> Mail:
         log.debug("body parse failed", exc_info=True)
         text = ""
     return Mail(from_name=_decode_str(name).strip('"'), from_addr=addr,
-                subject=subject, date=date, snippet=make_snippet(text))
+                subject=subject, date=date,
+                snippet=make_snippet(text, limit=body_chars))
 
 
 def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
                  imap=imaplib.IMAP4_SSL, now: Optional[datetime] = None,
                  timeout: float = IMAP_TIMEOUT,
-                 unread_only: bool = True) -> list[Mail]:
+                 unread_only: bool = True,
+                 body_bytes: int = BODY_BYTES,
+                 body_chars: int = SNIPPET_CHARS) -> list[Mail]:
     """INBOX mail newer than ``since_hours``, newest first.
 
     ``unread_only=False`` drops the UNSEEN filter, which is what answers
@@ -390,7 +409,8 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
 
     if len(accounts) > 1:
         merged, failures = _fetch_every(accounts, since, limit, imap,
-                                        timeout, unread_only)
+                                        timeout, unread_only,
+                                        body_bytes, body_chars)
         # One mailbox with a stale app password must not blind Jarvis to the
         # rest, so failures are collected and only re-raised if EVERY mailbox
         # failed -- silence there would look identical to an empty inbox.
@@ -420,7 +440,7 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
             b",".join(ids),
             "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE "
             "CONTENT-TRANSFER-ENCODING)] "
-            f"BODY.PEEK[TEXT]<0.{BODY_BYTES}>)")
+            f"BODY.PEEK[TEXT]<0.{body_bytes}>)")
         if typ != "OK":
             raise imaplib.IMAP4.error(f"fetch failed: {typ}")
     finally:
@@ -429,14 +449,16 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
                 closer()
             except Exception:
                 log.debug("imap logout failed", exc_info=True)
-    mails = [_parse_message(h, b) for h, b in _parse_fetch(data)]
+    mails = [_parse_message(h, b, body_chars) for h, b in _parse_fetch(data)]
     fresh = [m for m in mails if m.date is None or m.date >= since]
     fresh.sort(key=lambda m: m.date or since, reverse=True)
     return fresh
 
 
 def _fetch_every(accounts: list[dict], since: datetime, limit: int,
-                 imap, timeout: float, unread_only: bool
+                 imap, timeout: float, unread_only: bool,
+                 body_bytes: int = BODY_BYTES,
+                 body_chars: int = SNIPPET_CHARS
                  ) -> tuple[list[Mail], list[Exception]]:
     """Every mailbox at once -> (merged mail, failures).
 
@@ -462,7 +484,7 @@ def _fetch_every(accounts: list[dict], since: datetime, limit: int,
     with ThreadPoolExecutor(max_workers=workers,
                             thread_name_prefix="mail") as pool:
         futures = [pool.submit(_fetch_one, account, since, limit, imap,
-                               timeout, unread_only) for account in accounts]
+                               timeout, unread_only, body_bytes, body_chars) for account in accounts]
         for i, (account, future) in enumerate(zip(accounts, futures)):
             try:
                 per_account[i] = future.result()
@@ -473,7 +495,9 @@ def _fetch_every(accounts: list[dict], since: datetime, limit: int,
 
 
 def _fetch_one(settings: dict, since: datetime, limit: int,
-               imap, timeout: float, unread_only: bool = True) -> list[Mail]:
+               imap, timeout: float, unread_only: bool = True,
+               body_bytes: int = BODY_BYTES,
+               body_chars: int = SNIPPET_CHARS) -> list[Mail]:
     """One mailbox. Same conversation as the single-account path, with each
     Mail tagged so a merged briefing can say which inbox it came from."""
     log.info("mail: connecting to %s for %s (%s)", settings["host"],
@@ -497,7 +521,7 @@ def _fetch_one(settings: dict, since: datetime, limit: int,
             b",".join(ids),
             "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE CONTENT-TYPE "
             "CONTENT-TRANSFER-ENCODING)] "
-            f"BODY.PEEK[TEXT]<0.{BODY_BYTES}>)")
+            f"BODY.PEEK[TEXT]<0.{body_bytes}>)")
         if typ != "OK":
             raise imaplib.IMAP4.error(f"fetch failed: {typ}")
     finally:
@@ -505,7 +529,7 @@ def _fetch_one(settings: dict, since: datetime, limit: int,
             conn.logout()
         except Exception:
             log.debug("imap logout failed", exc_info=True)
-    mails = [_parse_message(h, b) for h, b in _parse_fetch(data)]
+    mails = [_parse_message(h, b, body_chars) for h, b in _parse_fetch(data)]
     for m in mails:
         m.account = settings["label"]
     return [m for m in mails if m.date is None or m.date >= since]
@@ -964,6 +988,94 @@ def resolve_sender(services, sender: str) -> tuple[str, str]:
     return raw, raw
 
 
+def read_one(cfg, sender: str = "", subject: str = "",
+             imap=imaplib.IMAP4_SSL, timeout: float = IMAP_TIMEOUT,
+             since_hours: int = NAMED_SEARCH_HOURS,
+             now: Optional[datetime] = None) -> Optional[Mail]:
+    """ONE message with a readable body on it, or None.
+
+    HIS ASK, 2026-09-11, after reporting "he talks about the subject then
+    doesnt work reading the rest": yes to reading email bodies aloud.
+
+    This is the whole of the new fetching, and it is deliberately the
+    SAME fetch as a listing with two numbers changed -- READ_BODY_BYTES
+    and READ_BODY_CHARS. Everything a listing already handles correctly
+    (three mailboxes in parallel, the 15 s socket timeout, MIME decoding,
+    quoted-reply and signature stripping, one dead mailbox not blinding
+    the rest) is handled here for free, and a second fetcher would have
+    had to re-earn all of it.
+
+    So ``Mail.snippet`` carries the BODY here rather than a preview. It is
+    the same field because it is the same extraction -- ``make_snippet``
+    with a wider limit -- and giving it a second name would imply a second
+    code path that does not exist.
+
+    Newest match wins. ``sender`` and ``subject`` narrow it; with neither,
+    it is simply the most recent message, which is what "read it" means
+    straight after Jarvis has mentioned one. Read mail counts: a message
+    he has just been told about may well have been read already.
+    """
+    mails = fetch_unread(cfg, since_hours=int(since_hours),
+                         limit=SENDER_FETCH_LIMIT, imap=imap, now=now,
+                         timeout=timeout, unread_only=False,
+                         body_bytes=READ_BODY_BYTES,
+                         body_chars=READ_BODY_CHARS)
+    wanted = " ".join(str(sender or "").split())
+    about = " ".join(str(subject or "").split())
+    if wanted:
+        mails = [m for m in mails if sender_matches(m, wanted)]
+    if about:
+        mails = [m for m in mails if subject_matches(m, about)]
+    if not mails:
+        return None
+    # fetch_unread already sorts newest-first, but a caller may pass its
+    # own list one day and an unsorted "the latest" is a silent wrong
+    # answer rather than a loud one.
+    mails.sort(key=lambda m: m.date or datetime.min.replace(
+        tzinfo=(m.date.tzinfo if m.date else None)), reverse=True)
+    return mails[0]
+
+
+def spoken_body(mail: Optional[Mail]) -> str:
+    """What the reader should say, or "".
+
+    The sender and subject are spoken FIRST and as one line, because by
+    the time he says "read it" he may have been told about three messages
+    and needs to hear which one this is before a minute of body arrives.
+    """
+    if mail is None:
+        return ""
+    body = " ".join(str(getattr(mail, "snippet", "") or "").split())
+    if not body:
+        return ""
+    subject = " ".join(str(getattr(mail, "subject", "") or "").split())
+    head = f"From {mail.sender}"
+    if subject and subject != "(no subject)":
+        head += f", subject: {subject}"
+    return f"{head}. {body}"
+
+
+def _park_last_mail(services, mail: Optional[Mail], sender: str = "") -> None:
+    """Record which message was just described, for "read it".
+
+    Sender and subject only -- never the body. The body is re-fetched on
+    demand by ``read_one`` (which is the only call that asks IMAP for a
+    whole message), so nothing here holds message content in memory
+    between turns.
+    """
+    if services is None or mail is None:
+        return
+    try:
+        services.last_mail = {
+            "sender": sender or mail.sender,
+            "subject": mail.subject,
+            "account": mail.account,
+            "at": time.time(),
+        }
+    except Exception:                  # noqa: BLE001 - a namespace boundary
+        log.debug("could not park the last mail", exc_info=True)
+
+
 def make_tools(cfg, services) -> list[ToolSpec]:
     imap_cls = getattr(services, "imap", None) if services is not None else None
     imap_cls = imap_cls or imaplib.IMAP4_SSL
@@ -1039,6 +1151,12 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                            else SHEET_SNIPPET_CHARS)
         if who:
             sheet = f"From {who}: " + sheet
+        # REMEMBER WHAT "IT" IS. Once he has been told about a message,
+        # "read it" has a referent -- and until 2026-09-11 it did not:
+        # "read it" reached the X selection instead, because nothing
+        # anywhere recorded which mail had just been described. The TOP
+        # result only: that is the one the spoken summary leads with.
+        _park_last_mail(services, mails[0], sender=who or wanted)
         return ToolResult(text=sheet, max_sentences=4)
 
     spec = ToolSpec(

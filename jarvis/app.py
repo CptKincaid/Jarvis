@@ -2329,9 +2329,40 @@ class JarvisApp:
         # queue is FIFO). Disarm the filler; the watchdog stays. _say latches
         # it too; this is the earlier of the two.
         self._disarm_filler()
-        if self._last_source == "voice":
+        if self._last_source == "voice" and not self._no_followup_turn():
             self._followup_after_speech = True
         self._say(sentence)
+
+    def _no_followup_turn(self) -> bool:
+        """Does the reply now being spoken END the turn?
+
+        LATCHED FOR THE TURN, not consumed per call, because one reply asks
+        TWICE: the streaming path speaks each sentence and the SPEAK tag
+        closes the same reply. A one-shot read would let the second ask
+        re-open the mic the first had just closed -- guard-one-half, in a
+        single feature. _take_no_followup clears the services flag once and
+        the answer is remembered until the next turn starts.
+        """
+        if getattr(self, "_no_followup_latch", None) is None:
+            self._no_followup_latch = self._take_no_followup()
+        return bool(self._no_followup_latch)
+
+    def _take_no_followup(self) -> bool:
+        """True ONCE when the reply just spoken ENDED the turn -- a music
+        action or a custom-phrase shortcut (commander._set_no_followup).
+
+        His ruling, 2026-09-11: "he should just do it and stop listening".
+        One-shot, so a second reply in the same batch of tags does not
+        inherit a suppression meant for the first.
+        """
+        services = getattr(self, "services", None)
+        if services is None or not getattr(services, "no_followup", False):
+            return False
+        try:
+            services.no_followup = False
+        except Exception:                  # noqa: BLE001 - a namespace boundary
+            log.debug("could not clear the no-followup flag", exc_info=True)
+        return True
 
     def _take_claude_check_offer(self) -> bool:
         """True ONCE when this reply is a local attempt at work Jarvis is
@@ -2435,7 +2466,8 @@ class JarvisApp:
                         self._followup_after_speech = True
                     # brain._remember has already recorded this exchange;
                     # recording it here too rendered every turn twice.
-                    if self._last_source == "voice":
+                    if self._last_source == "voice" and \
+                            not self._no_followup_turn():
                         self._followup_after_speech = True
                 elif tag in ("BRIEFING", "STREAMED"):
                     pass                               # consumed by the SPEAK
@@ -4889,7 +4921,8 @@ class JarvisApp:
         if reply and done and not getattr(result, "ack", False):
             if his_turn:
                 self.context.add_exchange(text, reply)
-            if source == "voice" and result.speak and CONFIG.talkback:
+            if source == "voice" and result.speak and CONFIG.talkback \
+                    and not self._no_followup_turn():
                 self._followup_after_speech = True
         if his_turn and done and getattr(result, "speak", False):
             # After the answer, never inside it. _emit_result has already
@@ -6916,11 +6949,18 @@ class JarvisApp:
     _turn_seq = 0
     _turn_answered = False
     _uncertain_turn = None
+    # None = not asked yet this turn; see _no_followup_turn.
+    _no_followup_latch = None
 
     def _dispatch(self, text, source, confidence=None, addressee=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
+        # ...and neither must the previous turn's "this ends the turn"
+        # answer. Cleared HERE, at the one point every utterance passes
+        # through, so the latch is per-turn by construction rather than by
+        # every reply site remembering to reset it (_no_followup_turn).
+        self._no_followup_latch = None
         # A barge's mute must not outlive the barged turn: a typed reply
         # used to arrive silently after a fruitless barge-in capture.
         self._stream_muted = False

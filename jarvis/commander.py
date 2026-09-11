@@ -1778,6 +1778,31 @@ _READ_PRONOUN_RX = re.compile(
     r"^" + _JV + r"read\s+(?:me\s+)?(?:it|that)(?:\s+(?:to me|back|aloud|"
     r"out loud|back to me))?[.!\s]*$", re.I)
 LAST_DOCUMENT_S = 900.0
+# ...and the same idea for a message he has just been told about. HIS ASK,
+# 2026-09-11: yes to reading email bodies aloud, after reporting "he talks
+# about the subject then doesnt work reading the rest".
+#
+# "read it" now has THREE claimants -- the X selection, the last document
+# and the last mail -- and the rule between them is RECENCY, not a
+# priority order: whichever he was shown most recently is what "it" means.
+# A fixed order would be the guard-one-half shape in a new place, and it
+# would be wrong half the time by construction.
+LAST_MAIL_S = 900.0
+FETCHING_MAIL_LINE = "One moment, sir."
+NO_SUCH_MAIL_LINE = "I can't find that message to read, sir."
+NO_MAIL_TO_READ_LINE = "I haven't a message on hand to read, sir."
+# "read the rest" / "read the email" matched NOTHING before today: not the
+# selection branch, not the document branch, not inline text. It was the
+# literal sentence in his report and the router had no answer for it.
+_READ_MAIL_RX = re.compile(
+    r"^" + _JV + r"(?:read|finish|go on with)\s+(?:me\s+|out\s+)?"
+    r"(?:the\s+|that\s+|this\s+|it\s+)?"
+    r"(?:(?:whole|full|entire|rest of(?: the)?)\s+)?"
+    r"(?:e-?mail|message|mail)"
+    r"(?:\s+(?:aloud|out loud|to me|back to me|back|in full))?[.!\s]*$", re.I)
+_READ_REST_RX = re.compile(
+    r"^" + _JV + r"read\s+(?:me\s+)?the\s+rest(?:\s+of\s+(?:it|that))?"
+    r"(?:\s+(?:aloud|out loud|to me))?[.!\s]*$", re.I)
 NO_DOCUMENT_LINE = "I haven't a document on hand to read, sir."
 NO_SUCH_DOCUMENT_LINE = "I can't find a document called {name}, sir."
 EXPLAIN_ACK_LINE = "Let me have a look at {name}, sir."
@@ -1896,13 +1921,95 @@ def _fresh_document(c):
     return path
 
 
+def _fresh_mail(c):
+    """The message he was last told about, or None. Sender + subject only;
+    the body is re-fetched on demand (mail._park_last_mail)."""
+    services = getattr(c, "services", None) or c._svc("services")
+    last = getattr(services, "last_mail", None) if services is not None else None
+    if not isinstance(last, dict) or not last:
+        return None
+    try:
+        if time.time() - float(last.get("at") or 0.0) > LAST_MAIL_S:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return last
+
+
+def _read_the_mail(c, last) -> CommandResult:
+    """Fetch ONE message and hand it to the reader -- OFF THE TURN.
+
+    The fetch is a live IMAP round trip across every mailbox, and doing it
+    on the turn is precisely the lockout he reported ("locks me out"). So
+    the ack is spoken immediately, the turn closes, and the reader starts
+    when the body arrives. The reader chunks it and asks before going on,
+    which is what makes "go on" work afterwards for free.
+
+    No follow-up window: this ends in a minute of email being read at him
+    and a live mic through that is the worst moment available to listen.
+    """
+    c._set_no_followup(True)
+    assistant, reader = c._svc("assistant"), c._svc("reader")
+    if assistant is None or reader is None:
+        return CommandResult(handled=True, reply=NO_MAIL_TO_READ_LINE,
+                             speak=True, status="No reader")
+
+    # The SAME injected seam tools/mail.make_tools uses (services.imap), so
+    # a test drives this handler with a fake mailbox and no monkeypatching,
+    # and nothing here can reach a real account by accident.
+    services = getattr(c, "services", None) or c._svc("services")
+    imap_cls = getattr(services, "imap", None) if services is not None else None
+
+    def work():
+        from jarvis.tools import mail as mail_mod
+        import imaplib as _imaplib
+        try:
+            got = mail_mod.read_one(assistant,
+                                    sender=str(last.get("sender") or ""),
+                                    subject=str(last.get("subject") or ""),
+                                    imap=imap_cls or _imaplib.IMAP4_SSL)
+            body = mail_mod.spoken_body(got)
+        except Exception:              # noqa: BLE001 - provider boundary
+            log.exception("read the mail failed")
+            body = ""
+        if not body:
+            bus.publish(JarvisReply(text=NO_SUCH_MAIL_LINE, speak=True))
+            return
+        reader.read_text(body, label="the message")
+
+    c._bg(work)
+    return CommandResult(handled=True, reply=FETCHING_MAIL_LINE, speak=True,
+                         status="Reading the message")
+
+
+def _h_read_mail(c, t, m):
+    last = _fresh_mail(c)
+    if last is None:
+        return CommandResult(handled=True, reply=NO_MAIL_TO_READ_LINE,
+                             speak=True, status="No message")
+    return _read_the_mail(c, last)
+
+
+def read_mail_kind(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(_READ_MAIL_RX.match(t) or _READ_REST_RX.match(t))
+
+
 def _h_read_aloud(c, t, m):
     reader = c._svc("reader")
     kind, arg = m
     raw = getattr(c, "_raw_text", "") or t
-    if kind == "selection" and _READ_PRONOUN_RX.match(raw.strip()) \
-            and _fresh_document(c) is not None:
-        kind = "document"
+    if kind == "selection" and _READ_PRONOUN_RX.match(raw.strip()):
+        # THREE CLAIMANTS FOR "it", decided by RECENCY rather than by a
+        # fixed order -- see LAST_MAIL_S. A message he was shown after the
+        # document is what "it" means, and vice versa.
+        doc, mail_last = _fresh_document(c), _fresh_mail(c)
+        doc_at = float((getattr(c, "_last_document", None) or (None, 0.0))[1])
+        mail_at = float((mail_last or {}).get("at") or 0.0)
+        if mail_last is not None and (doc is None or mail_at >= doc_at):
+            return _read_the_mail(c, mail_last)
+        if doc is not None:
+            kind = "document"
     if kind == "document":
         path = _fresh_document(c)
         if path is None:
@@ -9577,6 +9684,11 @@ REGISTRY: list[Command] = [
             needs=("assistant",)),
     Command("verbosity", _PREF_VERBOSITY_RX.match, _h_verbosity,
             needs=("assistant",)),
+    # BEFORE "last mail": "read the rest" and "read that email" are about a
+    # message he has ALREADY been told about, and routing them into a fresh
+    # model turn is what used to lose them.
+    Command("read mail", read_mail_kind, _h_read_mail,
+            needs=("reader",)),
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     # Liked Songs, forced onto the tool with shuffle decided from the words
@@ -12981,6 +13093,31 @@ class Commander:
             "".join(c for c in str(text).lower() if c.isalnum() or c.isspace())
             .split())
 
+    def _set_no_followup(self, value: bool) -> None:
+        """Park (or clear) "this reply ENDS the turn" for the app.
+
+        HIS RULING, 2026-09-11: "for drop my needle or for starting my
+        Spotify music Jarvis shouldn't listen again for another command he
+        should just do it and stop listening."
+
+        app._on_result opens a 4 s wake-word-free window after any spoken
+        reply on the voice path. That is right for an ANSWER and wrong for
+        a completed ACTION -- the music is playing, there is nothing to
+        follow up, and a live mic in a room that has just started playing
+        music is the worst moment available to be listening.
+
+        Written on EVERY route rather than only the music ones, so the flag
+        is always fresh: a turn that sets it and then dies without speaking
+        cannot leave it armed for the next one.
+        """
+        services = getattr(self, "services", None) or self._svc("services")
+        if services is None:
+            return
+        try:
+            services.no_followup = bool(value)
+        except Exception:              # noqa: BLE001 - a namespace boundary
+            log.debug("could not park the no-followup flag", exc_info=True)
+
     def _try_custom_phrase(self, cmd_text: str) -> Optional[CommandResult]:
         """User-defined phrase -> tool call, from assistant.json.
 
@@ -13037,6 +13174,10 @@ class Commander:
         name = str(entry["tool"])
         args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
         log.info("custom phrase -> %s(%s)", name, args)
+        # A shortcut IS the action ("drop my needle" -> the record is on).
+        # Nothing follows it, so the mic does not re-open. See
+        # _set_no_followup.
+        self._set_no_followup(True)
         try:
             res = tools.call(name, dict(args))
         except Exception:
@@ -14340,6 +14481,11 @@ class Commander:
 
     def _dispatch_route(self, d: RouteDecision, text: str) -> CommandResult:
         log.info("route %s (%s) %r", d.kind, d.reason, (d.prompt or text)[:60])
+        # THE ROUTER'S OWN MUSIC CUE TABLE DECIDES, not a second word list
+        # invented here: local:music is what already answers "play some
+        # jazz", "skip this track" and "turn the volume down a bit", and it
+        # is measured and tested (tests/test_router.py's media corpus).
+        self._set_no_followup(d.reason == "local:music")
         brain = self._svc("brain")
         claude = self._svc("claude")
         if d.kind == "action":

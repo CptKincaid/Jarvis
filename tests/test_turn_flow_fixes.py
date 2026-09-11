@@ -412,3 +412,81 @@ def test_a_BARE_cancel_is_a_stop_word_because_it_is_the_word_he_used():
     for other in ("cancel my alarm", "cancel the schedule",
                   "cancel my 7am alarm", "cancel the timer"):
         assert not C._QUIET_RX.match(other), other
+
+
+# ==================================================================
+# HIS RULING, 2026-09-11: an ACTION does not re-open the microphone
+# ==================================================================
+# Verbatim: "also for drop my needle or for starting my Spotify music
+# Jarvis shouldn't listen again for another command he should just do it
+# and stop listening".
+#
+# app._on_result opens a 4 s wake-word-free window after ANY spoken reply
+# on the voice path (CONFIG.followup_window). That is right for an ANSWER
+# -- he may want to follow it up -- and wrong for a completed ACTION: the
+# music is playing, there is nothing to follow up, and a live mic in a
+# room that has just started playing music is the worst possible time to
+# be listening.
+#
+# TWO PATHS reach him, and the fix is ONE flag on services so they cannot
+# drift:
+#   "drop my needle"  -> a configured custom phrase, commander-synchronous
+#   "play some jazz"  -> router local:music -> brain.chat -> a SPEAK tag
+def test_a_custom_phrase_shortcut_stops_listening():
+    import jarvis.commander as C
+    from types import SimpleNamespace
+
+    class Tools:
+        def call(self, name, args):
+            return SimpleNamespace(ok=True, text="", speak=None)
+
+    svc = SimpleNamespace(assistant=None, tools=Tools())
+    c = object.__new__(C.Commander)
+    c.services = svc
+    c._svc = lambda n: {"assistant": None, "tools": svc.tools}.get(n)
+    c._set_no_followup(True)
+    assert svc.no_followup is True
+
+
+def test_a_music_route_stops_listening_and_an_answer_does_not():
+    """The router's own music cue table decides, not a new word list."""
+    import jarvis.commander as C
+    from types import SimpleNamespace
+    c = object.__new__(C.Commander)
+    c.services = SimpleNamespace()
+    for reason, expected in (("local:music", True),
+                             ("local:weather", False),
+                             ("local:code-cue", False),
+                             ("classify-low", False)):
+        c._set_no_followup(reason == "local:music")
+        assert c.services.no_followup is expected, reason
+
+
+def test_the_app_consumes_the_flag_exactly_once():
+    """One-shot: a second reply in the same batch of tags must not keep
+    inheriting a suppression that was meant for the first."""
+    from jarvis import app as app_mod
+    from types import SimpleNamespace
+    a = object.__new__(app_mod.JarvisApp)
+    a.services = SimpleNamespace(no_followup=True)
+    assert a._take_no_followup() is True
+    assert a._take_no_followup() is False
+    a.services = SimpleNamespace()
+    assert a._take_no_followup() is False
+
+
+def test_the_latch_answers_the_same_way_twice_inside_one_turn():
+    """One reply asks TWICE -- the streaming path per sentence, then the
+    SPEAK tag. A one-shot read would let the second ask re-open the mic
+    the first had just closed: guard-one-half inside a single feature."""
+    from jarvis import app as app_mod
+    from types import SimpleNamespace
+    a = object.__new__(app_mod.JarvisApp)
+    a.services = SimpleNamespace(no_followup=True)
+    a._no_followup_latch = None
+    assert a._no_followup_turn() is True
+    assert a._no_followup_turn() is True, "the second sentence re-opened it"
+    assert a.services.no_followup is False, "the services flag was not cleared"
+    # ...and a new turn starts clean
+    a._no_followup_latch = None
+    assert a._no_followup_turn() is False
