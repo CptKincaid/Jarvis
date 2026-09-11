@@ -43,6 +43,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from datetime import date
+
 import jarvis.app as app_mod
 from jarvis.commander import Commander, CommandResult, IntentClassifier
 from jarvis.config import CONFIG, PATHS
@@ -1267,10 +1269,18 @@ class TestTheDayShift:
     on "and / what about"."""
 
     PREV = "what do I have on tomorrow"
+    # THE DAY THESE WERE WRITTEN ON, injected. They read the wall clock
+    # until 2026-09-11 and so passed only on a Sunday: "tomorrow" plus one
+    # is Tuesday from a Sunday and Sunday from a Friday. day_shift_followup
+    # has always taken ``today``; the tests simply did not pass it, and the
+    # whole suite went red five days later for a reason that had nothing to
+    # do with the code under test.
+    TODAY = date(2026, 9, 6)             # a Sunday: tomorrow -> Mon, +1 -> Tue
 
     def test_bare_the_control(self):
         from jarvis.commander import day_shift_followup
-        assert day_shift_followup(self.PREV, "what about the next day") == \
+        assert day_shift_followup(self.PREV, "what about the next day",
+                                  today=self.TODAY) == \
             "what do I have on Tuesday"
 
     @pytest.mark.parametrize("said", ["uh, what about the next day",
@@ -1278,12 +1288,13 @@ class TestTheDayShift:
                                       "er, the next day", "and the next day, uh"])
     def test_a_filled_follow_up_still_moves_the_day(self, said):
         from jarvis.commander import day_shift_followup
-        assert day_shift_followup(self.PREV, said) == "what do I have on Tuesday", said
+        assert day_shift_followup(self.PREV, said,
+                                  today=self.TODAY) == "what do I have on Tuesday", said
 
     @pytest.mark.parametrize("said", PURE_FILLER + ["uh, what's the weather"])
     def test_a_pure_filler_or_a_new_subject_moves_nothing(self, said):
         from jarvis.commander import day_shift_followup
-        assert day_shift_followup(self.PREV, said) is None, said
+        assert day_shift_followup(self.PREV, said, today=self.TODAY) is None, said
 
 
 class TestTheLeaveTimeList:
@@ -1480,10 +1491,23 @@ class TestTheAddressAndTheFiller:
         assert leave_cmdr._pending_leave is None, said
 
     # -- the day-shift follow-up
+    #
+    # THE DAY AFTER TOMORROW IS NOT A FIXED WEEKDAY. These went through
+    # the real Commander, which reads the clock, and hard-coded "Tuesday"
+    # -- true only when run on a Sunday. They were written on 2026-09-06
+    # and took the whole suite red on 09-11. The weekday is computed here
+    # from the same clock the commander will use, so the assertion says
+    # what it means: the day moved by one.
+    @staticmethod
+    def _day_after_tomorrow() -> str:
+        from datetime import date, timedelta
+        return (date.today() + timedelta(days=2)).strftime("%A")
+
     def test_bare_the_control_day_shift(self, cmdr, redispatch):
         self._turn(cmdr, "what do I have on tomorrow")
         res = cmdr._try_day_shift("jarvis, what about the next day", "voice")
-        assert res is not None and res.corrected == "what do I have on Tuesday"
+        want = "what do I have on %s" % self._day_after_tomorrow()
+        assert res is not None and res.corrected == want
 
     @pytest.mark.parametrize("said", ["uh, jarvis, what about the next day",
                                       "jarvis, uh, and the day after that?"])
@@ -1491,8 +1515,9 @@ class TestTheAddressAndTheFiller:
             self, cmdr, redispatch, said):
         self._turn(cmdr, "what do I have on tomorrow")
         res = cmdr._try_day_shift(said, "voice")
-        assert res is not None and res.corrected == "what do I have on Tuesday", said
-        assert redispatch == ["what do I have on Tuesday"], said
+        want = "what do I have on %s" % self._day_after_tomorrow()
+        assert res is not None and res.corrected == want, said
+        assert redispatch == [want], said
 
     @pytest.mark.parametrize("said", PURE_FILLER + ["uh, jarvis"])
     def test_a_pure_filler_with_or_without_the_address_is_nothing(
