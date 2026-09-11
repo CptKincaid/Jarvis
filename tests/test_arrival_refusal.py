@@ -116,7 +116,8 @@ def test_the_damper_is_the_one_arrival_py_already_owns():
 def test_every_gate_on_the_path_has_a_name():
     """The gate names are a closed set so nothing can refuse anonymously."""
     assert set(arrival.DOOR_GATES) == {
-        "no-room", "wrong-room", "not-away", "already-greeted", "damper"}
+        "no-room", "wrong-room", "not-away", "already-greeted", "damper",
+        "nap"}
 
 
 def test_departure_ready_already_names_its_gates_and_still_does():
@@ -126,3 +127,43 @@ def test_departure_ready_already_names_its_gates_and_still_does():
     ok, why = arrival.departure_ready(now=10.0, since=0.0, last_turn=None,
                                       confirm=600.0, mic_silence=600.0)
     assert ok is False and "grace" in why
+
+
+# ==================================================================
+# THE NAP GATE -- the twin of the departure confirm window
+# ==================================================================
+# Measured 2026-09-11 on his own box: seven times in two days the phone
+# sentinel published "away", and TEN SECONDS LATER published
+# "home (returned)" and said "Welcome back, sir" to a man who had not
+# moved. Ten seconds is ``presence.poll_s_away``: his phone simply
+# answered the next poll. Twelve greetings in one day, eight of them off
+# this leg.
+#
+# The departure half already spends 300 s of latency on exactly this
+# doubt -- _on_presence's own docstring says "a sleeping phone radio
+# faking a departure while he is in the room is the failure worth
+# spending latency on". The arrival half spent none. Guard-one-half.
+def test_a_phone_return_inside_the_confirm_window_is_a_nap():
+    why = arrival.nap_refusal(source="phone", departure_pending=True,
+                              confirm_s=300.0)
+    assert why, "the ten-second false welcome is still spoken"
+    assert "nap" in why
+
+
+def test_a_phone_return_after_the_confirm_window_is_a_real_arrival():
+    assert arrival.nap_refusal(source="phone", departure_pending=False,
+                               confirm_s=300.0) == ""
+
+
+def test_a_RADAR_return_inside_the_window_is_NOT_a_nap():
+    """The gate is on the radio, not on the return. His flat is a
+    corridor and the kitchen radar sees a body on the doorstep; if that
+    fires three minutes after the away edge, a man walked in."""
+    assert arrival.nap_refusal(source="room:kitchen", departure_pending=True,
+                               confirm_s=300.0) == ""
+    assert arrival.nap_refusal(source="desk", departure_pending=True,
+                               confirm_s=300.0) == ""
+
+
+def test_the_nap_gate_names_itself_in_the_closed_set():
+    assert "nap" in arrival.DOOR_GATES

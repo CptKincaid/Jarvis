@@ -199,6 +199,19 @@ FILLER_DELAY_MAX_S = 8.0
 # the only network source on the Board and Spotify the only one on the
 # slab, so both are gated here rather than in the surfaces that draw them.
 CANVAS_TTL_S = 300.0          # the Board's Canvas half, cached 5 minutes
+
+
+def _same_day(a: float, b: float) -> bool:
+    """Are two wall-clock stamps the same LOCAL calendar day?
+
+    A cached sentence carries its own day word ("today 11:59 pm"), so it
+    expires at midnight however few seconds old it is. Local, not UTC:
+    the word was rendered against his clock.
+    """
+    if a <= 0.0 or b <= 0.0:
+        return False
+    fa, fb = time.localtime(a), time.localtime(b)
+    return (fa.tm_year, fa.tm_yday) == (fb.tm_year, fb.tm_yday)
 BOARD_SESSIONS = 6            # Claude sessions read off disk per poll
 ROOM_SPOTIFY_ACTIVE_S = 10.0  # playback poll while something IS playing
 ROOM_SPOTIFY_IDLE_S = 60.0    # …and once it has gone quiet
@@ -855,6 +868,9 @@ class JarvisApp:
         # HIS DEPARTURE RULE, as an ordered sequence. Pure and silent; see
         # _departure_seq_room.
         self._departure_seq = self._make_departure_seq()
+        # True while the departure confirm timer is armed -- see
+        # _cancel_departure and arrival.nap_refusal.
+        self._departure_pending = False
         # A radar whose gates have gone back to 0 sees 0.75 m and reads the
         # room as EMPTY -- measured twice on real hardware, 2026-09-03. The
         # check is a daemon thread that waits before its first read (the
@@ -2623,6 +2639,17 @@ class JarvisApp:
         is the feature, not the line.
         """
         now = time.monotonic()
+        # THE NAP GATE FIRST, because it is not "the same return twice" but
+        # "there was no return". The departure half already spends the
+        # confirm window doubting a sleeping radio; this is its twin.
+        nap = arrival_mod.nap_refusal(
+            source=source,
+            departure_pending=bool(getattr(self, "_departure_pending", False)),
+            confirm_s=arrival_mod.confirm_s(self.assistant.get))
+        if nap:
+            log.info("arrival: no greeting -- %s", nap)
+            bus.publish(Status(text="Home", kind="info"))
+            return
         last = getattr(self, "_last_greeted", 0.0)
         if last:
             why = arrival_mod.greet_refusal(source=source, since_s=now - last,
@@ -3441,6 +3468,18 @@ class JarvisApp:
             self._arm_departure(ev)
             return
         if ev.returned:
+            # A NAP IS NOT A RETURN, so it must not burn the once-a-day
+            # power-up latch either. Same pure gate _greet_return uses;
+            # checked here because the sweep runs before the greeting and
+            # the documented order is not worth disturbing.
+            nap = arrival_mod.nap_refusal(
+                source="phone",
+                departure_pending=bool(getattr(self, "_departure_pending", False)),
+                confirm_s=arrival_mod.confirm_s(self.assistant.get))
+            if nap:
+                log.info("presence: not a return -- %s", nap)
+                bus.publish(Status(text="Home", kind="info"))
+                return
             # The power-up sweep's proper trigger: the away->home edge is
             # the moment he actually sits down. Once a day, latched
             # (_maybe_power_up); the wake-word fallback covers a box where
@@ -3672,10 +3711,20 @@ class JarvisApp:
             log.debug("departure: the sequence failed", exc_info=True)
 
     # ------------------------------------------------------ departure
-    def _cancel_departure(self) -> None:
+    def _cancel_departure(self) -> bool:
+        """Cancel the confirm timer; True when one was still pending.
+
+        The answer is EVIDENCE, not bookkeeping. A timer still armed means
+        the away state has not outlived the confirm window, which is the
+        one fact ``arrival.nap_refusal`` needs to tell a homecoming from a
+        radio waking up. Stamped on the app because _on_presence cancels
+        before it dispatches, so _greet_return cannot ask the timer itself.
+        """
         timer, self._departure_timer = getattr(self, "_departure_timer", None), None
+        self._departure_pending = timer is not None
         if timer is not None:
             timer.cancel()
+        return self._departure_pending
 
     def _arm_departure(self, ev) -> None:
         """Schedule the confirm check. Nothing is spoken, then or later."""
@@ -4669,7 +4718,9 @@ class JarvisApp:
         # one turn in which the camera named Mara must not make tonight's
         # reminder and tomorrow's briefing come out addressed to her.
         self._gate_who_ts = -1e9
-        self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
+        # (monotonic, lines, wall) — see _board_canvas_lines on why two
+        # clocks; and _last_nudge_ts on why the sentinel is not 0.0.
+        self._canvas_due_cache = (-1e9, [], -1e9)
         self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
         self._room_playing_text = ""
@@ -5856,14 +5907,38 @@ class JarvisApp:
     # cached or gated HERE and never in the pure layer: health.snapshot()
     # spawns nvidia-smi with a 5 s timeout and canvas_due is a Canvas REST
     # call, while the Board polls every 5 s.
-    def _board_canvas_lines(self) -> list:
+    def _board_canvas_lines(self, now=None, wall=None) -> list:
         """Canvas items due soon, cached for CANVAS_TTL_S.
 
         Reached through the TOOL REGISTRY, not by import: canvas_due is a
         closure defined inside tools/canvas.make_tools and registered as a
         tool, exactly as tools/briefing.py calls it. Silent (and empty)
-        when the token is unset — a box with no Canvas must not nag."""
-        now = time.monotonic()
+        when the token is unset — a box with no Canvas must not nag.
+
+        TWO CLOCKS, and they were one until his bug #7: "the due and whats
+        next dates for items in the standby screen do not update after the
+        date passes". What comes back here is a PRE-RENDERED SENTENCE —
+        "BIOSENSORS - Lab 3 report, today 11:59 pm" — with its day word
+        baked in by the Canvas fact sheet at fetch time. Its neighbour on
+        the same slab, _room_next_event, recomputes its day word against a
+        fresh clock on every call. So the row could still be saying TODAY
+        about yesterday, and nothing re-rendered it.
+
+          * time.monotonic() bounds how often the REST call is made. It is
+            the right clock for that and the wrong one for everything else:
+            it does not advance across suspend-to-RAM, so a box that slept
+            at 23:00 satisfied the TTL on its first probe at 08:00 and
+            served last night's sheet to the morning's first standby face.
+          * the WALL clock bounds how stale the WORDS may be, and a day
+            rollover drops the cache outright however few seconds old it
+            is. A sentence fetched at 23:59:50 is four minutes old at
+            00:04:50 and wrong about the only thing it says.
+
+        Both are parameters so a test can state a date instead of waiting
+        for one; the defaults are the real clocks.
+        """
+        now = time.monotonic() if now is None else float(now)
+        wall = time.time() if wall is None else float(wall)
         # The TTL is on the TIMESTAMP, never on the payload: `if lines and
         # ...` could not be satisfied by a stored EMPTY result, so a Canvas
         # with nothing due (or one erroring) re-issued a live REST call on
@@ -5871,8 +5946,11 @@ class JarvisApp:
         # -1e9 rather than 0.0 because time.monotonic() is uptime-based: a
         # 0.0 default would serve the empty cache for the first 300 s after
         # boot instead of fetching once.
-        at, lines = getattr(self, "_canvas_due_cache", (-1e9, []))
-        if now - at < CANVAS_TTL_S:
+        at, lines, wall_at = getattr(self, "_canvas_due_cache",
+                                     (-1e9, [], -1e9))
+        if (now - at < CANVAS_TTL_S
+                and 0.0 <= wall - wall_at < CANVAS_TTL_S
+                and _same_day(wall, wall_at)):
             return lines
         from jarvis.tools.briefing import _due_lines
         try:
@@ -5880,7 +5958,7 @@ class JarvisApp:
         except Exception:                          # noqa: BLE001 - tool boundary
             log.debug("board: canvas_due failed", exc_info=True)
             lines = []
-        self._canvas_due_cache = (now, lines)
+        self._canvas_due_cache = (now, lines, wall)
         return lines
 
     def _board_sessions(self) -> list:

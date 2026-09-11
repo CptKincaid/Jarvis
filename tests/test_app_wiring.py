@@ -2427,3 +2427,54 @@ def test_restart_still_restarts_when_the_spoken_line_raises(app, paths):
                          sleep=clock.sleep, clock=clock)
     assert helper == 7
     assert order == ["spawn", "close"]
+
+
+# ==================================================================
+# THE STANDBY SLAB'S DUE ROW IS A FROZEN SENTENCE (his bug #7)
+# ==================================================================
+# "the due and whats next dates for items in the standby screen do not
+# update after the date passes". NEXT re-renders its day word against a
+# fresh clock on every call (_room_next_event); DUE is a PRE-RENDERED
+# sentence -- "BIOSENSORS - Lab 3 report, today 11:59 pm" -- built by the
+# Canvas fact sheet at fetch time and then handed back unchanged for
+# CANVAS_TTL_S. Two rows on one panel with different freshness rules.
+#
+# And the TTL is measured on time.monotonic(), which does not advance
+# across a suspend-to-RAM, so a box that sleeps overnight can satisfy it
+# on the first probe after waking.
+def test_the_canvas_cache_is_dropped_when_the_DAY_turns_over(app, monkeypatch):
+    """23:59 to 00:04 is four minutes by the TTL and a different date by
+    the calendar. The cached sentence still says "today"."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    midnight = _t.mktime((2026, 9, 11, 23, 59, 50, 0, 0, -1))
+    app._board_canvas_lines(now=1_000.0, wall=midnight)
+    app._board_canvas_lines(now=1_060.0, wall=midnight + 300.0)   # 00:04:50
+    assert len(calls) == 2, "the DUE row still says today about yesterday"
+
+
+def test_the_canvas_cache_is_dropped_when_the_WALL_CLOCK_jumps(app, monkeypatch):
+    """Suspend-to-RAM: monotonic barely moved, nine hours passed."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    evening = _t.mktime((2026, 9, 11, 23, 0, 0, 0, 0, -1))
+    app._board_canvas_lines(now=1_000.0, wall=evening)
+    app._board_canvas_lines(now=1_002.0, wall=evening + 9 * 3600.0)
+    assert len(calls) == 2, "the morning slab served last night's sheet"
+
+
+def test_the_canvas_cache_still_serves_three_ticks_inside_one_window(
+        app, monkeypatch):
+    """The saving this cache exists for is not given up to fix the above."""
+    calls = []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines",
+                        lambda reg: calls.append(1) or ["BIO - Lab 3, today"])
+    import time as _t
+    noon = _t.mktime((2026, 9, 11, 12, 0, 0, 0, 0, -1))
+    for step in (0.0, 5.0, 10.0):
+        app._board_canvas_lines(now=1_000.0 + step, wall=noon + step)
+    assert calls == [1]

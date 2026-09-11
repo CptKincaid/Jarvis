@@ -752,6 +752,12 @@ class GlobalHotkey:
 
 
 # ------------------------------------------------------------ main window
+# How long the ambient slab may go on showing an answer nobody refreshed.
+# Twelve failed 5 s passes. Short enough that a stuck DUE sentence blanks
+# instead of lying, long enough that one flaky poll changes nothing.
+ROOM_MAX_AGE_S = 60.0
+
+
 class MainWindow:
     """Assembles the whole V3 UI on a caller-provided tk.Tk root."""
 
@@ -3076,15 +3082,42 @@ class MainWindow:
         self._probe_devices()          # one-time GPU inventory (DEV row)
         beat = 0
         while not self._closing:
-            perf.mark("smi")                # nvidia-smi spawn (5 s)
-            self._temps_text = self._read_temps()
-            self._mem_text = self._read_mem()
-            if beat % 6 == 0:
-                self._probe_llm()
-            self._probe_room()
-            self._probe_sensing()
+            # ONE BAD PASS IS NOT A DEAD THREAD. _probe_room and
+            # _probe_sensing guard themselves; _read_temps, _read_mem and
+            # _probe_llm never did, so a single escape from any of the
+            # three ended this thread silently and for ever. Nothing
+            # watches it, and the slab goes on repainting its last dict at
+            # 1 Hz, which is a frozen standby face with no log line under
+            # it. (Guard-one-half: three of the five calls were bare.)
+            try:
+                self._temps_pass(beat)
+            except Exception:            # noqa: BLE001 - a pass, not the loop
+                self._pass_failed(beat)
             beat += 1
             time.sleep(5)
+
+    def _temps_pass(self, beat: int) -> None:
+        """One pass of the 5 s worker. Split out so the loop above can be
+        a net around it and so a test can make a pass fail on purpose."""
+        perf.mark("smi")                    # nvidia-smi spawn (5 s)
+        self._temps_text = self._read_temps()
+        self._mem_text = self._read_mem()
+        if beat % 6 == 0:
+            self._probe_llm()
+        self._probe_room()
+        self._probe_sensing()
+
+    def _pass_failed(self, beat: int) -> None:
+        """Say so, loudly the first time and once a minute after.
+
+        At DEBUG this would be invisible, which is how the frozen slab
+        stayed a mystery. At every tick it would be 720 tracebacks an
+        hour. Once, then every twelfth pass.
+        """
+        if beat % 12 == 0:
+            log.exception("temps pass failed (pass %d)", beat)
+        else:
+            log.debug("temps pass failed (pass %d)", beat, exc_info=True)
 
     def _probe_room(self):
         """Room facts for the ambient / standby slab, on THIS thread.
@@ -3096,9 +3129,26 @@ class MainWindow:
         fn = getattr(self.services, "room_state", None)
         if not callable(fn):
             return
+        now = time.time()
         try:
             self._room_data = dict(fn(**self._room_state_kwargs(fn)) or {})
+            self._room_at = now
+            return
         except Exception:                     # noqa: BLE001 - provider boundary
+            pass
+        # IT MUST AGE OUT. Keeping the previous dict is right for one bad
+        # poll and wrong for ever: a provider that is down left its last
+        # answer -- including its DUE and NEXT sentences, with yesterday's
+        # day words in them -- painted on the standby face indefinitely,
+        # and said so at DEBUG. The desk cache did exactly this through
+        # 400 dead polls and still answered "5 seconds ago".
+        at = getattr(self, "_room_at", 0.0)
+        age = now - at
+        if self._room_data and at and age >= ROOM_MAX_AGE_S:
+            log.warning("room state has not answered for %ds; clearing the "
+                        "slab rather than repainting it", int(age))
+            self._room_data = {}
+        else:
             log.debug("room state probe failed", exc_info=True)
 
     def _probe_sensing(self):

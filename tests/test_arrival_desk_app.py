@@ -553,3 +553,49 @@ def test_the_door_does_not_re_arm_on_a_drop(monkeypatch):
     a._dispatch_gen += 1
     _finish(a, gate)
     assert a._desk.armed is False
+
+
+# ==================================================================
+# THE NAP GATE, WIRED (jarvis/app.py)
+# ==================================================================
+def test_a_phone_return_before_the_confirm_closed_says_nothing():
+    """Seven times in two days, measured: away, then home(returned) ten
+    seconds later, then "Welcome back, sir" to a man who never left."""
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    a._greet_return("phone")
+    assert a.tts.spoken == [], "the false welcome is still spoken"
+    assert a.quiet.frags == HELD, "a nap drained the backlog he was owed"
+
+
+def test_the_same_return_once_the_confirm_has_closed_is_greeted():
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = False
+    a._greet_return("phone")
+    assert a.tts.spoken == [WELCOME_LINE]
+
+
+def test_a_door_return_is_greeted_even_with_the_confirm_still_armed():
+    """The radar saw a body. Only the radio is doubted."""
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    a._greet_return("room:kitchen")
+    assert a.tts.spoken == [WELCOME_LINE]
+
+
+def test_the_refused_nap_is_logged_by_name(caplog):
+    a = make_app(quiet=Quiet(HELD))
+    a._departure_pending = True
+    with caplog.at_level(logging.INFO, logger="jarvis.app"):
+        a._greet_return("phone")
+    assert any("nap" in r.getMessage() for r in caplog.records), \
+        "it refused anonymously, which is the defect this lane exists for"
+
+
+def test_cancelling_an_armed_confirm_reports_that_it_was_pending():
+    a = make_app()
+    a._departure_timer = SimpleNamespace(cancel=lambda: None)
+    assert a._cancel_departure() is True
+    assert a._departure_pending is True
+    assert a._cancel_departure() is False
+    assert a._departure_pending is False
