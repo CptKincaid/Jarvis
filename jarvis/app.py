@@ -7652,6 +7652,17 @@ class JarvisApp:
                 wd.start()
             except Exception:
                 log.exception("health watchdog failed to start")
+        # THE CLAUDE SESSION REAPER (jarvis/claude_session.py): a jarvis-*
+        # tmux session that has sat idle past claude.session_max_idle_s is
+        # ended, so a coding session does not outlive the Jarvis that
+        # started it by nine days (measured 2026-09-12).
+        mgr = getattr(self, "claude", None)
+        if mgr is not None and hasattr(mgr, "start_reaper"):
+            try:
+                from jarvis.claude_session import reap_every_s
+                mgr.start_reaper(every_s=reap_every_s(self.assistant))
+            except Exception:
+                log.exception("claude session reaper failed to start")
         sampler = getattr(self.services, "activity_sampler", None)
         if sampler is not None:
             try:

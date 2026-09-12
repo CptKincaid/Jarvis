@@ -1457,6 +1457,26 @@ def test_deadline_heads_up_starts_beside_the_meeting_one_and_stops(app, paths, m
     assert not d._thread.is_alive()
 
 
+# ---------------------------------------------- 11a. the session reaper
+def test_the_claude_session_reaper_starts_beside_the_watchers_and_stops(app):
+    """jarvis/claude_session.py reap_idle: started in start_assistant on
+    the manager the app built (one sweep at start, then every interval),
+    stopped and swept once more when the manager is closed. Every tmux
+    question goes through the run seam this test owns."""
+    from types import SimpleNamespace as NS
+    asked = []
+    app.claude._run = lambda argv, **kw: (asked.append(list(argv)),
+                                         NS(returncode=1, stdout="", stderr="no server"))[1]
+    app.start_assistant(residency=False)
+    assert app.claude.reaper_running
+    assert app.claude.session_max_idle_s == 4 * 3600.0     # the code default
+    app.stop_assistant()
+    assert not app.claude.reaper_running
+    # The boot sweep and the closing sweep both asked tmux through the seam
+    # and nothing more: no server, nothing to reap.
+    assert asked and all(a[:2] == ["tmux", "list-sessions"] for a in asked)
+
+
 # ------------------------------------------------------- 11b. watchers
 def test_the_three_watchers_start_dark_and_stop(app, paths):
     """grades / mailwatch / keyword watch (jarvis/watchers.py): started beside

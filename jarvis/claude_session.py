@@ -120,6 +120,54 @@ IDLE_LINE = "Claude's idle, sir."
 # ~/.bashrc wraps `claude` in `tmux new -s cc-<basename>`: the user's OWN
 # terminals, which Jarvis never started but can still see from the status.
 OWN_SESSION_PREFIX = "cc-"
+JARVIS_SESSION_PREFIX = "jarvis-"
+
+# THE REAPER. MEASURED 2026-09-12: tmux session jarvis-test held a `claude
+# --resume …` for 9 days 11 hours across three Jarvis restarts, because
+# nothing ever ended a session (close() unsubscribed two bus events;
+# cancel() sends C-c by design; max_task_s is per TASK). A session Jarvis
+# started may be ended once it is IDLE -- no task running, nobody attached,
+# the pane not mid-turn, no tmux activity for longer than this. Nothing is
+# lost but the live pane: the project keeps its session id, so the next
+# task resumes the same conversation with --resume. 0 switches it off.
+DEFAULT_SESSION_MAX_IDLE_S = 4 * 3600.0
+DEFAULT_REAP_EVERY_S = 600.0
+# tmux's #{session_activity} moves ONLY on creation, a client attaching, or
+# a key typed by an attached client (tmux 3.4 session_update_activity's four
+# callers) -- never on send-keys or pane output. For a session Jarvis drives
+# it is the CREATION time, so the reaper keeps its own clock: the last task
+# start / finish / cancel per project, with the project's persisted
+# last_used as the floor across a restart. tmux's value is one input more.
+
+
+def _seconds(value, default: float, name: str = "") -> float:
+    """A positive-or-zero seconds value from config, or the default. A
+    bool is never a duration (`true` is not one second), a string like
+    '10m' is refused by name rather than silently disabling anything."""
+    if value is None or isinstance(value, bool):
+        if isinstance(value, bool) and name:
+            log.warning("%s: %r is not a number of seconds; using %.0f",
+                        name, value, default)
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        if name:
+            log.warning("%s: %r is not a number of seconds; using %.0f",
+                        name, value, default)
+        return default
+    return out
+
+
+def reap_every_s(cfg) -> float:
+    """How often the reaper sweeps, from ``claude.reap_every_s``."""
+    v = _seconds(_cfg_get(cfg, "claude.reap_every_s", None),
+                 DEFAULT_REAP_EVERY_S, "claude.reap_every_s")
+    return v if v > 0 else DEFAULT_REAP_EVERY_S
+# What a reapable pane may be running: the Claude TUI (a `claude` shim or
+# the node it execs) or a bare shell. vim, a build, anything else is work
+# in progress in a session that merely carries the name.
+REAPABLE_PANE_CMDS = frozenset({"claude", "node", "bash", "zsh", "sh", "fish", "dash"})
 
 # ------------------------------------------------- the interactive pane
 # VERIFIED live on tmux 3.4 / Claude Code 2.1.247, 2026-08-27:
@@ -532,6 +580,19 @@ def _ago(seconds: float) -> str:
     if h == 1:
         return "an hour ago"
     return f"{words[h] if h < 20 else h} hours ago"
+
+
+def _idle_words(seconds: float) -> str:
+    """'9 d 11 h', '3 h 20 m', '45 m' -- a log figure, not a spoken one."""
+    s = max(0, int(seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d} d {h} h"
+    if h:
+        return f"{h} h {m} m"
+    return f"{m} m"
 
 
 _OBJECT_WORDS = ("code", "function", "class", "module", "file", "files",
@@ -1184,14 +1245,208 @@ class ClaudeSessionManager:
         self._resume_candidates: Optional[tuple] = None
         self._fast_mode_warned = False
         self.max_task_s = float(_cfg_get(cfg, "claude.max_task_s", 7200) or 7200)
+        self.session_max_idle_s = _seconds(
+            _cfg_get(cfg, "claude.session_max_idle_s", None),
+            DEFAULT_SESSION_MAX_IDLE_S, "claude.session_max_idle_s")
+        self._reap_stop = threading.Event()
+        self._reap_thread: Optional[threading.Thread] = None
+        self._reaper_started = False
+        self._sweep_lock = threading.Lock()     # two sweeps never overlap
+        self._sweeping = False
+        self._last_active: dict[str, float] = {}   # slug -> last start/finish/cancel
+        self._monotonic = time.monotonic
         self._load_state()
         self._refresh_projects()
         bus.subscribe(ApprovalRequested, self._on_approval_requested)
         bus.subscribe(ApprovalResolved, self._on_approval_resolved)
 
-    def close(self):
+    def close(self, join_s: float = 2.0):
+        """Quit or restart: stop the reaper and sweep once more, so an idle
+        session does not outlive the Jarvis that started it. A busy or
+        watched session survives, on purpose -- it is reattached next boot.
+        A manager whose reaper never ran (a test, a script) asks tmux for
+        nothing here, and the closing sweep is bounded so a wedged tmux
+        cannot hold a quit."""
+        started = self._reaper_started
+        self.stop_reaper(join_s=join_s)
+        if started:
+            try:
+                self.reap_idle(budget_s=5.0)
+            except Exception:                        # noqa: BLE001 - never block a quit
+                log.debug("final reap failed", exc_info=True)
         bus.unsubscribe(ApprovalRequested, self._on_approval_requested)
         bus.unsubscribe(ApprovalResolved, self._on_approval_resolved)
+
+    # ---------------------------------------------------------- reaper
+    def touch_session(self, slug: str) -> None:
+        """The reaper's own idle clock: a task started, finished or was
+        cancelled for this project just now."""
+        with self._lock:
+            self._last_active[slug] = self._now()
+
+    def _last_use(self, slug: str, tmux_activity: float) -> float:
+        """The newest of tmux's clock, the in-process clock and the
+        project's persisted last_used (which survives a restart)."""
+        with self._lock:
+            mine = self._last_active.get(slug, 0.0)
+            proj = self._projects.get(slug)
+            finished = max((t.finished or 0.0 for t in self._tasks.values()
+                            if t.project == slug), default=0.0)
+        used = float(getattr(proj, "last_used", 0.0) or 0.0) if proj else 0.0
+        return max(tmux_activity, mine, used, finished)
+
+    def _busy_slugs(self) -> set:
+        with self._lock:
+            return ({t.project for t in self._running.values()}
+                    | {t.project for t in self._queue})
+
+    def reap_idle(self, now: Optional[float] = None,
+                  budget_s: Optional[float] = None) -> list[str]:
+        """End every jarvis-* tmux session that is idle past the cap, and
+        say which. Idle means ALL of: no task running or queued for that
+        project, no client attached (nobody is looking at it), exactly one
+        window (Jarvis opens one; a second means he has been in it), the
+        pane not mid-turn and holding only a RESTING Claude TUI or a bare
+        shell, and the newest of tmux's clock, the in-process clock and the
+        project's last_used older than ``session_max_idle_s``. His own
+        cc-* terminals and anything else in tmux are never touched. The
+        busy check is retaken under the lock right before the kill, and the
+        kill is issued while it is held, so a submit landing mid-sweep is
+        never killed under its runner. Never raises."""
+        cap = float(self.session_max_idle_s or 0.0)
+        if cap <= 0:
+            return []
+        if not self._sweep_lock.acquire(timeout=(budget_s if budget_s else 30.0)):
+            return []
+        self._sweeping = True
+        try:
+            return self._sweep(now, cap, budget_s)
+        finally:
+            self._sweeping = False
+            self._sweep_lock.release()
+
+    def _sweep(self, now, cap: float, budget_s: Optional[float]) -> list[str]:
+        started = self._monotonic()
+        now = self._now() if now is None else float(now)
+        r = self._tmux("list-sessions", "-F",
+                       "#{session_name}\t#{session_activity}\t#{session_attached}"
+                       "\t#{session_windows}", timeout=5)
+        if getattr(r, "returncode", 1) != 0:
+            return []
+        reaped: list[str] = []
+        for line in (getattr(r, "stdout", "") or "").splitlines():
+            if budget_s and self._monotonic() - started > budget_s:
+                log.info("reap: out of time after %d; the rest wait for the "
+                         "next sweep", len(reaped))
+                break
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            name, activity, attached = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            windows = parts[3].strip() if len(parts) > 3 else "1"
+            if not name.startswith(JARVIS_SESSION_PREFIX):
+                continue
+            slug = name[len(JARVIS_SESSION_PREFIX):]
+            if slug in self._busy_slugs():
+                continue
+            try:
+                tmux_activity = float(activity)
+            except (TypeError, ValueError):
+                continue
+            idle = now - self._last_use(slug, tmux_activity)
+            if idle < cap:
+                continue
+            if attached not in ("0", ""):
+                continue
+            if windows not in ("1", ""):
+                continue
+            text = self._capture_pane_named(name)
+            if pane_working(text):
+                continue
+            if not self._pane_reapable(name, text):
+                continue
+            with self._lock:
+                # THE TWIN of submit()'s registration: the same lock, taken
+                # again right before the kill.
+                if slug in ({t.project for t in self._running.values()}
+                            | {t.project for t in self._queue}):
+                    continue
+                k = self._tmux("kill-session", "-t", name, timeout=10)
+                if getattr(k, "returncode", 1) != 0:
+                    log.warning("could not reap %s: %s", name,
+                                getattr(k, "stderr", "") or "tmux refused")
+                    continue
+                self._panes.pop(slug, None)
+                self._clients.pop(slug, None)
+            reaped.append(name)
+            log.info("reaped %s: idle %s, no task, nobody attached, pane not "
+                     "mid-turn (cap %.0f h); the project keeps its session id",
+                     name, _idle_words(idle), cap / 3600.0)
+        return reaped
+
+    def _pane_reapable(self, name: str, text: str = "") -> bool:
+        """Only a bare shell, or the Claude TUI sitting at its idle prompt.
+        `node` is the TUI -- and also a dev server -- so a node/claude pane
+        counts only when the pane shows the ready prompt."""
+        r = self._tmux("list-panes", "-t", name, "-F", "#{pane_current_command}",
+                       timeout=5)
+        if getattr(r, "returncode", 1) != 0:
+            return False
+        cmds = [c.strip() for c in (getattr(r, "stdout", "") or "").splitlines()
+                if c.strip()]
+        if not cmds or any(c not in REAPABLE_PANE_CMDS for c in cmds):
+            return False
+        if any(c in ("claude", "node") for c in cmds):
+            return pane_state(text) == "ready"
+        return True
+
+    def start_reaper(self, every_s: float = DEFAULT_REAP_EVERY_S) -> None:
+        """A daemon thread that sweeps every ``every_s``; the app starts it
+        beside the other watchers, tests never do."""
+        if self._reap_thread is not None and self._reap_thread.is_alive():
+            return
+        if float(self.session_max_idle_s or 0.0) <= 0:
+            log.info("claude session reaper off (claude.session_max_idle_s = 0)")
+            return
+        self._reap_stop.clear()
+        self._reaper_started = True
+        every_s = max(30.0, float(every_s))
+
+        def loop():
+            # Once at start -- an orphan from before this boot must not get
+            # another ten minutes -- then every interval.
+            while True:
+                try:
+                    self.reap_idle()
+                except Exception:                    # noqa: BLE001 - a sweep may not kill the thread
+                    log.exception("claude session reap failed")
+                if self._reap_stop.wait(every_s):
+                    return
+
+        self._reap_thread = threading.Thread(target=loop, name="claude-reaper",
+                                             daemon=True)
+        self._reap_thread.start()
+        log.info("claude session reaper: idle cap %.1f h, every %.0f s",
+                 self.session_max_idle_s / 3600.0, every_s)
+
+    def stop_reaper(self, join_s: float = 2.0) -> None:
+        """Ask the loop to stop and wait, bounded. A sweep parked inside a
+        slow tmux outlives the wait: the thread reference is KEPT then, so
+        ``reaper_running`` stays honest and a later start_reaper() cannot
+        build a second loop beside it."""
+        self._reap_stop.set()
+        t = self._reap_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=join_s)
+            if t.is_alive():
+                log.info("claude session reaper still finishing a sweep")
+                return
+        self._reap_thread = None
+
+    @property
+    def reaper_running(self) -> bool:
+        t = self._reap_thread
+        return t is not None and t.is_alive()
 
     # ----------------------------------------------------------- state
     def _load_state(self):
@@ -1629,6 +1884,7 @@ class ClaudeSessionManager:
         task.state = "running"
         task.started = self._now()
         proj.last_used = task.started
+        self.touch_session(proj.slug)
         bus.publish(ClaudeTaskState(project=proj.slug, task_id=task.task_id,
                                     state="running",
                                     text=f"Claude started on {proj.display}: {_excerpt(task.prompt, 60)}"))
@@ -1716,6 +1972,7 @@ class ClaudeSessionManager:
                 log.error("tmux new-session %s failed: %s", name,
                           getattr(r, "stderr", ""))
                 return False
+            self.touch_session(proj.slug)
         # A DETACHED session ignores -x/-y (window-size 'latest' falls back
         # to default-size, 80x24) and the Claude TUI wraps into soup.  Only
         # claim the geometry while nobody is watching: an attached client
@@ -2110,6 +2367,7 @@ class ClaudeSessionManager:
             task.state = state
             task.finished = self._now()
             self._running.pop(task.task_id, None)
+            self._last_active[proj.slug] = task.finished
         log.info("task %s %s rc=%s", task.task_id, state, task.rc)
         if speak:
             bus.publish(ClaudeProgress(project=proj.slug, task_id=task.task_id,
@@ -2171,6 +2429,7 @@ class ClaudeSessionManager:
         with self._lock:
             task.finished = self._now()
             self._running.pop(task.task_id, None)
+            self._last_active[proj.slug] = task.finished
         log.info("task %s cancelled", task.task_id)
         bus.publish(ClaudeTaskState(project=proj.slug, task_id=task.task_id,
                                     state="cancelled", text=CANCELLED_LINE))

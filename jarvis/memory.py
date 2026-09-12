@@ -855,6 +855,21 @@ class JarvisMemory:
         legacy = self._legacy_dir
         if not legacy.is_dir():
             return
+        # A dir with NOTHING TO MIGRATE is not legacy data. JarvisAgent.
+        # __init__ mkdirs the old path on every boot, so for weeks this
+        # warned "already exists; leaving legacy dir in place" at every
+        # start about a directory holding nothing (measured 2026-09-12).
+        # The test is what the migration below actually reads -- habits.json
+        # or a voice note -- not emptiness, so a stray dotfile or an empty
+        # voice_notes/ cannot bring the warning back. Nothing is read here.
+        try:
+            has_data = ((legacy / "habits.json").exists()
+                        or any((legacy / "voice_notes").glob("note_*.txt")))
+        except OSError:
+            log.debug("legacy dir %s unreadable; leaving it", legacy, exc_info=True)
+            return
+        if not has_data:
+            return
         log.info("migrating legacy agent data from %s", legacy)
         try:
             # Merge habit entries (this merges the per-command counts too).

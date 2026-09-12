@@ -207,3 +207,44 @@ def test_format_for_context(mem_dir, legacy_dir):
     text = mem.format_for_context()
     assert "GB10 unified memory" in text
     assert "tested memory module" in text
+
+
+# ------------------------------------------------- the empty legacy dir
+def test_an_empty_legacy_dir_is_not_legacy_data_and_says_nothing(mem_dir, legacy_dir, caplog):
+    """MEASURED 2026-09-12: JarvisAgent.__init__ mkdirs ~/.aiws_trainer/
+    jarvis_data on every boot, so an EMPTY dir sits beside the real
+    jarvis_data.migrated and the migration warned 'already exists; leaving
+    legacy dir in place' at every start for weeks. An empty dir holds
+    nothing to migrate: no warning, no rename, nothing read."""
+    import logging
+    legacy_dir.mkdir()
+    (legacy_dir.parent / "jarvis_data.migrated").mkdir()
+    caplog.set_level(logging.INFO, logger="jarvis.memory")
+    make(mem_dir, legacy_dir)
+    assert legacy_dir.is_dir()                      # left alone
+    assert not [r for r in caplog.records if "legacy" in r.getMessage().lower()]
+
+
+def test_a_legacy_dir_with_data_still_migrates(mem_dir, legacy_dir, caplog):
+    import logging
+    legacy_dir.mkdir()
+    (legacy_dir / "habits.json").write_text("[]")
+    caplog.set_level(logging.INFO, logger="jarvis.memory")
+    make(mem_dir, legacy_dir)
+    assert (legacy_dir.parent / "jarvis_data.migrated").is_dir()
+    assert not legacy_dir.exists()
+    assert [r for r in caplog.records if "migrating legacy" in r.getMessage()]
+
+
+def test_a_legacy_dir_with_nothing_migration_reads_is_also_silent(mem_dir, legacy_dir, caplog):
+    """The guard is 'nothing to migrate', not 'empty': an empty voice_notes/
+    or a stray dotfile must not bring the every-boot warning back."""
+    import logging
+    legacy_dir.mkdir()
+    (legacy_dir / "voice_notes").mkdir()
+    (legacy_dir / ".directory").write_text("")
+    (legacy_dir.parent / "jarvis_data.migrated").mkdir()
+    caplog.set_level(logging.INFO, logger="jarvis.memory")
+    make(mem_dir, legacy_dir)
+    assert legacy_dir.is_dir()
+    assert not [r for r in caplog.records if "legacy" in r.getMessage().lower()]
