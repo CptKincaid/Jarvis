@@ -163,6 +163,82 @@ def test_a_device_that_cannot_be_opened_is_no_opinion_not_an_error():
     assert eye.device_open is False
 
 
+class NoCamera:
+    """An opener with no /dev/video*: every call raises, and counts."""
+
+    def __init__(self):
+        self.opens = 0
+        self.works = False
+
+    def __call__(self):
+        self.opens += 1
+        if self.works:
+            return FakeDevice()
+        raise OSError("No such file or directory: /dev/video0")
+
+
+class Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+
+def test_a_missing_camera_is_not_retried_every_frame():
+    """MEASURED 2026-09-12: with no /dev/video* the eye loop logged 1,236
+    open-failure tracebacks in fifteen hours, up to 160 a minute while the
+    desk room was armed. One failed open buys a pause before the next try;
+    the pause doubles to a cap while the failures continue."""
+    opener, clock = NoCamera(), Clock()
+    eye = Eye(allow=lambda: True, open_device=opener, now=clock.now)
+    for _ in range(50):
+        assert eye.capture() is None
+    assert opener.opens == 1
+    clock.t += eye_mod.OPEN_RETRY_S + 1.0
+    assert eye.capture() is None
+    assert opener.opens == 2
+    clock.t += eye_mod.OPEN_RETRY_S + 1.0            # doubled: still waiting
+    assert eye.capture() is None
+    assert opener.opens == 2
+    clock.t += eye_mod.OPEN_RETRY_S + 1.0
+    assert eye.capture() is None
+    assert opener.opens == 3
+    assert eye.open_failures == 3
+
+
+def test_the_open_retry_pause_is_capped():
+    opener, clock = NoCamera(), Clock()
+    eye = Eye(allow=lambda: True, open_device=opener, now=clock.now)
+    for _ in range(12):
+        eye.capture()
+        clock.t += eye_mod.OPEN_RETRY_MAX_S + 1.0
+    assert opener.opens == 12          # once per cap interval, never less
+
+
+def test_a_camera_that_comes_back_resets_the_pause(caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="jarvis.eye")
+    opener, clock = NoCamera(), Clock()
+    eye = Eye(allow=lambda: True, open_device=opener, now=clock.now)
+    for _ in range(4):
+        eye.capture()
+        clock.t += eye_mod.OPEN_RETRY_MAX_S + 1.0
+    opener.works = True
+    assert eye.capture() is not None
+    assert eye.open_failures == 0
+    lines = [r.getMessage() for r in caplog.records if "camera" in r.getMessage()]
+    assert len([m for m in lines if "could not open" in m]) == 1     # once per spell
+    assert len([m for m in lines if "back" in m]) == 1
+    # an unplug later starts a fresh, short pause
+    opener.works = False
+    eye.close()
+    eye.capture()
+    clock.t += eye_mod.OPEN_RETRY_S + 1.0
+    eye.capture()
+    assert opener.opens == 7
+
+
 def test_a_failed_read_releases_the_device_so_an_unplug_recovers():
     """Unplug it and nothing breaks -- the promise jarvis/roomsensor.py:33-40
     already makes for the mmWave leg."""

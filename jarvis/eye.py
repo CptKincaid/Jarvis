@@ -142,6 +142,15 @@ BODY_TTL_S = 900.0
 # miscalibrated both ways, which is why ``match_min`` is required rather than
 # defaulted: a caller must state which vector it is holding.
 BODY_MATCH_MIN = 0.75
+# A failed device open is not retried on the next frame. MEASURED 2026-09-12:
+# with no /dev/video* the eye loop tried to open the camera eight times a
+# second whenever the desk room armed it -- 1,236 open-failure tracebacks in
+# fifteen hours, 160 a minute at the peak. One failure buys this pause before
+# the next try, doubling while the failures continue, to the cap; a camera
+# that comes back is seen within one pause. Same shape as roomsensor's
+# breaker (30 s -> 5 min).
+OPEN_RETRY_S = 30.0
+OPEN_RETRY_MAX_S = 300.0
 
 
 @dataclass
@@ -205,6 +214,8 @@ class Eye:
         # so there is nothing for a first deny to invalidate.
         self._blind = True
         self.opens = 0        # devices actually opened; the UI lamp reads this
+        self.open_failures = 0    # consecutive failed opens in this spell
+        self._open_retry_at = 0.0     # no open attempt before this clock time
         self.denials = 0
         self.reads_dropped = 0    # frames grabbed and then thrown away
         self.blind_edges = 0      # deny transitions; on_blind fired this often
@@ -376,16 +387,38 @@ class Eye:
             return None
 
         if self._device is None:
+            now = self._now()
+            if now < self._open_retry_at:
+                return None            # a failed open bought a pause; keep it
             try:
                 self._device = self._open_device()
                 self.opens += 1
-            except Exception:
+            except Exception as exc:
                 # No /dev/video*, or the desktop session grabbed it: no
                 # opinion. "Unplug it and nothing changes" is the promise
-                # jarvis/roomsensor.py:33-40 makes for the mmWave leg.
-                log.debug("could not open the camera", exc_info=True)
+                # jarvis/roomsensor.py:33-40 makes for the mmWave leg -- and
+                # "nothing changes" includes the log, so the failure is said
+                # once per spell and then waited out, not repeated per frame.
+                self.open_failures += 1
+                pause = min(OPEN_RETRY_MAX_S,
+                            OPEN_RETRY_S * (2 ** (self.open_failures - 1)))
+                self._open_retry_at = now + pause
+                if self.open_failures == 1:
+                    log.info("could not open the camera (%s); trying again "
+                             "in %.0f s and doubling to %.0f s while it stays "
+                             "that way", exc, pause, OPEN_RETRY_MAX_S)
+                    log.debug("could not open the camera", exc_info=True)
+                else:
+                    log.debug("could not open the camera again (%d in a row); "
+                              "next try in %.0f s", self.open_failures, pause)
                 self._device = None
                 return None
+            if self.open_failures:
+                log.info("the camera is back after %d failed open%s",
+                         self.open_failures,
+                         "" if self.open_failures == 1 else "s")
+                self.open_failures = 0
+            self._open_retry_at = 0.0
 
         try:
             ok, frame = self._device.read()
