@@ -964,13 +964,17 @@ def test_a_rooms_only_box_goes_unknown_when_sensing_is_off(tmp_path):
     clock["t"] += 600.0
     s.tick()
     assert s.state == "home"
+    # An occupied room costs TWO GETs a poll -- the bit and its still
+    # distance (roomfabric's still-distance filter) -- and both must stop.
+    before = [r.sensor.reads for r in s.fabric.rooms]
+    assert before == [2, 2]
     p.disable()
     clock["t"] += 600.0
     assert s.tick() is None
     assert s.state == "unknown", "a house nobody can see is not a home"
     assert s.is_home() is True
     assert len(published) == 1, "no transition was invented on the way out"
-    assert [r.sensor.reads for r in s.fabric.rooms] == [1, 1], \
+    assert [r.sensor.reads for r in s.fabric.rooms] == before, \
         "the radars were polled while offline"
 
 

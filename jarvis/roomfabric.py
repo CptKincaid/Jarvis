@@ -68,6 +68,24 @@ ever, so a room whose presence bit has run continuously for
 ``stuck_after_h`` is dropped from both answers with one warning line and
 taken back the moment it reads false.
 
+A ROOM LOCKED ON ITS OWN FURNITURE is the third case, and his office is
+one: sensor -> open space -> the back of his chair -> him -> desk and
+monitors -> a cement wall, with nowhere else to mount it. Measured
+2026-09-11 (``jarvis/roomstill.py`` has the numbers): the presence bit read
+OCCUPIED 527 of 527 samples with the flat EMPTY, so the bit carries nothing
+about him in that room and the 12 h latch above would have made the house
+occupied for ever. The still DISTANCE does carry him -- a body breathes
+and shifts, a desk does not -- so every poll that reads occupied also reads
+``Still distance`` and feeds one ``StillWindow`` per room; when the reading
+has not moved 20 cm in 180 s the room is READ AS EMPTY, and the corrected
+bit is what ``observe()``, ``readings()``, ``anywhere()`` and the vote all
+see. The asymmetry is roomstill's: only a FIXTURE verdict may take an
+occupancy away; a missing or unreadable distance keeps the sensor's word.
+The window is keyed to the radar's RAW run and never to its own verdict --
+otherwise the corrected False would clear the evidence that produced it
+and the office would flap. ``still_check: false`` on a room's entry
+switches the filter off for that room.
+
 OFFLINE MODE (jarvis/sensing.py) governs the fabric through the SAME
 policy object every sensor already asks, with one adapter in between.
 ``SensingPolicy.attach`` is keyed by device NAME and replaces a duplicate,
@@ -87,7 +105,9 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
+from jarvis import roomstill
 from jarvis.logs import get_logger
+from jarvis.roomsensor import STILL_ENTITY
 
 log = get_logger("roomfabric")
 
@@ -109,6 +129,17 @@ NO_COUNT_REASON = ("an LD2410 reports one presence bit per room, not a "
 
 
 # --------------------------------------------------------------- config
+def _flag(value, default: bool = True) -> bool:
+    """A boolean the way a hand-edited JSON file spells it. ``bool("false")``
+    is True, and ``still_check`` is the one switch the docs tell him to type
+    himself, so the usual spellings of off are honoured."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
+
 def _cfg_get(cfg, key, default=None):
     get = getattr(cfg, "get", None)
     if not callable(get):
@@ -131,6 +162,10 @@ class RoomSpec:
     power_url: str = ""
     timeout_s: float = 1.5
     primary: bool = False
+    # The still-distance filter (module docstring, jarvis/roomstill.py). On
+    # for every radar by his ruling of 2026-09-12; ``still_check: false``
+    # on the entry switches one room off.
+    still_check: bool = True
 
     @property
     def spoken(self) -> str:
@@ -223,7 +258,9 @@ def room_specs(cfg) -> list:
                          label=DEFAULT_ROOM_NAME, primary=True,
                          timeout_s=default_timeout,
                          power_url=str(_cfg_get(
-                             cfg, "presence.room_sensor_power_url", "") or "").strip())]
+                             cfg, "presence.room_sensor_power_url", "") or "").strip(),
+                         still_check=_flag(_cfg_get(
+                             cfg, "presence.room_sensor_still_check", None), True))]
     out: list = []
     for entry in room_entries(cfg):
         url = str(entry.get("url") or "").strip()
@@ -237,6 +274,7 @@ def room_specs(cfg) -> list:
             power_url=str(entry.get("power_url") or "").strip(),
             timeout_s=_timeout(entry.get("timeout_s", default_timeout)),
             primary=bool(entry.get("primary", False)),
+            still_check=_flag(entry.get("still_check"), True),
         ))
     if out and not any(r.primary for r in out):
         # The room the Spark is in, where he is by default and whose speaker
@@ -323,8 +361,28 @@ class Room:
     was_active: bool = False       # did THIS run ever become the active room
     glimpse: Optional[tuple] = None   # (polls, seconds) pending a log line
     gap_said: bool = False
+    # THE STILL-DISTANCE FILTER (module docstring). ``raw`` is what the
+    # radar's bit said; ``value`` is that bit after the window has had its
+    # say. ``still`` is None for a room switched off in config.
+    raw: Optional[bool] = None
+    still: Any = None
+    still_verdict: str = "unknown"
+    still_blind: bool = False          # raw on, no readable distance for a window
+    still_last_read: float = 0.0       # when the window last got a reading
+    fixture_run: bool = False          # this poll proved the whole run a fixture
+    _raw_run: Optional[bool] = field(default=None, repr=False)
+    _run_last_true_before: float = field(default=0.0, repr=False)
+    _run_had_person: bool = field(default=False, repr=False)
     _run: Optional[bool] = field(default=None, repr=False)
     _warned_stuck: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Only a reader that can give a distance gets a window; the satellite
+        # lane's readers cannot, and a window that can never fill would only
+        # ever say "blind".
+        if self.still is None and getattr(self.spec, "still_check", True) \
+                and callable(getattr(self.sensor, "read_distance", None)):
+            self.still = roomstill.StillWindow()
 
     @property
     def name(self) -> str:
@@ -396,11 +454,26 @@ class Room:
                 self._warned_stuck = True
 
     def status(self) -> dict:
-        st = {"room": self.name, "value": self.value, "stuck": self.stuck}
+        st: dict = {}
         try:
             st.update(self.sensor.status())
         except Exception:  # noqa: BLE001 - a diagnostic must not raise
             log.debug("roomfabric: %s status failed", self.name, exc_info=True)
+        # The room's own truth goes LAST: RoomSensor.status() carries a
+        # ``value`` of its own (the raw bit) and must not overwrite the
+        # corrected one.
+        st.update({"room": self.name, "value": self.value, "raw": self.raw,
+                   "stuck": self.stuck})
+        if self.still is not None:
+            try:
+                st["still"] = {"verdict": self.still_verdict,
+                               "spread_cm": self.still.spread(),
+                               "samples": self.still.samples,
+                               "blind": self.still_blind,
+                               "corrected": self.raw is True and self.value is False}
+            except Exception:  # noqa: BLE001 - a diagnostic must not raise
+                log.debug("roomfabric: %s still status failed", self.name,
+                          exc_info=True)
         return st
 
 
@@ -463,6 +536,19 @@ class RoomFabric:
             # Long enough that a couple of dropped polls are a hiccup, short
             # enough that a real outage does not preserve a stale edge.
             r.gap_limit_s = max(self.leave_hold_s, 4.0 * self.poll_s)
+        # The still window is 180 s of wall clock with a 50-reading density
+        # floor: above 3.6 s a poll it can never fill and the filter would be
+        # silently inert. Say so once rather than let the ghost stand quietly.
+        if any(r.still is not None for r in self.rooms) and \
+                roomstill.WINDOW_S / self.poll_s < roomstill.MIN_SAMPLES:
+            log.warning("roomfabric: presence.rooms_poll_s is %.1f s, so the "
+                        "still-distance window (%.0f s) can hold at most %d "
+                        "readings against a floor of %d -- the fixture check "
+                        "can never judge at this cadence; poll every %.1f s "
+                        "or faster", self.poll_s, roomstill.WINDOW_S,
+                        int(roomstill.WINDOW_S / self.poll_s) + 1,
+                        roomstill.MIN_SAMPLES,
+                        roomstill.WINDOW_S / roomstill.MIN_SAMPLES)
 
     # ------------------------------------------------------------- names
     def __len__(self) -> int:
@@ -485,17 +571,131 @@ class RoomFabric:
         now = self._now()
         for r in self.rooms:
             try:
-                value = r.sensor.read()
+                raw = r.sensor.read()
             except Exception:  # noqa: BLE001 - one room may not break the rest
                 log.debug("roomfabric: %s read failed", r.name, exc_info=True)
-                value = None
+                raw = None
+            value = self._still_filter(r, raw, now)
             r.observe(value, now)
+            if r.fixture_run:
+                # The run that just ended was the furniture's from its
+                # first poll; it was no pass-through, so no glimpse line
+                # and no RoomGlimpsed for it.
+                r.glimpse, r.fixture_run = None, False
             r.check_stuck(now, self.stuck_after_s)
             self._note_edges(r, now)
         self.polls += 1
         if self.ready:
             self._ready.set()
         return self._resolve(now)
+
+    # ------------------------------------------ the still-distance filter
+    def _still_filter(self, room, raw: Optional[bool], now: float) -> Optional[bool]:
+        """The radar's bit after its still distance has had its say (module
+        docstring; the numbers are jarvis/roomstill.py's). Never raises: the
+        distance is a second GET, and its failure costs the room nothing but
+        the correction."""
+        room.raw = raw
+        win = room.still
+        if win is None:
+            return raw
+        if raw is None:
+            return None                  # no opinion is not evidence either way
+        if raw is False:
+            # THE RAW RUN ENDED. Only the sensor's own word ends a run --
+            # never the FIXTURE verdict, or the corrected False would erase
+            # the evidence that produced it and the room would flap.
+            win.clear()
+            room.still_verdict = roomstill.UNKNOWN
+            room.still_blind = False
+            room._raw_run = False
+            return False
+        # raw is True. The silence rule is observe()'s, word for word: a gap
+        # past the limit ended the run, so the old readings go with it.
+        started = room._raw_run is not True
+        if room.last_answer and now - room.last_answer > room.gap_limit_s:
+            win.clear()
+            room.still_verdict = roomstill.UNKNOWN
+            room.still_blind = False
+            started = True
+        room._raw_run = True
+        if started:
+            # Remember what the hint knew BEFORE this run: if the run turns
+            # out to be the furniture's from its first poll, its True
+            # readings were never a sighting (last_seen_room's 2026-09-06
+            # stuck-room lesson, applied to its twin).
+            room._run_last_true_before = room.last_true
+            room._run_had_person = False
+            room.still_last_read = now
+        cm = self._still_cm(room)
+        if cm is not None:
+            win.add(cm, now)
+            room.still_last_read = now
+            if room.still_blind:
+                room.still_blind = False
+                log.info("roomfabric: %s: the still distance can see again; "
+                         "the fixture check is back", room.name)
+        elif not room.still_blind and now - room.still_last_read > win.window_s:
+            room.still_blind = True
+            log.info("roomfabric: %s: no still distance for %.0f s; the "
+                     "fixture check is blind, reading the bit as-is",
+                     room.name, now - room.still_last_read)
+        # Age the window by the clock whether or not a reading came: a dead
+        # distance entity must not freeze the last verdict for ever.
+        win.expire(now)
+        verdict = win.verdict()
+        if verdict == roomstill.PERSON:
+            room._run_had_person = True
+        if verdict != room.still_verdict:
+            self._note_verdict(room, verdict, win)
+            if verdict == roomstill.FIXTURE and not room._run_had_person:
+                room.last_true = room._run_last_true_before
+                room.fixture_run = True
+            room.still_verdict = verdict
+        return roomstill.occupancy_is_real(verdict, True)
+
+    @staticmethod
+    def _still_cm(room) -> Optional[float]:
+        """``Still distance`` in CENTIMETRES, or None. ``read_distance``
+        reports METRES; the window was calibrated in cm on his recordings,
+        and an unconverted 0.48 m would read as "under 20" and make the man
+        at his desk a fixture. A reader with no distance (the satellite
+        lane's) simply never gets a verdict."""
+        read = getattr(room.sensor, "read_distance", None)
+        if not callable(read):
+            return None
+        try:
+            metres = read(STILL_ENTITY)
+        except Exception:  # noqa: BLE001 - a second GET may not cost the first
+            log.debug("roomfabric: %s still distance failed", room.name,
+                      exc_info=True)
+            return None
+        if metres is None:
+            return None
+        try:
+            return float(metres) * 100.0
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _note_verdict(room, verdict: str, win) -> None:
+        """One line when a room becomes a fixture and one when a BODY moves
+        in it again. UNKNOWN -> PERSON is every ordinary arrival and says
+        nothing, and FIXTURE -> UNKNOWN (the evidence aged out or the run
+        ended) is not "moving again" -- that sentence is only true of a
+        PERSON verdict."""
+        spread = win.spread()
+        if verdict == roomstill.FIXTURE:
+            log.info("roomfabric: %s reads occupied but its still distance has "
+                     "moved only %.0f cm in %.0f s (%d readings) -- a fixture, "
+                     "not a body; reading it empty",
+                     room.name, spread if spread is not None else 0.0,
+                     win.window_s, win.samples)
+        elif verdict == roomstill.PERSON and room.still_verdict == roomstill.FIXTURE:
+            log.info("roomfabric: %s: the still distance is moving again "
+                     "(%.0f cm in %.0f s) -- a body; reading it occupied",
+                     room.name, spread if spread is not None else 0.0,
+                     win.window_s)
 
     # -------------------------------------------------- the privacy switch
     @property
@@ -715,7 +915,9 @@ class RoomFabric:
             return (best.name, now - best.last_true)
 
     def readings(self) -> dict:
-        """``{room: True | False | None}`` as of the last tick, RAW.
+        """``{room: True | False | None}`` as of the last tick -- the radar's
+        bit after the still-distance filter (``Room.raw`` keeps the bit
+        itself), and otherwise RAW.
 
         Stuck rooms are NOT filtered here. There is exactly one place that
         drops a room -- ``presencevote.rooms_leg(faulted=...)`` -- and two

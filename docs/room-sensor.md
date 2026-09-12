@@ -227,6 +227,29 @@ scripts/roomsensor_stub.py serve --mode error     # HTTP 500
   life (factory: 5 s). That is a *departure* knob and it barely matters here — Jarvis's own
   twelve-minute grace dominates it. Raise it only if a still target flickers off while you
   read.
+* **It locks on to furniture.** The third surprise, and the one trimming the gates cannot
+  fix when the furniture is *behind* you: sensor → open space → the back of a chair → the
+  person → desk and monitors → a wall reads OCCUPIED for ever (measured 2026-09-11 in the
+  office: 527 of 527 samples with the flat empty, `Still distance` pinned at 306–313 cm,
+  and shortening the gate would have cut at 300 cm, where the person actually sits —
+  seated he reads 288–337 cm). Jarvis does not trust the bit alone in that case: every poll
+  that reads occupied also reads `Still distance`, and once the readings cover a **180 s**
+  window, a spread under **20 cm** means the room is read as **empty** (a body breathes
+  and shifts; a desk does not — the empty office measured at most 7 cm over any full
+  window, a seated person at least 35 cm). Nothing else can take an occupancy away: a
+  missing or unreadable distance keeps the sensor's word, and the window is aged by the
+  clock, so a distance entity that dies hands the bit back within three minutes. The costs,
+  measured on the same recordings: a locked room reads occupied for the first ~3 minutes
+  after Jarvis starts (or after the radar was unreachable for 8 s+), and a person who sits
+  down in front of a locked radar is seen once the distance moves 20 cm — median 12 s,
+  worst 82 s. The log says so, once, when it happens: `roomfabric: office reads occupied
+  but its still distance has moved only 7 cm in 180 s … a fixture, not a body; reading it
+  empty`, once when a body moves again, and once if the distance stops answering (`the
+  fixture check is blind`). It is on for every radar in `presence.rooms`; put
+  `"still_check": false` in a room's entry (or `presence.room_sensor_still_check` for the
+  single-sensor keys) to switch that room off. It needs `presence.rooms_poll_s` at 3.6 s or
+  faster (the default is 2.0) and warns at startup if it cannot fill its window. The numbers
+  live in `jarvis/roomstill.py`; the instrument that produced them is `scripts/room_trace.py`.
 
 ## 10. Turning it off
 

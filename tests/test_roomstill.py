@@ -31,28 +31,32 @@ def _still(path):
 
 
 def _verdicts(rows, **kw):
-    """Every verdict a full window would have produced over the trace."""
+    """Every verdict a full window would have produced over the trace --
+    only once the window could judge (enough readings, spanning it)."""
     win = R.StillWindow(**kw)
     out = []
     for at, cm in rows:
         win.add(cm, at=at)
-        if win.samples >= win.min_samples:
+        if win.spread() is not None:
             out.append(win.verdict())
     return out
 
 
 # ---------------------------------------------------------- arithmetic
+def _fill(win, cm_of, n=90, step=2.0):
+    """n readings at the fabric's cadence -- a full window at 2 s."""
+    for i in range(n):
+        win.add(cm_of(i), at=i * step)
+    return win
+
+
 def test_a_pinned_reading_is_a_fixture():
-    win = R.StillWindow()
-    for i in range(60):
-        win.add(310 + (i % 3), at=float(i))          # 2 cm of jitter
+    win = _fill(R.StillWindow(), lambda i: 310 + (i % 3))     # 2 cm of jitter
     assert win.verdict() == R.FIXTURE
 
 
 def test_a_wandering_reading_is_a_person():
-    win = R.StillWindow()
-    for i in range(60):
-        win.add(300 + (i % 2) * 34, at=float(i))     # 34 cm, his measured
+    win = _fill(R.StillWindow(), lambda i: 300 + (i % 2) * 34)  # 34 cm, his measured
     assert win.verdict() == R.PERSON
 
 
@@ -67,13 +71,11 @@ def test_too_little_evidence_is_UNKNOWN_never_fixture():
 def test_a_missing_reading_is_dropped_not_stored_as_zero():
     """A None kept as 0.0 would make a 310 cm spread out of nothing and
     read a locked sensor as a person -- the bug pointing backwards."""
-    win = R.StillWindow()
-    for i in range(60):
-        win.add(310, at=float(i))
-    for i in range(60, 70):
-        win.add(None, at=float(i))
-        win.add("", at=float(i))
-        win.add(0, at=float(i))
+    win = _fill(R.StillWindow(), lambda i: 310)
+    for i in range(90, 100):
+        win.add(None, at=i * 2.0)
+        win.add("", at=i * 2.0)
+        win.add(0, at=i * 2.0)
     assert win.verdict() == R.FIXTURE
 
 
@@ -81,15 +83,13 @@ def test_the_window_forgets_what_is_older_than_the_window():
     win = R.StillWindow(window_s=60.0, min_samples=20)
     for i in range(40):
         win.add(200, at=float(i))                    # long gone
-    for i in range(100, 140):
+    for i in range(100, 160):
         win.add(310 + (i % 3), at=float(i))
     assert win.verdict() == R.FIXTURE, "a stale reading widened the spread"
 
 
 def test_clearing_forgets_the_old_run():
-    win = R.StillWindow()
-    for i in range(60):
-        win.add(310, at=float(i))
+    win = _fill(R.StillWindow(), lambda i: 310)
     win.clear()
     assert win.verdict() == R.UNKNOWN
 
@@ -143,3 +143,61 @@ def test_the_threshold_sits_in_a_gap_with_NO_overlap():
     empty, desk = spreads(EMPTY_CSV), spreads(DESK_CSV)
     assert max(empty) < R.SPREAD_CM < min(desk), \
         f"empty max {max(empty)}, threshold {R.SPREAD_CM}, seated min {min(desk)}"
+
+
+# ------------------------------------------ the attack round, 2026-09-12
+def test_the_verdict_needs_the_whole_window_not_just_fifty_readings():
+    """Fifty readings in 12.5 s is not three minutes of evidence: the
+    calibration was a 180 s WINDOW, and MIN_SAMPLES only guards density.
+    Judged on the span, a 0.25 s poll cannot judge early and his own
+    at-desk recording has no run-start offset that reads him a fixture."""
+    fast = R.StillWindow()
+    for i in range(60):
+        fast.add(310 + (i % 3), at=i * 0.25)          # 15 s of readings
+    assert fast.verdict() == R.UNKNOWN
+    full = R.StillWindow()
+    for i in range(90):
+        full.add(310 + (i % 3), at=i * 2.0)           # 178 s of readings
+    assert full.verdict() == R.FIXTURE
+
+
+def test_expire_lets_a_verdict_decay_when_readings_stop():
+    """A dead distance entity must not freeze a FIXTURE for ever: the
+    window is pruned by the clock, not only by the next reading, so an
+    unreadable distance returns the sensor's word inside one window."""
+    win = R.StillWindow()
+    for i in range(90):
+        win.add(310, at=i * 2.0)
+    assert win.verdict() == R.FIXTURE
+    win.expire(at=180.0 + 400.0)
+    assert win.samples == 0
+    assert win.verdict() == R.UNKNOWN
+
+
+def test_a_bool_nan_or_inf_reading_is_dropped():
+    win = R.StillWindow()
+    for i in range(90):
+        win.add(310, at=i * 2.0)
+    win.add(True, at=181.0)
+    win.add(float("nan"), at=182.0)
+    win.add(float("inf"), at=183.0)
+    assert win.samples == 90
+    assert win.verdict() == R.FIXTURE
+
+
+@pytest.mark.skipif(not DESK_CSV.exists(), reason="his trace is not here")
+def test_NO_run_start_in_his_desk_recording_reads_him_as_a_fixture():
+    """The first verdict of a run, from every possible start offset. Under
+    a 50-reading rule 4 of 465 offsets called him furniture (measured
+    2026-09-12); under the span rule none may."""
+    rows = _still(DESK_CSV)
+    bad = 0
+    for start in range(len(rows)):
+        win = R.StillWindow()
+        for at, cm in rows[start:]:
+            win.add(cm, at=at)
+            v = win.verdict()
+            if v != R.UNKNOWN:
+                bad += v == R.FIXTURE
+                break
+    assert bad == 0
