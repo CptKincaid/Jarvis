@@ -979,10 +979,11 @@ class ThreeLegProbe:
         Neither available answer is right. Ageing from boot invents a
         number; answering None reads in ``cell6`` as HOME for ever. So the
         flag travels beside the age and the cell holds UNKNOWN on it.
-        Returns ``(seconds, pre_existing)``.
+        Returns ``(seconds, pre_existing, corroborated)`` -- the third
+        field added 2026-09-11, see the note beside the fallback below.
         """
         if self.stuck is None:
-            return None, False
+            return None, False, True
         try:
             ages, pre = [], False
             for row in self.stuck.status().values():
@@ -995,11 +996,21 @@ class ThreeLegProbe:
                 run_s = row.get("run_s")
                 if not run_s:
                     continue
-                ages.append(float(run_s if since is None else since))
-            return (min(ages) if ages else None), pre
+                # The pair, not just the number: an age that came from the
+                # RUN is not an age that came from an AGREEMENT, and until
+                # 2026-09-11 the two were indistinguishable by the time
+                # they reached cell 6. That is how a run which restarted at
+                # 19:33:32 with corroborated=0.0 was reported as "something
+                # agreed 5 s ago" and greeted an empty flat.
+                ages.append((float(run_s if since is None else since),
+                             since is not None))
+            if not ages:
+                return None, pre, True
+            best = min(ages, key=lambda a: a[0])
+            return best[0], pre, best[1]
         except Exception:  # noqa: BLE001 - unreadable history is not a fault
             log.debug("presence: the run history could not be read", exc_info=True)
-            return None, False
+            return None, False, True
 
     # -------------------------------------------------------- the vote
     def __call__(self, ip: str = "", mac: str = "") -> Optional[bool]:
@@ -1109,8 +1120,9 @@ class ThreeLegProbe:
         # Cell 6 needs to know how RECENTLY any occupied room's run was
         # agreed with -- not whether it ever was. Read only when a room is
         # on; the other 26 cells never see it.
-        agreed_s_ago, agreed_pre = (self._agreed_s_ago()
-                                    if rooms == pv.ROOMS_ON else (None, False))
+        agreed_s_ago, agreed_pre, agreed_corrob = (
+            self._agreed_s_ago() if rooms == pv.ROOMS_ON
+            else (None, False, True))
 
         # HIS OWN PRIVACY SWITCH, read once and handed to both paths. A
         # leg he switched off is BLIND, never a NO -- 15:10:57.
@@ -1128,6 +1140,7 @@ class ThreeLegProbe:
             verdict = pv.decide(phone=phone, camera=camera, rooms=rooms,
                                 agreed_s_ago=agreed_s_ago,
                                 agreed_pre_existing=agreed_pre,
+                                agreed_corroborated=agreed_corrob,
                                 recency_s=self.recency_s,
                                 mic=mic, mic_s_ago=mic_s_ago,
                                 mic_reason=mic_reason,

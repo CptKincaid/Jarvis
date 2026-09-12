@@ -729,7 +729,9 @@ def _span(seconds) -> str:
 def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
           mic: str = MIC_UNKNOWN, mic_s_ago=None,
           desk: str = DESK_UNKNOWN, desk_s_ago=None,
-          pre_existing: bool = False, mic_reason: str = "") -> tuple:
+          pre_existing: bool = False, mic_reason: str = "",
+          agreed_corroborated: bool = True,
+          phone_said_no: bool = False) -> tuple:
     """Cell 6: a room reads occupied, his phone did not answer past the
     grace, and the camera could not look.
 
@@ -829,6 +831,34 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
         return (HOME, "a room sees somebody and its history could not be "
                       "read; never away on that", None)
     if age < window:
+        if not agreed_corroborated:
+            # NOTHING HAS AGREED WITH THIS RUN. The number is the run's own
+            # AGE, not an agreement -- presence._agreed_s_ago falls back to
+            # it so a man who has just sat down is not called out before his
+            # radio wakes. That fallback is right, and reporting it as an
+            # agreement is not.
+            #
+            # MEASURED 2026-09-11 19:33:32 while he was OUT: the office run
+            # restarted, corroborated stayed 0.0, and five seconds later
+            # this branch said "something else agreed with that run 5 s ago"
+            # and Jarvis said "Welcome back, sir" to an empty flat.
+            if phone_said_no:
+                # A radar is the one leg that can latch and this one has
+                # nothing behind it; the phone did not fail to find him, it
+                # positively answered NO. Hold rather than greet an empty
+                # room. (Safe to believe the phone as of the same day's
+                # neighbour-state fix: ARP answered 7/7 with him home and
+                # 0/22 with him out, where ICMP answered 4/7 and 0/22.)
+                return (UNKNOWN, "a room sees somebody but nothing has ever "
+                                 "agreed with that run -- it is only %s old "
+                                 "-- and his phone positively answered no. A "
+                                 "radar that can latch does not outvote a leg "
+                                 "that looked and found nothing; holding"
+                        % _mins(age), None)
+            return (HOME, "a room sees somebody and its run is only %s old "
+                          "with nothing having agreed with it yet, which is "
+                          "what a man who just sat down looks like; never "
+                          "away on that" % _mins(age), None)
         return (HOME, "a room sees somebody and something else agreed with "
                       "that run %s ago, inside the %s window, so the radar "
                       "is telling the truth and his phone is napping"
@@ -843,6 +873,10 @@ def cell6(*, agreed_s_ago, recency_s: float = DEFAULT_RECENCY_S,
 def decide(*, phone: str, camera: str, rooms: str,
            agreed_s_ago: Optional[float] = None,
            agreed_pre_existing: bool = False,
+           # False when agreed_s_ago is the RUN's age rather than a real
+           # corroboration -- see cell6. Defaults True so every existing
+           # caller and test keeps the behaviour it was written against.
+           agreed_corroborated: bool = True,
            recency_s: float = DEFAULT_RECENCY_S,
            mic: str = MIC_UNKNOWN, mic_s_ago: Optional[float] = None,
            mic_reason: str = "",
@@ -882,7 +916,13 @@ def decide(*, phone: str, camera: str, rooms: str,
                               mic=mic, mic_s_ago=mic_s_ago,
                               desk=desk, desk_s_ago=desk_s_ago,
                               mic_reason=mic_reason,
-                              pre_existing=bool(agreed_pre_existing))
+                              pre_existing=bool(agreed_pre_existing),
+                              agreed_corroborated=bool(agreed_corroborated),
+                              # A NO, not an "I could not tell": phone_leg
+                              # returns PHONE_UNKNOWN for every could-not-ask,
+                              # so PHONE_NO here means the leg looked and
+                              # found nothing.
+                              phone_said_no=(phone == PHONE_NO))
         # An UNKNOWN out of cell 6 means HOLD: a room is still claiming
         # occupancy, so there is something worth keeping, and blanking the
         # verdict would be a decision the cell has just declined to make.

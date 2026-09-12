@@ -213,10 +213,36 @@ def test_the_probe_reads_the_freshest_agreement_across_open_runs(clocked):
                                  now=lambda: now["t"], grace_s=0.0)
     stuck.observe("office", False)
     stuck.observe("office", True)
+    # UPDATED AGAIN 2026-09-11, and this one IS the point of the test. It
+    # never corroborated the run, so what it was actually measuring was the
+    # RUN's age being reported as an agreement -- the fallback that greeted
+    # an empty flat at 19:33:37 that evening. A test named "the freshest
+    # AGREEMENT" has to make one, so it does; the freshness arithmetic it
+    # exists for is unchanged.
+    stuck.corroborate("phone", ago=0.0)
     now["t"] += 60.0
     assert leg("1.2.3.4", "") is True          # 60 s old: fresh
     now["t"] += 1800.0
     assert leg("1.2.3.4", "") is False         # half an hour: stale
+    assert leg.verdict.cell == 6
+
+
+def test_an_UNcorroborated_run_holds_instead_when_the_phone_said_no(clocked):
+    """The other half, and it is his 19:33:37 line. Same scenario with the
+    corroboration left out: nothing has ever agreed with the run, the phone
+    positively answered no, and the honest answer is to hold rather than to
+    call a latched radar a homecoming."""
+    stuck, now = clocked
+    fab = build_fabric(office=True, kitchen=False)
+    fab.tick()
+    leg = presence.ThreeLegProbe(fabric=fab, stuck=stuck,
+                                 phone=lambda ip, mac: False,
+                                 mic=lambda: None, recency_s=900.0,
+                                 now=lambda: now["t"], grace_s=0.0)
+    stuck.observe("office", False)
+    stuck.observe("office", True)
+    now["t"] += 60.0
+    assert leg("1.2.3.4", "") is None
     assert leg.verdict.cell == 6
 
 
@@ -473,3 +499,55 @@ def test_the_mic_window_reuses_the_key_arrival_already_has():
                       "presence.departure_mic_silence_min": 20}),
         publish=lambda e: None)
     assert s.legs.mic_window_s == 1200.0
+
+
+# ==================================================================
+# A RUN NOTHING HAS AGREED WITH IS NOT AN AGREEMENT (measured live)
+# ==================================================================
+# MEASURED on his box 2026-09-11 while he was OUT of the flat:
+#
+#   roomruns.json  office started 19:33:32, corroborated 0.0
+#   19:33:37.619   presence: home (cell 6) -- "something else agreed with
+#                  that run 5 s ago, inside the 15 min window"
+#   19:33:37.632   "Welcome back, sir."   to an empty flat
+#
+# with every other leg saying no: [phone phone-no, camera cam-blind,
+# rooms rooms-on, mic mic-unknown, desk desk-idle]. His phone trace read
+# FAILED continuously from 18:35 through 19:47; the desk monitor read 59
+# minutes idle. NOTHING agreed. The office radar's occupancy run simply
+# RESTARTED at 19:33:32, and _agreed_s_ago falls back to the run's own age
+# when nothing has corroborated it -- so a five-second-old latch was
+# reported as a five-second-old AGREEMENT and bought a full recency window.
+#
+# Two defects in one line: the sentence is false, and a never-corroborated
+# radar outvoted a phone that had positively said no.
+from jarvis import presencevote as pv                      # noqa: E402
+
+
+def test_a_young_run_nothing_agreed_with_does_not_claim_agreement():
+    state, reason, _ago = pv.cell6(agreed_s_ago=5.0, agreed_corroborated=False)
+    assert "agreed with that run" not in reason, reason
+
+
+def test_a_never_corroborated_run_cannot_outvote_a_phone_that_said_NO():
+    """His 19:33 line exactly. The radar is the one leg that can latch and
+    it had nothing behind it; the phone had positively answered no."""
+    state, reason, _ago = pv.cell6(agreed_s_ago=5.0, agreed_corroborated=False,
+                                   phone_said_no=True)
+    assert state == pv.UNKNOWN, (state, reason)
+
+
+def test_a_young_run_STILL_reads_home_when_nothing_contradicts_it():
+    """The case the fallback exists for and which must survive: he has
+    just sat down, the run is young, and his radio has not woken yet.
+    phone_said_no is False there -- an unknown is not a no."""
+    state, _r, _a = pv.cell6(agreed_s_ago=5.0, agreed_corroborated=False,
+                             phone_said_no=False)
+    assert state == pv.HOME
+
+
+def test_a_REAL_agreement_is_unchanged():
+    state, reason, _a = pv.cell6(agreed_s_ago=5.0, agreed_corroborated=True,
+                                 phone_said_no=True)
+    assert state == pv.HOME
+    assert "agreed with that run" in reason
