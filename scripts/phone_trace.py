@@ -84,8 +84,10 @@ def main() -> int:
         print("presence.phone_ip is not configured; nothing to trace.")
         return 1
 
-    out = Path(args.out or (Path(__file__).resolve().parent.parent /
-                            "phone_trace.csv"))
+    # HIS HOME, not the repo. The first run of this on 2026-09-11 left
+    # phone_trace.csv sitting untracked in the working tree, which is
+    # somebody's data in somebody else's git status.
+    out = Path(args.out or (Path.home() / "phone_trace.csv"))
     deadline = time.monotonic() + args.minutes * 60.0
     counts: dict[str, int] = {}
     pings = [0, 0]                         # [hit, total]
