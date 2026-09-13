@@ -1573,3 +1573,41 @@ class TestTheRawTextRungsTakeAFilledPause:
     def test_a_bare_filler_is_still_nothing(self, cmdr):
         res = cmdr.handle("uh", "voice")
         assert res is None or not getattr(res, "reply", "")
+
+
+# ---------------------------------------- the remember tool's undo (09-12)
+class TestScratchThatAfterTheTool:
+    def test_the_newer_parked_fact_undo_wins_over_an_older_action(self, cmdr):
+        """A timer at t0, the tool filing a fact 20 s later: 'scratch that'
+        forgets the FACT (the newer thing) and leaves the timer's undo on
+        the books for a second 'scratch that'."""
+        import time as t
+        cancelled, forgotten = [], []
+        cmdr._last_undo = (lambda: (cancelled.append(1), "Timer cancelled, sir.")[1],
+                           t.monotonic() - 20.0)
+        cmdr.services.remember_undo = {"undo": lambda: (forgotten.append(1), "Forgotten, sir.")[1],
+                                       "at": t.monotonic()}
+        res = cmdr.handle("scratch that", "voice")
+        assert res is not None and res.reply == "Forgotten, sir."
+        assert forgotten == [1] and cancelled == []
+        assert cmdr._last_undo is not None            # the timer's undo survives
+
+    def test_belay_keeps_its_fifteen_minutes_through_the_tool_door(self, cmdr):
+        import time as t
+        forgotten = []
+        cmdr.services.remember_undo = {"undo": lambda: (forgotten.append(1), "Forgotten, sir.")[1],
+                                       "at": t.monotonic() - 120.0}
+        res = cmdr.handle("belay that last order", "voice")
+        assert res is not None and res.reply == "Forgotten, sir."
+        assert forgotten == [1]
+
+    def test_a_filled_addressed_quiet_still_quiets(self, cmdr, monkeypatch):
+        """The addressed twin stripped fillers with 'jarvis,' still on the
+        text, so 'jarvis, um, quiet' went to the model."""
+        seen = []
+        import jarvis.commander as cm
+        monkeypatch.setattr(cm, "_h_quiet",
+                            lambda c, t, prefixed: (seen.append(t), CommandResult(
+                                handled=True, status="quiet"))[1])
+        res = cmdr.handle("jarvis, um, be quiet", "voice")
+        assert res is not None and res.status == "quiet"

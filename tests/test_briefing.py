@@ -683,7 +683,7 @@ def test_a_briefing_with_news_parks_a_follow_up_that_reads_the_stories(tmp_path,
     for n in r.card["news"]:
         assert n["title"] in line
     assert line.count("sir") == 1
-    assert offer["ttl_s"] >= 120                          # the briefing eats the first minute
+    assert "ttl_s" not in offer                           # one clock: the app re-stamps it
 
 
 def test_no_news_no_follow_up_and_the_switch_turns_it_off(tmp_path, monkeypatch):
@@ -718,3 +718,27 @@ def test_no_news_follow_up_beside_a_study_offer_from_the_same_call(tmp_path, mon
     services.study_offer = None
     assert spec.handler().ok
     assert services.briefing_offer["kind"] == "news"
+
+
+def test_no_news_follow_up_beside_a_live_wake_alarm_offer(tmp_path, monkeypatch):
+    """The study offer's twin: a preview ("what's on tomorrow") parks a
+    wake-alarm offer; a briefing asked in the same breath must not park
+    the stories on top of it."""
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer=None, alarm_offer=None, study_offer=None)
+    (spec,) = br.make_tools(Cfg(enabled=True), services)
+    monkeypatch.setattr(br, "build_preview",
+                        lambda *a, **k: ({"weather": "x", "calendar": [], "canvas": [],
+                                          "todos": [], "alarm": "7:00 am"}, "sheet",
+                                         {"time": "07:00", "line": "Shall I wake you?",
+                                          "made_at": _now_ts()}))
+    assert spec.handler(when="tomorrow").ok
+    assert services.alarm_offer
+    assert spec.handler().ok
+    assert services.briefing_offer is None                # the alarm question stands alone
+
+
+def _now_ts():
+    import time as _t
+    return _t.time()

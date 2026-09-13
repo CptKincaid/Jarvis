@@ -36,19 +36,23 @@ so the model is told where to go rather than left to invent a store.
 THE READ-BACK IS AUTHORED. ``speak`` carries "Noted, sir: <the fact as
 stored>." verbatim, so the turn ends on the words that were filed and the
 model cannot paraphrase them into something that was not. He ruled the
-read-back, so a secret he asks to remember IS read back; it is not logged
--- the log line carries the key's first words only. "Scratch that" after
-the read-back finds the undo parked on ``services.remember_undo``.
+read-back, so a secret he asks to remember IS read back and spoken; this
+module's own log line and memory.py's carry the key's first words only
+(the transcript line, the TTS line and the journal still carry what he
+said and what was answered, as they do for every turn). "Scratch that"
+after the read-back finds the undo parked on ``services.remember_undo``.
 """
 from __future__ import annotations
 
 import re
 import time
 
+from jarvis.endpoint import FILLER_WORDS
 from jarvis.logs import get_logger
 from jarvis.memory import (clean_spoken_fact, fact_key, is_spoken_pointer,
                            is_spoken_question, parse_person_statement,
                            store_fact_from_speech)
+from jarvis.router import is_question
 from jarvis.tools.registry import ToolResult, ToolSpec
 
 log = get_logger("tools.remember")
@@ -57,6 +61,9 @@ NOTED_LINE = "Noted, sir: {fact}."
 NO_MEMORY_TEXT = "memory unavailable: nothing was stored"
 NOT_HIS_WORDS_TEXT = ("not his words: nothing was stored. Pass the fact exactly "
                       "as he said it, or say plainly that nothing was stored")
+NOT_ASKED_TEXT = ("he asked a question and did not ask you to remember anything: "
+                  "nothing was stored; answer the question")
+UNJUDGED_TEXT = ("not judged against his words: nothing was stored")
 MAX_FACT_CHARS = 300        # a spoken fact; a paragraph is a document, not a fact
 
 # A courtesy opener the model may have carried along ("please set an alarm").
@@ -79,44 +86,71 @@ _OTHERS = (
 _TODO_WORDS = frozenset({"to"})
 _RECALL_WORDS = frozenset({"when", "what", "how", "where", "who", "why", "about",
                            "whether", "if", "down"})
-# A bare imperative is a command, not a fact about him.
+# A bare imperative is a command, not a fact about him -- but only when
+# no finite verb follows it: "book club is on Tuesdays", "pay day is the
+# 15th" and "start date is October 5th" open with a verb-shaped NOUN and
+# carry a copula, and the rung files them.
 _IMPERATIVE_RX = re.compile(
     r"^(?:call|phone|ring|text|email|message|buy|get|pick up|pick|fetch|pay|"
     r"turn|switch|play|pause|stop|start|open|close|send|tell|ask|book|order|"
     r"check|cancel|wake|set|schedule|find|search|look up|show|read|dim|"
     r"brighten|lock|unlock|restart|shut)\b", re.I)
+_FINITE_VERB_RX = re.compile(
+    r"\b(?:is|are|was|were|am|has|have|had|will|would|ends?|starts?|begins?|"
+    r"opens?|closes?|costs?|lives?|works?|runs?|falls?|comes?|goes|means?|"
+    r"takes?|needs?|prefers?|likes?|hates?|owes?)\b", re.I)
+# A question the model copied WITHOUT its "?" still opens like one.
+_AUX_OPENERS = frozenset({"do", "does", "did", "is", "are", "am", "was", "were",
+                          "can", "could", "will", "would", "should", "shall",
+                          "has", "have", "had", "may", "might"})
+# A negation on one side and not the other is a different claim.
+_NEGATION_RX = re.compile(r"\b(?:not|never|no|none|nothing|nobody|neither|nor)\b|n['’]t\b", re.I)
 
 _CONTRACTIONS = (
-    (re.compile(r"\bi[’']m\b", re.I), "i am"), (re.compile(r"\bi[’']ve\b", re.I), "i have"),
-    (re.compile(r"\bi[’']ll\b", re.I), "i will"), (re.compile(r"\bi[’']d\b", re.I), "i would"),
-    (re.compile(r"\bdon[’']t\b", re.I), "do not"), (re.compile(r"\bdoesn[’']t\b", re.I), "does not"),
-    (re.compile(r"\bcan[’']t\b", re.I), "cannot"), (re.compile(r"\bwon[’']t\b", re.I), "will not"),
-    (re.compile(r"\bisn[’']t\b", re.I), "is not"), (re.compile(r"\baren[’']t\b", re.I), "are not"),
-    (re.compile(r"\bit[’']s\b", re.I), "it is"), (re.compile(r"\bthat[’']s\b", re.I), "that is"),
-    (re.compile(r"\bthere[’']s\b", re.I), "there is"), (re.compile(r"\bwhat[’']s\b", re.I), "what is"),
+    # the irregular ones first, then the generic suffixes
+    (re.compile(r"\bcan[’']t\b", re.I), "can not"), (re.compile(r"\bwon[’']t\b", re.I), "will not"),
+    (re.compile(r"\bshan[’']t\b", re.I), "shall not"), (re.compile(r"\bain[’']t\b", re.I), "is not"),
+    (re.compile(r"\bcannot\b", re.I), "can not"),
+    (re.compile(r"(\w+)n[’']t\b", re.I), r"\1 not"),   # don't/isn't/wasn't/haven't/didn't
+    (re.compile(r"\bi[’']m\b", re.I), "i am"),
+    (re.compile(r"(\w+)[’']re\b", re.I), r"\1 are"),   # we're/they're/you're
+    (re.compile(r"(\w+)[’']ve\b", re.I), r"\1 have"),  # I've/we've/they've
+    (re.compile(r"(\w+)[’']ll\b", re.I), r"\1 will"),  # I'll/she'll
+    (re.compile(r"(\w+)[’']d\b", re.I), r"\1 would"),  # I'd/he'd
+    (re.compile(r"\b(it|that|there|what|who|where|when|how|he|she)[’']s\b", re.I), r"\1 is"),
     (re.compile(r"\b(\w+)[’']s\b", re.I), r"\1 s"),      # possessives: "patel's" -> "patel s"
 )
+_DOTTED_RX = re.compile(r"\b(?:[a-z]\.){2,}", re.I)          # "p.m.", "e.g.", "u.s."
 _NON_WORD_RX = re.compile(r"[^a-z0-9 ]+")
+_FILLERS = frozenset(w.lower() for w in FILLER_WORDS)
 
 
 def _norm(text) -> str:
-    """Case, punctuation, whitespace and the common contractions forgiven:
-    what two takes of the same sentence have in common."""
+    """Case, punctuation, whitespace, filled pauses and the contractions
+    forgiven: what two takes of the same sentence have in common. A
+    dotted abbreviation keeps its letters together ("5 p.m." -> "5 pm")."""
     out = str(text or "").lower()
+    out = _DOTTED_RX.sub(lambda m: m.group(0).replace(".", ""), out)
     for rx, rep in _CONTRACTIONS:
         out = rx.sub(rep, out)
     out = _NON_WORD_RX.sub(" ", out)
-    return re.sub(r"\s+", " ", out).strip()
+    words = [w for w in out.split() if w not in _FILLERS]
+    return " ".join(words)
 
 
 _HEAD_ONLY_RX = None
+
+
+_HEAD_ONLY_RX = None
+_LEAD_THAT_RX = re.compile(r"^(?:that|this)\s+", re.I)
 
 
 def _rung_grammar():
     # The commander is the grammar's home (it is the rung's); imported at
     # call time so this module never drags 14k lines in at boot.
     global _HEAD_ONLY_RX
-    from jarvis.commander import _MEM_ASK_RX, _MEM_COURTESY, _MEM_FACT_RX, _MEM_HEADS
+    from jarvis.commander import (_MEM_ASK_RX, _MEM_COURTESY, _MEM_FACT_RX,
+                                  _MEM_HEADS, strip_address)
     if _HEAD_ONLY_RX is None:
         # The head alone, so a head followed by what the rung refuses
         # ("remember TO call mom") still loses its head here and the
@@ -124,42 +158,84 @@ def _rung_grammar():
         _HEAD_ONLY_RX = re.compile(
             r"^" + _MEM_COURTESY + r"(?:" + _MEM_HEADS + r")\b"
             r"(?:\s*[,:]\s*|\s+)(?:(?:that|this)(?:\s*[,:]\s*|\s+))?", re.I)
-    return _MEM_ASK_RX, _MEM_FACT_RX, _HEAD_ONLY_RX
+    return _MEM_ASK_RX, _MEM_FACT_RX, _HEAD_ONLY_RX, strip_address
 
 
 def strip_head(fact: str) -> tuple:
     """(fact without the rung's head, bare_head): "remember that I
     graduate ..." -> ("I graduate ...", False); "remember that" -> ("",
-    True). A fact with no head passes through."""
-    ask_rx, fact_rx, head_rx = _rung_grammar()
+    True). The address ("Jarvis, ...") comes off first and a leading
+    "that"/"this" the model copied comes off last, so one sentence is one
+    fact under one key through either door."""
+    ask_rx, fact_rx, head_rx, strip_address = _rung_grammar()
     text = str(fact or "").strip()
+    try:
+        text = strip_address(text) or text
+    except Exception:                                # noqa: BLE001 - the address is a courtesy
+        pass
     if ask_rx.match(text):
         return "", True
     m = fact_rx.match(text)
     if m:
-        return m.group("fact").strip(), False
-    return head_rx.sub("", text, count=1).strip(), False
+        body = m.group("fact").strip()
+    else:
+        body = head_rx.sub("", text, count=1).strip()
+    return _LEAD_THAT_RX.sub("", body, count=1).strip(), False
 
 
 def his_words(fact: str, utterance: str) -> bool:
-    """Is the cleaned fact in what he said? A head on either side is
-    allowed; the comparison is on the normalised text."""
+    """Is the cleaned fact in what he said, as a whole-word run, and with
+    the same negation? "my pin is 12" is not in "my pin is 1234"; "I am
+    allergic to penicillin" is not in "it is not true that I am allergic
+    to penicillin"."""
     said = _norm(utterance)
     if not said:
         return False
     want, _bare = strip_head(fact)
-    return bool(want) and _norm(want) in said
+    want_n = _norm(want)
+    if not want_n or f" {want_n} " not in f" {said} ":
+        return False
+    # The negation is judged on what he said AFTER the head: "don't forget
+    # my dentist is Dr Patel" is not a denial of the dentist.
+    said_body, _ = strip_head(utterance)
+    if _NEGATION_RX.search(said_body) and not _NEGATION_RX.search(want):
+        return False
+    return True
+
+
+def asked_to_remember(utterance: str) -> bool:
+    """Did he ask for a store? A remember head anywhere in his words, or a
+    sentence that is not a question at all. "Do you know if my dentist is
+    Dr Patel?" asks nothing to be filed."""
+    text = str(utterance or "")
+    _ask_rx, _fact_rx, head_rx, _sa = _rung_grammar()
+    from jarvis.commander import _MEM_HEADS
+    if re.search(r"(?:^|\b)(?:" + _MEM_HEADS + r")\b", text, re.I):
+        return True
+    if head_rx.match(text):
+        return True
+    try:
+        return not is_question(text)
+    except Exception:                                # noqa: BLE001 - an unreadable question is one
+        return False
 
 
 def make_tools(cfg, services) -> list[ToolSpec]:
     def derive(utterance: str, args: dict) -> dict:
-        # A model call: judge the model's fact against his words. No
-        # utterance (a scripted or forced caller) is no judgement.
-        if not str(utterance or "").strip():
-            return {}
-        return {"verbatim": his_words(str(args.get("fact") or ""), utterance)}
+        # A model call: judge the model's fact against his words, and his
+        # words against the ask. FAILS CLOSED: any slip here is "not his
+        # words", never silent trust -- the model cannot vouch for itself,
+        # and neither can an exception.
+        try:
+            if not str(utterance or "").strip():
+                return {"verbatim": False, "asked": False}
+            return {"verbatim": his_words(str(args.get("fact") or ""), utterance),
+                    "asked": asked_to_remember(utterance)}
+        except Exception:                            # noqa: BLE001 - fail closed
+            log.exception("remember: the words check failed; refusing")
+            return {"verbatim": False, "asked": False}
 
-    def remember(fact="", verbatim=True, **_) -> ToolResult:
+    def remember(fact="", verbatim=None, asked=True, **_) -> ToolResult:
         memory = getattr(services, "memory", None) if services is not None else None
         if memory is None or not hasattr(memory, "remember"):
             return ToolResult(text=NO_MEMORY_TEXT, ok=False)
@@ -169,9 +245,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         if len(raw) > MAX_FACT_CHARS:
             return ToolResult(text="not a fact: too long to be one thing he said; "
                                    "store nothing", ok=False)
+        # verbatim is None only when nothing judged the words -- a caller
+        # that is not the registry's model path. A forced caller says
+        # verbatim=True itself; the model's own word is stripped (reserved).
+        if verbatim is None:
+            return ToolResult(text=UNJUDGED_TEXT, ok=False)
         if not verbatim:
             return ToolResult(text=NOT_HIS_WORDS_TEXT, ok=False)
-        if is_spoken_question(raw):
+        if not asked:
+            return ToolResult(text=NOT_ASKED_TEXT, ok=False)
+        if is_spoken_question(raw) or raw.rstrip().endswith("?"):
             return ToolResult(text="not a fact: that is a question; answer it "
                                    "or ask him what to remember", ok=False)
         body, bare_head = strip_head(_COURTESY_RX.sub("", raw, count=1))
@@ -180,6 +263,9 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                    "to remember, in his words", ok=False)
         cleaned = clean_spoken_fact(body)
         first = cleaned.split()[0].lower() if cleaned.split() else ""
+        if first in _AUX_OPENERS:
+            return ToolResult(text="not a fact: that is a question; answer it "
+                                   "or ask him what to remember", ok=False)
         if first in _TODO_WORDS:
             return ToolResult(text="not a fact: that is a to-do -- use the notes "
                                    "tool or set_reminder", ok=False)
@@ -189,7 +275,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         for rx, text in _OTHERS:
             if rx.search(cleaned):
                 return ToolResult(text=text, ok=False)
-        if _IMPERATIVE_RX.match(cleaned):
+        if _IMPERATIVE_RX.match(cleaned) and not _FINITE_VERB_RX.search(cleaned):
             return ToolResult(text="not a fact: that is a command, not something "
                                    "about him; use the tool that does it", ok=False)
         if is_spoken_pointer(cleaned) or len(cleaned.split()) < 2:
@@ -232,7 +318,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                             "description": "the fact, exactly as he said it"}},
                     "required": ["fact"]},
         handler=remember,
-        reserved=frozenset({"verbatim"}),
+        reserved=frozenset({"verbatim", "asked"}),
         derive=derive,
         derive_takes_args=True,
     )

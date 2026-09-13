@@ -565,6 +565,12 @@ UNBACKED_MEMORY_NUDGE = ("[You said you stored or would remember something, "
                          "remember a fact about me, call remember now with my "
                          "exact words. Otherwise answer the rest of my request "
                          "and say plainly that nothing was stored.]")
+# The retry after a QUESTION runs with no tools (an answer may not act), so
+# it cannot be told to call remember: it can only be honest.
+UNBACKED_MEMORY_NUDGE_QUESTION = (
+    "[You said you stored or would remember something, but nothing was "
+    "stored and this turn cannot store anything. Answer my question and say "
+    "plainly that nothing was stored.]")
 # A sentence that is ONLY an acknowledgement. Before a claim it is the yes
 # to that claim, and with the claim withheld it would stand as a yes to
 # nothing -- "Of course, sir." then a refusal, heard as one reply (probe
@@ -725,12 +731,23 @@ _NEG_SUBJECT_VOCATIVE_RX = re.compile(
     r"\s*,\s*"
     r"(?:sir|ma['’]am|madam|mam|of course|certainly|naturally|"
     r"i(?:'m| am) afraid|i think|i believe|as it happens|for now)\s*,"
-    # ... and ONLY when the negative subject's own predicate follows. A
+    # ... and only when the negative subject's OWN sentence continues. A
     # conjunction or a new subject after the vocative ("Nothing, sir, but
     # I have added milk") keeps its comma, so the claim in the next clause
-    # is judged on its own (the 2026-09-12 attack round's regression).
-    r"(?=\s*(?:has|have|had|is|was|are|were|will|would|could|can|got|did|"
-    r"does|needs?|remains?|went|came|happened|changed|moved)\b)", re.I)
+    # is judged on its own (the 2026-09-12 attack round's regression). The
+    # lookahead is inverted -- refuse the fold on those -- rather than a
+    # list of predicates, which refused honest "Nothing, sir, gets added".
+    # -- UNLESS a conjunction or a new subject follows the vocative: then
+    # the comma was a real clause boundary and stays one.
+    r"(?!\s*(?:but|and|though|although|yet|so|however|except|other than|"
+    r"i|i['’](?:m|ve|ll|d)|we|you|it|he|she|they|jarvis)\b)", re.I)
+
+
+# An unpunctuated conjunction followed by a first-person subject opens a
+# new clause too: "Nothing has been added to your list and I have set a
+# timer" -- the "Nothing" does not reach the timer.
+_CONJ_SUBJECT_RX = re.compile(
+    r"\b(?:and|but|though|although|yet|so)\s*(?=i\b|i['’]|we\b|$)", re.I)
 
 
 def _claim_negated(before):
@@ -738,6 +755,7 @@ def _claim_negated(before):
     ends? Only one in the claim's own clause counts, and a lead-in idiom
     opening that clause is not one."""
     before = _NEG_SUBJECT_VOCATIVE_RX.sub(r"\1 ", before or "")
+    before = _CONJ_SUBJECT_RX.split(before)[-1]
     clause = _CLAUSE_BOUNDARY_RX.split(before)[-1]
     clause = _NEGATED_LEAD_IN_RX.sub(" ", clause)
     return bool(_CLAIM_NEGATED_RX.search(clause))
@@ -4457,8 +4475,10 @@ class JarvisBrain:
                             unbacked_ran_at = len(ran_results)
                             messages.append({"role": "assistant",
                                              "content": content})
+                            memory_nudge = (UNBACKED_MEMORY_NUDGE_QUESTION if question
+                                            else UNBACKED_MEMORY_NUDGE)
                             messages.append({"role": "user",
-                                             "content": (UNBACKED_MEMORY_NUDGE
+                                             "content": (memory_nudge
                                                          if claim_kind(claim) == "memory"
                                                          else UNBACKED_NUDGE)})
                             # ONE retry, with a round of its own: the

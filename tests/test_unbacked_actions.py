@@ -82,6 +82,8 @@ def _warnings(caplog):
     ("Nothing, sir, and I'll remember that.", "I'll remember that"),
     ("Nothing, sir. I've noted that.", "I've noted that"),
     ("No, sir, I've noted that.", "I've noted that"),
+    ("Nothing, sir, has been added to your list and I have set a timer.", "I have set"),
+    ("Nothing has been added and I've noted that.", "I've noted that"),
 ])
 def test_action_claims_are_recognised(line, claim):
     assert brain_mod.unbacked_claim(line) == claim
@@ -124,6 +126,10 @@ def test_action_claims_are_recognised(line, claim):
     "Nothing at all, sir, has been added to your list.",
     "Nothing new, sir, was set.",
     "None of it, sir, was sent.",
+    "Nothing, sir, gets added to your list.",
+    "Nothing, sir, shall be added to your list.",
+    "Nothing, sir, ever gets set without a yes.",
+    "Nothing, sir, seems to have been saved.",
 ])
 def test_ordinary_replies_are_not_claims(line):
     assert brain_mod.unbacked_claim(line) is None

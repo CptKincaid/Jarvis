@@ -3429,6 +3429,21 @@ class JarvisApp:
             return None
         return offer
 
+    def _restamp_news_offer(self) -> None:
+        """The news follow-up is parked when the briefing TOOL runs -- before
+        the model has rendered or a word has been spoken -- so its 60 s
+        started while the briefing was still being read. Same problem
+        _restamp_offer solves for the arrival offer, same answer: the clock
+        starts when he could first ANSWER, i.e. on the settled falling edge
+        of the burst that carried the briefing. Once per offer."""
+        services = getattr(self, "services", None)
+        offer = getattr(services, "briefing_offer", None)
+        if not isinstance(offer, dict) or offer.get("kind") != "news" \
+                or offer.get("stamped"):
+            return
+        offer["made_at"] = time.time()
+        offer["stamped"] = True
+
     def _restamp_offer(self, offer) -> None:
         """Start the offer's 60 s TTL from when he could first ANSWER.
 
@@ -5095,6 +5110,7 @@ class JarvisApp:
         tts = getattr(self, "tts", None)
         if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
             return                          # more speech is queued behind this burst
+        self._restamp_news_offer()
         if self._briefing_pending:
             # An OFFER, not the briefing (Hunter, 2026-09-02). Still here,
             # on the settled burst, rather than on some later "natural
@@ -5310,11 +5326,7 @@ class JarvisApp:
                 made = float(offer.get("made_at") or 0.0)
             except (TypeError, ValueError):
                 made = 0.0
-            try:
-                own = float(offer.get("ttl_s") or 0.0)     # the news follow-up's
-            except (TypeError, ValueError):
-                own = 0.0
-            if not made or time.time() - made <= (own if own > 0 else ttl):
+            if not made or time.time() - made <= ttl:
                 return True
         return False
 

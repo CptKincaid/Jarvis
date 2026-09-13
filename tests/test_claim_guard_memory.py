@@ -818,7 +818,9 @@ def test_the_retry_on_a_question_is_offered_no_tools_and_cannot_write(setup, cap
     p1, p2 = fake.chat_payloads()
     assert p1.get("tools")
     assert "tools" not in p2
-    assert p2["messages"][-1]["content"] == brain_mod.UNBACKED_MEMORY_NUDGE
+    # On a QUESTION the retry has no tools, so the nudge does not order a
+    # remember call it cannot make; it asks for the honest answer.
+    assert p2["messages"][-1]["content"] == brain_mod.UNBACKED_MEMORY_NUDGE_QUESTION
 
 
 def test_the_retry_on_a_question_may_still_answer_in_words(setup):

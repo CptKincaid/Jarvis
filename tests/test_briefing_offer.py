@@ -627,7 +627,7 @@ class TestTheNewsFollowUp:
         ran = []
         cmdr.services.briefing_offer = {
             "made_at": _t.time(), "kind": "news",
-            "deliver": lambda: (ran.append(1), ok)[1]}
+            "deliver": lambda: (ran.append(1), "Here they are, sir. One: a story.")[1]}
         return ran
 
     @pytest.mark.parametrize("said", ["let's hear it", "yes", "read them",
@@ -659,17 +659,19 @@ class TestTheNewsFollowUp:
         assert res is not None and res.handled
         assert res.reply == "Here they are, sir. One: a story." and res.speak is True
         assert res.done is not False
+        assert res.status.startswith("Briefing")      # the family that marks the day
 
-    def test_a_news_offer_carries_its_own_ttl(self, cmdr):
-        """Parked when the tool runs, before the briefing is even spoken:
-        the briefing itself eats the window, so the news offer says how
-        long it lives."""
+    def test_a_news_offer_lives_the_rungs_sixty_seconds_from_its_stamp(self, cmdr):
+        """One clock for every offer: the app re-stamps a news offer on the
+        settled falling edge of the briefing's own speech, so the 60 s start
+        when he could first answer -- there is no second TTL to keep in
+        step across three tables."""
         ran = []
         cmdr.services.briefing_offer = {
-            "made_at": _t.time() - 90.0, "kind": "news", "ttl_s": 180.0,
+            "made_at": _t.time() - 90.0, "kind": "news",
             "deliver": lambda: (ran.append(1), "Here they are, sir.")[1]}
         cmdr.handle("read them", "voice")
-        assert ran == [1]
+        assert ran == []                              # 90 s from the stamp: gone
 
     def test_a_filled_read_control_still_stands_aside_for_the_reader(self, cmdr):
         """The mirror of rung 4b's strip: while a reading is active, 'go
@@ -704,3 +706,22 @@ class TestTheNewsFollowUp:
         ran = self._news(cmdr)
         cmdr.handle("what's the weather", "voice")
         assert ran == [] and cmdr.services.briefing_offer is None
+
+
+def test_the_news_offer_is_stamped_when_the_briefing_finishes_speaking(monkeypatch, tmp_path):
+    """Parked when the tool runs, the news offer's clock started while the
+    briefing was still being read. The app re-stamps it once, on the
+    settled falling edge of that speech (_after_speech)."""
+    import time as t
+    from types import SimpleNamespace as NS
+    a = object.__new__(app_mod.JarvisApp)
+    offer = {"made_at": t.time() - 45.0, "kind": "news", "deliver": lambda: "x"}
+    a.services = NS(briefing_offer=offer)
+    a._restamp_news_offer()
+    assert t.time() - offer["made_at"] < 2.0 and offer["stamped"] is True
+    stamped = offer["made_at"]
+    a._restamp_news_offer()
+    assert offer["made_at"] == stamped                     # once
+    a.services.briefing_offer = {"made_at": 1.0, "deliver": lambda: True}   # the first-wake offer
+    a._restamp_news_offer()
+    assert a.services.briefing_offer["made_at"] == 1.0    # never touched

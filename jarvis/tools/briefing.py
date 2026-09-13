@@ -77,7 +77,6 @@ HN_SOURCE = "Hacker News"
 STOOQ_URL = "https://stooq.com/q/l/?s={sym}.us&f=sd2t2ohlcv&h&e=csv"
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
 NEWS_ITEMS = 3                     # total news items in the briefing
-NEWS_OFFER_TTL_S = 180.0           # the news follow-up's life; the briefing eats the first minute
 HN_SCAN = 30                       # top-story ids ranked by score
 FEED_SCAN = 6                      # entries examined per feed for a tech item
 NEWS_CACHE_S = 15 * 60
@@ -1254,7 +1253,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         exam, _checked = find_next_exam(cfg, cal)
         return exam
 
-    parked = {"study": False}      # did THIS call park a study offer?
+    parked = {"study": False, "alarm_at": 0.0}   # what this tool parked, and when
 
     def _park_study_offer(offer):
         # Answered by Commander._try_study_offer, the same way the wake-up
@@ -1289,9 +1288,12 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
         def deliver() -> str:
             return line
+        # made_at is re-stamped by the app on the settled falling edge of
+        # the burst that carries the briefing (app._restamp_news_offer), so
+        # his 60 s start when he can first answer, not when the tool ran.
         try:
             services.briefing_offer = {"made_at": time.time(), "deliver": deliver,
-                                       "kind": "news", "ttl_s": NEWS_OFFER_TTL_S}
+                                       "kind": "news"}
         except Exception:
             log.debug("could not park the news follow-up", exc_info=True)
 
@@ -1304,6 +1306,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return
         try:
             services.alarm_offer = offer
+            parked["alarm_at"] = time.time() if offer else 0.0
         except Exception:
             log.debug("could not park the alarm offer", exc_info=True)
 
@@ -1364,9 +1367,14 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         # day: "Let's hear it" was a generic yes with nothing parked, and
         # routed to the model, which answered about the inbox).
         # ONE question on the table per delivery: an exam week's briefing
-        # parks a study offer (services.study_offer) in the same call, and
-        # a yes must not have two questions to land on.
-        if sections.get("news") and news_follow_up(cfg) and not parked["study"]:
+        # parks a study offer in the same call, and a preview asked in the
+        # same breath ("what's on today and tomorrow") parks a wake-alarm
+        # offer that is still live -- a yes must not have two questions to
+        # land on.
+        alarm_live = bool(parked["alarm_at"]) and \
+            (time.time() - parked["alarm_at"]) <= OFFER_TTL_S
+        if sections.get("news") and news_follow_up(cfg) and not parked["study"] \
+                and not alarm_live:
             _park_news(sections["news"])
         return ToolResult(text=sheet, card=sections,
                           max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["today"]))

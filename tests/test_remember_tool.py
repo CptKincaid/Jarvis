@@ -30,8 +30,16 @@ def memory(tmp_path):
                         semantic=False)
 
 
-def _tool(memory):
-    (spec,) = rt.make_tools(None, SimpleNamespace(memory=memory))
+def _tool(memory, services=None):
+    (spec,) = rt.make_tools(None, services or SimpleNamespace(memory=memory))
+    handler = spec.handler
+
+    def judged(fact="", **kw):
+        # Direct calls stand in for the FORCED path, which vouches itself;
+        # the model's calls go through _call() and the deriver.
+        kw.setdefault("verbatim", True)
+        return handler(fact=fact, **kw)
+    spec.handler = judged
     return spec
 
 
@@ -154,10 +162,13 @@ def test_his_words_pass_the_check_with_case_punctuation_and_contractions_forgive
     assert r.speak.startswith("Noted, sir:")
 
 
-def test_the_forced_path_without_an_utterance_still_stores(memory):
-    """The commander's own force path carries no model arg to doubt."""
-    spec = _tool(memory)
-    assert spec.handler(fact="my locker code is 4412").ok
+def test_a_call_nobody_judged_is_refused_and_a_forced_caller_vouches(memory):
+    """verbatim=None means no deriver ran: not the registry's model path
+    and not a caller that said verbatim=True. Fail closed."""
+    (spec,) = rt.make_tools(None, SimpleNamespace(memory=memory))
+    assert not spec.handler(fact="my locker code is 4412").ok
+    assert memory._facts == {}
+    assert spec.handler(fact="my locker code is 4412", verbatim=True).ok
 
 
 def test_the_model_cannot_vouch_for_itself(memory):
@@ -246,9 +257,79 @@ def test_the_tool_parks_an_undo_for_scratch_that(memory):
     parks it on services the way the calendar parks last_add, and the
     commander's undo rung finds it there."""
     services = SimpleNamespace(memory=memory)
-    (spec,) = rt.make_tools(None, services)
+    spec = _tool(memory, services)
     spec.handler(fact="my locker code is 4412")
     parked = services.remember_undo
     assert callable(parked["undo"]) and parked["at"] > 0
     assert parked["undo"]() == "Forgotten, sir."
     assert memory._facts == {}
+
+
+# ------------------------------------------ the second attack round
+def test_a_question_that_asked_for_no_store_is_not_filed(memory):
+    """'Do you know if my dentist is Dr Patel?' -- the words are his and
+    the fact is in them, but he asked a question and asked for nothing
+    to be remembered. Nothing is filed and the model answers."""
+    r = _call(memory, "my dentist is Dr Patel", "Do you know if my dentist is Dr Patel?")
+    assert not r.ok and "question" in r.text.lower()
+    assert memory._facts == {}
+    # ... while a question that carries the ask is one
+    r = _call(memory, "my dentist is Dr Patel",
+              "Could you remember that my dentist is Dr Patel?")
+    assert r.ok
+
+
+@pytest.mark.parametrize("fact", [
+    "book club is on Tuesdays", "pay day is the 15th", "check-in is at 3pm",
+    "start date is October 5th", "play rehearsal is on Friday",
+])
+def test_a_verb_shaped_noun_with_a_finite_verb_is_a_fact(memory, fact):
+    spec = _tool(memory)
+    assert spec.handler(fact=fact).ok, fact
+
+
+@pytest.mark.parametrize("fact, said", [
+    ("my pin is 12", "remember that my pin is 1234"),
+    ("I am allergic to penicillin", "remember that it is not true that I am allergic to penicillin"),
+    ("I like tea", "remember that I never said I like tea"),
+])
+def test_a_truncated_number_or_a_denied_clause_is_not_his_words(memory, fact, said):
+    r = _call(memory, fact, said)
+    assert not r.ok
+    assert memory._facts == {}
+
+
+@pytest.mark.parametrize("fact, said", [
+    ("my dentist is Dr Patel", "my dentist, uh, is Dr Patel, keep that in mind"),
+    ("she is allergic to nuts", "remember that she's allergic to nuts"),
+    ("my meeting is at 5 pm", "remember that my meeting is at 5 p.m."),
+    ("we live at 12 Oak Street", "don't forget we're living at 12 Oak Street" if False else "don't forget we live at 12 Oak Street"),
+])
+def test_fillers_contractions_and_dotted_abbreviations_are_forgiven(memory, fact, said):
+    assert _call(memory, fact, said).ok, (fact, said)
+
+
+@pytest.mark.parametrize("fact", [
+    "that I graduate December 10th 2026",
+    "Jarvis, remember that I graduate December 10th 2026",
+    "please remember that I graduate December 10th 2026",
+])
+def test_a_copied_that_or_address_files_under_the_rungs_key(memory, fact):
+    spec = _tool(memory)
+    assert spec.handler(fact=fact).ok
+    assert list(memory._facts) == ["you graduate december 10th 2026"]
+
+
+def test_a_question_with_a_courtesy_tail_is_still_a_question(memory):
+    spec = _tool(memory)
+    assert not spec.handler(fact="do I graduate in December, jarvis?").ok
+    assert not spec.handler(fact="do I graduate in December").ok
+    assert memory._facts == {}
+
+
+def test_a_deriver_failure_refuses_rather_than_trusts(memory, monkeypatch):
+    """The registry swallows a deriver exception; the deriver must not
+    let that become silent trust."""
+    monkeypatch.setattr(rt, "his_words", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    r = _call(memory, "my dentist is Dr Patel", "remember that my dentist is Dr Patel")
+    assert not r.ok and memory._facts == {}

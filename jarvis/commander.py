@@ -3267,8 +3267,8 @@ BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment.
 # meaning no to a destructive read-back, and "okay" -- absent from
 # _YES_WORDS, so "okay" used to answer this question with total silence --
 # must not start meaning yes to one.
-# Only _BRIEFING_NO_RX reads this (the YES half has an inline tail of
-# its own): the "…" here widens the DECLINE and nothing else.
+# _BRIEFING_NO_RX and the news asks (_NEWS_ASK_RX) read this; the YES half
+# has an inline tail of its own, which learned the "…" on 2026-09-12.
 _BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!\u2026]*$"
 # An affirmative is a CHAIN: "Yes, go ahead." / "Yeah, sure." / "Okay, do
 # it." are how he actually answers, and a grammar that took one yes-word
@@ -3328,15 +3328,6 @@ _NEWS_ASK_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:read (?:them|those|the stories)(?: (?:to me|out))?|"
     r"what are they|which ones|hear them|let'?s hear (?:them|those))"
     + _BRIEFING_TAIL, re.I)
-
-
-def _offer_ttl(offer) -> float:
-    """The offer's own ``ttl_s`` when it carries one, else the rung's."""
-    try:
-        ttl = float((offer or {}).get("ttl_s") or 0.0)
-    except (TypeError, ValueError, AttributeError):
-        ttl = 0.0
-    return ttl if ttl > 0 else BRIEFING_OFFER_TTL_S
 
 
 def news_answer(text) -> Optional[bool]:
@@ -12394,14 +12385,21 @@ class Commander:
                  " (explicit)" if explicit else "")
         window = UNDO_EXPLICIT_WINDOW_S if explicit else UNDO_WINDOW_S
         pend, self._last_undo = self._last_undo, None
+        # A fact the remember TOOL filed after the last Tier-1 action is the
+        # newer thing on the books: "scratch that" after "Noted, sir: ..."
+        # must not cancel an older timer instead. Newest wins.
+        tool_at = self._remember_undo_at()
+        if tool_at and (pend is None or tool_at > pend[1]):
+            parked = self._remember_undo(window)
+            if parked is not None:
+                self._last_undo = pend           # the older one stays on the books
+                return parked
         if pend is None:
             # A calendar add made through the TOOL (the confident path, which
             # never asks) carries no CommandResult, so its undo is parked on
             # the source instead. Same staleness rule; nothing else is looked
             # for here.
             parked = self._calendar_add_undo()
-            if parked is None:
-                parked = self._remember_undo()
             if parked is not None:
                 return parked
             log.info("undo asked for with nothing to undo: %r", text)
@@ -12428,12 +12426,23 @@ class Commander:
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
 
-    def _remember_undo(self) -> Optional[CommandResult]:
+    def _remember_undo_at(self) -> float:
+        """When the remember tool last parked an undo (monotonic), or 0."""
+        entry = getattr(self.services, "remember_undo", None)
+        if not isinstance(entry, dict) or not callable(entry.get("undo")):
+            return 0.0
+        try:
+            return float(entry.get("at") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _remember_undo(self, window: float = UNDO_WINDOW_S) -> Optional[CommandResult]:
         """"Scratch that" after the remember TOOL filed a fact. The rung
         returns its undo in the CommandResult; a ToolResult cannot, so the
         tool parks {undo, at} on services.remember_undo (jarvis/tools/
-        remember.py), the way the calendar parks last_add. Same window,
-        cleared on the first try whether or not it worked."""
+        remember.py), the way the calendar parks last_add. The caller's
+        window (15 min for an explicit "belay"), cleared on the first try
+        whether or not it worked."""
         entry = getattr(self.services, "remember_undo", None)
         if not isinstance(entry, dict) or not callable(entry.get("undo")):
             return None
@@ -12445,7 +12454,7 @@ class Commander:
             at = float(entry.get("at") or 0.0)
         except (TypeError, ValueError):
             at = 0.0
-        if at and time.monotonic() - at > UNDO_WINDOW_S:
+        if at and time.monotonic() - at > window:
             log.info("remember undo expired (%.0fs)", time.monotonic() - at)
             return None
         try:
@@ -13789,11 +13798,7 @@ class Commander:
             made = float(offer.get("made_at") or 0.0)
         except (TypeError, ValueError):
             made = 0.0
-        # An offer may carry its own life: the news follow-up is parked
-        # when the TOOL runs, before the briefing is even spoken, so the
-        # briefing eats its first minute.
-        ttl = _offer_ttl(offer)
-        if made and time.time() - made > ttl:
+        if made and time.time() - made > BRIEFING_OFFER_TTL_S:
             log.info("briefing offer expired; %r is a new subject", text[:40])
             return None
         answer = (news_answer(text) if offer.get("kind") == "news"
@@ -13827,7 +13832,7 @@ class Commander:
             # line already composed it left the turn open until the 60 s
             # watchdog, with every wake word refused meanwhile.
             return CommandResult(handled=True, reply=outcome.strip(), speak=True,
-                                 status="News")
+                                 status="Briefing news")   # the Briefing family marks the day
         ran = bool(outcome)
         if not ran:
             # A yes that vanishes is worse than a refusal: the model was
@@ -14918,9 +14923,10 @@ class Commander:
             # (only mid-reading).
             # The addressed twin of rungs 3'' and 3''a: the same strip,
             # so "jarvis, say again, uh" is not the odd one out.
-            if quiet_kind(strip_fillers(text)):
-                return _h_quiet(self, strip_fillers(text), True)
-            if repeat_kind(strip_fillers(text)):
+            twin_words = strip_fillers(strip_jarvis_prefix(text) or text)
+            if quiet_kind(twin_words):
+                return _h_quiet(self, twin_words, True)
+            if repeat_kind(twin_words):
                 return _h_repeat(self, text, True)
             pm = _PRONOUNCE_RX.match(text.strip())
             if pm:
