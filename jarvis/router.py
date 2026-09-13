@@ -169,7 +169,7 @@ class PendingAsk:
 
 # ---------------------------------------------------------------- helpers
 _PREFIX_RX = re.compile(r"^(?:(?:hey|ok|okay|hi)[,\s]+)?jarvis[,!:]?\s*", re.I)
-_TRAIL_RX = re.compile(r"[\s.!?]+$")
+_TRAIL_RX = re.compile(r"[\s.!?…]+$")     # … is Whisper's trailing-off voice
 
 
 def normalise(text: str) -> str:

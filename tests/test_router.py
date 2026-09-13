@@ -1010,3 +1010,11 @@ def test_NOTHING_ROUTES_TO_ASK_ANY_MORE_and_that_is_on_purpose():
         seen.add(r.route(text, "jarvis").kind)
         r.clear_pending()
     assert "ask" not in seen, seen
+
+
+def test_normalise_strips_an_ellipsis_like_a_full_stop():
+    """Whisper writes '…' on a trailing-off voice; the router's trailing
+    punctuation strip knew '.', '!' and '?' and not that (census V06)."""
+    from jarvis.router import normalise
+    assert normalise("jarvis, what time is it…") == normalise("jarvis, what time is it")
+    assert normalise("stop…") == "stop"

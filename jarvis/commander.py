@@ -11978,7 +11978,11 @@ class Commander:
         #     which would otherwise eat "skip" / "back" / "pause" / "go on"
         #     before the reader saw them. When nothing is being read the
         #     handler returns None and every one of those keeps its meaning.
-        rc = read_control_kind(cmd_text if cmd_text is not None else text)
+        #     A trailing filler kept both raw-text rungs from matching --
+        #     "go on, uh" / "cancel that, uh" fell through to the model
+        #     (2026-09-12 census) -- so each reads the words with the
+        #     pauses taken off, the same strip every other rung uses.
+        rc = read_control_kind(strip_fillers(cmd_text if cmd_text is not None else text))
         if rc and self._svc("reader") is not None:
             res = _h_read_control(self, text, rc)
             if res is not None:
@@ -12035,8 +12039,9 @@ class Commander:
         #      Placed after the pending yes/no stages and the custom
         #      phrases (both of which own "cancel that" / may shadow a
         #      built-in) and before the gate, exactly like read_control.
-        if quiet_kind(text):
-            return _h_quiet(self, text, True)
+        quiet_words = strip_fillers(text)
+        if quiet_kind(quiet_words):
+            return _h_quiet(self, quiet_words, True)
 
         # 3''a. "Say again", the other half of the same hole, and the same
         #       silence -- his #8, "doesnt understand say again. or any of

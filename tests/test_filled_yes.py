@@ -1526,3 +1526,39 @@ class TestTheAddressAndTheFiller:
         assert cmdr._try_correction(said, "voice") is None, said
         assert cmdr._try_day_shift(said, "voice") is None, said
         assert redispatch == []
+
+
+# ---------------------------------------------- the raw-text rungs, filled
+class TestTheRawTextRungsTakeAFilledPause:
+    """Two rungs read the RAW text -- the quiet words and the read controls
+    -- and a trailing filler kept them from matching: "cancel that, uh"
+    fell through to the model (census V06, by code reading). The strip is
+    the same strip_fillers every other rung uses; a bare filler is still
+    nothing at all."""
+
+    def test_a_filled_cancel_is_still_the_quiet_word(self, cmdr, monkeypatch):
+        seen = []
+        import jarvis.commander as cm
+        monkeypatch.setattr(cm, "_h_quiet",
+                            lambda c, t, prefixed: (seen.append(t), CommandResult(
+                                handled=True, status="quiet"))[1])
+        res = cmdr.handle("cancel that, uh", "voice")
+        assert res is not None and res.status == "quiet"
+        assert seen == ["cancel that"]
+
+    @pytest.mark.parametrize("said, kind", [("go on, uh", "resume"),
+                                            ("skip, uh", "skip"),
+                                            ("um, go back", "back")])
+    def test_a_filled_read_control_still_steers_a_reading(self, cmdr, said, kind):
+        reader = SimpleNamespace(active=True, skip=MagicMock(), back=MagicMock(),
+                                 pause=MagicMock(), resume=MagicMock(), stop=MagicMock())
+        cmdr.services.reader = reader
+        from jarvis.commander import read_control_kind
+        assert read_control_kind(said) is None            # the raw text misses
+        res = cmdr.handle(said, "voice")
+        assert res is not None and res.handled
+        assert getattr(reader, kind).called, said
+
+    def test_a_bare_filler_is_still_nothing(self, cmdr):
+        res = cmdr.handle("uh", "voice")
+        assert res is None or not getattr(res, "reply", "")

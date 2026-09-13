@@ -108,6 +108,12 @@ def test_action_claims_are_recognised(line, claim):
     "In the film, he's playing now at the Odeon.",   # not Jarvis, not music
     "I've added a note about it in my head.",        # hedged: nothing done
     "I've cleared my afternoon in theory.",
+    # A vocative or an interjection between the negation and the verb
+    # is not a clause of its own (2026-09-12 census, V16).
+    "Nothing, sir, has been added to your list.",
+    "Nothing, ma'am, was set.",
+    "Nothing, of course, has been sent, sir.",
+    "Nothing, I'm afraid, was saved.",
 ])
 def test_ordinary_replies_are_not_claims(line):
     assert brain_mod.unbacked_claim(line) is None

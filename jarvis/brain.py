@@ -711,11 +711,21 @@ _NEGATED_LEAD_IN_RX = re.compile(
     r"will not|shall not|shan['’]t) forget(?: that| it| this)?)\b", re.I)
 
 
+# A vocative or an interjection set off by commas is not a clause of its
+# own: "Nothing, sir, has been added" is one negated clause with "sir" in
+# the middle of it, and splitting on the commas handed the guard " has
+# been " with the "Nothing" gone (2026-09-12 census, V16).
+_VOCATIVE_CLAUSE_RX = re.compile(
+    r",\s*(?:sir|ma['’]am|madam|mam|of course|certainly|naturally|"
+    r"i(?:'m| am) afraid|i think|i believe|as it happens|for now)\s*,", re.I)
+
+
 def _claim_negated(before):
     """Does a negation govern the claim that begins where ``before``
     ends? Only one in the claim's own clause counts, and a lead-in idiom
     opening that clause is not one."""
-    clause = _CLAUSE_BOUNDARY_RX.split(before or "")[-1]
+    before = _VOCATIVE_CLAUSE_RX.sub(" ", before or "")
+    clause = _CLAUSE_BOUNDARY_RX.split(before)[-1]
     clause = _NEGATED_LEAD_IN_RX.sub(" ", clause)
     return bool(_CLAIM_NEGATED_RX.search(clause))
 # 2. A HEDGE unsays it in the same breath: nothing was done and the model
