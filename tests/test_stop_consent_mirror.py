@@ -93,6 +93,12 @@ KNOWN = {
         "for: 09-05 12:24, 'Uh, yeah.' to 'Shall I run your briefing, "
         "sir?' was thrown away. Making it refuse a rising yes would undo "
         "the fix that started all four rounds."),
+    "commander.py:news_answer:_NEWS_ASK_RX": (NEITHER,
+        "The news follow-up rides the briefing offer (kind 'news'): 'read "
+        "them' / 'what are they' / 'go on then' read three headlines aloud. "
+        "Reversible, nothing leaves the flat, no device moves; a false yes "
+        "costs one sentence of stories, a false no costs him asking twice. "
+        "Parked only for 60 s after a briefing that summarised the news."),
     "commander.py:Commander._try_teach_offer:_TAKE_QUIZ_RX": (NEITHER,
         "'go on' / 'do it' takes a teach offer and builds a quiz from "
         "chunks already retrieved. Nothing is sent, opened or written "

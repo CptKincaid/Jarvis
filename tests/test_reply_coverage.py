@@ -969,6 +969,7 @@ AUTHORED_BY_WRITES = {
     ("spotify.py", "_like"), ("timekeeper.py", "set_reminder"),
     ("timekeeper.py", "set_timer"), ("timekeeper.py", "set_alarm"),
     ("timekeeper.py", "manage_schedule"),
+    ("remember.py", "remember"),           # "Noted, sir: <the fact as stored>."
 }
 # READS that author a success line -- every one of them invisible to
 # answer_owed, exactly the way screen_qa's own answer is. Measured
