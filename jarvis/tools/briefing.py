@@ -797,6 +797,32 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
     return sections, "\n".join(lines)
 
 
+def news_follow_up(cfg) -> bool:
+    """``briefing.news_follow_up``: after a briefing that summarised the
+    news, park the stories so "let's hear it" reads them. On by default."""
+    return _truthy(_cfg_get(cfg, "briefing.news_follow_up", True))
+
+
+_ORDINALS = ("One", "Two", "Three", "Four", "Five", "Six")
+
+
+def news_line(items) -> str:
+    """The stories, composed here and not by the model: "Here they are,
+    sir. One: <title>, from <source>. Two: ..." -- one sir, a full stop
+    between stories so the voice breathes (list-composition rule)."""
+    parts = []
+    for i, n in enumerate(items[:len(_ORDINALS)]):
+        title = str((n or {}).get("title") or "").strip().rstrip(".")
+        source = str((n or {}).get("source") or "").strip()
+        if not title:
+            continue
+        tail = f", from {source}" if source else ""
+        parts.append(f"{_ORDINALS[len(parts)]}: {title}{tail}.")
+    if not parts:
+        return "There is nothing to read, sir."
+    return "Here they are, sir. " + " ".join(parts)
+
+
 def briefing_enabled(cfg) -> bool:
     return _truthy(_cfg_get(cfg, "briefing.enabled", False))
 
@@ -1237,6 +1263,38 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         except Exception:
             log.debug("could not park the study offer", exc_info=True)
 
+    def _retire_offer():
+        if services is None:
+            return
+        try:
+            services.briefing_offer = None
+        except Exception:
+            log.debug("could not retire the briefing offer", exc_info=True)
+
+    def _park_news(items):
+        # Answered by Commander._try_briefing_offer -- end-anchored yes/no,
+        # the 60 s TTL, anything else a new subject with the offer dropped.
+        if services is None:
+            return
+
+        def deliver() -> bool:
+            speak = getattr(services, "speak", None)
+            if not callable(speak):
+                return False
+            try:
+                # An ANSWER to his yes, not a proactive line: quiet hours
+                # must not hold it for the digest.
+                speak(news_line(items), proactive=False)
+            except Exception:                        # noqa: BLE001 - the rung says "held"
+                log.exception("news follow-up could not be spoken")
+                return False
+            return True
+        try:
+            services.briefing_offer = {"made_at": time.time(), "deliver": deliver,
+                                       "kind": "news"}
+        except Exception:
+            log.debug("could not park the news follow-up", exc_info=True)
+
     def _park_offer(offer):
         # The commander answers the "shall I wake you" yes/no from here
         # (Commander._try_alarm_offer), the way a calendar add waits on
@@ -1290,6 +1348,22 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         if not got_any:
             return ToolResult(text="briefing sources unreachable", ok=False,
                               speak=NOTHING_LINE)
+        # A briefing that is being DELIVERED retires any parked offer of
+        # one -- HERE, because this tool is the one door every delivery
+        # goes through (the explicit rung, the model answering inside a
+        # compound question, the first wake). 2026-09-04 15:06: the model
+        # delivered it inline, the arrival offer from 14:44 then asked
+        # "Shall I run your briefing, sir?", he said yes, and the calendar
+        # and the lab were read a second time. Only the first-wake path
+        # cleared the offer; this covers the other two doors.
+        _retire_offer()
+        # ... and if the news was summarised rather than read, the stories
+        # go on the SAME offer protocol, so "let's hear it" / "yes" reads
+        # them and anything else drops them without a word (15:07:02 that
+        # day: "Let's hear it" was a generic yes with nothing parked, and
+        # routed to the model, which answered about the inbox).
+        if sections.get("news") and news_follow_up(cfg):
+            _park_news(sections["news"])
         return ToolResult(text=sheet, card=sections,
                           max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["today"]))
 

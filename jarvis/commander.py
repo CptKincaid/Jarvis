@@ -3312,6 +3312,27 @@ _BRIEFING_NO_RX = re.compile(
 BRIEFING_OFFER_TTL_S = 60.0
 
 
+# The NEWS follow-up rides the same offer (kind "news", parked by the
+# briefing tool after it summarised the stories). The asks that only make
+# sense for a list of stories are yeses for THAT kind and no other --
+# "read them" is not an answer to "Shall I run your briefing?". Same
+# shape as the yes grammar: end-anchored, a "jarvis" allowed in front.
+_NEWS_ASK_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:read (?:them|those|it|the stories)(?: (?:to me|out))?|"
+    r"tell me(?: (?:them|about them))?|what are they|which ones|"
+    r"go on(?: then)?|hear them|let'?s hear (?:them|those))"
+    + _BRIEFING_TAIL, re.I)
+
+
+def news_answer(text) -> Optional[bool]:
+    """``briefing_answer`` plus the asks that only a list of stories
+    invites."""
+    answer = briefing_answer(text)
+    if answer is not None:
+        return answer
+    return True if _NEWS_ASK_RX.match(strip_fillers(str(text or "")).strip()) else None
+
+
 def briefing_answer(text) -> Optional[bool]:
     """True / False / None for "Shall I run your briefing, sir?".
 
@@ -13719,7 +13740,8 @@ class Commander:
         if made and time.time() - made > BRIEFING_OFFER_TTL_S:
             log.info("briefing offer expired; %r is a new subject", text[:40])
             return None
-        answer = briefing_answer(text)
+        answer = (news_answer(text) if offer.get("kind") == "news"
+                  else briefing_answer(text))
         if answer is None:
             # Not answer-SHAPED, so not an answer: the offer is gone and
             # the words keep their own meaning. The ORIGINAL words are

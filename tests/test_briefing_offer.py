@@ -614,3 +614,43 @@ class TestTheOfferSaysSomethingHeCanRepeat:
         words would steal the evening preview instead."""
         res = cmdr.handle(f"my {word} briefing", "voice")
         assert res is None or res.status != "Briefing…", word
+
+
+# ------------------------------------------------ the news follow-up (09-04)
+class TestTheNewsFollowUp:
+    """After a briefing that summarised the news, the stories sit on this
+    same offer (kind "news"). "Let's hear it" was already a yes; the asks
+    that only make sense for a list of stories are yeses HERE and nowhere
+    else -- "read them" is not an answer to "Shall I run your briefing?"."""
+
+    def _news(self, cmdr, ok=True):
+        ran = []
+        cmdr.services.briefing_offer = {
+            "made_at": _t.time(), "kind": "news",
+            "deliver": lambda: (ran.append(1), ok)[1]}
+        return ran
+
+    @pytest.mark.parametrize("said", ["let's hear it", "yes", "read them",
+                                      "tell me", "what are they", "which ones",
+                                      "go on then", "read them to me"])
+    def test_a_yes_or_an_ask_for_the_stories_reads_them(self, cmdr, said):
+        ran = self._news(cmdr)
+        res = cmdr.handle(said, "voice")
+        assert res is not None and res.handled and ran == [1], said
+        assert cmdr.services.briefing_offer is None
+
+    @pytest.mark.parametrize("said", ["read them", "tell me", "what are they"])
+    def test_those_asks_are_not_a_yes_to_the_briefing_itself(self, cmdr, said):
+        ran = _offer(cmdr)
+        cmdr.handle(said, "voice")
+        assert ran == [], said
+
+    def test_a_no_is_a_quiet_no(self, cmdr):
+        ran = self._news(cmdr)
+        res = cmdr.handle("no thanks", "voice")
+        assert res is not None and res.reply == BRIEFING_DECLINED_LINE and ran == []
+
+    def test_anything_else_drops_the_stories_without_a_word(self, cmdr):
+        ran = self._news(cmdr)
+        cmdr.handle("what's the weather", "voice")
+        assert ran == [] and cmdr.services.briefing_offer is None

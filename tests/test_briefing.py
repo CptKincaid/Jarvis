@@ -626,3 +626,81 @@ def test_get_briefing_is_the_composed_summary_not_the_day_list():
                if sp.name == "get_calendar")
     assert "what's on today" in cal.description.lower()
     assert spec.description_words() <= 20 and cal.description_words() <= 20
+
+
+# ------------------------------------ the briefing given twice (09-04 15:06)
+def test_a_delivered_briefing_retires_the_parked_offer_whichever_door_called(tmp_path, monkeypatch):
+    """He asked for his briefing inside a compound question, the model
+    delivered it inline, and the arrival offer parked at 14:44 then asked
+    'Shall I run your briefing, sir?' -- yes, and the calendar and the lab
+    were read a second time. The first-wake path cleared the offer; the
+    tool itself is the one door every delivery goes through."""
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer={"made_at": 1.0, "deliver": lambda: True},
+                               speak=lambda *a, **k: None)
+    (spec,) = br.make_tools(Cfg(enabled=True, news_follow_up=False), services)
+    assert spec.handler().ok
+    assert services.briefing_offer is None
+
+
+def test_a_preview_or_a_failed_briefing_leaves_the_offer_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    offer = {"made_at": 1.0, "deliver": lambda: True}
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer=offer, speak=lambda *a, **k: None)
+    (spec,) = br.make_tools(Cfg(enabled=True), services)
+    spec.handler(when="week")
+    assert services.briefing_offer is offer
+    monkeypatch.setattr(br, "_fetch", FakeFetch({}))
+    (spec,) = br.make_tools(Cfg(enabled=True), SimpleNamespace(
+        tools=None, news_cache_path=tmp_path / "news2.json", briefing_offer=offer))
+    assert not spec.handler().ok
+    assert services.briefing_offer is offer
+
+
+# ------------------------------------------ "let's hear it" (09-04 15:07)
+def test_a_briefing_with_news_parks_a_follow_up_that_reads_the_stories(tmp_path, monkeypatch):
+    """The briefing said 'three stories to note, including one regarding
+    GPT-6 Astra'; he said 'Let's hear it' and the model answered about the
+    inbox. The stories go on the ONE offer protocol the briefing already
+    uses, so a yes reads them and anything else drops it silently."""
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    said = []
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer=None,
+                               speak=lambda text, proactive=True, kind="warning": said.append(
+                                   (text, proactive)))
+    (spec,) = br.make_tools(Cfg(enabled=True), services)
+    r = spec.handler()
+    assert r.ok and len(r.card["news"]) == 3
+    offer = services.briefing_offer
+    assert isinstance(offer, dict) and offer.get("kind") == "news"
+    assert callable(offer["deliver"]) and offer["made_at"] > 0
+    assert offer["deliver"]() is True
+    assert len(said) == 1 and said[0][1] is False        # an answer, not proactive
+    line = said[0][0]
+    for n in r.card["news"]:
+        assert n["title"] in line
+    assert line.count("sir") == 1
+
+
+def test_no_news_no_follow_up_and_the_switch_turns_it_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer=None, speak=lambda *a, **k: None)
+    (spec,) = br.make_tools(Cfg(enabled=True, sections={"news": False}), services)
+    assert spec.handler().ok
+    assert services.briefing_offer is None
+    (spec,) = br.make_tools(Cfg(enabled=True, news_follow_up=False), services)
+    assert spec.handler().ok
+    assert services.briefing_offer is None
+
+
+def test_the_follow_up_with_nothing_to_speak_through_reports_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "_fetch", FakeFetch())
+    services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
+                               briefing_offer=None)
+    (spec,) = br.make_tools(Cfg(enabled=True), services)
+    assert spec.handler().ok
+    assert services.briefing_offer["deliver"]() is False
