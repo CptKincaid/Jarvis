@@ -720,9 +720,17 @@ _NEGATED_LEAD_IN_RX = re.compile(
 # can't store that, sir, but I've noted it" is two clauses; both keep
 # their commas, and both are still claims.
 _NEG_SUBJECT_VOCATIVE_RX = re.compile(
-    r"^(\s*(?:nothing|nobody|none|no one|neither|not one))\s*,\s*"
+    r"^(\s*(?:nothing|nobody|none|no one|neither|not one|not a thing)"
+    r"(?: at all| new| else| more| yet| of (?:it|that|this|them|mine|yours|his|hers))?)"
+    r"\s*,\s*"
     r"(?:sir|ma['’]am|madam|mam|of course|certainly|naturally|"
-    r"i(?:'m| am) afraid|i think|i believe|as it happens|for now)\s*,", re.I)
+    r"i(?:'m| am) afraid|i think|i believe|as it happens|for now)\s*,"
+    # ... and ONLY when the negative subject's own predicate follows. A
+    # conjunction or a new subject after the vocative ("Nothing, sir, but
+    # I have added milk") keeps its comma, so the claim in the next clause
+    # is judged on its own (the 2026-09-12 attack round's regression).
+    r"(?=\s*(?:has|have|had|is|was|are|were|will|would|could|can|got|did|"
+    r"does|needs?|remains?|went|came|happened|changed|moved)\b)", re.I)
 
 
 def _claim_negated(before):

@@ -3282,10 +3282,13 @@ _BRIEFING_YES_WORD = (
     r"very well|please do|do it|do that|run it|go ahead|go for it|why not|"
     r"let'?s (?:hear it|do it)|i would|if you would|please|"
     r"that would be great)")
+# The tail admits "…" -- Whisper's trailing-off voice -- as the NO tail
+# and the router already did; without it "yes…" spent the day's one offer
+# as a new subject while "no…" declined (2026-09-12 attack round).
 _BRIEFING_YES_RX = re.compile(
     r"^(?:jarvis[,\s]+)?" + _BRIEFING_YES_WORD
     + r"(?:[,\s]+(?:" + _BRIEFING_YES_WORD
-    + r"|jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$", re.I)
+    + r"|jarvis|sir|please|thanks|thank you|then|now))*[?.!\u2026]*$", re.I)
 # "go on" / "carry on" / "continue" are deliberately NOT here and neither
 # is a bare "skip": _READ_CTL_RX owns the first three and "skip" alone is
 # in the live log as a real command routed to local:music
@@ -3317,11 +3320,23 @@ BRIEFING_OFFER_TTL_S = 60.0
 # sense for a list of stories are yeses for THAT kind and no other --
 # "read them" is not an answer to "Shall I run your briefing?". Same
 # shape as the yes grammar: end-anchored, a "jarvis" allowed in front.
+# NOT here, on purpose: "read it" (three claimants decided by recency --
+# selection, document, mail), "go on" (the reader's own prompt) and "tell
+# me" (every section invites it). The news may not be a fourth claimant
+# for a minute after every briefing.
 _NEWS_ASK_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?(?:read (?:them|those|it|the stories)(?: (?:to me|out))?|"
-    r"tell me(?: (?:them|about them))?|what are they|which ones|"
-    r"go on(?: then)?|hear them|let'?s hear (?:them|those))"
+    r"^(?:jarvis[,\s]+)?(?:read (?:them|those|the stories)(?: (?:to me|out))?|"
+    r"what are they|which ones|hear them|let'?s hear (?:them|those))"
     + _BRIEFING_TAIL, re.I)
+
+
+def _offer_ttl(offer) -> float:
+    """The offer's own ``ttl_s`` when it carries one, else the rung's."""
+    try:
+        ttl = float((offer or {}).get("ttl_s") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        ttl = 0.0
+    return ttl if ttl > 0 else BRIEFING_OFFER_TTL_S
 
 
 def news_answer(text) -> Optional[bool]:
@@ -12091,7 +12106,7 @@ class Commander:
         #       design, and it does not cover "say again" or "repeat
         #       that".) _REPEAT_RX is anchored like _QUIET_RX, so this
         #       fires only when the words ARE the request.
-        if repeat_kind(text):
+        if repeat_kind(strip_fillers(text)):
             return _h_repeat(self, text, True)
 
         # 3''b. "and the next day": re-ask HIS previous question one day
@@ -13750,7 +13765,7 @@ class Commander:
         # actually being read, those words belong to the reader and this
         # rung stands aside with the offer still parked. Narrow on purpose:
         # a "yes" is not a read control and still answers the question.
-        if read_control_kind(text) is not None and \
+        if read_control_kind(strip_fillers(text)) is not None and \
                 getattr(self._svc("reader"), "active", False) is True:
             log.debug("briefing offer: a reading owns %r", text[:40])
             return None
@@ -13774,7 +13789,11 @@ class Commander:
             made = float(offer.get("made_at") or 0.0)
         except (TypeError, ValueError):
             made = 0.0
-        if made and time.time() - made > BRIEFING_OFFER_TTL_S:
+        # An offer may carry its own life: the news follow-up is parked
+        # when the TOOL runs, before the briefing is even spoken, so the
+        # briefing eats its first minute.
+        ttl = _offer_ttl(offer)
+        if made and time.time() - made > ttl:
             log.info("briefing offer expired; %r is a new subject", text[:40])
             return None
         answer = (news_answer(text) if offer.get("kind") == "news"
@@ -13796,10 +13815,20 @@ class Commander:
             log.warning("briefing offer had no deliver callback")
             return None
         try:
-            ran = bool(deliver())
+            outcome = deliver()
         except Exception:
             log.exception("briefing offer: delivery failed")
-            ran = False
+            outcome = False
+        if isinstance(outcome, str) and outcome.strip():
+            # A delivery that hands back the LINE (the news follow-up) is
+            # spoken HERE as a finished reply, so the turn closes and the
+            # follow-up mic arms like any answer. done=False below is for a
+            # delivery that lands through brain.chat on a later beat; for a
+            # line already composed it left the turn open until the 60 s
+            # watchdog, with every wake word refused meanwhile.
+            return CommandResult(handled=True, reply=outcome.strip(), speak=True,
+                                 status="News")
+        ran = bool(outcome)
         if not ran:
             # A yes that vanishes is worse than a refusal: the model was
             # busy (or the app threw), so nothing was said and nothing was
@@ -14887,9 +14916,11 @@ class Commander:
             # Voice I/O answered locally: quiet, say again, pronounce,
             # spelled names / vocabulary, read aloud, continue reading
             # (only mid-reading).
-            if quiet_kind(text):
-                return _h_quiet(self, text, True)
-            if repeat_kind(text):
+            # The addressed twin of rungs 3'' and 3''a: the same strip,
+            # so "jarvis, say again, uh" is not the odd one out.
+            if quiet_kind(strip_fillers(text)):
+                return _h_quiet(self, strip_fillers(text), True)
+            if repeat_kind(strip_fillers(text)):
                 return _h_repeat(self, text, True)
             pm = _PRONOUNCE_RX.match(text.strip())
             if pm:

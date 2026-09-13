@@ -677,12 +677,13 @@ def test_a_briefing_with_news_parks_a_follow_up_that_reads_the_stories(tmp_path,
     offer = services.briefing_offer
     assert isinstance(offer, dict) and offer.get("kind") == "news"
     assert callable(offer["deliver"]) and offer["made_at"] > 0
-    assert offer["deliver"]() is True
-    assert len(said) == 1 and said[0][1] is False        # an answer, not proactive
-    line = said[0][0]
+    line = offer["deliver"]()                            # the LINE, for the rung to speak
+    assert isinstance(line, str) and line.startswith("Here they are, sir.")
+    assert said == []                                    # the tool speaks nothing itself
     for n in r.card["news"]:
         assert n["title"] in line
     assert line.count("sir") == 1
+    assert offer["ttl_s"] >= 120                          # the briefing eats the first minute
 
 
 def test_no_news_no_follow_up_and_the_switch_turns_it_off(tmp_path, monkeypatch):
@@ -697,10 +698,23 @@ def test_no_news_no_follow_up_and_the_switch_turns_it_off(tmp_path, monkeypatch)
     assert services.briefing_offer is None
 
 
-def test_the_follow_up_with_nothing_to_speak_through_reports_false(tmp_path, monkeypatch):
+def test_no_news_follow_up_beside_a_study_offer_from_the_same_call(tmp_path, monkeypatch):
+    """One delivery, one question on the table: when the briefing parked a
+    study offer, the stories are not parked on top of it."""
     monkeypatch.setattr(br, "_fetch", FakeFetch())
     services = SimpleNamespace(tools=FakeRegistry(), news_cache_path=tmp_path / "news.json",
-                               briefing_offer=None)
+                               briefing_offer=None, study_offer=None)
     (spec,) = br.make_tools(Cfg(enabled=True), services)
+    real = br.build_briefing
+
+    def parking(*a, **k):                      # this call parks a study offer
+        k["park_offer"]({"course": "x", "n": 3, "made_at": 1.0})
+        return real(*a, **k)
+    monkeypatch.setattr(br, "build_briefing", parking)
+    r = spec.handler()
+    assert r.ok and services.study_offer
+    assert services.briefing_offer is None
+    monkeypatch.setattr(br, "build_briefing", real)   # and the next call, no study offer, parks the news
+    services.study_offer = None
     assert spec.handler().ok
-    assert services.briefing_offer["deliver"]() is False
+    assert services.briefing_offer["kind"] == "news"

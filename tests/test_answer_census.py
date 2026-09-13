@@ -80,11 +80,6 @@ KNOWN_STRIPPERS = {
 #     it reaches is over that argument. Owner: the rung. A false hit named
 #     here rather than silenced in the derivation.
 KNOWN_UNSTRIPPED = {
-    "commander.py:read_control_kind:_READ_CTL_RX": (
-        "command grammar", "",
-        "\"skip\" while something is being READ belongs to the reader (rung 4b), "
-        "and the briefing offer stands aside for it; the reader's own rung is the "
-        "command grammar and is unstripped."),
     "commander.py:_send_clean:_SEND_FILLER_LEAD_RX": (
         "second list", "_send_clean",
         "the send lane's own lead list, inside _send_clean itself; backstopped by "

@@ -5310,7 +5310,11 @@ class JarvisApp:
                 made = float(offer.get("made_at") or 0.0)
             except (TypeError, ValueError):
                 made = 0.0
-            if not made or time.time() - made <= ttl:
+            try:
+                own = float(offer.get("ttl_s") or 0.0)     # the news follow-up's
+            except (TypeError, ValueError):
+                own = 0.0
+            if not made or time.time() - made <= (own if own > 0 else ttl):
                 return True
         return False
 

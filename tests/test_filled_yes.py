@@ -1559,6 +1559,17 @@ class TestTheRawTextRungsTakeAFilledPause:
         assert res is not None and res.handled
         assert getattr(reader, kind).called, said
 
+    def test_a_filled_say_again_is_still_say_again(self, cmdr, monkeypatch):
+        """The third raw-text rung beside the two: 'say that again, uh'
+        was dropped as background chat."""
+        seen = []
+        import jarvis.commander as cm
+        monkeypatch.setattr(cm, "_h_repeat",
+                            lambda c, t, *a, **k: (seen.append(t), CommandResult(
+                                handled=True, status="repeat"))[1])
+        res = cmdr.handle("say that again, uh", "voice")
+        assert res is not None and res.status == "repeat"
+
     def test_a_bare_filler_is_still_nothing(self, cmdr):
         res = cmdr.handle("uh", "voice")
         assert res is None or not getattr(res, "reply", "")

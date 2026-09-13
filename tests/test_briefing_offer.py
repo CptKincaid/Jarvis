@@ -631,13 +631,56 @@ class TestTheNewsFollowUp:
         return ran
 
     @pytest.mark.parametrize("said", ["let's hear it", "yes", "read them",
-                                      "tell me", "what are they", "which ones",
-                                      "go on then", "read them to me"])
+                                      "what are they", "which ones",
+                                      "read them to me", "hear them", "yes…"])
     def test_a_yes_or_an_ask_for_the_stories_reads_them(self, cmdr, said):
         ran = self._news(cmdr)
         res = cmdr.handle(said, "voice")
         assert res is not None and res.handled and ran == [1], said
         assert cmdr.services.briefing_offer is None
+
+    @pytest.mark.parametrize("said", ["read it", "go on", "tell me", "go on then"])
+    def test_words_with_other_owners_are_not_the_news_yes(self, cmdr, said):
+        """'read it' has three claimants decided by recency (selection,
+        document, mail) and 'go on' answers the reader; the news may not
+        be a fourth claimant for a minute after every briefing."""
+        ran = self._news(cmdr)
+        cmdr.handle(said, "voice")
+        assert ran == [], said
+
+    def test_the_news_yes_closes_the_turn_with_the_line_itself(self, cmdr):
+        """deliver() for the news kind hands back the LINE; the rung speaks
+        it as a finished reply, so the voice turn closes and the mic arms
+        -- done=False here left every wake word refused for 60 s."""
+        cmdr.services.briefing_offer = {
+            "made_at": _t.time(), "kind": "news",
+            "deliver": lambda: "Here they are, sir. One: a story."}
+        res = cmdr.handle("read them", "voice")
+        assert res is not None and res.handled
+        assert res.reply == "Here they are, sir. One: a story." and res.speak is True
+        assert res.done is not False
+
+    def test_a_news_offer_carries_its_own_ttl(self, cmdr):
+        """Parked when the tool runs, before the briefing is even spoken:
+        the briefing itself eats the window, so the news offer says how
+        long it lives."""
+        ran = []
+        cmdr.services.briefing_offer = {
+            "made_at": _t.time() - 90.0, "kind": "news", "ttl_s": 180.0,
+            "deliver": lambda: (ran.append(1), "Here they are, sir.")[1]}
+        cmdr.handle("read them", "voice")
+        assert ran == [1]
+
+    def test_a_filled_read_control_still_stands_aside_for_the_reader(self, cmdr):
+        """The mirror of rung 4b's strip: while a reading is active, 'go
+        on, uh' belongs to the reader, not to the parked offer."""
+        cmdr.services.reader = SimpleNamespace(active=True, skip=MagicMock(),
+                                               back=MagicMock(), pause=MagicMock(),
+                                               resume=MagicMock(), stop=MagicMock())
+        ran = _offer(cmdr)
+        res = cmdr.handle("skip it, uh", "voice")
+        assert ran == [] and cmdr.services.briefing_offer is not None
+        assert res is None or res.reply != BRIEFING_DECLINED_LINE
 
     @pytest.mark.parametrize("said", ["read them", "tell me", "what are they"])
     def test_those_asks_are_not_a_yes_to_the_briefing_itself(self, cmdr, said):
@@ -649,6 +692,13 @@ class TestTheNewsFollowUp:
         ran = self._news(cmdr)
         res = cmdr.handle("no thanks", "voice")
         assert res is not None and res.reply == BRIEFING_DECLINED_LINE and ran == []
+
+    def test_a_trailing_off_yes_is_still_a_yes_to_the_briefing(self, cmdr):
+        """'…' was added to the NO tail and the router, not the YES tail:
+        'yes…' spent the day's offer as a new subject while 'no…' declined."""
+        ran = _offer(cmdr)
+        res = cmdr.handle("yes…", "voice")
+        assert res is not None and ran == [1]
 
     def test_anything_else_drops_the_stories_without_a_word(self, cmdr):
         ran = self._news(cmdr)

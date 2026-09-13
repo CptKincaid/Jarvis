@@ -77,6 +77,7 @@ HN_SOURCE = "Hacker News"
 STOOQ_URL = "https://stooq.com/q/l/?s={sym}.us&f=sd2t2ohlcv&h&e=csv"
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
 NEWS_ITEMS = 3                     # total news items in the briefing
+NEWS_OFFER_TTL_S = 180.0           # the news follow-up's life; the briefing eats the first minute
 HN_SCAN = 30                       # top-story ids ranked by score
 FEED_SCAN = 6                      # entries examined per feed for a tech item
 NEWS_CACHE_S = 15 * 60
@@ -1253,6 +1254,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         exam, _checked = find_next_exam(cfg, cal)
         return exam
 
+    parked = {"study": False}      # did THIS call park a study offer?
+
     def _park_study_offer(offer):
         # Answered by Commander._try_study_offer, the same way the wake-up
         # offer below is answered by _try_alarm_offer.
@@ -1260,6 +1263,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return
         try:
             services.study_offer = offer
+            parked["study"] = bool(offer)
         except Exception:
             log.debug("could not park the study offer", exc_info=True)
 
@@ -1272,26 +1276,22 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             log.debug("could not retire the briefing offer", exc_info=True)
 
     def _park_news(items):
-        # Answered by Commander._try_briefing_offer -- end-anchored yes/no,
-        # the 60 s TTL, anything else a new subject with the offer dropped.
+        # Answered by Commander._try_briefing_offer -- end-anchored yes/no
+        # plus the asks a list of stories invites, anything else a new
+        # subject with the offer dropped. deliver() hands back the LINE and
+        # the rung speaks it as a finished reply (the turn closes, the mic
+        # arms); the tool speaks nothing itself. Its own TTL: it is parked
+        # when the tool runs, before the briefing is spoken, so the
+        # briefing eats the first minute.
         if services is None:
             return
+        line = news_line(items)
 
-        def deliver() -> bool:
-            speak = getattr(services, "speak", None)
-            if not callable(speak):
-                return False
-            try:
-                # An ANSWER to his yes, not a proactive line: quiet hours
-                # must not hold it for the digest.
-                speak(news_line(items), proactive=False)
-            except Exception:                        # noqa: BLE001 - the rung says "held"
-                log.exception("news follow-up could not be spoken")
-                return False
-            return True
+        def deliver() -> str:
+            return line
         try:
             services.briefing_offer = {"made_at": time.time(), "deliver": deliver,
-                                       "kind": "news"}
+                                       "kind": "news", "ttl_s": NEWS_OFFER_TTL_S}
         except Exception:
             log.debug("could not park the news follow-up", exc_info=True)
 
@@ -1338,6 +1338,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                   speak=WEEK_NOTHING_LINE)
             return ToolResult(text=sheet, card=sections,
                               max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["week"]))
+        parked["study"] = False
         sections, sheet = build_briefing(
             cfg, registry, cache_path=cache_path, exam_lookup=_next_exam,
             flashcards=getattr(services, "flashcards", None) if services else None,
@@ -1362,7 +1363,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         # them and anything else drops them without a word (15:07:02 that
         # day: "Let's hear it" was a generic yes with nothing parked, and
         # routed to the model, which answered about the inbox).
-        if sections.get("news") and news_follow_up(cfg):
+        # ONE question on the table per delivery: an exam week's briefing
+        # parks a study offer (services.study_offer) in the same call, and
+        # a yes must not have two questions to land on.
+        if sections.get("news") and news_follow_up(cfg) and not parked["study"]:
             _park_news(sections["news"])
         return ToolResult(text=sheet, card=sections,
                           max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["today"]))

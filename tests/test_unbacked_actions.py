@@ -75,6 +75,13 @@ def _warnings(caplog):
     ("Playing now, sir.", "Playing now"),
     ("I've just cancelled the alarm.", "I've just cancelled"),
     ("I am adding it to the list.", "I am adding"),
+    # A denial followed by a claim in the NEXT clause is still the claim:
+    # the vocative fold (2026-09-12) may not erase the boundary before it.
+    ("Nothing, sir, but I have added milk to your list.", "I have added"),
+    ("Nothing, sir, though I've set a timer.", "I've set"),
+    ("Nothing, sir, and I'll remember that.", "I'll remember that"),
+    ("Nothing, sir. I've noted that.", "I've noted that"),
+    ("No, sir, I've noted that.", "I've noted that"),
 ])
 def test_action_claims_are_recognised(line, claim):
     assert brain_mod.unbacked_claim(line) == claim
@@ -114,6 +121,9 @@ def test_action_claims_are_recognised(line, claim):
     "Nothing, ma'am, was set.",
     "Nothing, of course, has been sent, sir.",
     "Nothing, I'm afraid, was saved.",
+    "Nothing at all, sir, has been added to your list.",
+    "Nothing new, sir, was set.",
+    "None of it, sir, was sent.",
 ])
 def test_ordinary_replies_are_not_claims(line):
     assert brain_mod.unbacked_claim(line) is None
