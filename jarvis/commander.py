@@ -11730,6 +11730,14 @@ class Commander:
         timer, self._objection_timer = getattr(self, "_objection_timer", None), None
         if timer is not None:
             timer.cancel()
+            # cancel() only sets the Timer's flag; the thread exits a
+            # moment later. A caller that reads is_alive() straight after
+            # (stop_assistant's teardown, and its test) saw True now and
+            # then -- the 09-11 flake the census could not place. Joining
+            # makes the cancel mean what it says; never from the timer's
+            # own thread, which would deadlock it.
+            if timer is not threading.current_thread():
+                timer.join(timeout=1.0)
 
     def _speak_now(self, text: str) -> bool:
         """One line through the app's own TTS door (services.speak ->
