@@ -118,3 +118,137 @@ def test_the_app_registers_it():
 def test_the_nudge_now_names_the_tool():
     assert "remember" in brain_mod.UNBACKED_MEMORY_NUDGE
     assert "no tool that stores facts" not in brain_mod.UNBACKED_MEMORY_NUDGE
+
+
+# ------------------------------------------- the attack round, 2026-09-12
+def _call(memory, fact, utterance):
+    """Through the registry as the MODEL would call it: the deriver sees
+    his utterance beside the model's argument."""
+    reg = ToolRegistry()
+    reg.register_many(rt.make_tools(None, SimpleNamespace(memory=memory)))
+    return reg.call("remember", {"fact": fact}, from_model=True, utterance=utterance)
+
+
+def test_a_fact_he_did_not_say_is_refused_and_not_stored(memory):
+    """The registry hands every model call his utterance for exactly this:
+    the model may pass HIS words and nothing else. Invented, paraphrased or
+    third-person facts are refused, so nothing he did not say is filed."""
+    r = _call(memory, "you are feeling sad today", "what time is it")
+    assert not r.ok and "his words" in r.text.lower()
+    assert memory._facts == {}
+    r = _call(memory, "The user graduates on 10 December 2026 (EE degree)",
+              "Keep this in your memory: I graduate December 10th 2026 with an EE degree")
+    assert not r.ok
+    assert memory._facts == {}
+
+
+@pytest.mark.parametrize("fact, said", [
+    ("I graduate December 10th 2026", "Jarvis, remember that I graduate December 10th 2026, please."),
+    ("i graduate december 10th 2026", "Remember that I graduate December 10th 2026."),
+    ("I'm allergic to penicillin", "put it in your memory that I am allergic to penicillin"),
+    ("my dentist is Dr Patel", "Don't forget my dentist is Dr. Patel!"),
+])
+def test_his_words_pass_the_check_with_case_punctuation_and_contractions_forgiven(memory, fact, said):
+    r = _call(memory, fact, said)
+    assert r.ok, (fact, said)
+    assert r.speak.startswith("Noted, sir:")
+
+
+def test_the_forced_path_without_an_utterance_still_stores(memory):
+    """The commander's own force path carries no model arg to doubt."""
+    spec = _tool(memory)
+    assert spec.handler(fact="my locker code is 4412").ok
+
+
+def test_the_model_cannot_vouch_for_itself(memory):
+    """`verbatim` is reserved: a model that sends verbatim=true is stripped."""
+    reg = ToolRegistry()
+    reg.register_many(rt.make_tools(None, SimpleNamespace(memory=memory)))
+    r = reg.call("remember", {"fact": "you owe me money", "verbatim": True},
+                 from_model=True, utterance="what time is it")
+    assert not r.ok and memory._facts == {}
+
+
+@pytest.mark.parametrize("fact", [
+    "remember that I graduate December 10th 2026",
+    "don't forget that I graduate December 10th 2026",
+    "put it in your memory that I graduate December 10th 2026",
+    "keep in mind I graduate December 10th 2026",
+])
+def test_the_rungs_head_is_stripped_so_both_doors_file_one_fact(memory, fact):
+    """'His exact words' begin with the head; the head is not the fact.
+    The same sentence through the rung and the tool is ONE fact."""
+    spec = _tool(memory)
+    r = spec.handler(fact=fact)
+    assert r.ok
+    assert r.speak.lower().startswith("noted, sir: you graduate december 10th 2026")
+    assert len(memory._facts) == 1
+    assert next(iter(memory._facts)) == "you graduate december 10th 2026"
+
+
+@pytest.mark.parametrize("fact, why", [
+    ("remember that", "a bare head"),
+    ("note that down", "a bare head"),
+    ("remember me", "a bare head"),
+    ("remember to call mom at 5", "a to-do"),
+    ("to call mom at five", "a to-do"),
+    ("call mom at five", "a bare imperative"),
+    ("buy milk", "a bare imperative"),
+    ("turn off the lights", "a command"),
+    ("what my dentist's name is", "recall"),
+    ("when I graduate", "recall without its ?"),
+    ("about the thesis", "recall"),
+    ("please set an alarm for 6", "another tool's job, with a courtesy opener"),
+    ("could you remind me to call mom", "another tool's job, with a courtesy opener"),
+])
+def test_what_the_rung_refuses_the_tool_refuses(memory, fact, why):
+    spec = _tool(memory)
+    r = spec.handler(fact=fact)
+    assert not r.ok, why
+    assert memory._facts == {}, why
+
+
+def test_a_hallucinated_address_never_reaches_the_people_book(memory):
+    """The people-book side effect is his words too: an address the model
+    added is not in the utterance, so nothing is written under his alias."""
+    r = _call(memory, "my advisor is Dr Peyrovi, email hp@tamu.edu",
+              "remember that my advisor is Dr Peyrovi")
+    assert not r.ok                                 # the whole fact is not his words
+    assert memory.people() == {}
+
+
+def test_the_read_back_is_the_fact_but_the_log_is_only_its_key(memory, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="jarvis.tools.remember")
+    spec = _tool(memory)
+    r = spec.handler(fact="my wifi password is hunter2swordfish")
+    assert r.ok and "hunter2swordfish" in r.speak                 # his ruling: read it back
+    assert not any("hunter2swordfish" in rec.getMessage() for rec in caplog.records), \
+        [rec.name for rec in caplog.records if "hunter2swordfish" in rec.getMessage()]
+
+
+def test_a_non_string_fact_is_refused(memory):
+    spec = _tool(memory)
+    assert not spec.handler(fact={"a": 1}).ok
+    assert not spec.handler(fact=["x", "y"]).ok
+    assert not spec.handler(fact="x" * 3000).ok                     # a paragraph is not a fact
+    assert memory._facts == {}
+
+
+def test_a_trailing_ellipsis_is_not_part_of_the_fact(memory):
+    spec = _tool(memory)
+    r = spec.handler(fact="I graduate December 10th, please…")
+    assert r.ok and r.speak.lower() == "noted, sir: you graduate december 10th."
+
+
+def test_the_tool_parks_an_undo_for_scratch_that(memory):
+    """The rung returns an undo closure; a ToolResult cannot. The tool
+    parks it on services the way the calendar parks last_add, and the
+    commander's undo rung finds it there."""
+    services = SimpleNamespace(memory=memory)
+    (spec,) = rt.make_tools(None, services)
+    spec.handler(fact="my locker code is 4412")
+    parked = services.remember_undo
+    assert callable(parked["undo"]) and parked["at"] > 0
+    assert parked["undo"]() == "Forgotten, sir."
+    assert memory._facts == {}

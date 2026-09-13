@@ -1658,14 +1658,24 @@ def cap_tool_text(text, cap=MAX_TOOL_TEXT_CHARS):
     return head.rstrip() + marker, True
 
 
-def _args_for_log(args, cap=TOOL_ARGS_LOG_CHARS):
+# Tools whose arguments are HIS WORDS about himself and do not belong in a
+# log that is not his alone: the value is replaced by its length.
+_PRIVATE_ARG_TOOLS = frozenset({"remember"})
+
+
+def _args_for_log(args, cap=TOOL_ARGS_LOG_CHARS, tool=""):
     """The tool args as they appear in the "tool X -> ok" log line: ``""``
     for none, else a space and the JSON, cut at `cap` with an ellipsis so
     a pasted note body cannot flood the log. Non-JSON values (a Device
     dataclass, a datetime) go through str(), never raise — this runs
-    inside the tool loop and a logging failure must not kill the turn."""
+    inside the tool loop and a logging failure must not kill the turn.
+    A tool in ``_PRIVATE_ARG_TOOLS`` logs the shape of its arguments, not
+    their words."""
     if not args:
         return ""
+    if tool in _PRIVATE_ARG_TOOLS and isinstance(args, dict):
+        args = {k: (f"<{len(str(v))} chars>" if isinstance(v, str) else v)
+                for k, v in args.items()}
     try:
         body = json.dumps(args, default=str, ensure_ascii=False,
                           sort_keys=True)
@@ -4113,7 +4123,7 @@ class JarvisBrain:
             # "spotify_liked -> ok=True ...on shuffle" (2026-09-01 19:59)
             # could not say whether the shuffle was Hunter's or the
             # model's. Capped so a long note body cannot flood the log.
-            log.info("tool %s%s -> ok=%s %s", name, _args_for_log(args),
+            log.info("tool %s%s -> ok=%s %s", name, _args_for_log(args, tool=name),
                      result.ok, (result.text or "")[:80])
             self._journal_tool(name, args, result)
 
@@ -4277,9 +4287,14 @@ class JarvisBrain:
         unarmed_retry = False
 
         def ran_names():
-            # the tools that ran this turn, forced path included: what a
-            # claim is judged against (CLAIM_BACKERS)
-            return [name for name, _ in ran_results]
+            # the tools that ran this turn AND SUCCEEDED, forced path
+            # included: what a claim is judged against (CLAIM_BACKERS). A
+            # refused or failed run backs nothing -- measured 2026-09-12:
+            # remember refusing "remind me to call mom" (ok=False, nothing
+            # stored) followed by "I have noted that, sir" was spoken as
+            # backed, the exact lie the guard was built from on 09-04.
+            return [name for name, result in ran_results
+                    if getattr(result, "ok", True)]
 
         # A bare acknowledgement held back one sentence while the guard is
         # armed: "Of course, sir." is the yes to whatever follows, and if

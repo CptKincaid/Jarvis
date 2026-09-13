@@ -1110,3 +1110,46 @@ def test_the_three_round_count_holds_with_a_lead_in_negation(setup, caplog):
     assert record == THREE_RAN
     assert len(fake.chat_payloads()) == 3
     assert len(_warnings(caplog)) == 2
+
+
+# ---------------------------------- the remember tool's refusal (09-12 attack)
+def test_a_refused_remember_call_does_not_back_a_memory_claim(setup, caplog):
+    """CLAIM_BACKERS['memory'] = {'remember'} named the tool; the backer
+    list was every tool that RAN, ok or not. So a refused remember (a
+    question, another tool's job, a failed store) followed by 'I have
+    noted that, sir' was spoken as backed -- the exact lie the guard was
+    built from. Only a run that STORED backs the claim."""
+    from jarvis.tools import remember as rt
+    from types import SimpleNamespace
+    b, fake, record = setup
+    reg = brain_mod._REGISTRY
+    reg.register_many(rt.make_tools(None, SimpleNamespace(memory=None)))   # every call refuses
+    fake.replies = [tool_reply(("remember", {"fact": "remind me to call mom at 5"})),
+                    text_reply("I have noted that, sir."),
+                    text_reply("I can't do that from here, sir.")]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("Put it in your memory that I need to call mom at 5")
+    spoken = dict(tags)["SPEAK"]
+    assert "noted" not in spoken.lower(), spoken
+    assert _warnings(caplog), "the refused remember backed the claim"
+    assert len(fake.chat_payloads()) == 3                      # the one retry
+
+
+def test_a_stored_remember_call_backs_the_claim(setup, caplog):
+    from jarvis.tools import remember as rt
+    from jarvis.memory import JarvisMemory
+    from types import SimpleNamespace
+    import tempfile
+    from pathlib import Path
+    b, fake, record = setup
+    tmp = Path(tempfile.mkdtemp())
+    memory = JarvisMemory(memory_dir=tmp / "mem", legacy_dir=tmp / "legacy", semantic=False)
+    brain_mod._REGISTRY.register_many(rt.make_tools(None, SimpleNamespace(memory=memory)))
+    fake.replies = [tool_reply(("remember", {"fact": "I graduate December 10th 2026"})),
+                    text_reply("I have noted that, sir.")]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("Remember that I graduate December 10th 2026")
+    spoken = dict(tags)["SPEAK"]
+    assert spoken.startswith("Noted, sir:")                    # the authored line
+    assert not _warnings(caplog)
+    assert memory.recall("graduate")

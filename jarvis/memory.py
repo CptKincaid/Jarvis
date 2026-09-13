@@ -173,8 +173,8 @@ def speech_to_second_person(text):
 _FACT_LEAD_RX = re.compile(r"^\s*(?:(?:that|this)\s*[,:]\s*|[,:]\s*)+", re.I)
 _FACT_TAIL_RX = re.compile(
     r"(?:[,\s]+(?:please|jarvis|sir|thanks|thank you|would you|will you)"
-    r"[.!?,]*)+\s*$", re.I)
-_FACT_PUNCT_RX = re.compile(r"[\s.!?,;:]+$")
+    r"[.!?,\u2026]*)+\s*$", re.I)
+_FACT_PUNCT_RX = re.compile(r"[\s.!?,;:\u2026]+$")     # … is Whisper's trailing-off voice
 FACT_KEY_WORDS = 6
 
 
@@ -937,7 +937,10 @@ class JarvisMemory:
             entry["source"] = str(source)
         self._facts[key] = entry
         self._save("facts.json", self._facts)
-        log.info("remembered: %s = %s%s", key, str(value)[:50],
+        # The KEY's first words only: his facts are his (the log is read by
+        # tools and people who are not him), and he ruled the spoken
+        # read-back, not a log of what he asked Jarvis to keep.
+        log.info("remembered: %s…%s", " ".join(str(key).split()[:3]),
                  f" (from {source})" if source else "")
         if self._index is not None:
             try:

@@ -12385,6 +12385,8 @@ class Commander:
             # the source instead. Same staleness rule; nothing else is looked
             # for here.
             parked = self._calendar_add_undo()
+            if parked is None:
+                parked = self._remember_undo()
             if parked is not None:
                 return parked
             log.info("undo asked for with nothing to undo: %r", text)
@@ -12410,6 +12412,33 @@ class Commander:
             return None
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
+
+    def _remember_undo(self) -> Optional[CommandResult]:
+        """"Scratch that" after the remember TOOL filed a fact. The rung
+        returns its undo in the CommandResult; a ToolResult cannot, so the
+        tool parks {undo, at} on services.remember_undo (jarvis/tools/
+        remember.py), the way the calendar parks last_add. Same window,
+        cleared on the first try whether or not it worked."""
+        entry = getattr(self.services, "remember_undo", None)
+        if not isinstance(entry, dict) or not callable(entry.get("undo")):
+            return None
+        try:
+            self.services.remember_undo = None
+        except Exception:
+            log.debug("could not clear the parked remember undo", exc_info=True)
+        try:
+            at = float(entry.get("at") or 0.0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if at and time.monotonic() - at > UNDO_WINDOW_S:
+            log.info("remember undo expired (%.0fs)", time.monotonic() - at)
+            return None
+        try:
+            line = entry["undo"]()
+        except Exception:
+            log.exception("remember undo failed")
+            line = "I couldn't take that back, sir."
+        return CommandResult(handled=True, reply=str(line), speak=True, status="Undone")
 
     def _calendar_add_undo(self) -> Optional[CommandResult]:
         """"Scratch that" after an event was added by the tool.
