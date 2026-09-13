@@ -195,8 +195,12 @@ COMPOUND = ("Tell me the time and put this in your memory: I graduate "
 TIME_AND_LIE = "It's five past four, sir. I have noted that you graduate December 10th."
 
 
-def test_no_registry_tool_backs_a_memory_claim_today():
-    assert brain_mod.CLAIM_BACKERS["memory"] == frozenset()
+def test_only_the_remember_tool_backs_a_memory_claim():
+    """Until 2026-09-12 no registry tool stored a fact and this set was
+    empty; the `remember` tool (jarvis/tools/remember.py) is the one he
+    ruled for and the only name here."""
+    assert brain_mod.CLAIM_BACKERS["memory"] == frozenset({"remember"})
+    assert brain_mod.claim_backed("I have noted that", ("remember",)) is True
     assert brain_mod.CLAIM_BACKERS["action"] is None        # any tool at all
     assert brain_mod.claim_kind("I have noted that") == "memory"
     assert brain_mod.claim_kind("I'll keep that in mind") == "memory"

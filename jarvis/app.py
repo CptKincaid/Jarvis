@@ -141,6 +141,7 @@ TOOL_MODULES = (
     "jarvis.tools.screen",
     "jarvis.tools.health",
     "jarvis.tools.journal",
+    "jarvis.tools.remember",
     # Last, and usually free: oracle.make_tools returns NOTHING unless the
     # Oracle box is switched on AND has a key, so the default install pays
     # no schema for it. The registry is already over its 11-tool budget and

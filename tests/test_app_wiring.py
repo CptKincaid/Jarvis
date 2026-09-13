@@ -303,7 +303,9 @@ def test_every_tool_module_is_registered(app):
     # 27 since 2026-08-30: ask_code, the local index over his own repos --
     # one more schema in the static prefix, bought back on every "where
     # does X live" that no longer costs a claude -p.
-    assert len(names) == 27
+    # 28 since 2026-09-12: remember, the fact store the model can call --
+    # the one he ruled for on 09-04 ("yes give him a remember tool").
+    assert len(names) == 28
 
 
 def test_a_tool_module_that_fails_to_import_does_not_abort_boot(build,

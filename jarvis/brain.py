@@ -560,11 +560,11 @@ _AUTHORED_LINES = (UNBACKED_LINE, UNBACKED_MEMORY_LINE)
 # obeys it is not measured here (no Ollama in the suite); the line above
 # stands in when it does not.
 UNBACKED_MEMORY_NUDGE = ("[You said you stored or would remember something, "
-                         "but you have no tool that stores facts, and notes, "
-                         "reminders and events are not that. Do not store it "
-                         "anywhere. Answer the rest of my request, and for the "
-                         "store say plainly that you cannot remember that from "
-                         "here.]")
+                         "but you did not call the remember tool, and notes, "
+                         "reminders and events are not that. If I asked you to "
+                         "remember a fact about me, call remember now with my "
+                         "exact words. Otherwise answer the rest of my request "
+                         "and say plainly that nothing was stored.]")
 # A sentence that is ONLY an acknowledgement. Before a claim it is the yes
 # to that claim, and with the claim withheld it would stand as a yes to
 # nothing -- "Of course, sir." then a refusal, heard as one reply (probe
@@ -711,12 +711,17 @@ _NEGATED_LEAD_IN_RX = re.compile(
     r"will not|shall not|shan['’]t) forget(?: that| it| this)?)\b", re.I)
 
 
-# A vocative or an interjection set off by commas is not a clause of its
-# own: "Nothing, sir, has been added" is one negated clause with "sir" in
-# the middle of it, and splitting on the commas handed the guard " has
-# been " with the "Nothing" gone (2026-09-12 census, V16).
-_VOCATIVE_CLAUSE_RX = re.compile(
-    r",\s*(?:sir|ma['’]am|madam|mam|of course|certainly|naturally|"
+# A NEGATIVE SUBJECT with a vocative set off after it is one clause, not
+# two: "Nothing, sir, has been added" is "Nothing has been added" with
+# "sir" in the middle, and splitting on the commas handed the guard
+# " has been " with the "Nothing" gone (2026-09-12 census, V16). Narrow on
+# purpose -- only a bare negative pronoun in front of the vocative folds.
+# "No, sir, I've noted that" is an interjection before a claim and "I
+# can't store that, sir, but I've noted it" is two clauses; both keep
+# their commas, and both are still claims.
+_NEG_SUBJECT_VOCATIVE_RX = re.compile(
+    r"^(\s*(?:nothing|nobody|none|no one|neither|not one))\s*,\s*"
+    r"(?:sir|ma['’]am|madam|mam|of course|certainly|naturally|"
     r"i(?:'m| am) afraid|i think|i believe|as it happens|for now)\s*,", re.I)
 
 
@@ -724,7 +729,7 @@ def _claim_negated(before):
     """Does a negation govern the claim that begins where ``before``
     ends? Only one in the claim's own clause counts, and a lead-in idiom
     opening that clause is not one."""
-    before = _VOCATIVE_CLAUSE_RX.sub(" ", before or "")
+    before = _NEG_SUBJECT_VOCATIVE_RX.sub(r"\1 ", before or "")
     clause = _CLAUSE_BOUNDARY_RX.split(before)[-1]
     clause = _NEGATED_LEAD_IN_RX.sub(" ", clause)
     return bool(_CLAIM_NEGATED_RX.search(clause))
@@ -787,15 +792,15 @@ def claim_kind(claim):
 # WHAT BACKS A CLAIM: claim kind -> the tool names whose run this turn
 # makes the claim a report rather than an invention. None means any tool
 # at all -- the original rule, "a turn that ran a tool is trusted". A
-# memory claim is backed by a tool that STORES A FACT, and no registry
-# tool does: the remember rung is the commander's, which the model cannot
-# call, and notes/add_event/set_reminder write somewhere the recall path
-# never reads. So "I have noted that you graduate December 10th" beside a
-# real get_time result was as unbacked as it is alone, and the any-tool
-# exemption spoke it (2026-09-04 refuter, probe h). When a fact-storing
-# tool lands, name it HERE and nowhere else.
+# memory claim is backed only by a tool that STORES A FACT: notes,
+# add_event and set_reminder write somewhere the recall path never reads,
+# so "I have noted that you graduate December 10th" beside a real
+# get_time result was as unbacked as it is alone, and the any-tool
+# exemption spoke it (2026-09-04 refuter, probe h). Since 2026-09-12 the
+# `remember` tool (jarvis/tools/remember.py) is that tool -- the one he
+# ruled for on 09-04 -- and it is named HERE and nowhere else.
 CLAIM_BACKERS = {
-    "memory": frozenset(),
+    "memory": frozenset({"remember"}),
     "action": None,
 }
 
@@ -1344,7 +1349,7 @@ JARVIS_SYSTEM = f"""You are JARVIS, Hunter's personal AI: the calm, dry British 
 {VOICE_RULES}
 Never gush, never flatter, never sound like customer service. Answer the question and stop.
 
-Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. A live fact comes only from a tool result in this conversation: if you have not called the tool, you do not know the weather, what is on his calendar, what a timer is doing or what is in his mail, and you never state it from memory. Call the tool first, without commentary. After a tool result, answer in two to four sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If he asks how long something runs and the calendar gives only its start and the next thing after it, give him the bound those two times allow (it starts at ten to two and must end by his ten-past-four class at the latest) rather than saying there is no duration. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
+Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. When he tells you something to remember about himself, call remember with his exact words and nothing else; his own facts come from the memory in your background and from remember, never from his documents. A live fact comes only from a tool result in this conversation: if you have not called the tool, you do not know the weather, what is on his calendar, what a timer is doing or what is in his mail, and you never state it from memory. Call the tool first, without commentary. After a tool result, answer in two to four sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If he asks how long something runs and the calendar gives only its start and the next thing after it, give him the bound those two times allow (it starts at ten to two and must end by his ten-past-four class at the latest) rather than saying there is no duration. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
 
 Beyond your tools you cannot act: you cannot buy, book, browse, call, text, order, open files or run code yourself; the desktop commands and Claude do that through the rest of the system. If he asks for something no tool covers, say in one sentence that you cannot, naming what he asked for, and in the next name the one nearest thing that can actually do it: the tool you do have, or the desktop command; Claude only when it is code. Specific and dry, never a menu and never cheerful about it. If nothing in the system can do it, say so in that one dry sentence and stop: never send him to Claude for a thing Claude cannot do either. Check your tools before refusing: if one of them covers what he asked, call it, and never tell him to check something himself when a tool of yours can look it up; if you do not call it, offer it by name. A harmless request to say something ("say ma'am", "say some more", "say hi to my family") is not beyond you: it needs no tool, so simply do it, in character, and a hello for his family is spoken to them, with no names you were not given. Never say you checked, ran, read, saved or found anything unless a tool result in this conversation says so. When he asks for advice, give the one check anyone would make first and do not pretend to have inspected his code.
 
