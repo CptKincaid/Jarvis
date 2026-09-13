@@ -121,6 +121,11 @@ def make_loop(feed, detector=None, identifier=None, **kw):
     from jarvis import eyeloop as mod
     kw.setdefault("sleep", lambda s: None)
     kw.setdefault("burst_s", 0.0)          # one frame per burst unless asked
+    # NOON. The default curfew is his 21:00-07:00 and the default clock is
+    # the wall: every arm() in this file refused after nine at night, and
+    # 15 tests were red for the hour they were run in (measured 2026-09-12
+    # 21:20). The curfew has its own tests; these are not them.
+    kw.setdefault("clock", lambda: (12, 0))
     return mod.EyeLoop(feed, detector=detector, identifier=identifier, **kw)
 
 

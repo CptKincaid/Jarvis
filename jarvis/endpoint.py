@@ -18,8 +18,6 @@ no new package in the shared venv (the VSS project lives in it too).
 Measured on the GB10: 3.6 ms per 32 ms chunk on CPU, 11% of real time.
 """
 from __future__ import annotations
-
-
 import math
 import threading
 from pathlib import Path

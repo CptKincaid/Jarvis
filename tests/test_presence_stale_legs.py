@@ -347,9 +347,11 @@ def _lens(clock):
     # reading published in this test never ages and the camera leg answers
     # CAM_LOOKED for ever, which is a different test.
     feed.eye._now = clock.now
+    # clock=(12, 0): curfew=None means the DEFAULT 21:00-07:00 curfew on
+    # the wall clock, and this test is not about the curfew.
     loop = eyeloop_mod.EyeLoop(feed, detector=Detector(faces=0),
                                curfew=None, sleep=lambda s: None,
-                               now=clock.now)
+                               now=clock.now, clock=lambda: (12, 0))
     return feed, device, loop
 
 
